@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+* Fixed: on displays with Windows scaling (laptop screens at 125-150%) the overlay showed only the
+  top-left part of the picture, enlarged.
 * The FrameWarp panel warns when Windows' hardware-accelerated GPU scheduling is off on the game's
   GPU. Without it, the output may not reach the refresh rate.
 * README: explains why an RTX GPU is required.

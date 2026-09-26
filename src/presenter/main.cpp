@@ -350,6 +350,17 @@ void render_thread() {
         }
         if (sh.backbuffer_width != renderer.width() || sh.backbuffer_height != renderer.height())
             renderer.resize(sh.backbuffer_width, sh.backbuffer_height);
+        {
+            // The overlay window should cover exactly the game's frame; a mismatch (display scaling,
+            // windowed modes) would crop or offset the picture, so it is logged when it changes.
+            static std::uint32_t logged_w = 0, logged_h = 0;
+            const std::uint32_t cw = g_app.client_w, ch = g_app.client_h;
+            if (cw && ch && (cw != logged_w || ch != logged_h)) {
+                logf("overlay window %ux%u, game frame %ux%u%s", cw, ch, sh.backbuffer_width, sh.backbuffer_height,
+                     cw == sh.backbuffer_width && ch == sh.backbuffer_height ? "" : " (MISMATCH)");
+                logged_w = cw; logged_h = ch;
+            }
+        }
 
         PoseSettings ps;
         ps.use_mouse = settings.use_mouse != 0;
@@ -717,6 +728,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         logf("hardware-accelerated GPU scheduling: %s", hags == 2 ? "on" : hags == 1 ? "OFF (output may not reach the refresh rate)" : "unknown");
     }
 
+    // Real pixels everywhere. Without this, on a display with Windows scaling (laptops: 125-150%) the game
+    // window's size reads scaled (2560x1440 for a 4K panel at 150%) and the overlay showed only the
+    // top-left part of the frame, enlarged.
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     WNDCLASSW wc{};
     wc.lpfnWndProc = window_proc; wc.hInstance = instance; wc.lpszClassName = L"FrameWarpOverlay";
     wc.hCursor = nullptr;

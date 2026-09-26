@@ -28,7 +28,11 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
 }
 float4 ps(float4 pos : SV_Position) : SV_Target {
     int2 p = int2(pos.xy);
-    float4 c = src.Load(int3(p, 0));
+    // Scale to fit when the frame and the window differ in size (1:1 when they match, as usual).
+    uint sw, sh;
+    src.GetDimensions(sw, sh);
+    const int2 sp = min(int2(pos.xy * float2(sw, sh) / float2(size)), int2(sw, sh) - 1);
+    float4 c = src.Load(int3(sp, 0));
     // Debug strip (top-left, 16 cells of 48x48 px): one white cell advances every presented frame,
     // the rest is green while warping / red while showing the original. Only exists in our output.
     if (marker != 0 && p.y < 48 && p.x < 48 * 16) {
