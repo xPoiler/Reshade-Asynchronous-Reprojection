@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+* The FrameWarp panel warns when Windows' hardware-accelerated GPU scheduling is off on the game's
+  GPU. Without it, the output may not reach the refresh rate.
+* README: explains why an RTX GPU is required.
+
 ## 1.2.0
 
 * **Cyberpunk 2077 support.**

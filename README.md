@@ -24,7 +24,8 @@ Other games that use NVIDIA Streamline for DLSS may work but are untested.
 * An NVIDIA RTX GPU rendering the game. FrameWarp takes its data from the game's DLSS and Reflex, so the
   GPU must support both (DLSS needs an RTX card), and NVIDIA's Frame Warp engine runs on RTX GPUs too.
 * Windows 11 (tested; Windows 10 may work) with **Hardware-accelerated GPU scheduling** turned on (Settings > System >
-  Display > Graphics).
+  Display > Graphics, then restart). Without it the output may not reach the refresh rate; the FrameWarp
+  panel warns you if it is off.
 * [ReShade](https://reshade.me) 6.x **with full add-on support**, installed for the game.
 * DLSS and Reflex enabled in the game.
 * **`nvngx_latewarp.dll`**, NVIDIA's Reflex 2 Frame Warp (Latewarp) DLL. It is NVIDIA's file and

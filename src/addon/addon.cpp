@@ -144,6 +144,10 @@ void draw_overlay(effect_runtime*) {
 
     const bool alive = presenter_running();
     ImGui::Text("Presenter: %s", alive ? "running" : "not running");
+    if (alive && p.hardware_scheduling == 1)
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
+                           "Hardware-accelerated GPU scheduling is OFF: output may not reach the refresh rate.\n"
+                           "Turn it on in Windows Settings > System > Display > Graphics, then restart the PC.");
     if (!alive && ImGui::Button("Start presenter")) { g_presenter_launched = false; launch_presenter(); }
     if (alive) {
         ImGui::Text("Output %.1f fps | game %.1f fps | warp GPU %.2f ms | source age %.1f ms",

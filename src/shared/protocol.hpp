@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 18;
+constexpr std::uint32_t kVersion = 19;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -82,7 +82,7 @@ struct Settings {
 // Presenter status, displayed by the add-on UI.
 struct PresenterStatus {
     volatile LONG pid;
-    std::uint32_t pad0;
+    std::uint32_t hardware_scheduling;  // Windows hardware-accelerated GPU scheduling on the game's GPU: 0 unknown, 1 off, 2 on
     std::int64_t heartbeat_qpc;
     float output_fps, source_fps, warp_gpu_ms, source_age_ms;
     float gain_x, gain_y, delay_ms, fit_quality_x, fit_quality_y;

@@ -3,6 +3,8 @@
 #include "presenter/pose.hpp"
 #include "presenter/renderer.hpp"
 #include <shellapi.h>
+#include <winternl.h>  // NTSTATUS for d3dkmthk.h
+#include <d3dkmthk.h>
 #include <dxgi1_4.h>
 #include <pdh.h>
 #include <wrl/client.h>
@@ -240,6 +242,32 @@ void apply_gpu_priority(std::uint32_t setting) {
     }
     logf("GPU scheduling priority class: %s", result);
     std::snprintf(g_gpu_priority, sizeof(g_gpu_priority), "%s", result);
+}
+
+// Hardware-accelerated GPU scheduling actually active on this adapter (not just the setting, which only
+// applies after a reboot): 2 on, 1 off, 0 unknown. Without it the realtime priority cannot preempt the
+// game's GPU work well and output falls below the refresh rate.
+std::uint32_t hardware_scheduling(const LUID& adapter) {
+    HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
+    auto open = reinterpret_cast<PFND3DKMT_OPENADAPTERFROMLUID>(GetProcAddress(gdi, "D3DKMTOpenAdapterFromLuid"));
+    auto query = reinterpret_cast<PFND3DKMT_QUERYADAPTERINFO>(GetProcAddress(gdi, "D3DKMTQueryAdapterInfo"));
+    auto close = reinterpret_cast<PFND3DKMT_CLOSEADAPTER>(GetProcAddress(gdi, "D3DKMTCloseAdapter"));
+    if (!open || !query || !close) return 0;
+    D3DKMT_OPENADAPTERFROMLUID opened{};
+    opened.AdapterLuid = adapter;
+    if (open(&opened) != 0) return 0;
+    D3DKMT_WDDM_2_7_CAPS caps{};
+    D3DKMT_QUERYADAPTERINFO info{};
+    info.hAdapter = opened.hAdapter;
+    info.Type = KMTQAITYPE_WDDM_2_7_CAPS;
+    info.pPrivateDriverData = &caps;
+    info.PrivateDriverDataSize = sizeof(caps);
+    const LONG result = query(&info);
+    D3DKMT_CLOSEADAPTER closing{};
+    closing.hAdapter = opened.hAdapter;
+    close(&closing);
+    if (result != 0) return 0;
+    return caps.HwSchEnabled ? 2u : 1u;
 }
 
 void render_thread() {
@@ -683,6 +711,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     // Render thread priority matters as much as GPU priority for hitting every vblank.
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
     apply_gpu_priority(g_app.shared->settings.gpu_priority);
+    {
+        const std::uint32_t hags = hardware_scheduling(g_app.shared->adapter);
+        g_app.shared->presenter.hardware_scheduling = hags;
+        logf("hardware-accelerated GPU scheduling: %s", hags == 2 ? "on" : hags == 1 ? "OFF (output may not reach the refresh rate)" : "unknown");
+    }
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = window_proc; wc.hInstance = instance; wc.lpszClassName = L"FrameWarpOverlay";
