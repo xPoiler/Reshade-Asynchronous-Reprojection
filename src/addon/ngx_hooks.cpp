@@ -71,7 +71,19 @@ NVSDK_NGX_Result NVSDK_CONV hk_evaluate(ID3D12GraphicsCommandList* list, const N
                                         PFN_NVSDK_NGX_ProgressCallback callback) {
     if (auto* s = stats()) {
         ++s->evaluate_calls;
-        const std::uint32_t feature = feature_of(handle);
+        std::uint32_t feature = feature_of(handle);
+        if (feature == 0xFFFFFFFFu && params) {
+            // Created before our hooks (or CreateFeature could not be hooked): an evaluation that carries
+            // both depth and motion vectors is an upscaler; treat it as DLSS from now on.
+            ID3D12Resource *depth = nullptr, *motion = nullptr;
+            if (params->Get(NVSDK_NGX_Parameter_Depth, &depth) == NVSDK_NGX_Result_Success && depth &&
+                params->Get(NVSDK_NGX_Parameter_MotionVectors, &motion) == NVSDK_NGX_Result_Success && motion) {
+                feature = NVSDK_NGX_Feature_SuperSampling;
+                remember(handle, feature);
+                if (!s->dlss_feature) s->dlss_feature = feature;
+                ++s->identified_by_inputs;
+            }
+        }
         if (feature < 16) ++s->feature_calls[feature];
         else ++s->unknown_handle_calls;
         if (is_dlss(feature) && params) {

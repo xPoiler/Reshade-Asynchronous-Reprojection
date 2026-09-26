@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 21;
+constexpr std::uint32_t kVersion = 22;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -137,7 +137,7 @@ struct NgxStats {
     std::uint32_t subrect_w, subrect_h;
     float jitter[2], mv_scale[2];
     std::uint32_t dlss_feature;  // 1 Super Resolution, 13 Ray Reconstruction (0: none seen)
-    std::uint32_t pad;
+    std::uint32_t identified_by_inputs;  // DLSS handles recognised from their inputs (created before our hooks)
 };
 
 struct Shared {

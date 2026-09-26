@@ -102,8 +102,36 @@ std::size_t relocatable_prologue_length(const std::uint8_t* code, std::size_t mi
     return total <= 16 ? total : 0;
 }
 
+// Follows unconditional jumps at a function's entry: jmp rel32 (E9), jmp rel8 (EB), jmp [rip+disp32]
+// (FF 25, optionally REX.W-prefixed). Returns where the code really starts.
+std::uint8_t* follow_jumps(std::uint8_t* code) {
+    for (int hops = 0; hops < 8; ++hops) {
+        if (code[0] == 0xE9) {
+            std::int32_t rel; std::memcpy(&rel, code + 1, 4);
+            code = code + 5 + rel;
+        } else if (code[0] == 0xEB) {
+            code = code + 2 + static_cast<std::int8_t>(code[1]);
+        } else if ((code[0] == 0xFF && code[1] == 0x25) || (code[0] == 0x48 && code[1] == 0xFF && code[2] == 0x25)) {
+            const int prefix = code[0] == 0x48 ? 1 : 0;
+            std::int32_t disp; std::memcpy(&disp, code + prefix + 2, 4);
+            std::uint8_t* slot = code + prefix + 6 + disp;
+            std::uint8_t* next = nullptr;
+            std::memcpy(&next, slot, sizeof(next));
+            if (!next) break;
+            code = next;
+        } else {
+            break;
+        }
+    }
+    return code;
+}
+
 bool InlineHook::install(void* target, void* detour) {
     if (target_) { error_ = "already installed"; return false; }
+    // Another tool may already have hooked this function (its first instruction is a jump to that
+    // tool's detour or thunk). Follow the jumps and hook where they lead: the other hook keeps working
+    // and ours runs after it.
+    target = follow_jumps(static_cast<std::uint8_t*>(target));
     auto* code = static_cast<std::uint8_t*>(target);
     const std::size_t length = relocatable_prologue_length(code);
     if (!length) {

@@ -63,6 +63,28 @@ int main() {
     EXPECT(read() == 1235, "trampoline reads the relocated RIP-relative global");
     rip_hook.remove();
     EXPECT(read() == 1234, "restored");
+    // Already hooked by another tool: the entry is a jump (jmp rel32, or jmp [rip]) to the real code.
+    // Our hook must land on the real code and the other tool's jump must keep working.
+    {
+        auto* block = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+        std::memcpy(block + 256, add_code, sizeof(add_code));
+        const std::int32_t rel = 256 - 5;
+        block[0] = 0xE9; std::memcpy(block + 1, &rel, 4);                       // jmp rel32 -> block+256
+        block[16] = 0xFF; block[17] = 0x25; const std::int32_t zero = 0;       // jmp [rip+0] -> address below
+        std::memcpy(block + 18, &zero, 4);
+        std::uint8_t* real = block + 256; std::memcpy(block + 22, &real, 8);
+        FlushInstructionCache(GetCurrentProcess(), block, 4096);
+        EXPECT(follow_jumps(block) == block + 256, "follows jmp rel32");
+        EXPECT(follow_jumps(block + 16) == block + 256, "follows jmp [rip]");
+        auto via_jump = reinterpret_cast<AddFn>(block);
+        EXPECT(via_jump(2, 3) == 5, "jump stub unhooked");
+        EXPECT(g_hook.install(block, reinterpret_cast<void*>(&detour)), g_hook.error().c_str());
+        EXPECT(via_jump(2, 3) == 50, "hooked through the other tool's jump");
+        EXPECT(block[0] == 0xE9, "the other tool's jump is left alone");
+        g_hook.remove();
+        EXPECT(via_jump(2, 3) == 5, "restored behind the jump");
+    }
+
     const std::uint8_t call_first[] = {0xE8, 0, 0, 0, 0, 0x90};
     EXPECT(relocatable_prologue_length(call_first) == 0, "branches must be refused");
 

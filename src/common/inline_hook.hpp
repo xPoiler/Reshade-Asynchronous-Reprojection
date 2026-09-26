@@ -12,6 +12,9 @@ namespace fw {
 // Returns the number of bytes (>= 5) covered by whole relocatable instructions at code, or 0.
 std::size_t relocatable_prologue_length(const std::uint8_t* code, std::size_t minimum = 5);
 
+// Where a function's code really starts after any leading unconditional jumps (e.g. another tool's hook).
+std::uint8_t* follow_jumps(std::uint8_t* code);
+
 class InlineHook {
 public:
     InlineHook() = default;
