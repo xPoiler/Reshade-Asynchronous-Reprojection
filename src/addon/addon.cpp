@@ -6,6 +6,7 @@
 #include "addon/producer.hpp"
 #include "addon/game_probe.hpp"
 #include "addon/streamline_hooks.hpp"
+#include "addon/ngx_hooks.hpp"
 #include <d3d12.h>
 #include <cstdio>
 #include <memory>
@@ -84,6 +85,7 @@ void on_init_swapchain(swapchain* sc, bool) {
     g_producer->set_swapchain(static_cast<HWND>(sc->get_hwnd()), desc.texture.width, desc.texture.height,
                               static_cast<DXGI_FORMAT>(desc.texture.format), to_dxgi_color_space(sc->get_color_space()));
     fw::install_streamline_hooks(g_producer.get());
+    fw::install_ngx_hooks(g_producer.get());
 }
 
 // reshade_present runs after ReShade has drawn its effects and menu, so the captured frame (which
@@ -92,6 +94,7 @@ void on_reshade_present(effect_runtime* runtime) {
     command_queue* queue = runtime->get_command_queue();
     if (!g_producer || !g_producer->ready() || !queue || queue->get_device()->get_api() != device_api::d3d12) return;
     fw::install_streamline_hooks(g_producer.get());  // no-op once everything is hooked
+    fw::install_ngx_hooks(g_producer.get());
     static unsigned probe_counter = 0;
     if ((probe_counter++ % 120) == 0) fw::probe_streamline_features();
     auto* bb = reinterpret_cast<ID3D12Resource*>(runtime->get_current_back_buffer().handle);
@@ -208,6 +211,22 @@ void draw_overlay(effect_runtime*) {
         }
     }
 
+    if (ImGui::CollapsingHeader("NGX diagnostics (DLSS without Streamline)")) {
+        const auto& n = sh.ngx;
+        ImGui::Text("Hooks: CreateFeature %s, EvaluateFeature %s", (n.hooks & 1) ? "yes" : "no", (n.hooks & 2) ? "yes" : "no");
+        ImGui::Text("Calls: create %u (DLSS %u), evaluate %u (DLSS %u, unknown handle %u), resets %u", n.create_calls, n.dlss_creates,
+                    n.evaluate_calls, n.dlss_calls, n.unknown_handle_calls, n.resets);
+        for (int i = 0; i < 16; ++i)
+            if (n.feature_calls[i]) ImGui::Text("  feature %2d: %u evaluations", i, n.feature_calls[i]);
+        ImGui::Text("DLSS create: render %ux%u -> output %ux%u, flags 0x%X (%s%s%s%s)", n.render_w, n.render_h, n.out_w, n.out_h,
+                    n.create_flags, (n.create_flags & 1) ? "HDR " : "", (n.create_flags & 2) ? "MV-low-res " : "",
+                    (n.create_flags & 4) ? "MV-jittered " : "", (n.create_flags & 8) ? "depth-inverted" : "");
+        ImGui::Text("  depth %ux%u fmt %u | motion %ux%u fmt %u", n.depth_w, n.depth_h, n.depth_format, n.mv_w, n.mv_h, n.mv_format);
+        ImGui::Text("  colour %ux%u fmt %u | output %ux%u fmt %u", n.color_w, n.color_h, n.color_format, n.output_w, n.output_h,
+                    n.output_format);
+        ImGui::Text("  render subrect %ux%u | jitter %.3f, %.3f | MV scale %.4g, %.4g", n.subrect_w, n.subrect_h, n.jitter[0], n.jitter[1],
+                    n.mv_scale[0], n.mv_scale[1]);
+    }
     if (ImGui::CollapsingHeader("Streamline diagnostics")) {
         ImGui::Text("Hooks: constants %s, tag %s, tagForFrame %s, PCL %s",
                     (h.hooks_installed & 1) ? "yes" : "NO", (h.hooks_installed & 2) ? "yes" : "NO",
@@ -274,6 +293,7 @@ __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE reshade_modul
     g_presenter_path = dir + L"\\FrameWarp\\FrameWarpPresenter.exe";
     if (!g_producer) g_producer = std::make_unique<fw::Producer>();
     fw::install_streamline_hooks(g_producer.get());
+    fw::install_ngx_hooks(g_producer.get());
     fw::install_game_probes(g_producer->shared() ? &g_producer->shared()->hooks : nullptr);
     register_callbacks();
     return true;

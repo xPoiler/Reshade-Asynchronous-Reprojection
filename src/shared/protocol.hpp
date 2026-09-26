@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 19;
+constexpr std::uint32_t kVersion = 20;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -125,6 +125,19 @@ struct TimelineEvent {
 };
 constexpr int kTimeline = 4096;
 
+// NGX (DLSS without Streamline) diagnostics, written by the add-on's hooks in the driver's _nvngx.dll.
+struct NgxStats {
+    std::uint32_t hooks;  // bit 0 CreateFeature, bit 1 EvaluateFeature
+    std::uint32_t create_calls, dlss_creates, evaluate_calls, dlss_calls, unknown_handle_calls, resets;
+    std::uint32_t feature_calls[16];  // EvaluateFeature calls per NGX feature id
+    std::uint32_t create_flags;       // DLSS create flags (HDR, low-res MV, jittered MV, depth inverted, ...)
+    std::uint32_t render_w, render_h, out_w, out_h;
+    std::uint32_t depth_w, depth_h, depth_format, mv_w, mv_h, mv_format;
+    std::uint32_t color_w, color_h, color_format, output_w, output_h, output_format;
+    std::uint32_t subrect_w, subrect_h;
+    float jitter[2], mv_scale[2];
+};
+
 struct Shared {
     std::uint32_t magic, version;
     std::uint32_t producer_pid, pad0;
@@ -139,6 +152,7 @@ struct Shared {
     Settings settings;
     PresenterStatus presenter;
     HookStats hooks;
+    NgxStats ngx;
     volatile LONG64 timeline_count;
     TimelineEvent timeline[kTimeline];
 };

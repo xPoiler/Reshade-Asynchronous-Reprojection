@@ -29,9 +29,10 @@ target_compile_definitions(fw_options INTERFACE WIN32_LEAN_AND_MEAN NOMINMAX UNI
 target_include_directories(fw_options INTERFACE src)
 
 # In-game ReShade add-on (static CRT so it has no runtime dependency inside the game).
-add_library(FrameWarpAddon SHARED src/addon/addon.cpp src/addon/producer.cpp src/addon/streamline_hooks.cpp src/addon/game_probe.cpp src/common/inline_hook.cpp)
+add_library(FrameWarpAddon SHARED src/addon/addon.cpp src/addon/producer.cpp src/addon/streamline_hooks.cpp src/addon/ngx_hooks.cpp
+            src/addon/game_probe.cpp src/common/inline_hook.cpp)
 target_link_libraries(FrameWarpAddon PRIVATE fw_options d3d12)
-target_include_directories(FrameWarpAddon SYSTEM PRIVATE third_party/reshade/include third_party/imgui)
+target_include_directories(FrameWarpAddon SYSTEM PRIVATE third_party/reshade/include third_party/imgui "${FW_NGX_INCLUDE}")  # NGX headers only (no library)
 set_target_properties(FrameWarpAddon PROPERTIES OUTPUT_NAME "FrameWarp" PREFIX "" SUFFIX ".addon64"
                       MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
