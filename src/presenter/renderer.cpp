@@ -81,13 +81,13 @@ groupshared float4 gs_a[64], gs_b[64];
                 const float2 cam_px = cam * float2(rect.zw);
                 const float limit = max(threshold, 0.15 * length(cam_px));  // camera-model error grows with camera speed
                 const bool moving = (flags & 1) && dot(own, own) > limit * limit;
-                // Attached to the camera (first-person weapon, hands): the camera turned the world under it,
-                // but its own motion vector is close to zero.
-                const float2 game_px = g * mv_scale * float2(rect.zw);
+                // Attached to the camera (first-person weapon, hands): close to the camera and moving in a way the
+                // camera motion does not explain - stuck to the screen while the world moves under it, or mid
+                // animation (aiming in/out while walking). Nearby walls move exactly as the camera predicts.
                 // Only near the camera (reversed-Z: d = near / distance, so d > 1/64 means closer than 64x the
-                // near plane): the sky and distant scenery often have zero motion vectors too.
-                const bool attached = (flags & 1) && (flags & 16) && d > 1.0 / 64.0 && length(cam_px) > 1.5 &&
-                                      length(game_px) < 0.25 * length(cam_px);
+                // near plane): the sky and distant scenery often have motion vectors that ignore the camera too.
+                const bool attached = (flags & 1) && (flags & 16) && d > 1.0 / 64.0 &&
+                                      length(own) > max(1.0, 0.25 * length(cam_px));
                 o = float4(own, d, attached ? 2 : (moving ? 1 : 0));
                 // The scale fit only uses pixels whose motion vector points along the camera motion (either
                 // sign per axis); attached or independently moving pixels would bias it.

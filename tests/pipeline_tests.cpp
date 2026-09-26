@@ -364,6 +364,7 @@ int main(int argc, char** argv) {
         int hud_patch_colour = 0;
         bool horizontal_bar = false;
         bool near_wall = false;
+        float weapon_mv = 0.0f;  // the weapon strip's own motion vector (uv): 0 = stuck to the screen, else animating
         bool repeating = false;  // scenery that repeats every 6 px (= the camera motion per frame): windows, railings  // a wall close to the camera behind the HUD patch (normal motion vectors)
         int scene_offset = -1;  // textured scene (vertical grey stripes) shifting every frame; >= 0 freezes it
         auto publish = [&](std::uint64_t fid, float bg, LONG bar_dx, bool weapon, bool hud_patch, bool near_strip = true) -> int {
@@ -399,7 +400,7 @@ int main(int argc, char** argv) {
             std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
             list->ResourceBarrier(1, &b);
             std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
-            const float scene_mv[4] = {shift, 0, 0, 0}, none[4] = {0, 0, 0, 0};
+            const float scene_mv[4] = {shift, 0, 0, 0}, none[4] = {weapon_mv, 0, 0, 0};
             list->ClearRenderTargetView(mv_rtv->GetCPUDescriptorHandleForHeapStart(), scene_mv, 0, nullptr);
             if (weapon) {
                 const LONG bx = LONG(DW / 2);
@@ -486,6 +487,16 @@ int main(int argc, char** argv) {
         const double weapon_x0 = peak(px, w, h, true, 1);
         show(weapon_src, yaw);
         const double weapon_x1 = peak(px, w, h, true, 1);
+        // (A1) a weapon mid-animation (aiming in while walking): its motion vectors show the animation, not
+        // zero, and not the camera motion either. Still attached: not warped.
+        weapon_mv = -5.0f * shift;
+        IngestedSource anim_src = ingest_frame(publish(210, 0.1f, 0, true, false), false, true);
+        weapon_mv = 0.0f;
+        show(anim_src, 0);
+        const double anim_x0 = peak(px, w, h, true, 1);
+        show(anim_src, yaw);
+        const double anim_x1 = peak(px, w, h, true, 1);
+        EXPECT(std::fabs(anim_x1 - anim_x0) < 2.0, "an animating first-person weapon is not warped (%.0f -> %.0f)", anim_x0, anim_x1);
         // (A2) the same zero-motion strip far away (sky) is not a weapon: it must warp.
         renderer.reset_hud_detection();
         IngestedSource sky_src{};
