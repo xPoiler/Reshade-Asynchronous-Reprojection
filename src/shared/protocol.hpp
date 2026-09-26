@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 24;
+constexpr std::uint32_t kVersion = 25;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -158,6 +158,8 @@ struct Shared {
     PresenterStatus presenter;
     HookStats hooks;
     NgxStats ngx;
+    volatile LONG presents_without_frame;  // consecutive game presents with no captured frame (menus, loading)
+    std::uint32_t pad_presents;
     volatile LONG64 timeline_count;
     TimelineEvent timeline[kTimeline];
 };

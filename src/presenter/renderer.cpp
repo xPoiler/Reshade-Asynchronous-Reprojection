@@ -952,7 +952,7 @@ void Renderer::convert(ID3D12Resource* source, DXGI_FORMAT source_format, int sl
     transition(p, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 }
 
-IngestedSource Renderer::ingest(const Shared& shared, int slot) {
+IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::function<void(const IngestedSource&)>& after_depth) {
     IngestedSource out;
     const auto& m = shared.slots[slot];
     const auto& bb = m.tex[kBackbuffer];
@@ -968,6 +968,24 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot) {
     for (auto* r : sources)
         if (r) { barriers.push_back(transition_barrier(r, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)); reading_.push_back(r); }
     list_->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+
+    const auto& dp = m.tex[kDepth];
+    if (sources[kDepth]) {
+        ensure_private(kPDepth, dp.width, dp.height, DXGI_FORMAT_R32_FLOAT);
+        ensure_private(kPMotion, dp.width, dp.height, DXGI_FORMAT_R16G16_FLOAT);
+        convert(sources[kDepth], static_cast<DXGI_FORMAT>(dp.format), slot, kDepth, kPDepth, dp.width, dp.height);
+        const auto& mv = m.tex[kMotion];
+        if (sources[kMotion]) {
+            convert(sources[kMotion], static_cast<DXGI_FORMAT>(mv.format), slot, kMotion, kPMotion,
+                    std::min(mv.width, dp.width), std::min(mv.height, dp.height));
+            out.has_motion = true;
+        }
+        out.depth_rect = {dp.ext_x, dp.ext_y, dp.ext_w, dp.ext_h};
+        out.has_depth = true;
+    }
+    // Depth and motion vectors are recorded first: a caller that needs them on the CPU (camera
+    // estimation) can flush here and wait for this small amount of work, before the 4K colour work.
+    if (after_depth) after_depth(out);
 
     out.color_w = bb.width; out.color_h = bb.height;
     out.color_rect = {0, 0, bb.width, bb.height};
@@ -999,20 +1017,6 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot) {
     if (sources[kUi] && ui.width == bb.width && ui.height == bb.height) {
         convert(sources[kUi], static_cast<DXGI_FORMAT>(ui.format), slot, kUi, kPUi, bb.width, bb.height);
         out.has_ui = true;
-    }
-    const auto& dp = m.tex[kDepth];
-    if (sources[kDepth]) {
-        ensure_private(kPDepth, dp.width, dp.height, DXGI_FORMAT_R32_FLOAT);
-        ensure_private(kPMotion, dp.width, dp.height, DXGI_FORMAT_R16G16_FLOAT);
-        convert(sources[kDepth], static_cast<DXGI_FORMAT>(dp.format), slot, kDepth, kPDepth, dp.width, dp.height);
-        const auto& mv = m.tex[kMotion];
-        if (sources[kMotion]) {
-            convert(sources[kMotion], static_cast<DXGI_FORMAT>(mv.format), slot, kMotion, kPMotion,
-                    std::min(mv.width, dp.width), std::min(mv.height, dp.height));
-            out.has_motion = true;
-        }
-        out.depth_rect = {dp.ext_x, dp.ext_y, dp.ext_w, dp.ext_h};
-        out.has_depth = true;
     }
     ingested_ = true;
     last_had_hudless_ = out.has_hudless;

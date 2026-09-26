@@ -12,7 +12,8 @@ static const double kW = 1920, kH = 1080, kPi = 3.14159265358979;
 
 // Samples on a 64x36 grid for a camera rotating by `omega` (current -> previous camera coords) with a
 // vertical field of view `fov`; `outliers` of them get random motion (moving objects).
-static std::vector<MotionSample> make(const CameraEstimator::V3& omega, double fov, double outliers, std::mt19937& rng) {
+static std::vector<MotionSample> make(const CameraEstimator::V3& omega, double fov, double outliers, std::mt19937& rng,
+                                      const CameraEstimator::V3& T = {0, 0, 0}) {
     const double f = (kH * 0.5) / std::tan(fov * 0.5);
     const auto R = CameraEstimator::rotation(omega);
     std::uniform_real_distribution<double> u(0, 1), noise(-0.1, 0.1), wild(-40, 40);
@@ -22,11 +23,13 @@ static std::vector<MotionSample> make(const CameraEstimator::V3& omega, double f
             MotionSample p{};
             p.x = float((gx + 0.5) * kW / 64); p.y = float((gy + 0.5) * kH / 36);
             const double X = (p.x - kW * 0.5) / f, Y = -(p.y - kH * 0.5) / f;
-            const double c0 = R[0][0] * X + R[0][1] * Y + R[0][2], c1 = R[1][0] * X + R[1][1] * Y + R[1][2], c2 = R[2][0] * X + R[2][1] * Y + R[2][2];
+            // depth = 1 / distance: a mix of far scenery and near geometry (0.5 = two units away)
+            p.depth = float(u(rng) < 0.5 ? 0.001 + 0.01 * u(rng) : 0.05 + 0.45 * u(rng));
+            const double c0 = R[0][0] * X + R[0][1] * Y + R[0][2] + T[0] * p.depth, c1 = R[1][0] * X + R[1][1] * Y + R[1][2] + T[1] * p.depth,
+                         c2 = R[2][0] * X + R[2][1] * Y + R[2][2] + T[2] * p.depth;
             p.mx = float(kW * 0.5 + f * c0 / c2 - p.x + noise(rng));
             p.my = float(kH * 0.5 - f * c1 / c2 - p.y + noise(rng));
             if (u(rng) < outliers) { p.mx = float(wild(rng)); p.my = float(wild(rng)); }
-            p.depth = float(0.001 + 0.01 * u(rng));
             p.valid = 1;
             s.push_back(p);
         }
@@ -47,6 +50,20 @@ int main() {
         std::printf("rotation (%.3f %.3f %.3f) fitted (%.4f %.4f %.4f), error %.2e rad\n", omega[0], omega[1], omega[2], fit[0], fit[1], fit[2], err);
         EXPECT(err < 2e-4, "rotation recovered (error %g)", err);
     }
+    // Rotation + translation (strafing, walking forward, orbiting) from all samples.
+    for (const auto& case_ : {std::make_pair(CameraEstimator::V3{0, 0, 0}, CameraEstimator::V3{0.05, 0, 0}),
+                              std::make_pair(CameraEstimator::V3{0, 0.01, 0}, CameraEstimator::V3{0, 0, -0.1}),
+                              std::make_pair(CameraEstimator::V3{0.002, 0.02, 0}, CameraEstimator::V3{-0.06, 0.01, 0.02})}) {
+        const auto s = make(case_.first, fov, 0.0, rng, case_.second);
+        CameraEstimator::V3 o{}, t{};
+        CameraEstimator::fit_rotation(s, kW, kH, (kH * 0.5) / std::tan(fov * 0.5), o);
+        CameraEstimator::fit_motion(s, kW, kH, (kH * 0.5) / std::tan(fov * 0.5), o, t);
+        double eo = 0, et = 0;
+        for (int k = 0; k < 3; ++k) { eo = std::max(eo, std::fabs(o[k] - case_.first[k])); et = std::max(et, std::fabs(t[k] - case_.second[k])); }
+        std::printf("rotation+translation: T (%.3f %.3f %.3f) fitted (%.4f %.4f %.4f), rotation error %.1e, translation error %.1e\n",
+                    case_.second[0], case_.second[1], case_.second[2], t[0], t[1], t[2], eo, et);
+        EXPECT(eo < 3e-4 && et < 3e-3, "rotation and translation recovered (%g, %g)", eo, et);
+    }
     // Full estimator: learns the field of view from turning frames with 10% outliers, then tracks.
     CameraEstimator est;
     Camera game{};
@@ -56,7 +73,8 @@ int main() {
     EXPECT(std::fabs(est.vertical_fov() - fov) < 1.5 * kPi / 180, "field of view learned (%.2f deg)", est.vertical_fov() * 180 / kPi);
     EXPECT(est.fov_locked(), "field of view locks");
     const CameraEstimator::V3 omega{0.004, 0.025, 0};
-    const auto s = make(omega, fov, 0.10, rng);
+    const CameraEstimator::V3 strafe{0.04, 0, 0.02};
+    const auto s = make(omega, fov, 0.10, rng, strafe);
     const Camera cam = est.update(s, kW, kH, game);
     const auto got = est.last_omega();
     double err = 0;
@@ -64,7 +82,7 @@ int main() {
     EXPECT(err < 5e-4, "rotation with outliers (error %g)", err);
     // clipToPrevClip must map each (inlier) pixel to where its motion vector says it came from.
     double worst = 0;
-    for (const auto& p : make(omega, fov, 0.0, rng)) {
+    for (const auto& p : make(omega, fov, 0.0, rng, strafe)) {
         const double ndc_x = p.x / kW * 2 - 1, ndc_y = 1 - p.y / kH * 2;
         const double clip[4] = {ndc_x, ndc_y, p.depth, 1};
         double prev[4] = {};

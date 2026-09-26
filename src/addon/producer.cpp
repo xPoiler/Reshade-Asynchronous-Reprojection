@@ -285,7 +285,8 @@ std::uint64_t Producer::begin_present(ID3D12Resource* backbuffer, ID3D12Graphics
     }
     have_present_marker_ = false;
     push_event(shared_, kEvPresent, slot >= 0 ? shared_->slots[slot].frame_id : pending_present_frame_, slot >= 0 ? via : 0);
-    if (slot < 0) return 0;
+    if (slot < 0) { InterlockedIncrement(&shared_->presents_without_frame); return 0; }
+    InterlockedExchange(&shared_->presents_without_frame, 0);
     auto& m = shared_->slots[slot];
     // Frames older than the one being presented will never be presented: release them.
     for (int i = 0; i < kSlots; ++i)

@@ -429,14 +429,20 @@ void render_thread() {
             const SlotMeta& m = sh.slots[newest];
             // The previous frame's colour feeds the HUD detector (and the shelved object interpolation).
             renderer.set_keep_previous_colour(settings.extrapolate_objects != 0 || (settings.no_warp_mask != 0 && !game_has_hud_layers));
-            IngestedSource s = renderer.ingest(sh, newest);
+            // Games without a camera: sample the motion vectors as soon as depth/motion are recorded (the
+            // wait then covers only that work, not the 4K colour conversions).
+            bool sampled = false;
+            const bool wants_samples = m.camera.estimated != 0;
+            IngestedSource s = renderer.ingest(sh, newest, [&](const IngestedSource& early) {
+                if (wants_samples && early.has_depth && early.has_motion) sampled = renderer.sample_motion(early, 64, 36, raw_samples);
+            });
             held.push_back({newest, renderer.submitted_value() + 1});
             if (s.valid) {
                 // Games without a camera (DLSS without Streamline): estimate it from the motion vectors.
                 Camera cam = m.camera;
                 if (cam.estimated && s.has_depth && s.has_motion && s.depth_rect.w && s.depth_rect.h) {
                     constexpr std::uint32_t kGridW = 64, kGridH = 36;
-                    if (renderer.sample_motion(s, kGridW, kGridH, raw_samples)) {
+                    if (sampled) {
                         const double rw = s.depth_rect.w, rh = s.depth_rect.h;
                         motion_samples.clear();
                         for (std::uint32_t gy = 0; gy < kGridH; ++gy)
@@ -527,7 +533,9 @@ void render_thread() {
                                        view_matrix(source_basis, origin, z_sign), projection);
             if (warped) first_eval = false;
         }
-        g_app.has_frames = source.valid;
+        // Menus and loading screens often skip the game's usual frame (no DLSS call, no tags): when several
+        // presents in a row bring no frame, step aside and let the game's own picture show.
+        g_app.has_frames = source.valid && sh.presents_without_frame < 3;
         renderer.finish_frame(warped, settings.overlay_debug ? (warped ? 1 : 2) : 0);
         // Ctrl+Shift+M marks "it looks bad now" in the log.
         const bool mark_down = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000) && (GetAsyncKeyState('M') & 0x8000);

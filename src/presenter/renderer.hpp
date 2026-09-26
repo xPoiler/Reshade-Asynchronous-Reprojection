@@ -9,6 +9,7 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 #include <string>
+#include <functional>
 #include <vector>
 
 namespace fw {
@@ -53,7 +54,8 @@ public:
     // Frame recording.
     ID3D12GraphicsCommandList* begin_frame();
     // Records conversion of slot `slot` into private textures; the queue waits for the game's fence.
-    IngestedSource ingest(const Shared& shared, int slot);
+    // after_depth (optional) runs once depth and motion vectors are recorded, before the colour work.
+    IngestedSource ingest(const Shared& shared, int slot, const std::function<void(const IngestedSource&)>& after_depth = {});
     // Latewarp inputs referring to the private textures of the last ingest.
     LatewarpInputs latewarp_inputs(const IngestedSource& src, bool use_ui_tags);
     // Blits the warped output (or the unwarped private backbuffer) to the swapchain and presents.

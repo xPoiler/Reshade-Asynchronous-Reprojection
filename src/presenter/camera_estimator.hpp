@@ -3,7 +3,9 @@
 // Streamline). A camera rotation moves distant pixels in a pattern that depends on the rotation and
 // on the focal length, so both can be fitted from a grid of motion-vector samples. The estimator keeps
 // an integrated camera orientation and synthesizes the Camera the rest of the presenter expects
-// (basis, projection, clipToPrevClip). Rotation only: translation is not estimated.
+// (basis, projection, clipToPrevClip, position). Translation comes from parallax: with the depth
+// buffer (reversed-Z, depth = 1 / distance in the synthesized projection's units), a camera move shifts
+// near samples more than far ones, so rotation and translation are fitted together.
 #include "shared/protocol.hpp"
 #include <algorithm>
 #include <array>
@@ -82,6 +84,63 @@ public:
         return best;
     }
 
+    // Rotation and translation together (current -> previous camera: p_prev = R p_cur + T). For a sample
+    // at direction c and depth d (= 1 / distance): p_prev / distance = R c + T d, so the sky (d = 0) only
+    // constrains the rotation. Starts from `omega`; returns the mean squared residual (px^2).
+    static double fit_motion(const std::vector<MotionSample>& s, double w, double h, double f, V3& omega, V3& T) {
+        auto project = [&](const MotionSample& p, const M3& R, const V3& t, double& px, double& py) {
+            const double X = (p.x - w * 0.5) / f, Y = -(p.y - h * 0.5) / f, d = p.depth;
+            const V3 c = mul(R, V3{X, Y, 1.0});
+            const double qx = c[0] + t[0] * d, qy = c[1] + t[1] * d, qz = std::max(c[2] + t[2] * d, 1e-6);
+            px = w * 0.5 + f * qx / qz; py = h * 0.5 - f * qy / qz;
+        };
+        auto residual = [&](const V3& o, const V3& t) {
+            const M3 R = rotation(o);
+            double sum = 0; int n = 0;
+            for (const auto& p : s) {
+                if (p.valid < 0.5f) continue;
+                double px, py; project(p, R, t, px, py);
+                const double ex = px - (p.x + p.mx), ey = py - (p.y + p.my);
+                sum += ex * ex + ey * ey; ++n;
+            }
+            return n ? sum / n : 1e30;
+        };
+        double best = residual(omega, T);
+        for (int it = 0; it < 6; ++it) {
+            double A[6][6] = {}, g[6] = {};
+            const double eps = 1e-5;
+            const M3 R0 = rotation(omega);
+            M3 Rd[3];
+            for (int k = 0; k < 3; ++k) { V3 o = omega; o[k] += eps; Rd[k] = rotation(o); }
+            for (const auto& p : s) {
+                if (p.valid < 0.5f) continue;
+                double px, py; project(p, R0, T, px, py);
+                const double r[2] = {px - (p.x + p.mx), py - (p.y + p.my)};
+                double J[2][6];
+                for (int k = 0; k < 6; ++k) {
+                    double qx, qy;
+                    if (k < 3) project(p, Rd[k], T, qx, qy);
+                    else { V3 t = T; t[k - 3] += eps; project(p, R0, t, qx, qy); }
+                    J[0][k] = (qx - px) / eps; J[1][k] = (qy - py) / eps;
+                }
+                for (int a = 0; a < 2; ++a)
+                    for (int i = 0; i < 6; ++i) {
+                        g[i] += J[a][i] * r[a];
+                        for (int j = 0; j < 6; ++j) A[i][j] += J[a][i] * J[a][j];
+                    }
+            }
+            for (int i = 0; i < 6; ++i) A[i][i] += 1e-9 + 1e-6 * A[i][i];  // damping: translation is weak without near samples
+            double step[6];
+            if (!solve6(A, g, step)) break;
+            const V3 o{omega[0] - step[0], omega[1] - step[1], omega[2] - step[2]};
+            const V3 t{T[0] - step[3], T[1] - step[4], T[2] - step[5]};
+            const double e = residual(o, t);
+            if (!(e < best)) break;
+            omega = o; T = t; best = e;
+        }
+        return best;
+    }
+
     // One game frame. Updates the orientation and returns the synthesized camera.
     Camera update(const std::vector<MotionSample>& all, double w, double h, const Camera& game) {
         // Distant pixels carry rotation almost only (translation parallax falls off with distance):
@@ -113,20 +172,51 @@ public:
             ok = std::isfinite(e) && std::sqrt(e) < 4.0;
             last_residual_ = std::sqrt(e);
         }
-        if (!ok || game.reset) omega = V3{0, 0, 0};
+        // Rotation and translation from all samples (near ones carry the translation), starting from the
+        // distant-sample rotation; samples the motion does not explain (moving objects) are dropped.
+        V3 T{};
+        if (ok) {
+            std::vector<MotionSample> valid;
+            for (const auto& p : all) if (p.valid > 0.5f) valid.push_back(p);
+            const double f = focal(h);
+            V3 o = omega, t{};
+            double e = fit_motion(valid, w, h, f, o, t);
+            std::vector<double> errs;
+            const M3 R0 = rotation(o);
+            for (const auto& p : valid) {
+                const double X = (p.x - w * 0.5) / f, Y = -(p.y - h * 0.5) / f;
+                const V3 c = mul(R0, V3{X, Y, 1.0});
+                const double qz = std::max(c[2] + t[2] * p.depth, 1e-6);
+                const double ex = w * 0.5 + f * (c[0] + t[0] * p.depth) / qz - (p.x + p.mx);
+                const double ey = h * 0.5 - f * (c[1] + t[1] * p.depth) / qz - (p.y + p.my);
+                errs.push_back(std::sqrt(ex * ex + ey * ey));
+            }
+            std::vector<double> sorted = errs;
+            std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
+            const double limit = std::max(1.0, 3.0 * sorted[sorted.size() / 2]);
+            std::vector<MotionSample> inliers;
+            for (std::size_t i = 0; i < valid.size(); ++i) if (errs[i] <= limit) inliers.push_back(valid[i]);
+            if (inliers.size() >= 32) e = fit_motion(inliers, w, h, f, o, t);
+            if (std::isfinite(e) && std::sqrt(e) < 4.0) { omega = o; T = t; last_residual_ = std::sqrt(e); }
+        }
+        if (!ok || game.reset) { omega = V3{0, 0, 0}; T = V3{0, 0, 0}; }
         last_omega_ = omega;
+        last_translation_ = T;
+        // The camera now sits at T in the previous camera's coordinates: world move = B_prev * T.
+        for (int i = 0; i < 3; ++i) position_[i] += basis_[i][0] * T[0] + basis_[i][1] * T[1] + basis_[i][2] * T[2];
         // world = B_prev * c_prev = B_prev * R * c_cur  ->  B_cur = B_prev * R  (B columns: right, up, fwd)
         const M3 R = rotation(omega);
         basis_ = mul(basis_, R);
         orthonormalize(basis_);
-        return synthesize(w, h, R, game);
+        return synthesize(w, h, R, T, game);
     }
 
     double vertical_fov() const { return fov_; }
     bool fov_locked() const { return fov_locked_; }
     double last_residual() const { return last_residual_; }
     V3 last_omega() const { return last_omega_; }
-    void reset() { basis_ = identity_basis(); fov_votes_.clear(); fov_locked_ = false; fov_ = kDefaultFov; }
+    V3 last_translation() const { return last_translation_; }
+    void reset() { basis_ = identity_basis(); position_ = V3{}; fov_votes_.clear(); fov_locked_ = false; fov_ = kDefaultFov; }
 
     static constexpr double kDefaultFov = 1.2217;  // 70 degrees vertical until learned
 
@@ -161,6 +251,23 @@ private:
             x[k] = (M[0][0] * (M[1][1] * M[2][2] - M[1][2] * M[2][1]) - M[0][1] * (M[1][0] * M[2][2] - M[1][2] * M[2][0]) +
                     M[0][2] * (M[1][0] * M[2][1] - M[1][1] * M[2][0])) / det;
         }
+        return true;
+    }
+    static bool solve6(double A[6][6], const double b[6], double x[6]) {
+        double M[6][7];
+        for (int i = 0; i < 6; ++i) { for (int j = 0; j < 6; ++j) M[i][j] = A[i][j]; M[i][6] = b[i]; }
+        for (int c = 0; c < 6; ++c) {
+            int piv = c;
+            for (int r = c + 1; r < 6; ++r) if (std::fabs(M[r][c]) > std::fabs(M[piv][c])) piv = r;
+            if (std::fabs(M[piv][c]) < 1e-18) return false;
+            for (int j = 0; j < 7; ++j) std::swap(M[c][j], M[piv][j]);
+            for (int r = 0; r < 6; ++r) {
+                if (r == c) continue;
+                const double k = M[r][c] / M[c][c];
+                for (int j = c; j < 7; ++j) M[r][j] -= k * M[c][j];
+            }
+        }
+        for (int i = 0; i < 6; ++i) x[i] = M[i][6] / M[i][i];
         return true;
     }
     // Small-rotation flow model: dX = wy(1+X^2) - wx XY - wz Y,  dY = -wx(1+Y^2) + wy XY + wz X (normalized).
@@ -234,7 +341,7 @@ private:
         for (int i = 0; i < 3; ++i) { B[i][0] = r[i]; B[i][1] = u[i]; B[i][2] = f[i]; }
     }
 
-    Camera synthesize(double w, double h, const M3& R, const Camera& game) const {
+    Camera synthesize(double w, double h, const M3& R, const V3& T, const Camera& game) const {
         Camera c = game;
         const double f = focal(h);
         const float sx = float(2 * f / w), sy = float(2 * f / h), near_plane = 1.0f;
@@ -244,15 +351,16 @@ private:
         std::copy(P, P + 16, c.view_to_clip);
         std::copy(Pinv, Pinv + 16, c.clip_to_view);
         // clipToPrevClip = Pinv * Mrow * P, Mrow = row-vector rotation current -> previous view (= R^T).
-        double M[4][4] = {}, T[4][4] = {}, C[4][4] = {};
+        double M[4][4] = {}, PM[4][4] = {}, C[4][4] = {};
         for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) M[i][j] = R[j][i];
+        for (int j = 0; j < 3; ++j) M[3][j] = T[j];
         M[3][3] = 1;
-        for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) for (int k = 0; k < 4; ++k) T[i][j] += double(Pinv[i * 4 + k]) * M[k][j];
-        for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) for (int k = 0; k < 4; ++k) C[i][j] += T[i][k] * double(P[k * 4 + j]);
+        for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) for (int k = 0; k < 4; ++k) PM[i][j] += double(Pinv[i * 4 + k]) * M[k][j];
+        for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) for (int k = 0; k < 4; ++k) C[i][j] += PM[i][k] * double(P[k * 4 + j]);
         for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) c.clip_to_prev_clip[i * 4 + j] = float(C[i][j]);
         for (int i = 0; i < 3; ++i) {
             c.right[i] = float(basis_[i][0]); c.up[i] = float(basis_[i][1]); c.fwd[i] = float(basis_[i][2]);
-            c.pos[i] = 0;
+            c.pos[i] = float(position_[i]);
         }
         c.near_plane = near_plane; c.far_plane = 0;
         c.fov = float(fov_); c.aspect = float(w / h);
@@ -265,7 +373,7 @@ private:
     double fov_ = kDefaultFov, last_residual_ = 0;
     bool fov_locked_ = false;
     std::vector<double> fov_votes_;
-    V3 last_omega_{};
+    V3 last_omega_{}, last_translation_{}, position_{};
 };
 
 }  // namespace fw
