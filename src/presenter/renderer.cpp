@@ -793,7 +793,10 @@ bool Renderer::sample_motion(const IngestedSource& src, std::uint32_t grid_w, st
     auto to_copy = transition_barrier(samples_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     list_->ResourceBarrier(1, &to_copy);
     list_->CopyBufferRegion(samples_readback_.Get(), 0, samples_.Get(), 0, bytes);
+    LARGE_INTEGER a, b, f; QueryPerformanceCounter(&a);
     flush_and_wait();
+    QueryPerformanceCounter(&b); QueryPerformanceFrequency(&f);
+    last_flush_ms_ = float(double(b.QuadPart - a.QuadPart) * 1000.0 / double(f.QuadPart));
     float* mapped = nullptr;
     D3D12_RANGE range{0, bytes};
     if (FAILED(samples_readback_->Map(0, &range, reinterpret_cast<void**>(&mapped)))) return false;

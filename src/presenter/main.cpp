@@ -312,6 +312,8 @@ void render_thread() {
     bool game_has_hud_layers = false, mask_logged = false;
     CameraEstimator estimator;
     bool estimator_logged = false, fov_logged = false;
+    double estimator_ms_sum = 0, flush_ms_sum = 0;
+    int estimator_runs = 0;
     std::vector<float> raw_samples;
     std::vector<MotionSample> motion_samples;
 
@@ -456,7 +458,16 @@ void render_thread() {
                                 p.valid = (v[3] > 0.5f && std::isfinite(p.mx) && std::isfinite(p.my) && std::fabs(p.mx) < 1e4f) ? 1.0f : 0.0f;
                                 motion_samples.push_back(p);
                             }
+                        const double t0 = now_seconds();
                         cam = estimator.update(motion_samples, rw, rh, m.camera);
+                        estimator_ms_sum += (now_seconds() - t0) * 1000.0; ++estimator_runs;
+                        flush_ms_sum += renderer.last_flush_ms();
+                        if (estimator_runs >= 300) {
+                            logf("camera estimation: %.2f ms CPU + %.2f ms waiting for the samples per game frame, residual %.2f px, field of view %.1f deg%s",
+                                 estimator_ms_sum / estimator_runs, flush_ms_sum / estimator_runs, estimator.last_residual(),
+                                 estimator.vertical_fov() * 180.0 / 3.14159265358979, estimator.fov_locked() ? "" : " (learning)");
+                            estimator_ms_sum = 0; flush_ms_sum = 0; estimator_runs = 0;
+                        }
                         if (!estimator_logged) { logf("no camera from the game: estimating it from DLSS motion vectors"); estimator_logged = true; }
                         if (estimator.fov_locked() && !fov_logged) {
                             logf("field of view learned: %.1f deg vertical", estimator.vertical_fov() * 180.0 / 3.14159265358979);

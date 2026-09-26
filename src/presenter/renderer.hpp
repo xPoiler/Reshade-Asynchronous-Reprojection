@@ -95,6 +95,7 @@ public:
     // Camera estimation (games without a camera): motion vector (raw) and depth on a grid over the render
     // rect, 4 floats per sample (mv.x, mv.y, depth, valid). Submits the frame's work so far and waits.
     bool sample_motion(const IngestedSource& src, std::uint32_t grid_w, std::uint32_t grid_h, std::vector<float>& out);
+    float last_flush_ms() const { return last_flush_ms_; }  // how long sample_motion waited for the GPU
     ID3D12Resource* no_warp_mask() const { return mask_ready_ ? private_[kPMask].texture.Get() : nullptr; }
     void reset_hud_detection() { reset_hud_ = true; mask_ready_ = false; }
 
@@ -144,6 +145,7 @@ private:
     ComPtr<ID3D12PipelineState> cs_analyze_, cs_reduce_, cs_clear_, cs_splat_, cs_gather_, cs_hud_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_;
     ComPtr<ID3D12Resource> samples_, samples_readback_;
     UINT samples_count_ = 0;
+    float last_flush_ms_ = 0;
     ComPtr<ID3D12Resource> hud_counts_;
     bool mask_ready_ = false, reset_hud_ = false;
     ComPtr<ID3D12Resource> partials_, sums_, fit_readback_;

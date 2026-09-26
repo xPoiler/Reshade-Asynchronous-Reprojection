@@ -1,6 +1,7 @@
 // CameraEstimator: recovers per-frame rotation and the field of view from motion vectors alone, and
 // its synthesized clipToPrevClip maps each pixel to where its motion vector says it came from.
 #include "presenter/camera_estimator.hpp"
+#include <windows.h>
 #include <cstdio>
 #include <random>
 
@@ -102,6 +103,18 @@ int main() {
     const double dot_right = after.fwd[0] * before.right[0] + after.fwd[1] * before.right[1] + after.fwd[2] * before.right[2];
     std::printf("after turning: forward . old right = %.3f (positive = turned right)\n", dot_right);
     EXPECT(dot_right > 0.1, "basis turns the way the image says");
+    // CPU cost per game frame (the presenter runs this on every new frame): 64x36 samples, 10% outliers,
+    // turning and moving.
+    {
+        std::vector<std::vector<MotionSample>> frames;
+        for (int i = 0; i < 50; ++i) frames.push_back(make({turn(rng) * 0.5, turn(rng), 0}, fov, 0.10, rng, {turn(rng), 0, turn(rng)}));
+        LARGE_INTEGER f0, a, b; QueryPerformanceFrequency(&f0); QueryPerformanceCounter(&a);
+        for (const auto& fr : frames) est.update(fr, kW, kH, game);
+        QueryPerformanceCounter(&b);
+        const double ms = double(b.QuadPart - a.QuadPart) * 1000.0 / double(f0.QuadPart) / frames.size();
+        std::printf("estimator CPU: %.3f ms per game frame\n", ms);
+        EXPECT(ms < 1.5, "estimator is cheap enough per game frame (%.3f ms)", ms);
+    }
     if (failures) { std::printf("%d failure(s)\n", failures); return 1; }
     std::printf("estimator tests passed\n");
     return 0;

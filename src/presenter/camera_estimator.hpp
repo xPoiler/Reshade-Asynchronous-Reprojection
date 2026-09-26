@@ -88,57 +88,67 @@ public:
     // at direction c and depth d (= 1 / distance): p_prev / distance = R c + T d, so the sky (d = 0) only
     // constrains the rotation. Starts from `omega`; returns the mean squared residual (px^2).
     static double fit_motion(const std::vector<MotionSample>& s, double w, double h, double f, V3& omega, V3& T) {
-        auto project = [&](const MotionSample& p, const M3& R, const V3& t, double& px, double& py) {
-            const double X = (p.x - w * 0.5) / f, Y = -(p.y - h * 0.5) / f, d = p.depth;
-            const V3 c = mul(R, V3{X, Y, 1.0});
-            const double qx = c[0] + t[0] * d, qy = c[1] + t[1] * d, qz = std::max(c[2] + t[2] * d, 1e-6);
-            px = w * 0.5 + f * qx / qz; py = h * 0.5 - f * qy / qz;
-        };
-        auto residual = [&](const V3& o, const V3& t) {
-            const M3 R = rotation(o);
+        // Gauss-Newton with the exact Jacobian (one projection per sample and iteration). The rotation is
+        // updated multiplicatively: R <- exp(delta) R, for which d(R c)/d(delta) = -[R c]x.
+        M3 R = rotation(omega);
+        auto evaluate = [&](const M3& Rm, const V3& t, double A[6][6], double g[6]) {
             double sum = 0; int n = 0;
             for (const auto& p : s) {
                 if (p.valid < 0.5f) continue;
-                double px, py; project(p, R, t, px, py);
-                const double ex = px - (p.x + p.mx), ey = py - (p.y + p.my);
-                sum += ex * ex + ey * ey; ++n;
-            }
-            return n ? sum / n : 1e30;
-        };
-        double best = residual(omega, T);
-        for (int it = 0; it < 6; ++it) {
-            double A[6][6] = {}, g[6] = {};
-            const double eps = 1e-5;
-            const M3 R0 = rotation(omega);
-            M3 Rd[3];
-            for (int k = 0; k < 3; ++k) { V3 o = omega; o[k] += eps; Rd[k] = rotation(o); }
-            for (const auto& p : s) {
-                if (p.valid < 0.5f) continue;
-                double px, py; project(p, R0, T, px, py);
+                const double X = (p.x - w * 0.5) / f, Y = -(p.y - h * 0.5) / f, d = p.depth;
+                const V3 c = mul(Rm, V3{X, Y, 1.0});
+                const double qx = c[0] + t[0] * d, qy = c[1] + t[1] * d, qz = std::max(c[2] + t[2] * d, 1e-6);
+                const double px = w * 0.5 + f * qx / qz, py = h * 0.5 - f * qy / qz;
                 const double r[2] = {px - (p.x + p.mx), py - (p.y + p.my)};
+                sum += r[0] * r[0] + r[1] * r[1]; ++n;
+                if (!A) continue;
+                // d(px, py)/dq
+                const double iz = 1.0 / qz;
+                const double dq[2][3] = {{f * iz, 0, -f * qx * iz * iz}, {0, -f * iz, f * qy * iz * iz}};
+                // dq/d(delta) = -[c]x  (c = R X), dq/dT = d * I
+                const double sk[3][3] = {{0, c[2], -c[1]}, {-c[2], 0, c[0]}, {c[1], -c[0], 0}};
                 double J[2][6];
-                for (int k = 0; k < 6; ++k) {
-                    double qx, qy;
-                    if (k < 3) project(p, Rd[k], T, qx, qy);
-                    else { V3 t = T; t[k - 3] += eps; project(p, R0, t, qx, qy); }
-                    J[0][k] = (qx - px) / eps; J[1][k] = (qy - py) / eps;
+                for (int a = 0; a < 2; ++a) {
+                    for (int k = 0; k < 3; ++k) J[a][k] = dq[a][0] * sk[0][k] + dq[a][1] * sk[1][k] + dq[a][2] * sk[2][k];
+                    for (int k = 0; k < 3; ++k) J[a][3 + k] = dq[a][k] * d;
                 }
                 for (int a = 0; a < 2; ++a)
                     for (int i = 0; i < 6; ++i) {
                         g[i] += J[a][i] * r[a];
-                        for (int j = 0; j < 6; ++j) A[i][j] += J[a][i] * J[a][j];
+                        for (int j = i; j < 6; ++j) A[i][j] += J[a][i] * J[a][j];
                     }
             }
+            return n ? sum / n : 1e30;
+        };
+        double best = 1e30;
+        for (int it = 0; it < 5; ++it) {
+            double A[6][6] = {}, g[6] = {};
+            const double e = evaluate(R, T, A, g);
+            if (it == 0) best = e;
+            for (int i = 0; i < 6; ++i) for (int j = 0; j < i; ++j) A[i][j] = A[j][i];
             for (int i = 0; i < 6; ++i) A[i][i] += 1e-9 + 1e-6 * A[i][i];  // damping: translation is weak without near samples
             double step[6];
             if (!solve6(A, g, step)) break;
-            const V3 o{omega[0] - step[0], omega[1] - step[1], omega[2] - step[2]};
-            const V3 t{T[0] - step[3], T[1] - step[4], T[2] - step[5]};
-            const double e = residual(o, t);
-            if (!(e < best)) break;
-            omega = o; T = t; best = e;
+            const M3 Rn = mul(rotation(V3{-step[0], -step[1], -step[2]}), R);
+            const V3 Tn{T[0] - step[3], T[1] - step[4], T[2] - step[5]};
+            const double en = evaluate(Rn, Tn, nullptr, nullptr);
+            if (!(en < best)) break;
+            const double gain = best - en;
+            R = Rn; T = Tn; best = en;
+            if (gain < 1e-6 * (best + 1e-9)) break;
         }
+        omega = log_rotation(R);
         return best;
+    }
+
+    // Rotation vector (axis * angle) of a rotation matrix.
+    static V3 log_rotation(const M3& R) {
+        const double c = std::clamp((R[0][0] + R[1][1] + R[2][2] - 1.0) * 0.5, -1.0, 1.0);
+        const double a = std::acos(c);
+        const V3 v{R[2][1] - R[1][2], R[0][2] - R[2][0], R[1][0] - R[0][1]};
+        if (a < 1e-9) return V3{v[0] * 0.5, v[1] * 0.5, v[2] * 0.5};
+        const double k = a / (2.0 * std::sin(a));
+        return V3{v[0] * k, v[1] * k, v[2] * k};
     }
 
     // One game frame. Updates the orientation and returns the synthesized camera.
@@ -158,7 +168,9 @@ public:
         if (distant.size() >= 16) {
             if (!fov_locked_) learn_fov(distant, w, h);
             const double f = focal(h);
-            double e = fit_rotation(distant, w, h, f, omega);
+            omega = linear_rotation(distant, w, h, f);
+            V3 no_move{};
+            double e = fit_motion(distant, w, h, f, omega, no_move);  // distant: rotation dominates; T is refitted below
             // Reject samples the rotation does not explain (moving objects, near geometry), then refit.
             std::vector<double> errs;
             const M3 R = rotation(omega);
@@ -168,7 +180,7 @@ public:
             const double limit = std::max(1.0, 3.0 * sorted[sorted.size() / 2]);
             std::vector<MotionSample> inliers;
             for (std::size_t i = 0; i < distant.size(); ++i) if (errs[i] <= limit) inliers.push_back(distant[i]);
-            if (inliers.size() >= 16) e = fit_rotation(inliers, w, h, f, omega);
+            if (inliers.size() >= 16) { V3 t0{}; e = fit_motion(inliers, w, h, f, omega, t0); }
             ok = std::isfinite(e) && std::sqrt(e) < 4.0;
             last_residual_ = std::sqrt(e);
         }
