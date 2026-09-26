@@ -32,6 +32,9 @@ std::uint32_t feature_of(const void* handle) {
     return 0xFFFFFFFFu;
 }
 
+// DLSS Super Resolution, or DLSS Ray Reconstruction (which upscales too, from the same inputs).
+bool is_dlss(std::uint32_t feature) { return feature == NVSDK_NGX_Feature_SuperSampling || feature == NVSDK_NGX_Feature_RayReconstruction; }
+
 NgxStats* stats() { return g_producer && g_producer->shared() ? &g_producer->shared()->ngx : nullptr; }
 
 void describe(const NVSDK_NGX_Parameter* p, const char* name, std::uint32_t& w, std::uint32_t& h, std::uint32_t& format) {
@@ -48,7 +51,8 @@ NVSDK_NGX_Result NVSDK_CONV hk_create(ID3D12GraphicsCommandList* list, NVSDK_NGX
         ++s->create_calls;
         if (NVSDK_NGX_SUCCEED(result) && out && *out) {
             remember(*out, static_cast<std::uint32_t>(feature));
-            if (feature == NVSDK_NGX_Feature_SuperSampling && params) {
+            if (is_dlss(static_cast<std::uint32_t>(feature)) && params) {
+                s->dlss_feature = static_cast<std::uint32_t>(feature);
                 unsigned int v = 0; int flags = 0;
                 if (params->Get(NVSDK_NGX_Parameter_Width, &v) == NVSDK_NGX_Result_Success) s->render_w = v;
                 if (params->Get(NVSDK_NGX_Parameter_Height, &v) == NVSDK_NGX_Result_Success) s->render_h = v;
@@ -70,7 +74,7 @@ NVSDK_NGX_Result NVSDK_CONV hk_evaluate(ID3D12GraphicsCommandList* list, const N
         const std::uint32_t feature = feature_of(handle);
         if (feature < 16) ++s->feature_calls[feature];
         else ++s->unknown_handle_calls;
-        if (feature == NVSDK_NGX_Feature_SuperSampling && params) {
+        if (is_dlss(feature) && params) {
             ++s->dlss_calls;
             describe(params, NVSDK_NGX_Parameter_Depth, s->depth_w, s->depth_h, s->depth_format);
             describe(params, NVSDK_NGX_Parameter_MotionVectors, s->mv_w, s->mv_h, s->mv_format);

@@ -218,7 +218,8 @@ void draw_overlay(effect_runtime*) {
                     n.evaluate_calls, n.dlss_calls, n.unknown_handle_calls, n.resets);
         for (int i = 0; i < 16; ++i)
             if (n.feature_calls[i]) ImGui::Text("  feature %2d: %u evaluations", i, n.feature_calls[i]);
-        ImGui::Text("DLSS create: render %ux%u -> output %ux%u, flags 0x%X (%s%s%s%s)", n.render_w, n.render_h, n.out_w, n.out_h,
+        ImGui::Text("DLSS (%s) create: render %ux%u -> output %ux%u, flags 0x%X (%s%s%s%s)",
+                    n.dlss_feature == 13 ? "Ray Reconstruction" : n.dlss_feature == 1 ? "Super Resolution" : "none yet", n.render_w, n.render_h, n.out_w, n.out_h,
                     n.create_flags, (n.create_flags & 1) ? "HDR " : "", (n.create_flags & 2) ? "MV-low-res " : "",
                     (n.create_flags & 4) ? "MV-jittered " : "", (n.create_flags & 8) ? "depth-inverted" : "");
         ImGui::Text("  depth %ux%u fmt %u | motion %ux%u fmt %u", n.depth_w, n.depth_h, n.depth_format, n.mv_w, n.mv_h, n.mv_format);
