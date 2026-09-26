@@ -12,7 +12,8 @@ param(
     [string]$EngineIni,   # override the detected Unreal Engine.ini
     [switch]$NoCvar,      # do not touch Engine.ini
     [string]$Latewarp,    # path to nvngx_latewarp.dll (or a folder containing it)
-    [switch]$Uninstall
+    [switch]$Uninstall,
+    [switch]$Force        # replace an existing FrameWarp without asking
 )
 $ErrorActionPreference = "Stop"
 # Run from a release package (files next to this script) or from the source tree (build\Release).
@@ -34,6 +35,15 @@ function Get-SteamGameDirs {
         if (Test-Path $common) { Get-ChildItem -Directory $common }
     }
 }
+
+# Version of a FrameWarp add-on, read from the "FrameWarp x.y.z" string it carries (every release does).
+function Get-FrameWarpVersion([string]$path) {
+    if (-not $path -or -not (Test-Path -PathType Leaf $path)) { return $null }
+    $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($path))
+    $m = [regex]::Match($text, 'FrameWarp (\d+\.\d+\.\d+)')
+    if ($m.Success) { return $m.Groups[1].Value } else { return "unknown" }
+}
+$packageVersion = Get-FrameWarpVersion (Join-Path $build "FrameWarp.addon64")
 
 function Test-ReShade([string]$path) {
     $info = (Get-Item $path).VersionInfo
@@ -62,10 +72,13 @@ if ($GameDir) {
     foreach ($dir in @(Get-SteamGameDirs | Sort-Object FullName -Unique)) {
         $found = @(Get-ChildItem -Recurse -Depth 8 -File -ErrorAction SilentlyContinue $dir.FullName -Include ($reshadeNames + "FrameWarp.addon64", "sl.interposer.dll"))
         $hasReShade = [bool]($found | Where-Object { $reshadeNames -contains $_.Name } | Where-Object { Test-ReShade $_.FullName })
-        $hasFrameWarp = [bool]($found | Where-Object { $_.Name -eq "FrameWarp.addon64" })
+        # The installed add-on (not a staged copy): the one closest to the game folder.
+        $installedAddon = $found | Where-Object { $_.Name -eq "FrameWarp.addon64" } | Sort-Object { $_.FullName.Split('\').Count } | Select-Object -First 1
+        $hasFrameWarp = [bool]$installedAddon
+        $installedVersion = if ($installedAddon) { Get-FrameWarpVersion $installedAddon.FullName } else { $null }
         $hasStreamline = [bool]($found | Where-Object { $_.Name -eq "sl.interposer.dll" })
         if (($Uninstall -and $hasFrameWarp) -or (-not $Uninstall -and $hasReShade)) {
-            $choices += [pscustomobject]@{ Name = $dir.Name; Path = $dir.FullName; FrameWarp = $hasFrameWarp; Streamline = $hasStreamline }
+            $choices += [pscustomobject]@{ Name = $dir.Name; Path = $dir.FullName; FrameWarp = $hasFrameWarp; Version = $installedVersion; Streamline = $hasStreamline }
         }
     }
     Write-Host ""
@@ -77,9 +90,10 @@ if ($GameDir) {
             $c = $choices[$i]
             $notes = @()
             if (-not $Uninstall) {
-                if ($c.FrameWarp) { $notes += "FrameWarp installed (will update)" }
+                if ($c.FrameWarp) { $notes += "FrameWarp $($c.Version) installed" }
                 if (-not $c.Streamline) { $notes += "no Streamline: will not work" }
             }
+            if ($Uninstall -and $c.Version) { $notes += "FrameWarp $($c.Version)" }
             Write-Host ("  {0,2}) {1}{2}" -f ($i + 1), $c.Name, $(if ($notes) { "   [" + ($notes -join ", ") + "]" } else { "" }))
         }
     }
@@ -127,9 +141,33 @@ if ($reshade.Count -eq 0) {
 $target = Join-Path $binDir "FrameWarp"
 $record = Join-Path $target "install.json"
 
-# The game must not be running (its exe lives in or below the game folder).
-$running = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($GameDir, [StringComparison]::OrdinalIgnoreCase) }
+# An existing FrameWarp is only replaced after asking (or with -Force).
+if (-not $Uninstall -and -not $Force) {
+    $existing = Get-FrameWarpVersion (Join-Path $binDir "FrameWarp.addon64")
+    if ($existing) {
+        $question = "FrameWarp $existing is installed. Update it to $packageVersion?"
+        try {
+            if ($existing -ne "unknown" -and $packageVersion -and $packageVersion -ne "unknown") {
+                if ([version]$existing -eq [version]$packageVersion) { $question = "FrameWarp $existing is already installed. Reinstall it?" }
+                elseif ([version]$existing -gt [version]$packageVersion) { $question = "FrameWarp $existing is installed, which is NEWER than this package ($packageVersion). Replace it with the older version?" }
+            }
+        } catch {}
+        $answer = (Read-Host "$question (Y/N)").Trim()
+        if ($answer -notmatch '^[Yy]') { Write-Host "Nothing changed."; return }
+    }
+}
+
+# The game must not be running (its exe lives in or below the game folder). A presenter left over from
+# a crashed game session would lock its exe and break the update: stop it (it only serves the game).
+$inGame = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($GameDir, [StringComparison]::OrdinalIgnoreCase) })
+$running = @($inGame | Where-Object { $_.ProcessName -ne "FrameWarpPresenter" })
 if ($running) { throw "Close the game first ($(($running | ForEach-Object ProcessName | Select-Object -Unique) -join ', '))." }
+$leftover = @($inGame | Where-Object { $_.ProcessName -eq "FrameWarpPresenter" })
+if ($leftover) {
+    $leftover | Stop-Process -Force -ErrorAction SilentlyContinue
+    $leftover | ForEach-Object { $_.WaitForExit(5000) | Out-Null }
+    Write-Host "Stopped a FrameWarp presenter left running from an earlier game session."
+}
 
 # Unreal Engine layout: <Game>\<Project>\Binaries\Win64\<exe>. The user config lives in
 # %LOCALAPPDATA%\<Project>\Saved\Config\Windows (UE5), WindowsNoEditor (UE4) or WinGDK (Game Pass).
@@ -195,6 +233,11 @@ if (-not (Test-Path (Join-Path $env:SystemRoot "System32\msvcp140.dll"))) {
 $previous = if (Test-Path $record) { Get-Content -Raw $record | ConvertFrom-Json } else { $null }
 New-Item -ItemType Directory -Force $target | Out-Null
 Copy-Item -Force (Join-Path $build "FrameWarp.addon64") $binDir
+# Some games copy their DLLs into a staging folder at launch and load them from there (RE9: _storage_);
+# replace those copies too, so an update never depends on the game refreshing them.
+Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue $GameDir -Filter "FrameWarp.addon64" |
+    Where-Object { $_.DirectoryName -ne $binDir } |
+    ForEach-Object { Copy-Item -Force (Join-Path $build "FrameWarp.addon64") $_.FullName; Write-Host "Updated staged copy: $($_.FullName)" }
 Copy-Item -Force (Join-Path $build "FrameWarp\FrameWarpPresenter.exe") $target
 $latewarpTarget = Join-Path $target "nvngx_latewarp.dll"
 if ((Resolve-Path $latewarpDll).Path -ne $latewarpTarget) { Copy-Item -Force $latewarpDll $latewarpTarget }

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+* Installer: the game list shows which FrameWarp version is installed, and it asks before replacing an
+  existing install (it says so for the same version or a downgrade; `-Force` skips the question).
+* Installer: updates are safer. Staged copies of the add-on (RE9's `_storage_`) are replaced too, and
+  a presenter left running from a crashed game session is stopped instead of blocking the update.
+  Logs, calibration and the Latewarp DLL are kept.
 * Fixed: on displays with Windows scaling (laptop screens at 125-150%) the overlay showed only the
   top-left part of the picture, enlarged.
 * The FrameWarp panel warns when Windows' hardware-accelerated GPU scheduling is off on the game's
