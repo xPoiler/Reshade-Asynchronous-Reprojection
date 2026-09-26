@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 22;
+constexpr std::uint32_t kVersion = 24;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -41,6 +41,8 @@ struct Camera {
     float near_plane, far_plane, fov, aspect;
     float jitter[2], mvec_scale[2];
     std::uint32_t depth_inverted, reset, valid, position_epoch;  // epoch changes when pos is discontinuous
+    std::uint32_t estimated;  // 1: no camera from the game (DLSS without Streamline): the presenter estimates it
+    std::uint32_t pad;
 };
 
 struct SlotMeta {
@@ -138,6 +140,7 @@ struct NgxStats {
     float jitter[2], mv_scale[2];
     std::uint32_t dlss_feature;  // 1 Super Resolution, 13 Ray Reconstruction (0: none seen)
     std::uint32_t identified_by_inputs;  // DLSS handles recognised from their inputs (created before our hooks)
+    std::uint32_t frames_published, pad2;  // frames published from DLSS calls (camera estimated by the presenter)
 };
 
 struct Shared {

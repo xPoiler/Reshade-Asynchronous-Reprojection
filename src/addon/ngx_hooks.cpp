@@ -35,6 +35,8 @@ std::uint32_t feature_of(const void* handle) {
 // DLSS Super Resolution, or DLSS Ray Reconstruction (which upscales too, from the same inputs).
 bool is_dlss(std::uint32_t feature) { return feature == NVSDK_NGX_Feature_SuperSampling || feature == NVSDK_NGX_Feature_RayReconstruction; }
 
+std::atomic<std::uint64_t> g_frame{0};
+
 NgxStats* stats() { return g_producer && g_producer->shared() ? &g_producer->shared()->ngx : nullptr; }
 
 void describe(const NVSDK_NGX_Parameter* p, const char* name, std::uint32_t& w, std::uint32_t& h, std::uint32_t& format) {
@@ -100,6 +102,34 @@ NVSDK_NGX_Result NVSDK_CONV hk_evaluate(ID3D12GraphicsCommandList* list, const N
             if (params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &v) == NVSDK_NGX_Result_Success) s->subrect_w = v;
             if (params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &v) == NVSDK_NGX_Result_Success) s->subrect_h = v;
             if (params->Get(NVSDK_NGX_Parameter_Reset, &reset) == NVSDK_NGX_Result_Success && reset) ++s->resets;
+            // Games without a Streamline camera: publish this frame's depth and motion vectors with a camera
+            // the presenter estimates from the motion vectors. (Streamline games publish through their own
+            // hooks; once slSetConstants has been seen, this stays off.)
+            auto* shared = g_producer->shared();
+            ID3D12Resource *depth = nullptr, *motion = nullptr;
+            // Only after 60 DLSS evaluations without any Streamline camera: a Streamline game sets its camera
+            // before its first DLSS call, so it can never reach this (and frame numbers cannot mix).
+            if (shared && shared->hooks.constants_calls == 0 && s->dlss_calls > 60 &&
+                params->Get(NVSDK_NGX_Parameter_Depth, &depth) == NVSDK_NGX_Result_Success && depth &&
+                params->Get(NVSDK_NGX_Parameter_MotionVectors, &motion) == NVSDK_NGX_Result_Success && motion) {
+                const std::uint64_t frame = ++g_frame;
+                Camera cam{};
+                cam.valid = 1;
+                cam.estimated = 1;
+                cam.reset = reset ? 1u : 0u;
+                // Unreal and most modern engines use reversed depth; the create flags say so when we saw them.
+                cam.depth_inverted = (s->create_flags == 0 || (s->create_flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted)) ? 1u : 0u;
+                cam.jitter[0] = s->jitter[0]; cam.jitter[1] = s->jitter[1];
+                cam.mvec_scale[0] = s->mv_scale[0] != 0 ? s->mv_scale[0] : 1.0f;  // motion vector * scale = render pixels
+                cam.mvec_scale[1] = s->mv_scale[1] != 0 ? s->mv_scale[1] : 1.0f;
+                g_producer->on_constants(frame, cam);
+                const std::uint32_t w = s->subrect_w ? s->subrect_w : s->depth_w, h = s->subrect_h ? s->subrect_h : s->depth_h;
+                // DLSS inputs are in a shader-resource state when evaluated.
+                const auto state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                g_producer->on_tag(frame, kDepth, depth, state, 0, 0, w, h, list);
+                g_producer->on_tag(frame, kMotion, motion, state, 0, 0, w, h, list);
+                ++s->frames_published;
+            }
         }
     }
     return reinterpret_cast<EvaluateFn>(g_evaluate_hook.original())(list, handle, params, callback);

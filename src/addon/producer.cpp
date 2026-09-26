@@ -194,7 +194,7 @@ void Producer::on_constants(std::uint64_t frame, const Camera& camera) {
     // frame-to-frame motion. Integrate it into an absolute position on every frame (even frames that
     // never reach the presenter) so translation - e.g. a third-person orbit - is known.
     Camera cam = camera;
-    {
+    if (!camera.estimated) {
         // The previous frame's zoom and near plane (they change while aiming in some games); the jitter
         // terms stay the current frame's, so games whose projection only jitters behave exactly as before.
         float previous_projection[16];

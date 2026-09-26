@@ -219,6 +219,7 @@ void draw_overlay(effect_runtime*) {
         for (int i = 0; i < 16; ++i)
             if (n.feature_calls[i]) ImGui::Text("  feature %2d: %u evaluations", i, n.feature_calls[i]);
         if (n.identified_by_inputs) ImGui::TextDisabled("  DLSS recognised from its inputs (it was created before the hooks)");
+        if (n.frames_published) ImGui::Text("  frames published from DLSS (camera estimated): %u", n.frames_published);
         ImGui::Text("DLSS (%s) create: render %ux%u -> output %ux%u, flags 0x%X (%s%s%s%s)",
                     n.dlss_feature == 13 ? "Ray Reconstruction" : n.dlss_feature == 1 ? "Super Resolution" : "none yet", n.render_w, n.render_h, n.out_w, n.out_h,
                     n.create_flags, (n.create_flags & 1) ? "HDR " : "", (n.create_flags & 2) ? "MV-low-res " : "",

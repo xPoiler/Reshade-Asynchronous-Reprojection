@@ -277,6 +277,25 @@ int main(int argc, char** argv) {
         auto* l = renderer.begin_frame();
         IngestedSource src = renderer.ingest(sh, slot);
         EXPECT(src.has_motion, "motion vectors ingested");
+        {
+            // Camera estimation input: the sampled grid returns the motion field (bar -20 px, else 0) and the
+            // frame keeps recording after the mid-frame flush.
+            std::vector<float> grid;
+            const int kGW = int(DW / 4), kGH = 36;  // every 4th render column: samples land on the 12 px bar
+            EXPECT(renderer.sample_motion(src, kGW, kGH, grid) && grid.size() == std::size_t(kGW) * kGH * 4, "motion samples read back");
+            double on_bar = 0, elsewhere = 0; int nb = 0, ne = 0;
+            for (int gy = 0; gy < kGH; ++gy)
+                for (int gx = 0; gx < kGW; ++gx) {
+                    const float* v = &grid[(gy * kGW + gx) * 4];
+                    const double sx = std::floor((gx + 0.5) * DW / double(kGW)) + 0.5;
+                    if (std::fabs(sx - DW / 2.0) < 5) { on_bar += v[0] * DW; ++nb; }
+                    else if (std::fabs(sx - DW / 2.0) > 12) { elsewhere += std::fabs(v[0]) * DW; ++ne; }
+                }
+            std::printf("motion samples: bar %.2f px (expected -20), elsewhere %.2f px (%d / %d samples)\n", nb ? on_bar / nb : 0.0,
+                        ne ? elsewhere / ne : 0.0, nb, ne);
+            EXPECT(nb && std::fabs(on_bar / nb + 20.0) < 0.2, "sampled bar motion");
+            EXPECT(ne && elsewhere / ne < 0.01, "sampled static motion");
+        }
         renderer.analyze_motion(src, still.clip_to_prev_clip, 1.0f, 1.0f, true);
         auto evaluate = [&](ID3D12GraphicsCommandList* list_now, float alpha, bool rendered) {
             auto inputs = renderer.latewarp_inputs(src, true);

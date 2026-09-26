@@ -283,6 +283,14 @@ uint hud_classify(uint2 id, out float weight) {
     hud_score_u[id.xy] = lerp(hud_score_u[id.xy], 1.0, weight);
 }
 
+// Motion/depth samples on a grid (mv_size = grid size) over the render rect, for camera estimation.
+RWStructuredBuffer<float4> sample_u : register(u0);
+[numthreads(8, 8, 1)] void cs_sample(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= mv_size)) return;
+    const uint2 p = rect.xy + uint2((float2(id.xy) + 0.5) * float2(rect.zw) / float2(mv_size));
+    sample_u[id.y * mv_size.x + id.x] = float4(motion_t.Load(int3(p, 0)), depth_t.Load(int3(p, 0)), 1);
+}
+
 [numthreads(8, 8, 1)] void cs_clear_score(uint3 id : SV_DispatchThreadID) { if (all(id.xy < out_size)) hud_score_u[id.xy] = 0; }
 
 // No-warp mask (output resolution, R8): HUD (score, widened by 1 px for anti-aliased edges) and
@@ -319,8 +327,8 @@ constexpr UINT kPrivSrv = 48;       // + private id
 constexpr UINT kXSrvCount = 6;
 constexpr UINT kXAnalyzeSrv = 64, kXAnalyzeUav = 70, kXReduceUav = 72, kXSplatSrv = 74, kXSplatUav = 80;
 constexpr UINT kXGatherSrvHudless = 82, kXGatherSrvBackbuffer = 88, kXGatherUav = 94;
-constexpr UINT kXHudSrv = 96, kXHudUav = 102, kXMaskSrv = 104, kXMaskUav = 110;
-constexpr UINT kHeapSize = 112;
+constexpr UINT kXHudSrv = 96, kXHudUav = 102, kXMaskSrv = 104, kXMaskUav = 110, kXSampleSrv = 112, kXSampleUav = 118;
+constexpr UINT kHeapSize = 120;
 
 DXGI_FORMAT srv_format(DXGI_FORMAT f) {
     switch (f) {
@@ -515,7 +523,7 @@ bool Renderer::create_pipelines(std::string& error) {
     struct { const char* entry; ComPtr<ID3D12PipelineState>* pso; } xs[] = {
         {"cs_analyze", &cs_analyze_}, {"cs_reduce", &cs_reduce_}, {"cs_clear", &cs_clear_}, {"cs_splat", &cs_splat_}, {"cs_gather", &cs_gather_},
         {"cs_hud", &cs_hud_}, {"cs_mask", &cs_mask_}, {"cs_clear_score", &cs_clear_score_},
-        {"cs_hud_count", &cs_hud_count_}, {"cs_clear_counts", &cs_clear_counts_}};
+        {"cs_hud_count", &cs_hud_count_}, {"cs_clear_counts", &cs_clear_counts_}, {"cs_sample", &cs_sample_}};
     for (auto& x : xs) {
         auto code = compile(x.entry, "cs_5_0", error, kShadersX);
         if (!code) return false;
@@ -733,6 +741,66 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
     transition(private_[kPMask], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     mask_ready_ = true;
     return private_[kPMask].texture.Get();
+}
+
+void Renderer::flush_and_wait() {
+    list_->Close();
+    if (pending_game_wait_ && fence_game_) { queue_->Wait(fence_game_.Get(), pending_game_wait_); pending_game_wait_ = 0; }
+    ID3D12CommandList* lists[] = {list_.Get()};
+    queue_->ExecuteCommandLists(1, lists);
+    queue_->Signal(fence_.Get(), ++fence_value_);
+    frame_values_[frame_index_] = fence_value_;
+    wait_idle();
+    allocators_[frame_index_]->Reset();
+    list_->Reset(allocators_[frame_index_].Get(), nullptr);
+    ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
+    list_->SetDescriptorHeaps(1, heaps);
+}
+
+bool Renderer::sample_motion(const IngestedSource& src, std::uint32_t grid_w, std::uint32_t grid_h, std::vector<float>& out) {
+    if (!src.has_depth || !src.has_motion) return false;
+    const UINT count = grid_w * grid_h, bytes = count * 16;
+    if (!samples_ || samples_count_ < count) {
+        wait_idle();
+        samples_.Reset(); samples_readback_.Reset();
+        D3D12_HEAP_PROPERTIES def{}; def.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC bd{}; bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = bytes; bd.Height = 1;
+        bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&samples_))))
+            return false;
+        D3D12_HEAP_PROPERTIES rb{}; rb.Type = D3D12_HEAP_TYPE_READBACK;
+        bd.Flags = D3D12_RESOURCE_FLAG_NONE;
+        if (FAILED(device_->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                    IID_PPV_ARGS(&samples_readback_)))) return false;
+        samples_count_ = count;
+    }
+    set_x_srv(kXSampleSrv + 0, kPDepth);
+    set_x_srv(kXSampleSrv + 1, kPMotion);
+    for (UINT i = 2; i < kXSrvCount; ++i) set_x_srv(kXSampleSrv + i, kPDepth);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
+    d.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; d.Format = DXGI_FORMAT_UNKNOWN;
+    d.Buffer.NumElements = count; d.Buffer.StructureByteStride = 16;
+    device_->CreateUnorderedAccessView(samples_.Get(), nullptr, &d, cpu(kXSampleUav + 0));
+    device_->CreateUnorderedAccessView(samples_.Get(), nullptr, &d, cpu(kXSampleUav + 1));
+    XConstants c{};
+    const UINT w = private_[kPDepth].width, h = private_[kPDepth].height;
+    const Rect2 r = src.depth_rect.w ? src.depth_rect : Rect2{0, 0, w, h};
+    c.rect[0] = r.x; c.rect[1] = r.y; c.rect[2] = std::min(r.w, w - r.x); c.rect[3] = std::min(r.h, h - r.y);
+    c.grid[0] = w; c.grid[1] = h;
+    c.mv_size[0] = grid_w; c.mv_size[1] = grid_h;
+    x_dispatch(cs_sample_.Get(), &c, kXSampleSrv, kXSampleUav, (grid_w + 7) / 8, (grid_h + 7) / 8);
+    auto to_copy = transition_barrier(samples_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list_->ResourceBarrier(1, &to_copy);
+    list_->CopyBufferRegion(samples_readback_.Get(), 0, samples_.Get(), 0, bytes);
+    flush_and_wait();
+    float* mapped = nullptr;
+    D3D12_RANGE range{0, bytes};
+    if (FAILED(samples_readback_->Map(0, &range, reinterpret_cast<void**>(&mapped)))) return false;
+    out.assign(mapped, mapped + count * 4);
+    D3D12_RANGE none{0, 0};
+    samples_readback_->Unmap(0, &none);
+    return true;
 }
 
 bool Renderer::take_motion_fit(MotionFit& fit) {

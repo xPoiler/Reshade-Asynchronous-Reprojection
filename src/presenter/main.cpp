@@ -1,6 +1,7 @@
 // FrameWarpPresenter: presents the game's latest frame at display rate, reprojected with NVIDIA
 // Latewarp to the camera predicted from raw mouse input and the game's own camera history.
 #include "presenter/pose.hpp"
+#include "presenter/camera_estimator.hpp"
 #include "presenter/renderer.hpp"
 #include <shellapi.h>
 #include <winternl.h>  // NTSTATUS for d3dkmthk.h
@@ -309,6 +310,10 @@ void render_thread() {
     MotionVectorScale mv_scale;
     double last_mv_log = 0;
     bool game_has_hud_layers = false, mask_logged = false;
+    CameraEstimator estimator;
+    bool estimator_logged = false, fov_logged = false;
+    std::vector<float> raw_samples;
+    std::vector<MotionSample> motion_samples;
 
     while (g_app.running) {
         WaitForSingleObjectEx(renderer.waitable(), 100, FALSE);
@@ -427,15 +432,41 @@ void render_thread() {
             IngestedSource s = renderer.ingest(sh, newest);
             held.push_back({newest, renderer.submitted_value() + 1});
             if (s.valid) {
+                // Games without a camera (DLSS without Streamline): estimate it from the motion vectors.
+                Camera cam = m.camera;
+                if (cam.estimated && s.has_depth && s.has_motion && s.depth_rect.w && s.depth_rect.h) {
+                    constexpr std::uint32_t kGridW = 64, kGridH = 36;
+                    if (renderer.sample_motion(s, kGridW, kGridH, raw_samples)) {
+                        const double rw = s.depth_rect.w, rh = s.depth_rect.h;
+                        motion_samples.clear();
+                        for (std::uint32_t gy = 0; gy < kGridH; ++gy)
+                            for (std::uint32_t gx = 0; gx < kGridW; ++gx) {
+                                const float* v = &raw_samples[(gy * kGridW + gx) * 4];
+                                MotionSample p{};
+                                p.x = float((std::floor((gx + 0.5) * rw / kGridW)) + 0.5);
+                                p.y = float((std::floor((gy + 0.5) * rh / kGridH)) + 0.5);
+                                p.mx = v[0] * m.camera.mvec_scale[0]; p.my = v[1] * m.camera.mvec_scale[1];
+                                p.depth = v[2];
+                                p.valid = (v[3] > 0.5f && std::isfinite(p.mx) && std::isfinite(p.my) && std::fabs(p.mx) < 1e4f) ? 1.0f : 0.0f;
+                                motion_samples.push_back(p);
+                            }
+                        cam = estimator.update(motion_samples, rw, rh, m.camera);
+                        if (!estimator_logged) { logf("no camera from the game: estimating it from DLSS motion vectors"); estimator_logged = true; }
+                        if (estimator.fov_locked() && !fov_logged) {
+                            logf("field of view learned: %.1f deg vertical", estimator.vertical_fov() * 180.0 / 3.14159265358979);
+                            fov_logged = true;
+                        }
+                    }
+                }
                 source = s;
-                source_camera = m.camera;
-                source_basis = to_basis(m.camera);
+                source_camera = cam;
+                source_basis = to_basis(cam);
                 source_time = seconds(m.qpc_sim_start ? m.qpc_sim_start : m.qpc_constants);
                 source_frame = m.frame_id;
-                g_app.model.add_source(m.frame_id, source_time, seconds(qpc_now()), source_basis, m.camera.reset != 0, now_seconds(),
-                                       m.camera.position_epoch);
+                g_app.model.add_source(m.frame_id, source_time, seconds(qpc_now()), source_basis, cam.reset != 0, now_seconds(),
+                                       cam.position_epoch);
                 if (g_app.csv_sources) {
-                    const auto& c = m.camera;
+                    const auto& c = cam;
                     std::fprintf(g_app.csv_sources,
                                  "%llu,%lld,%lld,%lld,%lld,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.5f,%.5f,%u,%d,%d,%d",
                                  static_cast<unsigned long long>(m.frame_id), m.qpc_sim_start, m.qpc_constants, m.qpc_present, qpc_now(),
@@ -450,10 +481,10 @@ void render_thread() {
                 game_has_hud_layers = s.has_hudless && s.has_ui && settings.use_ui_tags;
                 const bool mask = settings.no_warp_mask && !game_has_hud_layers && s.has_depth;
                 if ((settings.extrapolate_objects || mask) && s.has_motion)
-                    renderer.analyze_motion(s, m.camera.clip_to_prev_clip, float(mv_scale.scale(0, s.depth_rect.w)),
-                                            float(mv_scale.scale(1, s.depth_rect.h)), mv_scale.valid, m.camera.depth_inverted != 0);
+                    renderer.analyze_motion(s, cam.clip_to_prev_clip, float(mv_scale.scale(0, s.depth_rect.w)),
+                                            float(mv_scale.scale(1, s.depth_rect.h)), mv_scale.valid, cam.depth_inverted != 0);
                 if (mask) {
-                    renderer.build_no_warp_mask(s, m.camera.clip_to_prev_clip, true, s.has_motion && mv_scale.valid, m.camera.depth_inverted != 0);
+                    renderer.build_no_warp_mask(s, cam.clip_to_prev_clip, true, s.has_motion && mv_scale.valid, cam.depth_inverted != 0);
                     if (!mask_logged) { logf("no HUD layers from the game: detecting HUD and first-person weapon for the no-warp mask"); mask_logged = true; }
                 }
                 first_eval = true;

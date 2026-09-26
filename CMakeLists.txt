@@ -62,6 +62,10 @@ if(BUILD_TESTING)
   target_link_libraries(motion_tests PRIVATE fw_options)
   add_test(NAME camera_motion COMMAND motion_tests)
 
+  add_executable(estimator_tests tests/estimator_tests.cpp)
+  target_link_libraries(estimator_tests PRIVATE fw_options)
+  add_test(NAME camera_estimator COMMAND estimator_tests)
+
   add_executable(hook_tests tests/hook_tests.cpp src/common/inline_hook.cpp)
   target_link_libraries(hook_tests PRIVATE fw_options)
   add_test(NAME inline_hook COMMAND hook_tests)
