@@ -71,6 +71,9 @@ NVSDK_NGX_Result NVSDK_CONV hk_create(ID3D12GraphicsCommandList* list, NVSDK_NGX
 
 NVSDK_NGX_Result NVSDK_CONV hk_evaluate(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* params,
                                         PFN_NVSDK_NGX_ProgressCallback callback) {
+    std::uint64_t published = 0;  // frame whose DLSS output is copied once the evaluation is recorded
+    ID3D12Resource* output = nullptr;
+    std::uint32_t output_w = 0, output_h = 0;
     if (auto* s = stats()) {
         ++s->evaluate_calls;
         std::uint32_t feature = feature_of(handle);
@@ -129,10 +132,18 @@ NVSDK_NGX_Result NVSDK_CONV hk_evaluate(ID3D12GraphicsCommandList* list, const N
                 g_producer->on_tag(frame, kDepth, depth, state, 0, 0, w, h, list);
                 g_producer->on_tag(frame, kMotion, motion, state, 0, 0, w, h, list);
                 ++s->frames_published;
+                if (params->Get(NVSDK_NGX_Parameter_Output, &output) == NVSDK_NGX_Result_Success && output) {
+                    published = frame; output_w = s->out_w; output_h = s->out_h;
+                }
             }
         }
     }
-    return reinterpret_cast<EvaluateFn>(g_evaluate_hook.original())(list, handle, params, callback);
+    const NVSDK_NGX_Result result = reinterpret_cast<EvaluateFn>(g_evaluate_hook.original())(list, handle, params, callback);
+    // The upscaled scene (before post-processing and HUD): DLSS writes its output as an unordered-access
+    // resource, recorded on this list just now.
+    if (published && output && result == NVSDK_NGX_Result_Success)
+        g_producer->on_tag(published, kScene, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 0, 0, output_w, output_h, list);
+    return result;
 }
 
 }  // namespace

@@ -48,7 +48,7 @@ struct App {
     FILE* csv_sources = nullptr;  // ingested frames + camera
     FILE* csv_outputs = nullptr;  // presented frames + applied warp
     std::int64_t events_read = 0;
-    bool mark_was_down = false;
+    bool mark_was_down = false, dump_was_down = false;
 };
 App g_app;
 
@@ -152,8 +152,13 @@ struct MotionVectorScale {
                           std::fabs(value[0] / candidate[0] - 1) < 0.05 && std::fabs(value[1] / candidate[1] - 1) < 0.05;
         agree = same ? agree + 1 : 1;
         if (!same) { candidate[0] = value[0]; candidate[1] = value[1]; candidate_pixels = pixels; }
-        const bool differs = !valid || pixels != pixel_units || std::fabs(value[0] / locked[0] - 1) > 0.05 ||
-                             std::fabs(value[1] / locked[1] - 1) > 0.05;
+        // Compared in uv units: the same scale can come out as "render pixels" in one window and as a
+        // slightly different custom value in the next; only a real change (> 5%) relocks, or an exact
+        // render-pixel match replacing a custom value.
+        const double uv_new[2] = {pixels ? value[0] / render_w : value[0], pixels ? value[1] / render_h : value[1]};
+        const double uv_old[2] = {pixel_units ? locked[0] / render_w : locked[0], pixel_units ? locked[1] / render_h : locked[1]};
+        const bool differs = !valid || (pixels && !pixel_units) || std::fabs(uv_new[0] / uv_old[0] - 1) > 0.05 ||
+                             std::fabs(uv_new[1] / uv_old[1] - 1) > 0.05;
         if (differs && agree >= (valid ? 10 : 3)) {
             locked[0] = candidate[0]; locked[1] = candidate[1]; pixel_units = candidate_pixels; valid = true;
             return true;
@@ -313,15 +318,132 @@ void render_thread() {
     CameraEstimator estimator;
     bool estimator_logged = false, fov_logged = false;
     double estimator_ms_sum = 0, flush_ms_sum = 0;
-    int estimator_runs = 0;
+    int estimator_runs = 0, mask_builds = 0;
     std::vector<float> raw_samples;
     std::vector<MotionSample> motion_samples;
+    double intake_ms = 4.0;  // how long taking in a new game frame takes (GPU span, smoothed)
+    std::uint64_t waiting_frame = 0;  // newest game frame seen while waiting for a refresh, and since when
+    std::int64_t waiting_since = 0;
+    std::uint64_t intakes = 0;
 
     while (g_app.running) {
         WaitForSingleObjectEx(renderer.waitable(), 100, FALSE);
         if (!g_app.running) break;
         const Settings settings = sh.settings;
         apply_gpu_priority(settings.gpu_priority);
+        // Newest published frame whose GPU work is already complete (-1: none).
+        auto find_newest = [&]() {
+            const std::uint64_t game_done = renderer.game_fence_completed();
+            int newest = -1;
+            for (int i = 0; i < kSlots; ++i) {
+                const auto& m = sh.slots[i];
+                if (m.state == kReady && m.frame_id > source_frame && m.camera.valid && m.fence_value <= game_done &&
+                    (newest < 0 || m.frame_id > sh.slots[newest].frame_id)) newest = i;
+            }
+            return newest;
+        };
+        // Takes in a new game frame: converts it, estimates the camera, builds the no-warp mask. Recorded on
+        // the current command list; returns false if the slot was taken meanwhile.
+        auto take_in = [&](int newest) {
+            if (InterlockedCompareExchange(&sh.slots[newest].state, kReading, kReady) != kReady) return false;
+            const SlotMeta& m = sh.slots[newest];
+            // The previous frame's colour feeds the HUD detector (and the shelved object interpolation).
+            renderer.set_keep_previous_colour(settings.extrapolate_objects != 0 || (settings.no_warp_mask != 0 && !game_has_hud_layers));
+            // Games without a camera: sample the motion vectors as soon as depth/motion are recorded (the
+            // wait then covers only that work, not the 4K colour conversions).
+            bool sampled = false;
+            const bool wants_samples = m.camera.estimated != 0;
+            IngestedSource s = renderer.ingest(sh, newest, [&](const IngestedSource& early) {
+                if (wants_samples && early.has_depth && early.has_motion) sampled = renderer.sample_motion(early, 64, 36, raw_samples);
+            });
+            held.push_back({newest, renderer.submitted_value() + 1});
+            if (s.valid) {
+                // Games without a camera (DLSS without Streamline): estimate it from the motion vectors.
+                Camera cam = m.camera;
+                if (cam.estimated && s.has_depth && s.has_motion && s.depth_rect.w && s.depth_rect.h) {
+                    constexpr std::uint32_t kGridW = 64, kGridH = 36;
+                    if (sampled) {
+                        const double rw = s.depth_rect.w, rh = s.depth_rect.h;
+                        motion_samples.clear();
+                        for (std::uint32_t gy = 0; gy < kGridH; ++gy)
+                            for (std::uint32_t gx = 0; gx < kGridW; ++gx) {
+                                const float* v = &raw_samples[(gy * kGridW + gx) * 4];
+                                MotionSample p{};
+                                p.x = float((std::floor((gx + 0.5) * rw / kGridW)) + 0.5);
+                                p.y = float((std::floor((gy + 0.5) * rh / kGridH)) + 0.5);
+                                p.mx = v[0] * m.camera.mvec_scale[0]; p.my = v[1] * m.camera.mvec_scale[1];
+                                p.depth = v[2];
+                                p.valid = (v[3] > 0.5f && std::isfinite(p.mx) && std::isfinite(p.my) && std::fabs(p.mx) < 1e4f) ? 1.0f : 0.0f;
+                                motion_samples.push_back(p);
+                            }
+                        const double t0 = now_seconds();
+                        cam = estimator.update(motion_samples, rw, rh, m.camera);
+                        estimator_ms_sum += (now_seconds() - t0) * 1000.0; ++estimator_runs;
+                        flush_ms_sum += renderer.last_flush_ms();
+                        if (estimator_runs >= 300) {
+                            logf("camera estimation: %.2f ms CPU + %.2f ms waiting for the samples per game frame, residual %.2f px, field of view %.1f deg%s",
+                                 estimator_ms_sum / estimator_runs, flush_ms_sum / estimator_runs, estimator.last_residual(),
+                                 estimator.vertical_fov() * 180.0 / 3.14159265358979, estimator.fov_locked() ? "" : " (learning)");
+                            estimator_ms_sum = 0; flush_ms_sum = 0; estimator_runs = 0;
+                        }
+                        if (!estimator_logged) { logf("no camera from the game: estimating it from DLSS motion vectors"); estimator_logged = true; }
+                        if (estimator.fov_locked() && !fov_logged) {
+                            logf("field of view learned: %.1f deg vertical", estimator.vertical_fov() * 180.0 / 3.14159265358979);
+                            fov_logged = true;
+                        }
+                    }
+                }
+                source = s;
+                source_camera = cam;
+                source_basis = to_basis(cam);
+                source_time = seconds(m.qpc_sim_start ? m.qpc_sim_start : m.qpc_constants);
+                source_frame = m.frame_id;
+                g_app.model.add_source(m.frame_id, source_time, seconds(qpc_now()), source_basis, cam.reset != 0, now_seconds(),
+                                       cam.position_epoch);
+                if (g_app.csv_sources) {
+                    const auto& c = cam;
+                    std::fprintf(g_app.csv_sources,
+                                 "%llu,%lld,%lld,%lld,%lld,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.5f,%.5f,%u,%d,%d,%d",
+                                 static_cast<unsigned long long>(m.frame_id), m.qpc_sim_start, m.qpc_constants, m.qpc_present, qpc_now(),
+                                 c.pos[0], c.pos[1], c.pos[2], c.fwd[0], c.fwd[1], c.fwd[2], c.up[0], c.up[1], c.up[2],
+                                 c.right[0], c.right[1], c.right[2], c.fov, c.aspect, c.reset, int(g_app.model.mouse_gate()),
+                                 int(s.has_depth), int(s.has_hudless));
+                    // Projection and the game's frame-to-frame reprojection (same line, appended).
+                    for (float v : c.view_to_clip) std::fprintf(g_app.csv_sources, ",%.7g", v);
+                    for (float v : c.clip_to_prev_clip) std::fprintf(g_app.csv_sources, ",%.7g", v);
+                    std::fputc('\n', g_app.csv_sources);
+                }
+                game_has_hud_layers = s.has_hudless && s.has_ui && settings.use_ui_tags;
+                const bool mask = settings.no_warp_mask && !game_has_hud_layers && s.has_depth;
+                if ((settings.extrapolate_objects || mask) && s.has_motion)
+                    renderer.analyze_motion(s, cam.clip_to_prev_clip, float(mv_scale.scale(0, s.depth_rect.w)),
+                                            float(mv_scale.scale(1, s.depth_rect.h)), mv_scale.valid, cam.depth_inverted != 0);
+                if (mask) {
+                    renderer.build_no_warp_mask(s, cam.clip_to_prev_clip, true, s.has_motion && mv_scale.valid, cam.depth_inverted != 0);
+                    if (++mask_builds >= 300) {
+                        mask_builds = 0;
+                        const HudStats hs = renderer.take_hud_stats();
+                        if (hs.scene_frames)
+                            logf("HUD from the upscaler's output: %d frames, %.1f%% of the screen on average; GPU ms per frame: "
+                                 "curves %.2f, tiles %.2f, final %.2f",
+                                 hs.scene_frames, 100.0 * hs.scene_share_sum / hs.scene_frames,
+                                 (hs.scene_pass_ms[0] + hs.scene_pass_ms[1] + hs.scene_pass_ms[2] + hs.scene_pass_ms[3] + hs.scene_pass_ms[4] +
+                                  hs.scene_pass_ms[6] + hs.scene_pass_ms[7]) / hs.scene_frames,
+                                 (hs.scene_pass_ms[5] + hs.scene_pass_ms[8]) / hs.scene_frames, hs.scene_pass_ms[9] / hs.scene_frames);
+                        if (hs.frames)
+                            logf("HUD detection: %d frames, learned from %d (HUD-like share %.0f%%), %d with too little detail, %d held back by the guard",
+                                 hs.frames, hs.learned, hs.learned ? 100.0 * hs.share_sum / hs.learned : 0.0, hs.too_little, hs.guarded);
+                    }
+                    if (!mask_logged) { logf("no HUD layers from the game: detecting HUD and first-person weapon for the no-warp mask"); mask_logged = true; }
+                }
+                first_eval = true;
+                const double present_t = seconds(m.qpc_present);
+                if (last_source_present > 0) source_interval = present_t - last_source_present;
+                last_source_present = present_t;
+                ++stat_sources;
+            }
+            return true;
+        };
         // DWM composes shortly after each vblank; a frame that is not finished by then waits a
         // whole refresh. Render `lead` ms before the next vblank so the GPU has room even when the
         // game delays our work.
@@ -341,7 +463,34 @@ void render_thread() {
             if (last_target_vblank && v <= last_target_vblank + static_cast<std::int64_t>(vblank.period / 2))
                 v = last_target_vblank + static_cast<std::int64_t>(vblank.period);
             last_target_vblank = v;
-            sleep_until(v + compose - lead);
+            // New game frames are taken in while waiting for the refresh, each as its own GPU submission, so
+            // the refresh itself only warps (taking a frame in costs several ms of GPU at 4K). One that
+            // arrives too close to the refresh waits until just after it.
+            const std::int64_t tick = v + compose - lead;
+            const std::int64_t budget = static_cast<std::int64_t>((intake_ms + 1.0) * 1e-3 * f);
+            const bool can_take_in = g_app.visible && renderer.session_open(sh.session) &&
+                                     sh.backbuffer_width == renderer.width() && sh.backbuffer_height == renderer.height();
+            for (;;) {
+                const std::int64_t t = qpc_now();
+                if (t >= tick) break;
+                const int newest = can_take_in ? find_newest() : -1;
+                if (newest >= 0 && sh.slots[newest].frame_id != waiting_frame) { waiting_frame = sh.slots[newest].frame_id; waiting_since = t; }
+                // ...unless it has already waited a whole refresh (taking in would never fit otherwise).
+                const bool overdue = newest >= 0 && t - waiting_since > static_cast<std::int64_t>(vblank.period);
+                if (newest >= 0 && (t + budget < tick || overdue)) {
+                    renderer.begin_frame();
+                    const double t0 = now_seconds();
+                    const bool taken = take_in(newest);
+                    renderer.submit_work();
+                    if (taken) {
+                        intake_ms = std::clamp(0.8 * intake_ms + 0.2 * std::max<double>(renderer.last_intake_gpu_ms(), (now_seconds() - t0) * 1000.0), 2.0, 12.0);
+                        if (++intakes % 600 == 0)
+                            logf("game frames taken in between refreshes: %.1f ms each (smoothed)%s", intake_ms, overdue ? ", this one late" : "");
+                    }
+                    continue;
+                }
+                sleep_until(std::min(tick, t + static_cast<std::int64_t>(1e-3 * f)));  // look for new frames every ms
+            }
         } else {
             last_target_vblank = 0;
         }
@@ -417,99 +566,12 @@ void render_thread() {
             logf("pacing re-synchronised after a pause");
         }
 
-        // Newest published frame whose GPU work is already complete.
-        const std::uint64_t game_done = renderer.game_fence_completed();
-        int newest = -1;
-        for (int i = 0; i < kSlots; ++i) {
-            const auto& m = sh.slots[i];
-            if (m.state == kReady && m.frame_id > source_frame && m.camera.valid && m.fence_value <= game_done &&
-                (newest < 0 || m.frame_id > sh.slots[newest].frame_id)) newest = i;
-        }
-
+        // Without pacing, the frame is taken in right here, in the refresh (paced loops take frames in
+        // between refreshes, above).
         auto* list = renderer.begin_frame();
-        if (newest >= 0 && InterlockedCompareExchange(&sh.slots[newest].state, kReading, kReady) == kReady) {
-            const SlotMeta& m = sh.slots[newest];
-            // The previous frame's colour feeds the HUD detector (and the shelved object interpolation).
-            renderer.set_keep_previous_colour(settings.extrapolate_objects != 0 || (settings.no_warp_mask != 0 && !game_has_hud_layers));
-            // Games without a camera: sample the motion vectors as soon as depth/motion are recorded (the
-            // wait then covers only that work, not the 4K colour conversions).
-            bool sampled = false;
-            const bool wants_samples = m.camera.estimated != 0;
-            IngestedSource s = renderer.ingest(sh, newest, [&](const IngestedSource& early) {
-                if (wants_samples && early.has_depth && early.has_motion) sampled = renderer.sample_motion(early, 64, 36, raw_samples);
-            });
-            held.push_back({newest, renderer.submitted_value() + 1});
-            if (s.valid) {
-                // Games without a camera (DLSS without Streamline): estimate it from the motion vectors.
-                Camera cam = m.camera;
-                if (cam.estimated && s.has_depth && s.has_motion && s.depth_rect.w && s.depth_rect.h) {
-                    constexpr std::uint32_t kGridW = 64, kGridH = 36;
-                    if (sampled) {
-                        const double rw = s.depth_rect.w, rh = s.depth_rect.h;
-                        motion_samples.clear();
-                        for (std::uint32_t gy = 0; gy < kGridH; ++gy)
-                            for (std::uint32_t gx = 0; gx < kGridW; ++gx) {
-                                const float* v = &raw_samples[(gy * kGridW + gx) * 4];
-                                MotionSample p{};
-                                p.x = float((std::floor((gx + 0.5) * rw / kGridW)) + 0.5);
-                                p.y = float((std::floor((gy + 0.5) * rh / kGridH)) + 0.5);
-                                p.mx = v[0] * m.camera.mvec_scale[0]; p.my = v[1] * m.camera.mvec_scale[1];
-                                p.depth = v[2];
-                                p.valid = (v[3] > 0.5f && std::isfinite(p.mx) && std::isfinite(p.my) && std::fabs(p.mx) < 1e4f) ? 1.0f : 0.0f;
-                                motion_samples.push_back(p);
-                            }
-                        const double t0 = now_seconds();
-                        cam = estimator.update(motion_samples, rw, rh, m.camera);
-                        estimator_ms_sum += (now_seconds() - t0) * 1000.0; ++estimator_runs;
-                        flush_ms_sum += renderer.last_flush_ms();
-                        if (estimator_runs >= 300) {
-                            logf("camera estimation: %.2f ms CPU + %.2f ms waiting for the samples per game frame, residual %.2f px, field of view %.1f deg%s",
-                                 estimator_ms_sum / estimator_runs, flush_ms_sum / estimator_runs, estimator.last_residual(),
-                                 estimator.vertical_fov() * 180.0 / 3.14159265358979, estimator.fov_locked() ? "" : " (learning)");
-                            estimator_ms_sum = 0; flush_ms_sum = 0; estimator_runs = 0;
-                        }
-                        if (!estimator_logged) { logf("no camera from the game: estimating it from DLSS motion vectors"); estimator_logged = true; }
-                        if (estimator.fov_locked() && !fov_logged) {
-                            logf("field of view learned: %.1f deg vertical", estimator.vertical_fov() * 180.0 / 3.14159265358979);
-                            fov_logged = true;
-                        }
-                    }
-                }
-                source = s;
-                source_camera = cam;
-                source_basis = to_basis(cam);
-                source_time = seconds(m.qpc_sim_start ? m.qpc_sim_start : m.qpc_constants);
-                source_frame = m.frame_id;
-                g_app.model.add_source(m.frame_id, source_time, seconds(qpc_now()), source_basis, cam.reset != 0, now_seconds(),
-                                       cam.position_epoch);
-                if (g_app.csv_sources) {
-                    const auto& c = cam;
-                    std::fprintf(g_app.csv_sources,
-                                 "%llu,%lld,%lld,%lld,%lld,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.5f,%.5f,%u,%d,%d,%d",
-                                 static_cast<unsigned long long>(m.frame_id), m.qpc_sim_start, m.qpc_constants, m.qpc_present, qpc_now(),
-                                 c.pos[0], c.pos[1], c.pos[2], c.fwd[0], c.fwd[1], c.fwd[2], c.up[0], c.up[1], c.up[2],
-                                 c.right[0], c.right[1], c.right[2], c.fov, c.aspect, c.reset, int(g_app.model.mouse_gate()),
-                                 int(s.has_depth), int(s.has_hudless));
-                    // Projection and the game's frame-to-frame reprojection (same line, appended).
-                    for (float v : c.view_to_clip) std::fprintf(g_app.csv_sources, ",%.7g", v);
-                    for (float v : c.clip_to_prev_clip) std::fprintf(g_app.csv_sources, ",%.7g", v);
-                    std::fputc('\n', g_app.csv_sources);
-                }
-                game_has_hud_layers = s.has_hudless && s.has_ui && settings.use_ui_tags;
-                const bool mask = settings.no_warp_mask && !game_has_hud_layers && s.has_depth;
-                if ((settings.extrapolate_objects || mask) && s.has_motion)
-                    renderer.analyze_motion(s, cam.clip_to_prev_clip, float(mv_scale.scale(0, s.depth_rect.w)),
-                                            float(mv_scale.scale(1, s.depth_rect.h)), mv_scale.valid, cam.depth_inverted != 0);
-                if (mask) {
-                    renderer.build_no_warp_mask(s, cam.clip_to_prev_clip, true, s.has_motion && mv_scale.valid, cam.depth_inverted != 0);
-                    if (!mask_logged) { logf("no HUD layers from the game: detecting HUD and first-person weapon for the no-warp mask"); mask_logged = true; }
-                }
-                first_eval = true;
-                const double present_t = seconds(m.qpc_present);
-                if (last_source_present > 0) source_interval = present_t - last_source_present;
-                last_source_present = present_t;
-                ++stat_sources;
-            }
+        if (!paced) {
+            const int newest = find_newest();
+            if (newest >= 0) take_in(newest);
         }
 
         const double now = now_seconds();
@@ -543,6 +605,7 @@ void render_thread() {
             warped = latewarp.evaluate(list, inputs, first_eval, view_matrix(p.camera, origin, z_sign),
                                        view_matrix(source_basis, origin, z_sign), projection);
             if (warped) first_eval = false;
+            if (warped && settings.show_mask && inputs.no_warp_mask) renderer.tint_mask();
         }
         // Menus and loading screens often skip the game's usual frame (no DLSS call, no tags): when several
         // presents in a row bring no frame, step aside and let the game's own picture show.
@@ -553,6 +616,32 @@ void render_thread() {
         const int mark = mark_down && !g_app.mark_was_down ? 1 : 0;
         g_app.mark_was_down = mark_down;
         if (mark) logf("MARK (user flagged a bad moment)");
+        // Ctrl+Shift+D (development): saves the game's frame and the upscaler's output of the newest frame
+        // (half-float RGBA, 8-byte header: width, height) to captures\.
+        const bool dump_down = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000) && (GetAsyncKeyState('D') & 0x8000);
+        if (dump_down && !g_app.dump_was_down && source.valid) {
+            static int captures = 0;
+            const auto dir = g_app.base_dir / L"captures";
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            const int n = ++captures;
+            for (const auto& [which, name] : {std::pair{0, L"frame"}, std::pair{2, L"scene"}}) {
+                std::vector<std::uint16_t> px;
+                std::uint32_t cw = 0, ch = 0;
+                if (which == 2 && !source.has_scene) { logf("capture %d: no upscaler output this frame", n); continue; }
+                if (!renderer.read_back(which, px, cw, ch)) continue;
+                const auto path = dir / (L"capture_" + std::to_wstring(n) + L"_" + name + L".f16");
+                FILE* f = nullptr;
+                if (_wfopen_s(&f, path.c_str(), L"wb") == 0 && f) {
+                    const std::uint32_t header[2] = {cw, ch};
+                    std::fwrite(header, sizeof(header), 1, f);
+                    std::fwrite(px.data(), 2, px.size(), f);
+                    std::fclose(f);
+                }
+            }
+            logf("capture %d saved", n);
+        }
+        g_app.dump_was_down = dump_down;
         if (g_app.csv_outputs) {
             const auto tm = renderer.last_timing();
             const auto pstats = renderer.present_stats();

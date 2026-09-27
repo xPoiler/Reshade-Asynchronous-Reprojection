@@ -181,7 +181,7 @@ public:
             std::vector<MotionSample> inliers;
             for (std::size_t i = 0; i < distant.size(); ++i) if (errs[i] <= limit) inliers.push_back(distant[i]);
             if (inliers.size() >= 16) { V3 t0{}; e = fit_motion(inliers, w, h, f, omega, t0); }
-            ok = std::isfinite(e) && std::sqrt(e) < 4.0;
+            ok = std::isfinite(e) && std::sqrt(e) < acceptable(distant);
             last_residual_ = std::sqrt(e);
         }
         // Rotation and translation from all samples (near ones carry the translation), starting from the
@@ -209,7 +209,7 @@ public:
             std::vector<MotionSample> inliers;
             for (std::size_t i = 0; i < valid.size(); ++i) if (errs[i] <= limit) inliers.push_back(valid[i]);
             if (inliers.size() >= 32) e = fit_motion(inliers, w, h, f, o, t);
-            if (std::isfinite(e) && std::sqrt(e) < 4.0) { omega = o; T = t; last_residual_ = std::sqrt(e); }
+            if (std::isfinite(e) && std::sqrt(e) < acceptable(valid)) { omega = o; T = t; last_residual_ = std::sqrt(e); }
         }
         if (!ok || game.reset) { omega = V3{0, 0, 0}; T = V3{0, 0, 0}; }
         last_omega_ = omega;
@@ -221,6 +221,17 @@ public:
         basis_ = mul(basis_, R);
         orthonormalize(basis_);
         return synthesize(w, h, R, T, game);
+    }
+
+    // Largest fit error (px, root mean square) still accepted: 4 px, or 6% of the typical motion on fast
+    // turns (motion vectors and the model both get less exact with speed; dropping the fit then would
+    // show a still camera, or no translation, exactly when it matters most).
+    static double acceptable(const std::vector<MotionSample>& s) {
+        std::vector<double> m;
+        for (const auto& p : s) if (p.valid > 0.5f) m.push_back(std::hypot(p.mx, p.my));
+        if (m.empty()) return 4.0;
+        std::nth_element(m.begin(), m.begin() + m.size() / 2, m.end());
+        return std::max(4.0, 0.06 * m[m.size() / 2]);
     }
 
     double vertical_fov() const { return fov_; }

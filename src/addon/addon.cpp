@@ -194,6 +194,10 @@ void draw_overlay(effect_runtime*) {
         if (ImGui::Checkbox("Detect HUD and first-person weapon (games without HUD layers)", &mask)) s.no_warp_mask = mask;
         if (mask && p.mv_scale_x == 0.0f)
             ImGui::TextDisabled("  weapon detection starts after a few seconds of turning the camera");
+        if (mask) {
+            bool show = s.show_mask != 0;
+            if (ImGui::Checkbox("Show the mask (debug: magenta = kept still, green = HUD being learned)", &show)) s.show_mask = show;
+        }
         ImGui::Separator();
         ImGui::Text("Camera model  yaw: %s gain %.3g mrad/count, smoothing %.0f ms, quality %.2f",
                     p.calibrated_x ? "fitted" : "learning", p.gain_x * 1000.0f, p.tau_x_ms, p.fit_quality_x);

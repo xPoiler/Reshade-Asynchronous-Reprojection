@@ -386,6 +386,18 @@ int main(int argc, char** argv) {
         float weapon_mv = 0.0f;  // the weapon strip's own motion vector (uv): 0 = stuck to the screen, else animating
         bool repeating = false;  // scenery that repeats every 6 px (= the camera motion per frame): windows, railings  // a wall close to the camera behind the HUD patch (normal motion vectors)
         int scene_offset = -1;  // textured scene (vertical grey stripes) shifting every frame; >= 0 freezes it
+        // The upscaler's output (games calling DLSS directly): the same scene before tone mapping (here
+        // frame = sqrt(scene / 4) per channel) and without the HUD.
+        bool with_scene = false;
+        ComPtr<ID3D12Resource> scene_tex;
+        ComPtr<ID3D12DescriptorHeap> scene_rtv;
+        {
+            D3D12_RESOURCE_DESC sd = cd; sd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            game->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &sd, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&scene_tex));
+            D3D12_DESCRIPTOR_HEAP_DESC sh_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            game->CreateDescriptorHeap(&sh_desc, IID_PPV_ARGS(&scene_rtv));
+            game->CreateRenderTargetView(scene_tex.Get(), nullptr, scene_rtv->GetCPUDescriptorHandleForHeapStart());
+        }
         auto publish = [&](std::uint64_t fid, float bg, LONG bar_dx, bool weapon, bool hud_patch, bool near_strip = true) -> int {
             alloc->Reset();
             list->Reset(alloc.Get(), nullptr);
@@ -416,6 +428,18 @@ int main(int argc, char** argv) {
                     list->ClearRenderTargetView(rtv, colour, 1, &stripe);
                 }
             }
+            if (with_scene) {
+                const auto srtv = scene_rtv->GetCPUDescriptorHandleForHeapStart();
+                auto lin = [](float v) { return 4.0f * v * v; };
+                const float sback[4] = {lin(bg), lin(bg), lin(bg), 1}, sgrey[4] = {lin(bg + 0.15f), lin(bg + 0.15f), lin(bg + 0.15f), 1};
+                const float swhite[4] = {4, 4, 4, 1};
+                list->ClearRenderTargetView(srtv, sback, 0, nullptr);
+                for (LONG x = phase; x < LONG(W); x += 16) {
+                    const D3D12_RECT stripe{x, 0, x + 4, LONG(H)};
+                    list->ClearRenderTargetView(srtv, sgrey, 1, &stripe);
+                }
+                list->ClearRenderTargetView(srtv, swhite, 1, &bar);
+            }
             std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
             list->ResourceBarrier(1, &b);
             std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
@@ -445,6 +469,7 @@ int main(int argc, char** argv) {
             }
             producer.on_tag(fid, kDepth, depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 0, 0, DW, DH, list.Get());
             producer.on_tag(fid, kMotion, motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 0, 0, DW, DH, list.Get());
+            if (with_scene) producer.on_tag(fid, kScene, scene_tex.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 0, 0, W, H, list.Get());
             const auto t = producer.begin_present(backbuffer.Get(), list.Get());
             list->Close();
             queue->ExecuteCommandLists(1, lists);
@@ -626,6 +651,50 @@ int main(int argc, char** argv) {
         show(glass_src, yaw);
         const double glass_x1 = green_x();
         hud_patch_colour = 0;
+        // (K) HUD from the upscaler's output: found in the very first frame, with the camera still
+        // (nothing to learn from), opaque and semi-transparent; the scene around it still warps.
+        renderer.reset_hud_detection();
+        with_scene = true;
+        scene_offset = 3;
+        IngestedSource scene_src = ingest_frame(publish(600, 0.1f, 0, false, true), true, false);
+        show(scene_src, 0);
+        const double sp_x0 = green_x(), sb_x0 = peak(px, w, h, true, 1);
+        show(scene_src, yaw);
+        const double sp_x1 = green_x(), sb_x1 = peak(px, w, h, true, 1);
+        hud_patch_colour = 2;
+        IngestedSource scene_glass = ingest_frame(publish(601, 0.3f, 0, false, true), true, false);
+        show(scene_glass, 0);
+        const double sg_x0 = green_x();
+        show(scene_glass, yaw);
+        const double sg_x1 = green_x();
+        hud_patch_colour = 0;
+        // GPU cost of the scene HUD passes (per pass, from the renderer's own timestamps).
+        {
+            const int cost_slot = publish(603, 0.1f, 0, false, true);
+            renderer.take_hud_stats();
+            for (int i = 0; i < 12; ++i) ingest_frame(cost_slot, true, false);
+            for (int i = 0; i < 3; ++i) { renderer.begin_frame(); renderer.finish_frame(false, 0); renderer.wait_idle(); }
+            const HudStats hs = renderer.take_hud_stats();
+            const double n = std::max(1, hs.scene_frames);
+            std::printf("scene HUD GPU ms per frame at %ux%u (%d frames):", W, H, hs.scene_frames);
+            for (double v : hs.scene_pass_ms) std::printf(" %.3f", v / n);
+            std::printf("\n");
+        }
+        // (L) Without HUD, nothing of the scene is taken for HUD: the bar and the stripes all warp.
+        IngestedSource scene_clean = ingest_frame(publish(602, 0.1f, 0, false, false), true, false);
+        show(scene_clean, 0);
+        const double sc_x0 = peak(px, w, h, true, 1);
+        show(scene_clean, yaw);
+        const double sc_x1 = peak(px, w, h, true, 1);
+        with_scene = false;
+        scene_offset = -1;
+        std::printf("HUD from the upscaler's output: patch x %.1f -> %.1f, bar x %.0f -> %.0f; semi-transparent patch x %.1f -> %.1f; "
+                    "no HUD: bar x %.0f -> %.0f\n", sp_x0, sp_x1, sb_x0, sb_x1, sg_x0, sg_x1, sc_x0, sc_x1);
+        EXPECT(scene_src.has_scene, "the upscaler's output is ingested");
+        EXPECT(sp_x0 > 0 && std::fabs(sp_x1 - sp_x0) < 2.0, "HUD found from the upscaler's output in one frame (%.1f -> %.1f)", sp_x0, sp_x1);
+        EXPECT(std::fabs(sb_x1 - sb_x0) > 20.0, "the scene next to that HUD still warps (%.0f -> %.0f)", sb_x0, sb_x1);
+        EXPECT(sg_x0 > 0 && std::fabs(sg_x1 - sg_x0) < 2.0, "semi-transparent HUD found from the upscaler's output (%.1f -> %.1f)", sg_x0, sg_x1);
+        EXPECT(std::fabs(sc_x1 - sc_x0) > 20.0, "no HUD: nothing held (%.0f -> %.0f)", sc_x0, sc_x1);
         std::printf("no-warp mask: weapon strip x %.0f -> %.0f; HUD patch x %.1f -> %.1f, scene bar x %.0f -> %.0f; changed patch x %.1f -> %.1f; "
                     "after weapon x %.0f -> %.0f; semi-transparent patch x %.1f -> %.1f (5 deg yaw)\n",
                     weapon_x0, weapon_x1, patch_x0, patch_x1, bar_x0, bar_x1, gone_x0, gone_x1, after_x0, after_x1, glass_x0, glass_x1);

@@ -17,10 +17,20 @@ using Microsoft::WRL::ComPtr;
 
 struct IngestedSource {
     bool valid = false;
-    bool has_hudless = false, has_ui = false, has_depth = false;
+    bool has_hudless = false, has_ui = false, has_depth = false, has_scene = false;
     std::uint32_t color_w = 0, color_h = 0;
     Rect2 color_rect, depth_rect;
     bool has_motion = false;  // game motion vectors converted into the private motion texture
+};
+
+// HUD detection frames: learned from, skipped for too few telling pixels, or held back by the
+// whole-frame guard (too many pixels looked like HUD).
+struct HudStats {
+    int frames = 0, learned = 0, too_little = 0, guarded = 0;
+    double share_sum = 0;  // HUD-like share of the telling pixels, over learned frames
+    int scene_frames = 0;  // frames whose HUD came from the upscaler's output instead
+    double scene_share_sum = 0;  // share of the screen found to be HUD, summed over those frames
+    double scene_pass_ms[10] = {};  // GPU time per pass, summed: clear, accum, finish, accum, finish, tiles, accum, finish, tiles, final
 };
 
 // Least-squares sums relating the game's motion vectors g to the camera-only motion c (uv per frame,
@@ -61,6 +71,12 @@ public:
     // Blits the warped output (or the unwarped private backbuffer) to the swapchain and presents.
     // marker: 0 none, 1 green (warped), 2 red (original).
     void finish_frame(bool warped, int marker);
+    // Submits the work recorded since begin_frame without presenting (a new game frame taken in between
+    // refreshes, so the refresh itself only warps).
+    void submit_work();
+    float last_intake_gpu_ms() const { return intake_gpu_ms_; }  // GPU span of the last such submission
+    // Debug: tints the no-warp mask and the HUD score onto the warped output (call after Latewarp).
+    void tint_mask();
     // Signalled value that completes all work recorded so far.
     std::uint64_t submitted_value() const { return fence_value_; }
     bool completed(std::uint64_t value) const { return fence_->GetCompletedValue() >= value; }
@@ -86,6 +102,8 @@ public:
     // Keep a copy of the previous game frame's colour at each ingest (background for uncovered areas).
     void set_keep_previous_colour(bool on) { keep_previous_ = on; if (!on) previous_valid_ = false; }
     bool take_motion_fit(MotionFit& fit);
+    // HUD learning per game frame since the last call (read back a few frames later).
+    HudStats take_hud_stats() { const HudStats s = hud_stats_; hud_stats_ = {}; return s; }
     // Once per new game frame (after analyze_motion): the no-warp mask for games without HUD layers.
     // hud: pixels that stay unchanged while the camera moves the scene under them (needs the previous
     // colour, see set_keep_previous_colour); attached: pixels whose motion vectors ignore the camera
@@ -100,7 +118,8 @@ public:
     void reset_hud_detection() { reset_hud_ = true; mask_ready_ = false; }
 
     // Test/diagnostic helper: synchronously reads back the warped output (RGBA16F) or private backbuffer.
-    bool read_back(bool output, std::vector<std::uint16_t>& pixels, std::uint32_t& w, std::uint32_t& h);
+    // which: 0 the game's frame, 1 the warped output, 2 the upscaler's output (scene before HUD).
+    bool read_back(int which, std::vector<std::uint16_t>& pixels, std::uint32_t& w, std::uint32_t& h);
 
 private:
     struct Private {
@@ -109,7 +128,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     };
-    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPDest, kPExtrap, kPPrevious, kPHudScore, kPMask, kPCount };
+    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPDest, kPExtrap, kPPrevious, kPHudScore, kPMask, kPScene, kPCount };
 
     bool create_pipelines(std::string& error);
     bool ensure_private(PrivateId id, std::uint32_t w, std::uint32_t h, DXGI_FORMAT format);
@@ -119,6 +138,8 @@ private:
     D3D12_GPU_DESCRIPTOR_HANDLE gpu(UINT index) const;
     void convert(ID3D12Resource* source, DXGI_FORMAT source_format, int slot, int kind, PrivateId target, std::uint32_t w, std::uint32_t h);
     void create_swapchain_views();
+    // HUD in this frame from the upscaler's output (into the HUD score texture, 1 = HUD).
+    void detect_hud_from_scene(const struct XConstants& base);
     void flush_and_wait();  // submit what is recorded, wait for it, continue recording the same frame
     void set_x_srv(UINT index, PrivateId id);
     void set_x_uav(UINT index, PrivateId id);
@@ -142,11 +163,15 @@ private:
     const char* priority_name_ = "normal";
 
     ComPtr<ID3D12RootSignature> root_, root_x_;
-    ComPtr<ID3D12PipelineState> cs_analyze_, cs_reduce_, cs_clear_, cs_splat_, cs_gather_, cs_hud_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_;
+    ComPtr<ID3D12PipelineState> cs_analyze_, cs_reduce_, cs_clear_, cs_splat_, cs_gather_, cs_hud_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_;
     ComPtr<ID3D12Resource> samples_, samples_readback_;
     UINT samples_count_ = 0;
     float last_flush_ms_ = 0;
-    ComPtr<ID3D12Resource> hud_counts_;
+    ComPtr<ID3D12Resource> hud_counts_, hud_readback_, scene_fit_, scene_stamps_readback_;
+    ComPtr<ID3D12QueryHeap> scene_stamps_;
+    bool hud_pending_[3] = {}, hud_scene_pending_[3] = {}, hud_from_scene_ = false;
+    double hud_scene_pixels_ = 1;
+    HudStats hud_stats_;
     bool mask_ready_ = false, reset_hud_ = false;
     ComPtr<ID3D12Resource> partials_, sums_, fit_readback_;
     UINT partial_groups_ = 0;
@@ -167,7 +192,8 @@ private:
     std::vector<std::string> notes_;
     UINT frame_latency_ = 1;
     PresentStats present_stats_;
-    float gpu_ms_ = 0;
+    float gpu_ms_ = 0, intake_gpu_ms_ = 0;
+    bool intake_slot_[3] = {};
 
     Private private_[kPCount];
     DWORD pid_ = 0;

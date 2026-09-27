@@ -10,13 +10,14 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 25;
+constexpr std::uint32_t kVersion = 27;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
-enum Tex : int { kBackbuffer = 0, kHudless, kUi, kDepth, kMotion, kTexCount };
+// kScene: the upscaler's output (games without Streamline): the scene before post-processing and HUD.
+enum Tex : int { kBackbuffer = 0, kHudless, kUi, kDepth, kMotion, kScene, kTexCount };
 inline const char* tex_name(int t) {
-    static const char* n[] = {"backbuffer", "hudless", "ui", "depth", "motion"};
+    static const char* n[] = {"backbuffer", "hudless", "ui", "depth", "motion", "scene"};
     return t >= 0 && t < kTexCount ? n[t] : "?";
 }
 
@@ -79,6 +80,8 @@ struct Settings {
     std::uint32_t gpu_priority;    // presenter GPU scheduling class: 0 realtime (default), 1 high, 2 normal
     std::uint32_t extrapolate_objects;  // shelved experiment (no UI): interpolate moving objects with the game's motion vectors
     std::uint32_t no_warp_mask;    // games without HUD layers: detect HUD + first-person weapon and keep them unwarped
+    std::uint32_t show_mask;       // debug: tint the no-warp mask (magenta) and the HUD score still learning (green)
+    std::uint32_t pad_settings;
 };
 
 // Presenter status, displayed by the add-on UI.

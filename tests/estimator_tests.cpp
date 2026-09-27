@@ -103,6 +103,20 @@ int main() {
     const double dot_right = after.fwd[0] * before.right[0] + after.fwd[1] * before.right[1] + after.fwd[2] * before.right[2];
     std::printf("after turning: forward . old right = %.3f (positive = turned right)\n", dot_right);
     EXPECT(dot_right > 0.1, "basis turns the way the image says");
+    // Fast turn (7 degrees in one game frame) while moving, with motion vectors 4% off: the fit is less
+    // exact at this speed but must still be used, translation included (not replaced by a still camera).
+    {
+        const CameraEstimator::V3 fast{0.01, 0.12, 0}, move{0.03, 0, 0.05};
+        auto fs = make(fast, fov, 0.05, rng, move);
+        std::normal_distribution<double> rel(0, 0.04);
+        for (auto& p : fs) { const double k = 1 + rel(rng); p.mx = float(p.mx * k); p.my = float(p.my * k); }
+        est.update(fs, kW, kH, game);
+        const auto o = est.last_omega(), t = est.last_translation();
+        std::printf("fast turn: rotation %.3f %.3f (true %.3f %.3f), translation %.3f %.3f %.3f (true %.3f %.3f %.3f), residual %.2f px\n",
+                    o[0], o[1], fast[0], fast[1], t[0], t[1], t[2], move[0], move[1], move[2], est.last_residual());
+        EXPECT(std::fabs(o[1] - fast[1]) < 0.005, "fast turn rotation kept (%g)", o[1]);
+        EXPECT(std::fabs(t[0] - move[0]) < 0.015 && std::fabs(t[2] - move[2]) < 0.015, "fast turn translation kept");
+    }
     // CPU cost per game frame (the presenter runs this on every new frame): 64x36 samples, 10% outliers,
     // turning and moving.
     {

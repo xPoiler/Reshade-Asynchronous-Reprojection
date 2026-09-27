@@ -317,6 +317,179 @@ RWTexture2D<unorm float> mask_u : register(u0);
     }
     mask_u[id.xy] = keep ? 1.0 : 0.0;
 }
+
+// HUD from the upscaler's output (games without HUD layers that call DLSS directly). The upscaler's
+// output is the scene before post-processing and HUD; the game's frame is that scene tone-mapped and
+// post-processed, plus the HUD. Predict the frame from the scene - a tone curve per channel over the
+// whole screen, then a smooth affine colour correction per 128 px tile (vignette, damage tint, bloom) -
+// and what the prediction misses is HUD, in this very frame. Fits sample every fourth pixel and leave
+// out, on refitting, the pixels the previous fit missed (the HUD must not bend them).
+// rect: x curve slot read, y slot or tile set written, z which pixels count (0 all, 1 near curve 0,
+// 2 near curve 1 + tile set 0); grid: tile counts.
+Texture2D<float4> sc_frame_t : register(t0);
+Texture2D<float4> sc_scene_t : register(t1);
+RWTexture2D<float> sc_hud_u : register(u0);
+RWByteAddressBuffer sc_fit_u : register(u1);
+static const uint kBins = 64, kTile = 128, kMaxTiles = 4096;
+static const uint kMeanBase = 3 * kBins * 3 * 2 * 4, kTileBase = kMeanBase + 3 * kBins * 3 * 4;
+static const uint kHudCount = kTileBase + 2 * kMaxTiles * 3 * 2 * 4;
+float bin_pos(float v) { return (log2(max(v, 1.0 / 4096.0)) + 12.0) * (float(kBins) / 20.0); }
+float mean_of(uint slot, uint c, int b) { return asfloat(sc_fit_u.Load(kMeanBase + ((slot * 3 + c) * kBins + uint(b)) * 4)); }
+float curve(uint slot, uint c, float v) {
+    const float f = bin_pos(v) - 0.5, fl = floor(f);
+    const int i0 = clamp(int(fl), 0, int(kBins) - 1), i1 = clamp(int(fl) + 1, 0, int(kBins) - 1);
+    return lerp(mean_of(slot, c, i0), mean_of(slot, c, i1), saturate(f - fl));
+}
+float3 curve3(uint slot, float3 s) { return float3(curve(slot, 0, s.r), curve(slot, 1, s.g), curve(slot, 2, s.b)); }
+// The curve and its slope per doubling of the scene value.
+float curve_slope(uint slot, uint c, float v, out float slope) {
+    const float f = bin_pos(v) - 0.5, fl = floor(f);
+    const int i0 = clamp(int(fl), 0, int(kBins) - 1), i1 = clamp(int(fl) + 1, 0, int(kBins) - 1);
+    const float m0 = mean_of(slot, c, i0), m1 = mean_of(slot, c, i1);
+    slope = (m1 - m0) * (float(kBins) / 20.0);
+    return lerp(m0, m1, saturate(f - fl));
+}
+// Tile correction (a, b per channel), bilinear between tile centres.
+void correction(uint set, uint2 p, out float3 a, out float3 b) {
+    const float2 t = (float2(p) + 0.5) / float(kTile) - 0.5;
+    const float2 fl = floor(t), f = saturate(t - fl);
+    const int2 last = int2(grid) - 1;
+    a = 0; b = 0;
+    [unroll] for (int k = 0; k < 4; ++k) {
+        const int2 q = clamp(int2(fl) + int2(k & 1, k >> 1), int2(0, 0), last);
+        const float w = ((k & 1) ? f.x : 1 - f.x) * ((k >> 1) ? f.y : 1 - f.y);
+        const uint base = kTileBase + ((set * kMaxTiles + uint(q.y) * grid.x + uint(q.x)) * 3) * 8;
+        [unroll] for (uint c = 0; c < 3; ++c) {
+            a[c] += w * asfloat(sc_fit_u.Load(base + c * 8));
+            b[c] += w * asfloat(sc_fit_u.Load(base + c * 8 + 4));
+        }
+    }
+}
+float miss(float3 frame, float3 pred) { const float3 d = abs(frame - pred); return max(d.r, max(d.g, d.b)); }
+bool counts(uint rule, uint2 p, float3 frame, float3 scene) {
+    if (rule == 1) return miss(frame, curve3(0, scene)) < 0.1;
+    if (rule == 2) { float3 a, b; correction(0, p, a, b); return miss(frame, a * curve3(1, scene) + b) < 0.08; }
+    return true;
+}
+[numthreads(64, 1, 1)] void cs_scene_clear(uint3 id : SV_DispatchThreadID) {
+    for (uint i = id.x; i < 3 * kBins * 3 * 2; i += 64) sc_fit_u.Store(i * 4, 0);
+    if (id.x == 0) sc_fit_u.Store(kHudCount, 0);
+}
+groupshared uint sc_bins[kBins * 3 * 2];
+[numthreads(8, 8, 1)] void cs_scene_accum(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+    for (uint i = gi; i < kBins * 3 * 2; i += 64) sc_bins[i] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    const uint2 p = id.xy * 4;
+    if (all(p < out_size)) {
+        const float3 frame = sc_frame_t.Load(int3(p, 0)).rgb, scene = max(sc_scene_t.Load(int3(p, 0)).rgb, 0);
+        if (counts(rect.z, p, frame, scene))
+            [unroll] for (uint c = 0; c < 3; ++c) {
+                const uint b = min(uint(max(bin_pos(scene[c]), 0.0)), kBins - 1);
+                InterlockedAdd(sc_bins[(c * kBins + b) * 2], uint(saturate(frame[c]) * 1024.0 + 0.5));
+                InterlockedAdd(sc_bins[(c * kBins + b) * 2 + 1], 1);
+            }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for (uint j = gi; j < kBins * 3 * 2; j += 64)
+        if (sc_bins[j]) sc_fit_u.InterlockedAdd((rect.y * kBins * 3 * 2 + j) * 4, sc_bins[j]);
+}
+// Mean per bin; empty bins take the line between their nearest filled neighbours.
+[numthreads(64, 3, 1)] void cs_scene_finish(uint3 id : SV_DispatchThreadID) {
+    const uint b = id.x, c = id.y, acc = rect.y * kBins * 3 * 2;
+    int lo = -1, hi = -1;
+    for (int k = int(b); k >= 0; --k) if (sc_fit_u.Load((acc + (c * kBins + uint(k)) * 2 + 1) * 4)) { lo = k; break; }
+    for (int m = int(b); m < int(kBins); ++m) if (sc_fit_u.Load((acc + (c * kBins + uint(m)) * 2 + 1) * 4)) { hi = m; break; }
+    float v = 0;
+    if (lo >= 0 || hi >= 0) {
+        const int l = lo >= 0 ? lo : hi, h = hi >= 0 ? hi : lo;
+        const uint el = (acc + (c * kBins + uint(l)) * 2) * 4, eh = (acc + (c * kBins + uint(h)) * 2) * 4;
+        const float vl = float(sc_fit_u.Load(el)) / 1024.0 / float(sc_fit_u.Load(el + 4));
+        const float vh = float(sc_fit_u.Load(eh)) / 1024.0 / float(sc_fit_u.Load(eh + 4));
+        v = h > l ? lerp(vl, vh, float(int(b) - l) / float(h - l)) : vl;
+    }
+    sc_fit_u.Store(kMeanBase + ((rect.y * 3 + c) * kBins + b) * 4, asuint(v));
+}
+groupshared float sc_red[256];
+groupshared float sc_tot[13];
+[numthreads(16, 16, 1)] void cs_scene_tiles(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_GroupIndex) {
+    float v[13];
+    [unroll] for (uint q = 0; q < 13; ++q) v[q] = 0;
+    for (uint y = 0; y < 2; ++y)
+        for (uint x = 0; x < 2; ++x) {
+            const uint2 p = gid.xy * kTile + (tid.xy * 2 + uint2(x, y)) * 4;
+            if (any(p >= out_size)) continue;
+            const float3 frame = sc_frame_t.Load(int3(p, 0)).rgb, scene = max(sc_scene_t.Load(int3(p, 0)).rgb, 0);
+            if (!counts(rect.z, p, frame, scene)) continue;
+            const float3 pr = curve3(rect.x, scene);
+            [unroll] for (uint c = 0; c < 3; ++c) {
+                v[c * 4] += pr[c]; v[c * 4 + 1] += frame[c]; v[c * 4 + 2] += pr[c] * pr[c]; v[c * 4 + 3] += pr[c] * frame[c];
+            }
+            v[12] += 1;
+        }
+    [unroll] for (uint k = 0; k < 13; ++k) {
+        sc_red[gi] = v[k];
+        GroupMemoryBarrierWithGroupSync();
+        for (uint s = 128; s > 0; s >>= 1) {
+            if (gi < s) sc_red[gi] += sc_red[gi + s];
+            GroupMemoryBarrierWithGroupSync();
+        }
+        if (gi == 0) sc_tot[k] = sc_red[0];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi != 0) return;
+    const float n = sc_tot[12];
+    const uint base = kTileBase + ((rect.y * kMaxTiles + gid.y * grid.x + gid.x) * 3) * 8;
+    [unroll] for (uint c = 0; c < 3; ++c) {
+        float a = 1, b = 0;
+        if (n >= float(kTile * kTile / 128)) {  // an eighth of the tile's samples
+            const float sp = sc_tot[c * 4], sf = sc_tot[c * 4 + 1], spp = sc_tot[c * 4 + 2], spf = sc_tot[c * 4 + 3];
+            const float var = spp - sp * sp / n;
+            a = var > 1e-4 * n ? clamp((spf - sp * sf / n) / var, 0.4, 2.5) : 1.0;
+            b = (sf - a * sp) / n;
+        }
+        sc_fit_u.Store(base + c * 8, asuint(a));
+        sc_fit_u.Store(base + c * 8 + 4, asuint(b));
+    }
+}
+// Final prediction (curve 2, tile set 1) at full resolution. The tolerance grows with the prediction's
+// own gradient (sharpening, sub-pixel differences between the two images): the curve's slope times the
+// scene's gradient, per channel.
+groupshared uint sc_hud_pixels;
+[numthreads(8, 8, 1)] void cs_scene_hud(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+    if (gi == 0) sc_hud_pixels = 0;
+    GroupMemoryBarrierWithGroupSync();
+    if (all(id.xy < out_size)) {
+        float3 a, b;
+        correction(1, id.xy, a, b);
+        const int2 p = int2(id.xy), last = int2(out_size) - 1;
+        const float3 scene = max(sc_scene_t.Load(int3(p, 0)).rgb, 0);
+        float3 slope;
+        const float3 pred = a * float3(curve_slope(2, 0, scene.r, slope.r), curve_slope(2, 1, scene.g, slope.g), curve_slope(2, 2, scene.b, slope.b)) + b;
+        float3 ls[4];
+        const int2 offs[4] = {int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1)};
+        [unroll] for (uint i = 0; i < 4; ++i)
+            ls[i] = log2(max(sc_scene_t.Load(int3(clamp(p + offs[i], int2(0, 0), last), 0)).rgb, 1.0 / 4096.0));
+        const float3 g = max(abs(ls[1] - ls[0]), abs(ls[3] - ls[2]));
+        const float gradient = dot(abs(a * slope) * g, float3(1, 1, 1) / 3.0);
+        const bool hud = miss(sc_frame_t.Load(int3(p, 0)).rgb, pred) > 0.06 + 0.5 * gradient;
+        sc_hud_u[id.xy] = hud ? 1.0 : 0.0;
+        if (hud) InterlockedAdd(sc_hud_pixels, 1);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (gi == 0 && sc_hud_pixels) sc_fit_u.InterlockedAdd(kHudCount, sc_hud_pixels);
+}
+
+// Debug view on the warped output: masked pixels magenta, HUD score still below the threshold green.
+Texture2D<unorm float> tint_mask_t : register(t0);
+Texture2D<float> tint_score_t : register(t1);
+RWTexture2D<float4> tint_u : register(u0);
+[numthreads(8, 8, 1)] void cs_tint(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= out_size)) return;
+    const float m = tint_mask_t.Load(int3(id.xy, 0)), s = tint_score_t.Load(int3(id.xy, 0));
+    const float4 c = tint_u[id.xy];
+    if (m > 0.5) tint_u[id.xy] = float4(lerp(c.rgb, float3(1, 0, 1), 0.5), c.a);
+    else if (s > 0.05) tint_u[id.xy] = float4(lerp(c.rgb, float3(0, 1, 0), 0.5 * saturate(s / 0.6)), c.a);
+}
 )";
 
 // Descriptor layout in the shader-visible heap.
@@ -328,7 +501,13 @@ constexpr UINT kXSrvCount = 6;
 constexpr UINT kXAnalyzeSrv = 64, kXAnalyzeUav = 70, kXReduceUav = 72, kXSplatSrv = 74, kXSplatUav = 80;
 constexpr UINT kXGatherSrvHudless = 82, kXGatherSrvBackbuffer = 88, kXGatherUav = 94;
 constexpr UINT kXHudSrv = 96, kXHudUav = 102, kXMaskSrv = 104, kXMaskUav = 110, kXSampleSrv = 112, kXSampleUav = 118;
-constexpr UINT kHeapSize = 120;
+constexpr UINT kXTintSrv = 120, kXTintUav = 126, kXSceneSrv = 128, kXSceneUav = 134;
+constexpr UINT kHeapSize = 136;
+// Scene HUD fit buffer (see cs_scene_*): 3 curve accumulators, 3 curves, 2 tile sets, HUD pixel count.
+constexpr UINT kSceneBins = 64, kSceneTile = 128, kSceneMaxTiles = 4096;
+constexpr UINT kSceneHudCount = 3 * kSceneBins * 3 * 2 * 4 + 3 * kSceneBins * 3 * 4 + 2 * kSceneMaxTiles * 3 * 2 * 4;
+constexpr UINT kSceneFitBytes = kSceneHudCount + 16;
+constexpr UINT kSceneStamps = 11;  // before the first pass and after each of the 10
 
 DXGI_FORMAT srv_format(DXGI_FORMAT f) {
     switch (f) {
@@ -425,6 +604,11 @@ bool Renderer::init(const LUID& adapter_luid, HWND window, std::uint32_t width, 
     device_->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback_));
     queue_->GetTimestampFrequency(&timestamp_frequency_);
     queue_->GetClockCalibration(&calib_gpu_, &calib_cpu_);
+    // GPU time of each scene-HUD pass (one set per frame in flight), for the log.
+    D3D12_QUERY_HEAP_DESC sq{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 3 * kSceneStamps, 0};
+    device_->CreateQueryHeap(&sq, IID_PPV_ARGS(&scene_stamps_));
+    bd.Width = 3 * kSceneStamps * 8;
+    device_->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&scene_stamps_readback_));
 
     // Composition swapchain: DWM composites it over the game without taking focus or input.
     width_ = width; height_ = height;
@@ -523,7 +707,9 @@ bool Renderer::create_pipelines(std::string& error) {
     struct { const char* entry; ComPtr<ID3D12PipelineState>* pso; } xs[] = {
         {"cs_analyze", &cs_analyze_}, {"cs_reduce", &cs_reduce_}, {"cs_clear", &cs_clear_}, {"cs_splat", &cs_splat_}, {"cs_gather", &cs_gather_},
         {"cs_hud", &cs_hud_}, {"cs_mask", &cs_mask_}, {"cs_clear_score", &cs_clear_score_},
-        {"cs_hud_count", &cs_hud_count_}, {"cs_clear_counts", &cs_clear_counts_}, {"cs_sample", &cs_sample_}};
+        {"cs_hud_count", &cs_hud_count_}, {"cs_clear_counts", &cs_clear_counts_}, {"cs_sample", &cs_sample_}, {"cs_tint", &cs_tint_},
+        {"cs_scene_clear", &cs_scene_clear_}, {"cs_scene_accum", &cs_scene_accum_}, {"cs_scene_finish", &cs_scene_finish_},
+        {"cs_scene_tiles", &cs_scene_tiles_}, {"cs_scene_hud", &cs_scene_hud_}};
     for (auto& x : xs) {
         auto code = compile(x.entry, "cs_5_0", error, kShadersX);
         if (!code) return false;
@@ -543,10 +729,18 @@ bool Renderer::create_pipelines(std::string& error) {
     if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&hud_counts_)))) {
         error = "HUD counter buffer"; return false;
     }
+    bd.Width = kSceneFitBytes;
+    if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&scene_fit_)))) {
+        error = "scene HUD buffer"; return false;
+    }
     D3D12_HEAP_PROPERTIES rbh{}; rbh.Type = D3D12_HEAP_TYPE_READBACK;
     bd.Width = 3 * 2 * 16; bd.Flags = D3D12_RESOURCE_FLAG_NONE;
     if (FAILED(device_->CreateCommittedResource(&rbh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&fit_readback_)))) {
         error = "motion fit readback"; return false;
+    }
+    bd.Width = 3 * 16;
+    if (FAILED(device_->CreateCommittedResource(&rbh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&hud_readback_)))) {
+        error = "HUD counter readback"; return false;
     }
     return true;
 }
@@ -579,7 +773,7 @@ void Renderer::x_dispatch(ID3D12PipelineState* pso, const void* constants, UINT 
     list_->Dispatch(groups_x, groups_y, 1);
 }
 
-namespace {
+// Root constants of the compute passes (the renderer's header names the type).
 struct XConstants {
     float clip_to_prev[16];
     std::uint32_t rect[4], grid[2], mv_size[2], out_size[2];
@@ -587,7 +781,6 @@ struct XConstants {
     std::uint32_t groups_x, flags;
 };
 static_assert(sizeof(XConstants) == 32 * 4, "root constants");
-}  // namespace
 
 void Renderer::analyze_motion(const IngestedSource& src, const float clip_to_prev_clip[16], float scale_x, float scale_y, bool scale_valid,
                               bool depth_inverted) {
@@ -710,7 +903,16 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
         for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXHudSrv + i, kPBackbuffer);
         x_dispatch(cs_clear_score_.Get(), &z, kXHudSrv, kXHudUav, (ow + 7) / 8, (oh + 7) / 8);
     }
-    if (hud && previous) {
+    const bool from_scene = hud && src.has_scene && private_[kPScene].texture && private_[kPScene].width == ow && private_[kPScene].height == oh;
+    if (from_scene) {
+        hud_from_scene_ = true;
+        detect_hud_from_scene(c);
+    } else if (hud_from_scene_) {
+        // The upscaler's output stopped coming: the learned map starts over.
+        hud_from_scene_ = false;
+        reset_hud_ = true;
+    }
+    if (hud && previous && !from_scene) {
         set_x_srv(kXHudSrv + 0, kPBackbuffer);
         set_x_srv(kXHudSrv + 1, kPPrevious);
         set_x_srv(kXHudSrv + 2, kPDepth);
@@ -729,6 +931,13 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
         x_dispatch(cs_hud_count_.Get(), &c, kXHudSrv, kXHudUav, (ow + 7) / 8, (oh + 7) / 8);
         list_->ResourceBarrier(1, &counts);
         x_dispatch(cs_hud_.Get(), &c, kXHudSrv, kXHudUav, (ow + 7) / 8, (oh + 7) / 8);
+        // The counters go to the log (how often the whole-frame guard holds learning back).
+        auto to_copy = transition_barrier(hud_counts_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list_->ResourceBarrier(1, &to_copy);
+        list_->CopyBufferRegion(hud_readback_.Get(), UINT64(frame_index_) * 16, hud_counts_.Get(), 0, 8);
+        std::swap(to_copy.Transition.StateBefore, to_copy.Transition.StateAfter);
+        list_->ResourceBarrier(1, &to_copy);
+        hud_pending_[frame_index_] = true;
     }
     transition(private_[kPHudScore], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     set_x_srv(kXMaskSrv + 0, kPHudScore);
@@ -741,6 +950,73 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
     transition(private_[kPMask], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     mask_ready_ = true;
     return private_[kPMask].texture.Get();
+}
+
+void Renderer::detect_hud_from_scene(const XConstants& base) {
+    const UINT ow = private_[kPBackbuffer].width, oh = private_[kPBackbuffer].height;
+    XConstants c = base;
+    c.grid[0] = (ow + kSceneTile - 1) / kSceneTile; c.grid[1] = (oh + kSceneTile - 1) / kSceneTile;
+    if (c.grid[0] * c.grid[1] > kSceneMaxTiles) return;
+    set_x_srv(kXSceneSrv + 0, kPBackbuffer);
+    set_x_srv(kXSceneSrv + 1, kPScene);
+    for (UINT i = 2; i < kXSrvCount; ++i) set_x_srv(kXSceneSrv + i, kPScene);
+    set_x_uav(kXSceneUav + 0, kPHudScore);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC raw{};
+    raw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; raw.Format = DXGI_FORMAT_R32_TYPELESS;
+    raw.Buffer.NumElements = kSceneFitBytes / 4; raw.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    device_->CreateUnorderedAccessView(scene_fit_.Get(), nullptr, &raw, cpu(kXSceneUav + 1));
+    transition(private_[kPHudScore], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_RESOURCE_BARRIER fit{}; fit.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; fit.UAV.pResource = scene_fit_.Get();
+    auto run_pass = [&](ID3D12PipelineState* pso, UINT read, UINT write, UINT rule, UINT gx, UINT gy) {
+        c.rect[0] = read; c.rect[1] = write; c.rect[2] = rule; c.rect[3] = 0;
+        x_dispatch(pso, &c, kXSceneSrv, kXSceneUav, gx, gy);
+        list_->ResourceBarrier(1, &fit);
+    };
+    UINT stamp = 0;
+    auto mark = [&]() { if (scene_stamps_) list_->EndQuery(scene_stamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * kSceneStamps + stamp++); };
+    auto run = [&](ID3D12PipelineState* pso, UINT read, UINT write, UINT rule, UINT gx, UINT gy) {
+        run_pass(pso, read, write, rule, gx, gy);
+        mark();
+    };
+    const UINT hx = (ow / 4 + 7) / 8, hy = (oh / 4 + 7) / 8;
+    mark();
+    run(cs_scene_clear_.Get(), 0, 0, 0, 1, 1);
+    run(cs_scene_accum_.Get(), 0, 0, 0, hx, hy);   // curve 0 from every pixel
+    run(cs_scene_finish_.Get(), 0, 0, 0, 1, 1);
+    run(cs_scene_accum_.Get(), 0, 1, 1, hx, hy);   // curve 1 without what curve 0 misses
+    run(cs_scene_finish_.Get(), 0, 1, 0, 1, 1);
+    run(cs_scene_tiles_.Get(), 1, 0, 0, c.grid[0], c.grid[1]);  // tile set 0: every pixel (a tint over the scene)
+    run(cs_scene_accum_.Get(), 0, 2, 2, hx, hy);   // curve 2 without what curve 1 + tiles 0 miss
+    run(cs_scene_finish_.Get(), 0, 2, 0, 1, 1);
+    run(cs_scene_tiles_.Get(), 2, 1, 2, c.grid[0], c.grid[1]);  // tile set 1: without those pixels either
+    run(cs_scene_hud_.Get(), 2, 1, 0, (ow + 7) / 8, (oh + 7) / 8);
+    // The HUD pixel count goes to the log.
+    auto to_copy = transition_barrier(scene_fit_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list_->ResourceBarrier(1, &to_copy);
+    list_->CopyBufferRegion(hud_readback_.Get(), UINT64(frame_index_) * 16 + 8, scene_fit_.Get(), kSceneHudCount, 4);
+    std::swap(to_copy.Transition.StateBefore, to_copy.Transition.StateAfter);
+    list_->ResourceBarrier(1, &to_copy);
+    if (scene_stamps_)
+        list_->ResolveQueryData(scene_stamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * kSceneStamps, kSceneStamps,
+                                scene_stamps_readback_.Get(), UINT64(frame_index_) * kSceneStamps * 8);
+    hud_scene_pending_[frame_index_] = true;
+    hud_scene_pixels_ = double(ow) * double(oh);
+}
+
+void Renderer::tint_mask() {
+    if (!mask_ready_ || !private_[kPOutput].texture || !private_[kPHudScore].texture) return;
+    const UINT ow = private_[kPOutput].width, oh = private_[kPOutput].height;
+    if (private_[kPMask].width != ow || private_[kPMask].height != oh) return;
+    XConstants c{};
+    c.out_size[0] = ow; c.out_size[1] = oh;
+    set_x_srv(kXTintSrv + 0, kPMask);
+    set_x_srv(kXTintSrv + 1, kPHudScore);
+    for (UINT i = 2; i < kXSrvCount; ++i) set_x_srv(kXTintSrv + i, kPMask);
+    set_x_uav(kXTintUav + 0, kPOutput); set_x_uav(kXTintUav + 1, kPOutput);
+    transition(private_[kPOutput], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_RESOURCE_BARRIER written{}; written.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; written.UAV.pResource = private_[kPOutput].texture.Get();
+    list_->ResourceBarrier(1, &written);  // after Latewarp's writes
+    x_dispatch(cs_tint_.Get(), &c, kXTintSrv, kXTintUav, (ow + 7) / 8, (oh + 7) / 8);
 }
 
 void Renderer::flush_and_wait() {
@@ -893,8 +1169,12 @@ ID3D12GraphicsCommandList* Renderer::begin_frame() {
         std::uint64_t* ts = nullptr;
         D3D12_RANGE range{frame_index_ * 16, frame_index_ * 16 + 16};
         if (SUCCEEDED(readback_->Map(0, &range, reinterpret_cast<void**>(&ts)))) {
-            const auto a = ts[frame_index_ * 2], b = ts[frame_index_ * 2 + 1];
-            if (b > a) gpu_ms_ = static_cast<float>(double(b - a) * 1000.0 / double(timestamp_frequency_));
+            auto a = ts[frame_index_ * 2], b = ts[frame_index_ * 2 + 1];
+            const float ms = b > a ? static_cast<float>(double(b - a) * 1000.0 / double(timestamp_frequency_)) : 0.0f;
+            if (intake_slot_[frame_index_]) {  // a new game frame taken in between refreshes
+                if (b > a) intake_gpu_ms_ = ms;
+                b = a;  // not a presented frame: no present timing from it
+            } else if (b > a) gpu_ms_ = ms;
             // Convert GPU timestamps to CPU QPC with the calibration pair.
             LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);
             auto to_qpc = [&](std::uint64_t gpu) {
@@ -918,6 +1198,41 @@ ID3D12GraphicsCommandList* Renderer::begin_frame() {
             fit_ready_ = true;
             D3D12_RANGE none{0, 0};
             fit_readback_->Unmap(0, &none);
+        }
+    }
+    if (hud_scene_pending_[frame_index_] && hud_readback_) {
+        hud_scene_pending_[frame_index_] = false;
+        std::uint32_t* v = nullptr;
+        D3D12_RANGE range{frame_index_ * 16 + 8, frame_index_ * 16 + 12};
+        if (SUCCEEDED(hud_readback_->Map(0, &range, reinterpret_cast<void**>(&v)))) {
+            ++hud_stats_.scene_frames;
+            hud_stats_.scene_share_sum += double(v[frame_index_ * 4 + 2]) / std::max(1.0, hud_scene_pixels_);
+            D3D12_RANGE none{0, 0};
+            hud_readback_->Unmap(0, &none);
+        }
+        std::uint64_t* ts = nullptr;
+        D3D12_RANGE tr{frame_index_ * kSceneStamps * 8, (frame_index_ + 1) * kSceneStamps * 8};
+        if (scene_stamps_readback_ && SUCCEEDED(scene_stamps_readback_->Map(0, &tr, reinterpret_cast<void**>(&ts)))) {
+            const std::uint64_t* t = ts + frame_index_ * kSceneStamps;
+            for (UINT i = 0; i + 1 < kSceneStamps; ++i)
+                if (t[i + 1] >= t[i]) hud_stats_.scene_pass_ms[i] += double(t[i + 1] - t[i]) * 1000.0 / double(timestamp_frequency_);
+            D3D12_RANGE none{0, 0};
+            scene_stamps_readback_->Unmap(0, &none);
+        }
+    }
+    if (hud_pending_[frame_index_] && hud_readback_) {
+        hud_pending_[frame_index_] = false;
+        std::uint32_t* v = nullptr;
+        D3D12_RANGE range{frame_index_ * 16, frame_index_ * 16 + 8};
+        if (SUCCEEDED(hud_readback_->Map(0, &range, reinterpret_cast<void**>(&v)))) {
+            const std::uint32_t evidence = v[frame_index_ * 4], changed = v[frame_index_ * 4 + 1];
+            ++hud_stats_.frames;
+            // Same rule as cs_hud.
+            if (evidence + changed < 256) ++hud_stats_.too_little;
+            else if (evidence > 0.35 * (evidence + changed)) ++hud_stats_.guarded;
+            else { ++hud_stats_.learned; hud_stats_.share_sum += double(evidence) / double(evidence + changed); }
+            D3D12_RANGE none{0, 0};
+            hud_readback_->Unmap(0, &none);
         }
     }
     allocators_[frame_index_]->Reset();
@@ -1021,6 +1336,12 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
         convert(sources[kUi], static_cast<DXGI_FORMAT>(ui.format), slot, kUi, kPUi, bb.width, bb.height);
         out.has_ui = true;
     }
+    const auto& sc = m.tex[kScene];
+    if (sources[kScene] && sc.width == bb.width && sc.height == bb.height &&
+        ensure_private(kPScene, bb.width, bb.height, DXGI_FORMAT_R16G16B16A16_FLOAT)) {
+        convert(sources[kScene], static_cast<DXGI_FORMAT>(sc.format), slot, kScene, kPScene, bb.width, bb.height);
+        out.has_scene = true;
+    }
     ingested_ = true;
     last_had_hudless_ = out.has_hudless;
     barriers.clear();
@@ -1046,7 +1367,22 @@ LatewarpInputs Renderer::latewarp_inputs(const IngestedSource& src, bool use_ui_
     return in;
 }
 
+void Renderer::submit_work() {
+    if (timestamps_) {
+        list_->EndQuery(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * 2 + 1);
+        list_->ResolveQueryData(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * 2, 2, readback_.Get(), frame_index_ * 16);
+    }
+    list_->Close();
+    if (pending_game_wait_ && fence_game_) { queue_->Wait(fence_game_.Get(), pending_game_wait_); pending_game_wait_ = 0; }
+    ID3D12CommandList* lists[] = {list_.Get()};
+    queue_->ExecuteCommandLists(1, lists);
+    queue_->Signal(fence_.Get(), ++fence_value_);
+    frame_values_[frame_index_] = fence_value_;
+    intake_slot_[frame_index_] = true;
+}
+
 void Renderer::finish_frame(bool warped, int marker) {
+    intake_slot_[frame_index_] = false;
     ComPtr<ID3D12Resource> back;
     const UINT index = swapchain_->GetCurrentBackBufferIndex();
     swapchain_->GetBuffer(index, IID_PPV_ARGS(&back));
@@ -1103,8 +1439,8 @@ void Renderer::finish_frame(bool warped, int marker) {
     frame_values_[frame_index_] = fence_value_;
 }
 
-bool Renderer::read_back(bool output, std::vector<std::uint16_t>& pixels, std::uint32_t& w, std::uint32_t& h) {
-    auto& p = private_[output ? kPOutput : kPBackbuffer];
+bool Renderer::read_back(int which, std::vector<std::uint16_t>& pixels, std::uint32_t& w, std::uint32_t& h) {
+    auto& p = private_[which == 1 ? kPOutput : which == 2 ? kPScene : kPBackbuffer];
     if (!p.texture) return false;
     wait_idle();
     const auto desc = p.texture->GetDesc();
