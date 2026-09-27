@@ -7,6 +7,7 @@
 #include "addon/game_probe.hpp"
 #include "addon/streamline_hooks.hpp"
 #include "addon/ngx_hooks.hpp"
+#include "addon/ffx_hooks.hpp"
 #include <d3d12.h>
 #include <cstdio>
 #include <memory>
@@ -86,6 +87,7 @@ void on_init_swapchain(swapchain* sc, bool) {
                               static_cast<DXGI_FORMAT>(desc.texture.format), to_dxgi_color_space(sc->get_color_space()));
     fw::install_streamline_hooks(g_producer.get());
     fw::install_ngx_hooks(g_producer.get());
+    fw::install_ffx_hooks(g_producer.get());
     // The one setting remembered per game (ReShade.ini, [FrameWarp]).
     int from_scene = 0;
     if (g_producer->shared() && reshade::get_config_value(nullptr, "FrameWarp", "HudFromDlssOutput", from_scene))
@@ -99,6 +101,7 @@ void on_reshade_present(effect_runtime* runtime) {
     if (!g_producer || !g_producer->ready() || !queue || queue->get_device()->get_api() != device_api::d3d12) return;
     fw::install_streamline_hooks(g_producer.get());  // no-op once everything is hooked
     fw::install_ngx_hooks(g_producer.get());
+    fw::install_ffx_hooks(g_producer.get());
     static unsigned probe_counter = 0;
     if ((probe_counter++ % 120) == 0) fw::probe_streamline_features();
     auto* bb = reinterpret_cast<ID3D12Resource*>(runtime->get_current_back_buffer().handle);
@@ -194,6 +197,10 @@ void draw_overlay(effect_runtime*) {
         static const char* const kPriorities[] = {"Realtime (default)", "High", "Normal"};
         int priority = s.gpu_priority <= 2 ? static_cast<int>(s.gpu_priority) : 0;
         if (ImGui::Combo("Presenter GPU priority", &priority, kPriorities, 3)) s.gpu_priority = static_cast<std::uint32_t>(priority);
+        static const char* const kEngines[] = {"NVIDIA Latewarp (default)", "FrameWarp (experimental)"};
+        int engine = s.warp_engine == 1 ? 1 : 0;
+        if (ImGui::Combo("Warp engine", &engine, kEngines, 2)) s.warp_engine = static_cast<std::uint32_t>(engine);
+        ImGui::TextDisabled("  FrameWarp's own engine is used automatically when nvngx_latewarp.dll is missing");
         bool invert = s.invert_warp != 0;
         if (ImGui::Checkbox("Invert warp (debug)", &invert)) s.invert_warp = invert;
         bool ui = s.use_ui_tags != 0;
@@ -212,7 +219,7 @@ void draw_overlay(effect_runtime*) {
                                 p.mv_scale_x == 0.0f ? "; starts after a few seconds of turning the camera" : "");
         if (mask) {
             bool scene = s.hud_from_scene != 0;
-            if (ImGui::Checkbox("Find the HUD from the DLSS output", &scene)) {
+            if (ImGui::Checkbox("Find the HUD from the upscaler output (DLSS or FSR)", &scene)) {
                 s.hud_from_scene = scene;
                 reshade::set_config_value(nullptr, "FrameWarp", "HudFromDlssOutput", scene ? "1" : "0");
             }
@@ -239,6 +246,18 @@ void draw_overlay(effect_runtime*) {
         }
     }
 
+    if (ImGui::CollapsingHeader("FSR diagnostics (AMD FidelityFX 3.1 / 4)")) {
+        const auto& f = sh.fsr;
+        ImGui::Text("Hooks: amd_fidelityfx_dx12 %s, loader %s, upscaler %s", (f.hooks & 3) ? "yes" : "no", (f.hooks & 12) ? "yes" : "no",
+                    (f.hooks & 48) ? "yes" : "no");
+        ImGui::Text("Calls: upscale contexts %u, upscale dispatches %u, resets %u", f.upscale_creates, f.upscale_dispatches, f.resets);
+        ImGui::Text("Render %ux%u -> output %ux%u, context flags 0x%X%s", f.render_w, f.render_h, f.out_w, f.out_h, f.create_flags,
+                    (f.create_flags & 8) ? " (depth inverted)" : "");
+        ImGui::Text("Depth fmt %u state 0x%X | motion fmt %u | output state 0x%X", f.depth_format, f.depth_state, f.mv_format, f.output_state);
+        ImGui::Text("Camera: near %.3g far %.3g, vertical FOV %.1f deg | jitter %.3f, %.3f | MV scale %g, %g", f.near_plane, f.far_plane,
+                    f.fov * 57.29578f, f.jitter[0], f.jitter[1], f.mv_scale[0], f.mv_scale[1]);
+        ImGui::Text("Frames published from FSR (camera estimated): %u | outputs copied for HUD detection: %u", f.frames_published, f.outputs_copied);
+    }
     if (ImGui::CollapsingHeader("NGX diagnostics (DLSS without Streamline)")) {
         const auto& n = sh.ngx;
         ImGui::Text("Hooks: CreateFeature %s, EvaluateFeature %s", (n.hooks & 1) ? "yes" : "no", (n.hooks & 2) ? "yes" : "no");
@@ -348,6 +367,7 @@ __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE reshade_modul
     if (!g_producer) g_producer = std::make_unique<fw::Producer>();
     fw::install_streamline_hooks(g_producer.get());
     fw::install_ngx_hooks(g_producer.get());
+    fw::install_ffx_hooks(g_producer.get());
     fw::install_game_probes(g_producer->shared() ? &g_producer->shared()->hooks : nullptr);
     register_callbacks();
     return true;

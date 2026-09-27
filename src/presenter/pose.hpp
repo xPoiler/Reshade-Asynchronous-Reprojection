@@ -58,6 +58,54 @@ inline Mat4 view_matrix(const CameraBasis& c, Vec3 origin, double z_sign = 1.0) 
             static_cast<float>(-dot(p, c.right)), static_cast<float>(-dot(p, c.up)), static_cast<float>(-dot(p, z)), 1.0f};
 }
 
+// Row-vector 4x4 helpers for the own warp engine.
+inline Mat4 mat_mul(const Mat4& a, const Mat4& b) {
+    Mat4 r{};
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) {
+            double v = 0;
+            for (int k = 0; k < 4; ++k) v += double(a[i * 4 + k]) * double(b[k * 4 + j]);
+            r[i * 4 + j] = static_cast<float>(v);
+        }
+    return r;
+}
+inline bool mat_inverse(const Mat4& m, Mat4& out) {
+    double a[4][8];
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 8; ++j) a[i][j] = j < 4 ? double(m[i * 4 + j]) : (j - 4 == i ? 1.0 : 0.0);
+    for (int c = 0; c < 4; ++c) {
+        int pivot = c;
+        for (int r = c + 1; r < 4; ++r) if (std::fabs(a[r][c]) > std::fabs(a[pivot][c])) pivot = r;
+        if (std::fabs(a[pivot][c]) < 1e-12) return false;
+        for (int j = 0; j < 8; ++j) std::swap(a[c][j], a[pivot][j]);
+        const double d = a[c][c];
+        for (int j = 0; j < 8; ++j) a[c][j] /= d;
+        for (int r = 0; r < 4; ++r)
+            if (r != c) { const double f = a[r][c]; for (int j = 0; j < 8; ++j) a[r][j] -= f * a[c][j]; }
+    }
+    for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) out[i * 4 + j] = static_cast<float>(a[i][j + 4]);
+    return true;
+}
+// Displayed camera clip space -> rendered frame clip space for the camera's rotation only (translation
+// removed): clip_t * P^-1 * V_t^-1 * V_s * P.
+inline Mat4 clip_to_source_rotation(const Mat4& projection, const Mat4& view_target, const Mat4& view_source) {
+    Mat4 inv_p{}, inv_vt{};
+    Mat4 identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    if (!mat_inverse(projection, inv_p) || !mat_inverse(view_target, inv_vt)) return identity;
+    Mat4 rot = mat_mul(inv_vt, view_source);
+    rot[12] = rot[13] = rot[14] = 0.0f; rot[3] = rot[7] = rot[11] = 0.0f; rot[15] = 1.0f;
+    return mat_mul(mat_mul(inv_p, rot), projection);
+}
+
+// Rendered frame clip space (with depth) -> displayed camera clip space, rotation and movement:
+// clip_s * P^-1 * V_s^-1 * V_t * P.
+inline Mat4 clip_source_to_target(const Mat4& projection, const Mat4& view_source, const Mat4& view_target) {
+    Mat4 inv_p{}, inv_vs{};
+    Mat4 identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    if (!mat_inverse(projection, inv_p) || !mat_inverse(view_source, inv_vs)) return identity;
+    return mat_mul(mat_mul(mat_mul(inv_p, inv_vs), view_target), projection);
+}
+
 // Signed yaw about world up from a to b, and elevation of a forward vector.
 inline double yaw_between(Vec3 a, Vec3 b, Vec3 up) {
     const Vec3 ah = normalize(a - up * dot(a, up)), bh = normalize(b - up * dot(b, up));
@@ -193,6 +241,13 @@ public:
     double learned_orbit() const { return orbit_fit_; }
     void seed(const AxisParams& yaw, const AxisParams& pitch) { params_[0] = yaw; params_[1] = pitch; }
     void reset_fit() { params_[0] = params_[1] = AxisParams{}; frames_.clear(); since_fit_ = 0; }
+    // The camera source changed (the game's own camera <-> one estimated from motion vectors): their
+    // orientations have nothing in common, so the history starts over. The fitted calibration stays.
+    void reset_history() {
+        frames_.clear(); since_fit_ = 0; up_ = WorldUp{}; have_source_ = false;
+        blend_[0] = blend_[1] = 0; blend_pos_ = {}; velocity_ = {};
+        orbit_num_ = orbit_den_ = orbit_fit_ = 0; intervals_.clear(); frame_interval_ = 0; latencies_.clear();
+    }
 
     // A new rendered frame: t is the game's simulation (input) time, ingest_t when we received it.
     void add_source(std::uint64_t id, double t, double ingest_t, const CameraBasis& camera, bool reset, double now,

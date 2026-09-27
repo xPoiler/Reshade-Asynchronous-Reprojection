@@ -190,6 +190,7 @@ void Producer::copy_into(ID3D12GraphicsCommandList* list, ID3D12Resource* source
 
 void Producer::on_constants(std::uint64_t frame, const Camera& camera) {
     std::lock_guard lock(mutex_);
+    note_frame(frame);
     if (!ready()) return;
     // Streamline's cameraPos is camera-relative (always 0 in UE), but clipToPrevClip carries the real
     // frame-to-frame motion. Integrate it into an absolute position on every frame (even frames that
@@ -237,6 +238,7 @@ void Producer::on_constants(std::uint64_t frame, const Camera& camera) {
 
 void Producer::on_sim_start(std::uint64_t frame, std::int64_t qpc) {
     std::lock_guard lock(mutex_);
+    note_frame(frame);
     sim_start_frame_[frame % 64] = frame;
     sim_start_qpc_[frame % 64] = qpc;
     push_event(shared_, kEvSimStart, frame);
@@ -283,7 +285,10 @@ std::uint64_t Producer::begin_present(ID3D12Resource* backbuffer, ID3D12Graphics
     if (slot < 0) {
         via = 2;
         for (int i = 0; i < kSlots; ++i)
+            // Only frames from the last second: a slot left behind when the game stopped sending data for it
+            // (e.g. switching DLSS -> FSR) must not pass for the current frame forever.
             if (shared_->slots[i].state == kWriting && shared_->slots[i].camera.valid &&
+                qpc_now() - shared_->slots[i].qpc_constants < shared_->qpc_frequency &&
                 (slot < 0 || shared_->slots[i].frame_id < shared_->slots[slot].frame_id)) slot = i;
     }
     have_present_marker_ = false;

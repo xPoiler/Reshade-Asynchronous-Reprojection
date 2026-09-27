@@ -29,6 +29,7 @@ std::size_t modrm_length(const std::uint8_t* p, bool& rip) {
 struct Decoded {
     std::size_t length = 0;
     std::size_t disp_offset = 0;  // offset of a RIP-relative disp32 inside the instruction (0 = none)
+    bool jcc8 = false;            // short conditional jump (7x rel8): rewritten as a long one in the trampoline
 };
 
 // One instruction from the small accepted set; length 0 when unsupported.
@@ -42,6 +43,7 @@ Decoded decode(const std::uint8_t* p) {
     const std::size_t head = static_cast<std::size_t>(q - p);
     const std::uint8_t op = q[0];
     if (op >= 0x50 && op <= 0x57) { out.length = head + 1; return out; }  // push r64
+    if (head == 0 && op >= 0x70 && op <= 0x7F) { out.length = 2; out.jcc8 = true; return out; }  // jcc rel8
     bool rip = false;
     std::size_t opcode = 1, imm = 0, m = 0;
     switch (op) {
@@ -141,26 +143,46 @@ bool InlineHook::install(void* target, void* detour) {
     }
     std::uint8_t* stub = allocate_near(code);
     if (!stub) { error_ = "no memory near target"; return false; }
-    // [0..13] relay to detour, [16..] trampoline: displaced bytes + jmp back.
+    // [0..13] relay to detour, [16..] trampoline: the displaced instructions, a jmp back, then one
+    // absolute jump pad per short conditional jump that was displaced (its target is out of rel8 reach).
     write_abs_jmp(stub, detour);
     std::uint8_t* trampoline = stub + 16;
-    std::memcpy(trampoline, code, length);
-    // Re-target RIP-relative displacements: the stub is within +-1.5 GB, so they still fit in 32 bits.
+    std::size_t out = 0;
+    struct Pad { std::size_t rel_at; const std::uint8_t* target; };
+    Pad pads[8]; int pad_count = 0;
     for (std::size_t at = 0; at < length;) {
         const Decoded insn = decode(code + at);
-        if (insn.disp_offset) {
-            std::int32_t disp;
-            std::memcpy(&disp, code + at + insn.disp_offset, 4);
-            const std::int64_t absolute = reinterpret_cast<std::int64_t>(code + at + insn.length) + disp;
-            const std::int64_t moved = absolute - reinterpret_cast<std::int64_t>(trampoline + at + insn.length);
-            if (moved != static_cast<std::int32_t>(moved)) { VirtualFree(stub, 0, MEM_RELEASE); error_ = "RIP-relative out of range"; return false; }
-            const auto moved32 = static_cast<std::int32_t>(moved);
-            std::memcpy(trampoline + at + insn.disp_offset, &moved32, 4);
+        if (insn.jcc8) {
+            const std::uint8_t* jump_to = code + at + 2 + static_cast<std::int8_t>(code[at + 1]);
+            if (jump_to >= code && jump_to < code + length) { VirtualFree(stub, 0, MEM_RELEASE); error_ = "jump into the displaced bytes"; return false; }
+            trampoline[out] = 0x0F; trampoline[out + 1] = static_cast<std::uint8_t>(0x80 + (code[at] - 0x70));  // jcc rel32
+            pads[pad_count++] = {out + 2, jump_to};
+            out += 6;
+        } else {
+            std::memcpy(trampoline + out, code + at, insn.length);
+            // Re-target RIP-relative displacements: the stub is within +-1.5 GB, so they still fit in 32 bits.
+            if (insn.disp_offset) {
+                std::int32_t disp;
+                std::memcpy(&disp, code + at + insn.disp_offset, 4);
+                const std::int64_t absolute = reinterpret_cast<std::int64_t>(code + at + insn.length) + disp;
+                const std::int64_t moved = absolute - reinterpret_cast<std::int64_t>(trampoline + out + insn.length);
+                if (moved != static_cast<std::int32_t>(moved)) { VirtualFree(stub, 0, MEM_RELEASE); error_ = "RIP-relative out of range"; return false; }
+                const auto moved32 = static_cast<std::int32_t>(moved);
+                std::memcpy(trampoline + out + insn.disp_offset, &moved32, 4);
+            }
+            out += insn.length;
         }
         at += insn.length;
     }
-    write_abs_jmp(trampoline + length, code + length);
-    FlushInstructionCache(GetCurrentProcess(), stub, 64);
+    write_abs_jmp(trampoline + out, code + length);
+    std::size_t pad_at = out + 14;
+    for (int i = 0; i < pad_count; ++i) {
+        write_abs_jmp(trampoline + pad_at, pads[i].target);
+        const auto rel = static_cast<std::int32_t>(static_cast<std::int64_t>(pad_at) - static_cast<std::int64_t>(pads[i].rel_at + 4));
+        std::memcpy(trampoline + pads[i].rel_at, &rel, 4);
+        pad_at += 14;
+    }
+    FlushInstructionCache(GetCurrentProcess(), stub, 256);
 
     const auto rel = reinterpret_cast<std::int64_t>(stub) - reinterpret_cast<std::int64_t>(code + 5);
     DWORD old = 0;

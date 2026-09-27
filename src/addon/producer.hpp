@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 // Game-side half of the transport. Runs inside the game process and only ever records
 // barriers + copies into the game's own command lists, then signals a shared fence at present.
 #include "shared/protocol.hpp"
@@ -26,6 +27,11 @@ public:
     void on_constants(std::uint64_t frame, const Camera& camera);
     void on_sim_start(std::uint64_t frame, std::int64_t qpc);
     void on_present_marker(std::uint64_t frame);
+    // Highest frame id seen from the game (camera data or markers).
+    std::uint64_t highest_frame() const { return highest_frame_.load(); }
+    // The frame the game is rendering now (Reflex / PCL render-submit marker; 0 if the game sends none).
+    void on_render_submit(std::uint64_t frame) { rendering_frame_ = frame; note_frame(frame); }
+    std::uint64_t rendering_frame() const { return rendering_frame_.load(); }
     // Records a copy of one tagged buffer for `frame` into the game's command list.
     void on_tag(std::uint64_t frame, Tex kind, ID3D12Resource* source, D3D12_RESOURCE_STATES state,
                 std::uint32_t ext_x, std::uint32_t ext_y, std::uint32_t ext_w, std::uint32_t ext_h,
@@ -38,6 +44,8 @@ public:
     void set_message(const char* text);
 
 private:
+    std::atomic<std::uint64_t> highest_frame_{0}, rendering_frame_{0};
+    void note_frame(std::uint64_t f) { std::uint64_t h = highest_frame_.load(); while (f > h && !highest_frame_.compare_exchange_weak(h, f)) {} }
     std::uint64_t last_counted_frame_ = 0;  // frames_total counts each rendered frame once
     struct Texture {
         Microsoft::WRL::ComPtr<ID3D12Resource> resource;

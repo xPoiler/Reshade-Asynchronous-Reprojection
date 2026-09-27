@@ -2,12 +2,24 @@
 
 ## Unreleased
 
+* **FSR support** (FSR 3.1 and FSR 4): FrameWarp reads the depth and motion vectors FSR is given and
+  works out the camera's movement from them, so games running FSR work too. Switching between DLSS
+  and FSR in a game's menu is followed on the fly. **Find the HUD from the upscaler output** now
+  works with FSR as well.
+* **FrameWarp warp engine** (experimental, new **Warp engine** setting): FrameWarp's own warp, used
+  automatically when NVIDIA Latewarp is not available. It uses depth, so near and far objects move
+  apart correctly when you strafe, and it keeps the HUD and character/weapon still like Latewarp.
+* Estimated camera (games without their own camera data):
+  - zooming is no longer taken for moving forward or back;
+  - it follows games whose depth runs the standard way round;
+  - the field of view a game reports is checked against the picture, because some games report the
+    horizontal one. Resident Evil Requiem with FSR was choppy in fast turns because of this.
 * Game folders that only administrators may write to (some launchers install games that way): the
   installer says to run it as administrator, and FrameWarp keeps its logs and calibration in
   `%LOCALAPPDATA%\FrameWarp\<game folder>` instead.
 * Installer: DLSS games without Streamline are recognised (no more "Streamline not found" warning).
 * If ReShade refuses to load the add-on, the reason FrameWarp can see is written to
-  `%LOCALAPPDATA%\FrameWarpddon-init.log`.
+  `%LOCALAPPDATA%\FrameWarp\addon-init.log`.
 
 ## 1.3.0
 

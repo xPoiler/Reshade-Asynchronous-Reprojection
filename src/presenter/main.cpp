@@ -315,10 +315,13 @@ void render_thread() {
     bool pacing_paused = false;
     bool device_loss_logged = false;
     MotionVectorScale mv_scale;
+    bool have_source_kind = false, source_was_estimated = false;
     double last_mv_log = 0;
     bool game_has_hud_layers = false, mask_logged = false, source_masked = false;
     CameraEstimator estimator;
     bool estimator_logged = false, fov_logged = false;
+    bool fsr_logged = false;
+    int logged_fov_mode = 0;
     double estimator_ms_sum = 0, flush_ms_sum = 0;
     int estimator_runs = 0, mask_builds = 0;
     std::vector<float> raw_samples;
@@ -361,14 +364,25 @@ void render_thread() {
             bool sampled = false;
             const bool wants_samples = m.camera.estimated != 0;
             IngestedSource s = renderer.ingest(sh, newest, [&](const IngestedSource& early) {
-                if (wants_samples && early.has_depth && early.has_motion) sampled = renderer.sample_motion(early, 64, 36, raw_samples);
+                if (wants_samples && early.has_depth && early.has_motion) sampled = renderer.sample_motion(early, 80, 45, raw_samples);
             });
             held.push_back({newest, renderer.submitted_value() + 1});
             if (s.valid) {
                 // Games without a camera (DLSS without Streamline): estimate it from the motion vectors.
                 Camera cam = m.camera;
+                // A switch between the game's own camera and one estimated from motion vectors (e.g. the
+                // player changed DLSS <-> FSR in a game that sends Streamline data only with DLSS): nothing
+                // learned from one carries over to the other except the input calibration.
+                if (have_source_kind && (cam.estimated != 0) != source_was_estimated) {
+                    g_app.model.reset_history();
+                    estimator.reset();
+                    mv_scale = MotionVectorScale{};
+                    renderer.reset_hud_detection();
+                    logf("camera source switched to %s", cam.estimated ? "the upscaler's motion vectors (estimated)" : "the game's own camera data");
+                }
+                have_source_kind = true; source_was_estimated = cam.estimated != 0;
                 if (cam.estimated && s.has_depth && s.has_motion && s.depth_rect.w && s.depth_rect.h) {
-                    constexpr std::uint32_t kGridW = 64, kGridH = 36;
+                    constexpr std::uint32_t kGridW = 80, kGridH = 45;
                     if (sampled) {
                         const double rw = s.depth_rect.w, rh = s.depth_rect.h;
                         motion_samples.clear();
@@ -379,7 +393,8 @@ void render_thread() {
                                 p.x = float((std::floor((gx + 0.5) * rw / kGridW)) + 0.5);
                                 p.y = float((std::floor((gy + 0.5) * rh / kGridH)) + 0.5);
                                 p.mx = v[0] * m.camera.mvec_scale[0]; p.my = v[1] * m.camera.mvec_scale[1];
-                                p.depth = v[2];
+                                // near / distance (0 = sky) whichever way round the game stores depth
+                                p.depth = m.camera.depth_inverted ? v[2] : 1.0f - v[2];
                                 p.valid = (v[3] > 0.5f && std::isfinite(p.mx) && std::isfinite(p.my) && std::fabs(p.mx) < 1e4f) ? 1.0f : 0.0f;
                                 motion_samples.push_back(p);
                             }
@@ -388,12 +403,32 @@ void render_thread() {
                         estimator_ms_sum += (now_seconds() - t0) * 1000.0; ++estimator_runs;
                         flush_ms_sum += renderer.last_flush_ms();
                         if (estimator_runs >= 300) {
-                            logf("camera estimation: %.2f ms CPU + %.2f ms waiting for the samples per game frame, residual %.2f px, field of view %.1f deg%s",
+                            logf("camera estimation: %.2f ms CPU + %.2f ms waiting for the samples per game frame, residual %.2f px, field of view %.1f deg%s, "
+                                 "%.0f%% of frames unexplained, depth %s",
                                  estimator_ms_sum / estimator_runs, flush_ms_sum / estimator_runs, estimator.last_residual(),
-                                 estimator.vertical_fov() * 180.0 / 3.14159265358979, estimator.fov_locked() ? "" : " (learning)");
+                                 estimator.vertical_fov() * 180.0 / 3.14159265358979, estimator.fov_locked() ? "" : " (learning)",
+                                 estimator.take_rejected_fraction() * 100.0, m.camera.depth_inverted ? "reversed" : "standard");
                             estimator_ms_sum = 0; flush_ms_sum = 0; estimator_runs = 0;
                         }
-                        if (!estimator_logged) { logf("no camera from the game: estimating it from DLSS motion vectors"); estimator_logged = true; }
+                        if (!estimator_logged) { logf("no camera from the game: estimating it from the upscaler's motion vectors"); estimator_logged = true; }
+                        // The upscaler's motion vector settings, once (FSR games).
+                        if (!fsr_logged && g_app.shared->fsr.upscale_dispatches) {
+                            const FsrStats& fs = g_app.shared->fsr;
+                            logf("FSR: render %ux%u -> %ux%u, motion vector scale %g x %g, create flags 0x%x, near %g far %g, field of view %.1f deg",
+                                 fs.render_w, fs.render_h, fs.out_w, fs.out_h, fs.mv_scale[0], fs.mv_scale[1], fs.create_flags, fs.near_plane,
+                                 fs.far_plane, fs.fov * 180.0 / 3.14159265358979);
+                            fsr_logged = true;
+                        }
+                        if (estimator.game_fov_mode() != logged_fov_mode) {
+                            logged_fov_mode = estimator.game_fov_mode();
+                            const double deg = 180.0 / 3.14159265358979;
+                            if (logged_fov_mode == 1) logf("the game's field of view matches the picture: %.1f deg vertical", m.camera.fov * deg);
+                            else if (logged_fov_mode == 2)
+                                logf("the game's field of view (%.1f deg) is the horizontal one: %.1f deg vertical", m.camera.fov * deg, 2.0 * std::atan(std::tan(m.camera.fov * 0.5) * rh / rw) * deg);
+                            else if (logged_fov_mode == 3)
+                                logf("the game's field of view (%.1f deg) does not match the picture: using the learned %.1f deg vertical", m.camera.fov * deg,
+                                     estimator.learned_fov() * deg);
+                        }
                         if (estimator.fov_locked() && !fov_logged) {
                             logf("field of view learned: %.1f deg vertical", estimator.vertical_fov() * 180.0 / 3.14159265358979);
                             fov_logged = true;
@@ -616,7 +651,9 @@ void render_thread() {
         const double now = now_seconds();
         bool warped = false;
         Prediction applied{};
-        if (source.valid && settings.enabled && !settings.show_original && latewarp.ready() && source.has_depth) {
+        // FrameWarp's own warp engine when chosen, or when Latewarp is not available.
+        const bool own_engine = settings.warp_engine == 1 || !latewarp.ready();
+        if (source.valid && settings.enabled && !settings.show_original && source.has_depth) {
             Prediction p = g_app.model.predict(now);
             if (settings.invert_warp) p.camera = apply_rotation(source_basis, g_app.model.world_up(), -p.yaw, -p.pitch, source_basis.pos);
             applied = p;
@@ -641,8 +678,13 @@ void render_thread() {
                 }
             }
             const double z_sign = view_z_sign(source_camera.view_to_clip);
-            warped = latewarp.evaluate(list, inputs, first_eval, view_matrix(p.camera, origin, z_sign),
-                                       view_matrix(source_basis, origin, z_sign), projection);
+            if (own_engine) {
+                const Mat4 m = clip_source_to_target(projection, view_matrix(source_basis, origin, z_sign), view_matrix(p.camera, origin, z_sign));
+                warped = renderer.own_warp(source, settings.use_ui_tags != 0, inputs.no_warp_mask != nullptr, m.data(), inputs.depth_inverted);
+            } else {
+                warped = latewarp.evaluate(list, inputs, first_eval, view_matrix(p.camera, origin, z_sign),
+                                           view_matrix(source_basis, origin, z_sign), projection);
+            }
             if (warped) first_eval = false;
             if (warped && settings.show_mask && inputs.no_warp_mask) renderer.tint_mask();
         }

@@ -7,4 +7,8 @@ namespace fw {
 // with depth, motion vectors, jitter and the render size attached. Safe to call repeatedly: installs
 // once the driver's NGX module is loaded.
 void install_ngx_hooks(Producer* producer);
+// Frame ids for frames whose camera the presenter estimates (DLSS and FSR share one sequence).
+std::uint64_t next_estimated_frame();
+// DLSS published a frame within the last second (FSR then leaves the frames to it).
+bool dlss_publishing();
 }

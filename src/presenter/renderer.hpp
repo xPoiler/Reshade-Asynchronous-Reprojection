@@ -77,6 +77,9 @@ public:
     float last_intake_gpu_ms() const { return intake_gpu_ms_; }  // GPU span of the last such submission
     // Debug: tints the no-warp mask and the HUD score onto the warped output (call after Latewarp).
     void tint_mask();
+    // FrameWarp's own warp engine (experimental): writes the warped output like Latewarp would.
+    // source_to_target maps the rendered frame's clip space (with depth) to the displayed camera's (row vectors).
+    bool own_warp(const IngestedSource& src, bool use_ui_tags, bool use_mask, const float source_to_target[16], bool depth_inverted);
     // Signalled value that completes all work recorded so far.
     std::uint64_t submitted_value() const { return fence_value_; }
     bool completed(std::uint64_t value) const { return fence_->GetCompletedValue() >= value; }
@@ -165,7 +168,7 @@ private:
     const char* priority_name_ = "normal";
 
     ComPtr<ID3D12RootSignature> root_, root_x_;
-    ComPtr<ID3D12PipelineState> cs_analyze_, cs_reduce_, cs_clear_, cs_splat_, cs_gather_, cs_hud_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_;
+    ComPtr<ID3D12PipelineState> cs_analyze_, cs_reduce_, cs_clear_, cs_splat_, cs_gather_, cs_hud_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_;
     ComPtr<ID3D12Resource> samples_, samples_readback_;
     UINT samples_count_ = 0;
     float last_flush_ms_ = 0;

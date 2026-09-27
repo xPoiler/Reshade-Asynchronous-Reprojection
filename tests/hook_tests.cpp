@@ -85,6 +85,24 @@ int main() {
         EXPECT(via_jump(2, 3) == 5, "restored behind the jump");
     }
 
+    // A short conditional jump in the displaced bytes (FSR 4's ffxDispatch starts like this):
+    // int f(void*, void* p) { if (!p) return 2; return 1; }  =  test rdx,rdx ; je +6 ; mov eax,1 ; ret ; mov eax,2 ; ret
+    {
+        const std::uint8_t cond[] = {0x48, 0x85, 0xD2, 0x74, 0x06, 0xB8, 1, 0, 0, 0, 0xC3, 0xB8, 2, 0, 0, 0, 0xC3};
+        using CondFn = int (*)(void*, void*);
+        auto* cfn = make_function(cond, sizeof(cond));
+        auto f = reinterpret_cast<CondFn>(cfn);
+        static InlineHook cond_hook;
+        struct CondDetour { static int call(void* a, void* b) { return reinterpret_cast<CondFn>(cond_hook.original())(a, b) * 10; } };
+        int dummy = 0;
+        EXPECT(f(nullptr, &dummy) == 1 && f(nullptr, nullptr) == 2, "conditional function unhooked");
+        EXPECT(cond_hook.install(cfn, reinterpret_cast<void*>(&CondDetour::call)), cond_hook.error().c_str());
+        EXPECT(f(nullptr, &dummy) == 10, "hooked, jump not taken");
+        EXPECT(f(nullptr, nullptr) == 20, "hooked, displaced short jump taken to its real target");
+        cond_hook.remove();
+        EXPECT(f(nullptr, nullptr) == 2, "restored");
+    }
+
     const std::uint8_t call_first[] = {0xE8, 0, 0, 0, 0, 0x90};
     EXPECT(relocatable_prologue_length(call_first) == 0, "branches must be refused");
 

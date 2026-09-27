@@ -174,6 +174,68 @@ int main(int argc, char** argv) {
     EXPECT(std::fabs(std::fabs(y1 - y0) - expected_y) < 4.0, "pitch shift magnitude");
     EXPECT(y1 > y0, "looking up moves the scene down");
 
+    // FrameWarp's own warp engine: the same yaw and pitch shifts as Latewarp, and the scene edge revealed
+    // by the turn is filled (no black band).
+    {
+        auto run_own = [&](double yaw_, double pitch_, double side_ = 0.0) {
+            renderer.begin_frame();
+            const IngestedSource src = renderer.ingest(sh, slot);
+            CameraBasis target = apply_rotation(source, {0, 0, 1}, yaw_, pitch_, source.pos);
+            target.pos = target.pos + target.right * side_;
+            const Mat4 m = clip_source_to_target(projection, view_matrix(source, {}), view_matrix(target, {}));
+            const bool ok = renderer.own_warp(src, true, false, m.data(), true);
+            EXPECT(ok, "own warp ran");
+            renderer.finish_frame(ok, 0);
+            renderer.read_back(true, px, w, h);
+        };
+        run_own(0, 0);
+        const double ox0 = peak(px, w, h, true, 1), oy0 = peak(px, w, h, false, 0);
+        run_own(yaw, 0);
+        const double ox1 = peak(px, w, h, true, 1);
+        // The revealed right edge (turning right) must not be black: the dark background is 0.1.
+        double edge = 0;
+        for (std::uint32_t y = 0; y < h; y += 8) edge += half_to_float(px[(std::size_t(y) * w + (w - 2)) * 4 + 2]);
+        edge /= double((h + 7) / 8);
+        run_own(0, yaw);
+        const double oy1 = peak(px, w, h, false, 0);
+        std::printf("own warp engine: yaw bar x %.0f -> %.0f (shift %.1f, Latewarp %.1f); pitch red bar y %.0f -> %.0f (shift %.1f, Latewarp %.1f); "
+                    "revealed edge brightness %.2f\n", ox0, ox1, ox1 - ox0, x1 - x0, oy0, oy1, oy1 - oy0, y1 - y0, edge);
+        EXPECT(std::fabs(ox0 - x0) <= 1.0 && std::fabs(oy0 - y0) <= 1.0, "own engine: identity matches");
+        EXPECT(std::fabs((ox1 - ox0) - (x1 - x0)) <= 1.5, "own engine: yaw shift matches Latewarp");
+        EXPECT(std::fabs((oy1 - oy0) - (y1 - y0)) <= 1.5, "own engine: pitch shift matches Latewarp");
+        EXPECT(edge > 0.05, "own engine: the revealed edge is filled (%.2f)", edge);
+        // Moving sideways: the shift depends on depth (parallax), like Latewarp's.
+        run_own(0, 0, 50.0);
+        const double oxs = peak(px, w, h, true, 1);
+        // The bar is 1000 units away (depth 0.01, near plane 10): moving 50 units right shifts it left by
+        // (50 / 1000) / aspect * W/2 px - what Latewarp does in the sideways test below.
+        const double own_expected = -(50.0 / 1000.0) / aspect * (W / 2.0);
+        std::printf("own warp engine: sideways move 50 units: bar x %.0f -> %.0f (shift %.1f, expected %.1f)\n", ox0, oxs, oxs - ox0, own_expected);
+        EXPECT(std::fabs((oxs - ox0) - own_expected) <= 1.5, "own engine: sideways parallax uses depth");
+        // GPU time of a presented frame with the own engine vs Latewarp (steady state, no new source).
+        renderer.begin_frame();
+        const IngestedSource steady_src = renderer.ingest(sh, slot);
+        renderer.finish_frame(false, 0);
+        double own_ms = 0, late_ms = 0;
+        for (int i = 0; i < 40; ++i) {
+            auto* l = renderer.begin_frame();
+            const CameraBasis target = apply_rotation(source, {0, 0, 1}, 0.001 * i, 0, source.pos);
+            if (i & 1) {
+                const Mat4 m = clip_source_to_target(projection, view_matrix(source, {}), view_matrix(target, {}));
+                renderer.own_warp(steady_src, true, false, m.data(), true);
+            } else {
+                auto in = renderer.latewarp_inputs(steady_src, true);
+                in.depth_inverted = true;
+                latewarp.evaluate(l, in, false, view_matrix(target, {}), view_matrix(source, {}), projection);
+            }
+            renderer.finish_frame(true, 0);
+            renderer.wait_idle();
+            // The frame timestamps are read back when the frame slot is reused (3 frames later).
+            if (i >= 10) ((i - 3) & 1 ? own_ms : late_ms) += renderer.last_gpu_ms();
+        }
+        std::printf("GPU per presented frame at %ux%u: own engine %.3f ms, Latewarp %.3f ms\n", W, H, own_ms / 15, late_ms / 15);
+    }
+
     // A "rendered frame" evaluation (first use of a new source) must warp exactly like the others:
     // the presenter's first output after every new game frame is such an evaluation.
     run(true, yaw, 0, px, w, h);
@@ -516,6 +578,7 @@ int main(int argc, char** argv) {
             return weight > 0 ? sum / weight : -1.0;
         };
         // Present one frame of `s` with the mask, rendered, then turned by `yaw`.
+        bool own_engine = false;  // warp with FrameWarp's own engine instead of Latewarp
         auto show = [&](const IngestedSource& s, double turn) {
             auto* lf = renderer.begin_frame();
             auto inputs = renderer.latewarp_inputs(s, true);
@@ -523,7 +586,12 @@ int main(int argc, char** argv) {
             inputs.no_warp_mask = renderer.no_warp_mask();
             inputs.mask_rect = s.color_rect;
             const CameraBasis target = apply_rotation(source, {0, 0, 1}, turn, 0, source.pos);
-            latewarp.evaluate(lf, inputs, turn == 0, view_matrix(target, {}), view_matrix(source, {}), projection);
+            if (own_engine) {
+                const Mat4 m = clip_source_to_target(projection, view_matrix(source, {}), view_matrix(target, {}));
+                renderer.own_warp(s, true, inputs.no_warp_mask != nullptr, m.data(), true);
+            } else {
+                latewarp.evaluate(lf, inputs, turn == 0, view_matrix(target, {}), view_matrix(source, {}), projection);
+            }
             renderer.finish_frame(true, 0);
             renderer.read_back(true, px, w, h);
         };
@@ -700,6 +768,15 @@ int main(int argc, char** argv) {
         const double sp_x0 = green_x(), sb_x0 = peak(px, w, h, true, 1);
         show(scene_src, yaw);
         const double sp_x1 = green_x(), sb_x1 = peak(px, w, h, true, 1);
+        own_engine = true;  // the same frame and mask through FrameWarp's own engine
+        show(scene_src, 0);
+        const double op_x0 = green_x(), ob_x0 = peak(px, w, h, true, 1);
+        show(scene_src, yaw);
+        const double op_x1 = green_x(), ob_x1 = peak(px, w, h, true, 1);
+        own_engine = false;
+        std::printf("own engine with the HUD from the upscaler's output: patch x %.1f -> %.1f, bar x %.0f -> %.0f\n", op_x0, op_x1, ob_x0, ob_x1);
+        EXPECT(op_x0 > 0 && std::fabs(op_x1 - op_x0) < 2.0, "own engine holds the HUD found from the upscaler's output (%.1f -> %.1f)", op_x0, op_x1);
+        EXPECT(std::fabs(ob_x1 - ob_x0) > 20.0, "own engine still warps the scene next to it (%.0f -> %.0f)", ob_x0, ob_x1);
         hud_patch_colour = 2;
         IngestedSource scene_glass = ingest_frame(publish(601, 0.3f, 0, false, true), true, false);
         show(scene_glass, 0);

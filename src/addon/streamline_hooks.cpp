@@ -36,6 +36,7 @@ struct PendingOutput { std::uint64_t frame = 0; ID3D12Resource* resource = nullp
 std::mutex g_output_mutex;
 PendingOutput g_output;
 std::atomic<std::uint64_t> g_current_frame{0};
+std::atomic<std::int64_t> g_last_constants_qpc{0};
 std::atomic<int> g_constants_base{-1}, g_tag_base{-1};
 std::atomic<std::uint32_t> g_pcl_attempts{0};
 
@@ -110,6 +111,7 @@ int hk_set_constants(const void* values, const void* frame, const void* viewport
     std::uint32_t id = 0;
     if (g_producer && read_frame_token(frame, &id)) {
         g_current_frame = id;
+        g_last_constants_qpc = qpc_now();
         if (auto* s = stats()) ++s->constants_calls;
         Camera cam{};
         int base = g_constants_base;
@@ -281,6 +283,7 @@ int hk_marker(std::uint32_t marker, const void* frame) {
         if (auto* s = stats()) { ++s->marker_calls; if (marker < 16) ++s->marker_counts[marker]; }
         if (marker == kSimulationStart) g_producer->on_sim_start(id, qpc_now());
         else if (marker == kPresentStart) g_producer->on_present_marker(id);
+        else if (marker == kRenderSubmitStart) g_producer->on_render_submit(id);
     }
     return reinterpret_cast<MarkerFn>(g_marker_hook.original())(marker, frame);
 }
@@ -316,6 +319,11 @@ const std::uint32_t kProbedFeatures[] = {0, 1, 2, 3, 4, 5, 6, 7, 1000, 1001, 100
 const int kProbedFeatureCount = 12;
 
 bool streamline_loaded() { return GetModuleHandleW(L"sl.interposer.dll") != nullptr; }
+bool streamline_camera_recent() {
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+    const std::int64_t last = g_last_constants_qpc.load();
+    return last && qpc_now() - last < f.QuadPart;
+}
 
 void probe_streamline_features() {
     HMODULE sl = GetModuleHandleW(L"sl.interposer.dll");

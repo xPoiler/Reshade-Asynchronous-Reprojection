@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 30;
+constexpr std::uint32_t kVersion = 32;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -83,7 +83,7 @@ struct Settings {
     std::uint32_t show_mask;       // debug: tint the no-warp mask (magenta) and the HUD score still learning (green)
     std::uint32_t hud_from_scene;  // opt-in: find the HUD from the upscaler's output (saved per game in ReShade.ini)
     std::uint32_t keep_attached;   // keep what moves with the camera (third-person character, first-person weapon) unwarped, every game
-    std::uint32_t pad_settings;
+    std::uint32_t warp_engine;     // 0: NVIDIA Latewarp (default), 1: FrameWarp's own engine (experimental; also used when Latewarp is missing)
 };
 
 // Presenter status, displayed by the add-on UI.
@@ -149,6 +149,16 @@ struct NgxStats {
     std::uint32_t frames_published, pad2;  // frames published from DLSS calls (camera estimated by the presenter)
 };
 
+// AMD FidelityFX (FSR 3.1 / FSR 4) upscaler calls, for diagnostics and games without Streamline.
+struct FsrStats {
+    std::uint32_t hooks;  // bits: 2*i create, 2*i+1 dispatch for amd_fidelityfx_dx12 / _loader_dx12 / _upscaler_dx12
+    std::uint32_t upscale_creates, upscale_dispatches, resets, create_flags;
+    std::uint32_t render_w, render_h, out_w, out_h, depth_format, mv_format, depth_state, output_state;
+    float jitter[2], mv_scale[2];
+    float near_plane, far_plane, fov;  // as FSR is told them (fov: vertical, radians)
+    std::uint32_t frames_published, outputs_copied;
+};
+
 struct Shared {
     std::uint32_t magic, version;
     std::uint32_t producer_pid, pad0;
@@ -164,6 +174,7 @@ struct Shared {
     PresenterStatus presenter;
     HookStats hooks;
     NgxStats ngx;
+    FsrStats fsr;
     volatile LONG presents_without_frame;  // consecutive game presents with no captured frame (menus, loading)
     std::uint32_t pad_presents;
     // Totals since start: images the game presented and frames it rendered (distinct frames with camera

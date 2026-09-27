@@ -4,6 +4,7 @@
 #include <d3d12.h>
 #include <nvsdk_ngx_defs.h>
 #include <nvsdk_ngx_params.h>
+#include <algorithm>
 #include <atomic>
 #include <string>
 
@@ -36,6 +37,7 @@ std::uint32_t feature_of(const void* handle) {
 bool is_dlss(std::uint32_t feature) { return feature == NVSDK_NGX_Feature_SuperSampling || feature == NVSDK_NGX_Feature_RayReconstruction; }
 
 std::atomic<std::uint64_t> g_frame{0};
+std::atomic<std::int64_t> g_last_dlss_publish{0};
 
 NgxStats* stats() { return g_producer && g_producer->shared() ? &g_producer->shared()->ngx : nullptr; }
 
@@ -115,7 +117,8 @@ NVSDK_NGX_Result NVSDK_CONV hk_evaluate(ID3D12GraphicsCommandList* list, const N
             if (shared && shared->hooks.constants_calls == 0 && s->dlss_calls > 60 &&
                 params->Get(NVSDK_NGX_Parameter_Depth, &depth) == NVSDK_NGX_Result_Success && depth &&
                 params->Get(NVSDK_NGX_Parameter_MotionVectors, &motion) == NVSDK_NGX_Result_Success && motion) {
-                const std::uint64_t frame = ++g_frame;
+                const std::uint64_t frame = next_estimated_frame();
+                g_last_dlss_publish = qpc_now();
                 Camera cam{};
                 cam.valid = 1;
                 cam.estimated = 1;
@@ -147,6 +150,24 @@ NVSDK_NGX_Result NVSDK_CONV hk_evaluate(ID3D12GraphicsCommandList* list, const N
 }
 
 }  // namespace
+
+// After the game's own frame numbers (Streamline frame tokens), so frames estimated after a switch from
+// DLSS to FSR are never taken for older ones.
+// A game that still sends frame markers (Reflex / PCL render submit) names the frame being rendered: the
+// estimated frame then takes that id, and with it the frame's simulation time. Otherwise the sequence
+// continues after the highest id seen, so a frame after a switch is never taken for an older one.
+std::uint64_t next_estimated_frame() {
+    const std::uint64_t rendering = g_producer ? g_producer->rendering_frame() : 0;
+    const std::uint64_t highest = g_producer ? g_producer->highest_frame() : 0;
+    std::uint64_t f = g_frame.load(), next;
+    do { next = rendering ? std::max(f + 1, rendering) : std::max(f, highest) + 1; } while (!g_frame.compare_exchange_weak(f, next));
+    return next;
+}
+bool dlss_publishing() {
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+    const std::int64_t last = g_last_dlss_publish.load();
+    return last && qpc_now() - last < f.QuadPart;
+}
 
 void install_ngx_hooks(Producer* producer) {
     g_producer = producer;

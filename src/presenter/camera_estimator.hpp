@@ -87,7 +87,10 @@ public:
     // Rotation and translation together (current -> previous camera: p_prev = R p_cur + T). For a sample
     // at direction c and depth d (= 1 / distance): p_prev / distance = R c + T d, so the sky (d = 0) only
     // constrains the rotation. Starts from `omega`; returns the mean squared residual (px^2).
-    static double fit_motion(const std::vector<MotionSample>& s, double w, double h, double f, V3& omega, V3& T) {
+    // f: this frame's focal length (px), fp: the previous frame's (0: the same). A zoom between the two
+    // (the game told us both fields of view) is then part of the model instead of looking like movement.
+    static double fit_motion(const std::vector<MotionSample>& s, double w, double h, double f, V3& omega, V3& T, double fp = 0) {
+        if (fp <= 0) fp = f;
         // Gauss-Newton with the exact Jacobian (one projection per sample and iteration). The rotation is
         // updated multiplicatively: R <- exp(delta) R, for which d(R c)/d(delta) = -[R c]x.
         M3 R = rotation(omega);
@@ -98,13 +101,13 @@ public:
                 const double X = (p.x - w * 0.5) / f, Y = -(p.y - h * 0.5) / f, d = p.depth;
                 const V3 c = mul(Rm, V3{X, Y, 1.0});
                 const double qx = c[0] + t[0] * d, qy = c[1] + t[1] * d, qz = std::max(c[2] + t[2] * d, 1e-6);
-                const double px = w * 0.5 + f * qx / qz, py = h * 0.5 - f * qy / qz;
+                const double px = w * 0.5 + fp * qx / qz, py = h * 0.5 - fp * qy / qz;
                 const double r[2] = {px - (p.x + p.mx), py - (p.y + p.my)};
                 sum += r[0] * r[0] + r[1] * r[1]; ++n;
                 if (!A) continue;
                 // d(px, py)/dq
                 const double iz = 1.0 / qz;
-                const double dq[2][3] = {{f * iz, 0, -f * qx * iz * iz}, {0, -f * iz, f * qy * iz * iz}};
+                const double dq[2][3] = {{fp * iz, 0, -fp * qx * iz * iz}, {0, -fp * iz, fp * qy * iz * iz}};
                 // dq/d(delta) = -[c]x  (c = R X), dq/dT = d * I
                 const double sk[3][3] = {{0, c[2], -c[1]}, {-c[2], 0, c[0]}, {c[1], -c[0], 0}};
                 double J[2][6];
@@ -153,6 +156,15 @@ public:
 
     // One game frame. Updates the orientation and returns the synthesized camera.
     Camera update(const std::vector<MotionSample>& all, double w, double h, const Camera& game) {
+        // The game may tell the field of view (FSR asks for the vertical one). It is checked against the one
+        // learned from the motion: some games hand over the horizontal one, and some values are simply off.
+        // (only plausible values: some games hand FSR nonsense while loading)
+        const double kMinFov = 10.0 * 3.14159265358979 / 180.0, kMaxFov = 150.0 * 3.14159265358979 / 180.0;
+        game_v_ = game_h_ = 0;
+        if (game.fov > kMinFov && game.fov < kMaxFov) { game_v_ = game.fov; game_h_ = 2.0 * std::atan(std::tan(game.fov * 0.5) * h / w); }
+        choose_fov();
+        // Zooms are followed from frame to frame only with a field of view the game tells.
+        const bool follow_zoom = following_game_ && prev_fov_ > 0;
         // Distant pixels carry rotation almost only (translation parallax falls off with distance):
         // use the farther half of the valid samples.
         std::vector<float> depths;
@@ -165,22 +177,24 @@ public:
         }
         V3 omega{};
         bool ok = false;
+        // The previous frame's focal length (differs only while the game zooms and tells us its field of view).
+        const double fprev_fov = prev_fov_ > 0 ? prev_fov_ : fov_;
         if (distant.size() >= 16) {
-            if (!fov_locked_) learn_fov(distant, w, h);
-            const double f = focal(h);
-            omega = linear_rotation(distant, w, h, f);
+            if (!learned_locked_) learn_fov(distant, w, h);
+            const double f = focal(h), fp = (h * 0.5) / std::tan((follow_zoom ? fprev_fov : fov_) * 0.5);
+            omega = linear_rotation(distant, w, h, f, fp);
             V3 no_move{};
-            double e = fit_motion(distant, w, h, f, omega, no_move);  // distant: rotation dominates; T is refitted below
+            double e = fit_motion(distant, w, h, f, omega, no_move, fp);  // distant: rotation dominates; T is refitted below
             // Reject samples the rotation does not explain (moving objects, near geometry), then refit.
             std::vector<double> errs;
             const M3 R = rotation(omega);
-            for (const auto& p : distant) errs.push_back(sample_error(p, R, w, h, f));
+            for (const auto& p : distant) errs.push_back(sample_error(p, R, w, h, f, fp));
             std::vector<double> sorted = errs;
             std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
             const double limit = std::max(1.0, 3.0 * sorted[sorted.size() / 2]);
             std::vector<MotionSample> inliers;
             for (std::size_t i = 0; i < distant.size(); ++i) if (errs[i] <= limit) inliers.push_back(distant[i]);
-            if (inliers.size() >= 16) { V3 t0{}; e = fit_motion(inliers, w, h, f, omega, t0); }
+            if (inliers.size() >= 16) { V3 t0{}; e = fit_motion(inliers, w, h, f, omega, t0, fp); }
             ok = std::isfinite(e) && std::sqrt(e) < acceptable(distant);
             last_residual_ = std::sqrt(e);
         }
@@ -190,17 +204,17 @@ public:
         if (ok) {
             std::vector<MotionSample> valid;
             for (const auto& p : all) if (p.valid > 0.5f) valid.push_back(p);
-            const double f = focal(h);
+            const double f = focal(h), fp = (h * 0.5) / std::tan((follow_zoom ? fprev_fov : fov_) * 0.5);
             V3 o = omega, t{};
-            double e = fit_motion(valid, w, h, f, o, t);
+            double e = fit_motion(valid, w, h, f, o, t, fp);
             std::vector<double> errs;
             const M3 R0 = rotation(o);
             for (const auto& p : valid) {
                 const double X = (p.x - w * 0.5) / f, Y = -(p.y - h * 0.5) / f;
                 const V3 c = mul(R0, V3{X, Y, 1.0});
                 const double qz = std::max(c[2] + t[2] * p.depth, 1e-6);
-                const double ex = w * 0.5 + f * (c[0] + t[0] * p.depth) / qz - (p.x + p.mx);
-                const double ey = h * 0.5 - f * (c[1] + t[1] * p.depth) / qz - (p.y + p.my);
+                const double ex = w * 0.5 + fp * (c[0] + t[0] * p.depth) / qz - (p.x + p.mx);
+                const double ey = h * 0.5 - fp * (c[1] + t[1] * p.depth) / qz - (p.y + p.my);
                 errs.push_back(std::sqrt(ex * ex + ey * ey));
             }
             std::vector<double> sorted = errs;
@@ -208,9 +222,12 @@ public:
             const double limit = std::max(1.0, 3.0 * sorted[sorted.size() / 2]);
             std::vector<MotionSample> inliers;
             for (std::size_t i = 0; i < valid.size(); ++i) if (errs[i] <= limit) inliers.push_back(valid[i]);
-            if (inliers.size() >= 32) e = fit_motion(inliers, w, h, f, o, t);
+            if (inliers.size() >= 32) e = fit_motion(inliers, w, h, f, o, t, fp);
             if (std::isfinite(e) && std::sqrt(e) < acceptable(valid)) { omega = o; T = t; last_residual_ = std::sqrt(e); }
         }
+        ++frames_;
+        if (!ok) ++rejected_;
+        last_rejected_ = !ok;
         if (!ok || game.reset) { omega = V3{0, 0, 0}; T = V3{0, 0, 0}; }
         last_omega_ = omega;
         last_translation_ = T;
@@ -220,7 +237,10 @@ public:
         const M3 R = rotation(omega);
         basis_ = mul(basis_, R);
         orthonormalize(basis_);
-        return synthesize(w, h, R, T, game);
+        const Camera out = synthesize(w, h, R, T, game, (h * 0.5) / std::tan((follow_zoom ? prev_fov_ : fov_) * 0.5));
+        prev_fov_ = fov_;
+        if (learned_locked_ && game_v_ > 0 && game_fov_mode_ == 0) decide_game_fov();
+        return out;
     }
 
     // Largest fit error (px, root mean square) still accepted: 4 px, or 6% of the typical motion on fast
@@ -237,9 +257,19 @@ public:
     double vertical_fov() const { return fov_; }
     bool fov_locked() const { return fov_locked_; }
     double last_residual() const { return last_residual_; }
+    // Frames whose motion no camera move explained (the camera then held still for that frame); read and cleared.
+    bool last_rejected() const { return last_rejected_; }
+    double take_rejected_fraction() { const double r = frames_ ? double(rejected_) / double(frames_) : 0.0; frames_ = rejected_ = 0; return r; }
     V3 last_omega() const { return last_omega_; }
     V3 last_translation() const { return last_translation_; }
-    void reset() { basis_ = identity_basis(); position_ = V3{}; fov_votes_.clear(); fov_locked_ = false; fov_ = kDefaultFov; }
+    // How the game's field of view is used: 0 not checked yet (taken as vertical meanwhile), 1 as the vertical
+    // one, 2 as the horizontal one, 3 not at all (it does not match the picture; the learned one is used).
+    int game_fov_mode() const { return game_fov_mode_; }
+    double learned_fov() const { return learned_fov_; }
+    void reset() {
+        basis_ = identity_basis(); position_ = V3{}; fov_votes_.clear(); fov_locked_ = false; fov_ = kDefaultFov; prev_fov_ = 0;
+        learned_fov_ = kDefaultFov; learned_locked_ = false; game_fov_mode_ = 0; game_votes_v_.clear(); game_votes_h_.clear();
+    }
 
     static constexpr double kDefaultFov = 1.2217;  // 70 degrees vertical until learned
 
@@ -294,12 +324,14 @@ private:
         return true;
     }
     // Small-rotation flow model: dX = wy(1+X^2) - wx XY - wz Y,  dY = -wx(1+Y^2) + wy XY + wz X (normalized).
-    static V3 linear_rotation(const std::vector<MotionSample>& s, double w, double h, double f) {
+    static V3 linear_rotation(const std::vector<MotionSample>& s, double w, double h, double f, double fp = 0) {
+        if (fp <= 0) fp = f;
         double A[3][3] = {}, b[3] = {};
         for (const auto& p : s) {
             if (p.valid < 0.5f) continue;
             const double X = (p.x - w * 0.5) / f, Y = -(p.y - h * 0.5) / f;
-            const double dX = p.mx / f, dY = -p.my / f;
+            // where the pixel was in the previous frame, in that frame's normalized coordinates
+            const double dX = (p.x + p.mx - w * 0.5) / fp - X, dY = -(p.y + p.my - h * 0.5) / fp - Y;
             const double rx[3] = {-X * Y, 1 + X * X, -Y}, ry[3] = {-(1 + Y * Y), X * Y, X};
             for (int i = 0; i < 3; ++i) {
                 b[i] += rx[i] * dX + ry[i] * dY;
@@ -310,11 +342,11 @@ private:
         solve3(A, b, o);
         return o;
     }
-    static double sample_error(const MotionSample& p, const M3& R, double w, double h, double f) {
+    static double sample_error(const MotionSample& p, const M3& R, double w, double h, double f, double fp) {
         const double X = (p.x - w * 0.5) / f, Y = -(p.y - h * 0.5) / f;
         const V3 c = mul(R, V3{X, Y, 1.0});
         const double z = std::max(c[2], 1e-6);
-        const double ex = w * 0.5 + f * c[0] / z - (p.x + p.mx), ey = h * 0.5 - f * c[1] / z - (p.y + p.my);
+        const double ex = w * 0.5 + fp * c[0] / z - (p.x + p.mx), ey = h * 0.5 - fp * c[1] / z - (p.y + p.my);
         return std::sqrt(ex * ex + ey * ey);
     }
     double focal(double h) const { return (h * 0.5) / std::tan(fov_ * 0.5); }
@@ -339,13 +371,47 @@ private:
             if (e < best) { best = e; best_fov = fov; }
         }
         fov_votes_.push_back(best_fov);
+        // How far the game's value is from this frame's measurement, read either way (focal length ratio).
+        if (game_v_ > 0) {
+            game_votes_v_.push_back(std::log(std::tan(best_fov * 0.5) / std::tan(game_v_ * 0.5)));
+            game_votes_h_.push_back(std::log(std::tan(best_fov * 0.5) / std::tan(game_h_ * 0.5)));
+        }
         std::vector<double> v = fov_votes_;
         std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
-        fov_ = v[v.size() / 2];
+        learned_fov_ = v[v.size() / 2];
         if (fov_votes_.size() >= 30) {
             int close = 0;
-            for (double x : fov_votes_) if (std::fabs(x - fov_) < 3 * pi / 180) ++close;
-            if (close * 3 >= int(fov_votes_.size()) * 2) fov_locked_ = true;
+            for (double x : fov_votes_) if (std::fabs(x - learned_fov_) < 3 * pi / 180) ++close;
+            if (close * 3 >= int(fov_votes_.size()) * 2) learned_locked_ = true;
+        }
+    }
+
+    static double median_abs(std::vector<double> v) {
+        if (v.empty()) return 1e30;
+        std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+        return std::fabs(v[v.size() / 2]);
+    }
+
+    // The learned field of view settles which way the game's value is meant, compared frame by frame (so
+    // zooming while learning does not matter): within 12% of the focal length, or not used at all.
+    void decide_game_fov() {
+        double ev = median_abs(game_votes_v_), eh = median_abs(game_votes_h_);
+        if (game_votes_v_.size() < 10) {  // the game told its field of view only after learning finished
+            ev = std::fabs(std::log(std::tan(learned_fov_ * 0.5) / std::tan(game_v_ * 0.5)));
+            eh = std::fabs(std::log(std::tan(learned_fov_ * 0.5) / std::tan(game_h_ * 0.5)));
+        }
+        constexpr double kTolerance = 0.12;
+        game_fov_mode_ = (ev <= eh && ev < kTolerance) ? 1 : (eh < kTolerance) ? 2 : 3;
+    }
+
+    void choose_fov() {
+        following_game_ = game_v_ > 0 && game_fov_mode_ != 3;
+        if (following_game_) {
+            fov_ = game_fov_mode_ == 2 ? game_h_ : game_v_;
+            fov_locked_ = game_fov_mode_ != 0 || learned_locked_;
+        } else {
+            fov_ = learned_fov_;
+            fov_locked_ = learned_locked_;
         }
     }
 
@@ -364,22 +430,29 @@ private:
         for (int i = 0; i < 3; ++i) { B[i][0] = r[i]; B[i][1] = u[i]; B[i][2] = f[i]; }
     }
 
-    Camera synthesize(double w, double h, const M3& R, const V3& T, const Camera& game) const {
+    Camera synthesize(double w, double h, const M3& R, const V3& T, const Camera& game, double fprev) const {
         Camera c = game;
         const double f = focal(h);
         const float sx = float(2 * f / w), sy = float(2 * f / h), near_plane = 1.0f;
-        // Row-vector reversed-Z infinite projection with view z = forward (clip.w = z).
-        const float P[16] = {sx, 0, 0, 0, 0, sy, 0, 0, 0, 0, 0, 1, 0, 0, near_plane, 0};
-        const float Pinv[16] = {1 / sx, 0, 0, 0, 0, 1 / sy, 0, 0, 0, 0, 0, 1 / near_plane, 0, 0, 1, 0};
+        // Row-vector infinite projection with view z = forward (clip.w = z), in the game's depth convention:
+        // reversed (depth = near / z: clip.z = near) or standard (depth = 1 - near / z: clip.z = z - near).
+        const bool reversed = game.depth_inverted != 0;
+        const float zz = reversed ? 0.0f : 1.0f, wz = reversed ? near_plane : -near_plane;
+        const float P[16] = {sx, 0, 0, 0, 0, sy, 0, 0, 0, 0, zz, 1, 0, 0, wz, 0};
+        float Pinv[16] = {1 / sx, 0, 0, 0, 0, 1 / sy, 0, 0, 0, 0, 0, 1 / near_plane, 0, 0, 1, 0};
+        if (!reversed) { Pinv[10] = 0; Pinv[11] = -1 / near_plane; Pinv[14] = 1; Pinv[15] = 1 / near_plane; }
+        // The previous frame's projection (its own field of view while zooming).
+        const float psx = float(2 * fprev / w), psy = float(2 * fprev / h);
+        const float Pprev[16] = {psx, 0, 0, 0, 0, psy, 0, 0, 0, 0, zz, 1, 0, 0, wz, 0};
         std::copy(P, P + 16, c.view_to_clip);
         std::copy(Pinv, Pinv + 16, c.clip_to_view);
-        // clipToPrevClip = Pinv * Mrow * P, Mrow = row-vector rotation current -> previous view (= R^T).
+        // clipToPrevClip = Pinv * Mrow * Pprev, Mrow = row-vector rotation current -> previous view (= R^T).
         double M[4][4] = {}, PM[4][4] = {}, C[4][4] = {};
         for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) M[i][j] = R[j][i];
         for (int j = 0; j < 3; ++j) M[3][j] = T[j];
         M[3][3] = 1;
         for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) for (int k = 0; k < 4; ++k) PM[i][j] += double(Pinv[i * 4 + k]) * M[k][j];
-        for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) for (int k = 0; k < 4; ++k) C[i][j] += PM[i][k] * double(P[k * 4 + j]);
+        for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) for (int k = 0; k < 4; ++k) C[i][j] += PM[i][k] * double(Pprev[k * 4 + j]);
         for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) c.clip_to_prev_clip[i * 4 + j] = float(C[i][j]);
         for (int i = 0; i < 3; ++i) {
             c.right[i] = float(basis_[i][0]); c.up[i] = float(basis_[i][1]); c.fwd[i] = float(basis_[i][2]);
@@ -387,16 +460,22 @@ private:
         }
         c.near_plane = near_plane; c.far_plane = 0;
         c.fov = float(fov_); c.aspect = float(w / h);
-        c.depth_inverted = 1;
+        c.depth_inverted = reversed ? 1u : 0u;
         c.valid = 1;
         return c;
     }
 
     M3 basis_ = identity_basis();
-    double fov_ = kDefaultFov, last_residual_ = 0;
+    double fov_ = kDefaultFov, last_residual_ = 0, prev_fov_ = 0;
     bool fov_locked_ = false;
     std::vector<double> fov_votes_;
+    double learned_fov_ = kDefaultFov, game_v_ = 0, game_h_ = 0;
+    bool learned_locked_ = false, following_game_ = false;
+    int game_fov_mode_ = 0;
+    std::vector<double> game_votes_v_, game_votes_h_;
     V3 last_omega_{}, last_translation_{}, position_{};
+    std::uint64_t frames_ = 0, rejected_ = 0;
+    bool last_rejected_ = false;
 };
 
 }  // namespace fw
