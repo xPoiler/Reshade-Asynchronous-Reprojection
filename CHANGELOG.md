@@ -1,29 +1,36 @@
 # Changelog
 
-## Unreleased
+## 1.3.0
 
+* **Returnal support**, and games that call DLSS directly without NVIDIA Streamline: FrameWarp reads
+  DLSS's depth and motion vectors and works out the camera's movement from them (no launch options
+  needed).
+* **Frame generation safeguard:** FrameWarp and frame generation (DLSS, FSR or XeSS) do the same job and
+  cannot be combined. When a game has frame generation on, FrameWarp now pauses, leaves the game
+  untouched and says so in its panel; it resumes by itself when frame generation is turned off.
+  Before, the picture could freeze or break up.
+* **Keep still** dropdown: HUD + character/weapon (default), HUD only, character/weapon only, or off.
+  Character/weapon detection now works in every game, including games with their own HUD layers
+  (Clair Obscur: Expedition 33), and also holds a third-person character that stays put on screen
+  while the camera turns. Objects moving on their own keep warping.
+* New option **Find the HUD from the DLSS output** (off by default, remembered per game): the HUD is
+  found in every frame by comparing the final picture with DLSS's own output, which has no HUD. No
+  learning, and it follows HUD that fades in and out. Excellent in Resident Evil Requiem and Returnal;
+  in some games bright lights and neon may be kept still too, so check it with **Show the mask**.
+* **Show the mask** (debug): tints what is kept still.
+* Smoother output: new game frames are prepared between display refreshes instead of inside one, so
+  taking in a frame no longer makes the output miss a refresh.
+* FrameWarp steps aside in menus and loading screens that skip the game's usual rendering.
+* Fixed: on displays with Windows scaling (laptop screens at 125-150%) the overlay showed only the
+  top-left part of the picture, enlarged.
+* The FrameWarp panel warns when Windows' hardware-accelerated GPU scheduling is off on the game's
+  GPU. Without it, the output may not reach the refresh rate.
 * Installer: the game list shows which FrameWarp version is installed, and it asks before replacing an
   existing install (it says so for the same version or a downgrade; `-Force` skips the question).
 * Installer: updates are safer. Staged copies of the add-on (RE9's `_storage_`) are replaced too, and
   a presenter left running from a crashed game session is stopped instead of blocking the update.
   Logs, calibration and the Latewarp DLL are kept.
-* Fixed: on displays with Windows scaling (laptop screens at 125-150%) the overlay showed only the
-  top-left part of the picture, enlarged.
-* The FrameWarp panel warns when Windows' hardware-accelerated GPU scheduling is off on the game's
-  GPU. Without it, the output may not reach the refresh rate.
 * README: explains why an RTX GPU is required.
-* New option **Find the HUD from the DLSS output** (off by default, remembered per game): the HUD is
-  found in every frame by comparing the final picture with DLSS's own output, which has no HUD. No
-  learning, and it follows HUD that fades in and out. Very clean in Resident Evil Requiem and in games
-  that call DLSS directly; in some games parts of the scenery (neon, strong bloom) may be kept still,
-  so check it with the mask view.
-* **Keep still** dropdown: HUD + character/weapon (default), HUD only, character/weapon only, or off.
-  Character/weapon detection now works in every game, including games with their own HUD layers
-  (Clair Obscur: Expedition 33), and also holds a third-person character a few metres away when it
-  stays put on screen while the camera turns. Objects moving on their own keep warping.
-* New game frames are prepared between display refreshes instead of inside one, so taking in a frame
-  no longer makes the output miss a refresh.
-* Debug option to show the no-warp mask on screen.
 
 ## 1.2.0
 

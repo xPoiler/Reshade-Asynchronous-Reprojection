@@ -223,6 +223,7 @@ void Producer::on_constants(std::uint64_t frame, const Camera& camera) {
         prev_frame_ = frame;
         have_prev_camera_ = true;
     }
+    if (frame != last_counted_frame_) { last_counted_frame_ = frame; InterlockedIncrement(&shared_->frames_total); }
     const int slot = slot_for_frame(frame, true);
     if (slot < 0) return;
     auto& m = shared_->slots[slot];
@@ -273,6 +274,7 @@ void Producer::on_tag(std::uint64_t frame, Tex kind, ID3D12Resource* source, D3D
 std::uint64_t Producer::begin_present(ID3D12Resource* backbuffer, ID3D12GraphicsCommandList* list) {
     std::lock_guard lock(mutex_);
     if (!ready() || !backbuffer || !list) return 0;
+    InterlockedIncrement(&shared_->presents_total);
     // Which frame is being presented: the PCL present-start marker when the game sends it,
     // otherwise the oldest frame still being written (frames present in submission order).
     int slot = -1;

@@ -25,12 +25,14 @@
 | `src/addon/addon.cpp` | ReShade registration, `reshade_present` capture, presenter launch, ImGui panel. |
 | `src/addon/streamline_hooks.cpp` | Hooks for Streamline; runtime layout detection (BaseStructure size, ResourceTag stride); buffer classification. |
 | `src/addon/producer.cpp` | Slot management, GPU copies into shared textures, shared fence, camera position integration, event log. |
+| `src/addon/ngx_hooks.cpp` | Hooks on the driver's NGX exports (`CreateFeature`/`EvaluateFeature`): DLSS parameters, and for games without Streamline, depth, motion vectors and the DLSS output per evaluation. |
 | `src/addon/game_probe.cpp` | Byte-verified probes into Expedition 33's Unreal Streamline plugin (forces `ForceTagStreamlineBuffers()` true, counts calls). |
 | `src/common/inline_hook.cpp` | Minimal x64 inline hook (prologue relocation incl. RIP-relative, near relay, atomic patch). |
 | `src/presenter/main.cpp` | Presenter process: overlay window, raw input, render loop, logging, profile persistence. |
 | `src/presenter/renderer.cpp` | D3D12 device/queue, composition swapchain, shared-texture ingest + format conversion, blit, timing. |
 | `src/presenter/latewarp12.cpp` | NGX Latewarp on D3D12 (parameter names from `nvngx_latewarp.dll`). |
 | `src/presenter/pose.hpp` | Camera model: fitting, prediction/interpolation, handoff blending, cursor gate. |
+| `src/presenter/camera_estimator.hpp` | Games without camera data: rotation, translation and field of view fitted to the motion vectors. |
 
 ## Game side (add-on)
 
@@ -48,6 +50,13 @@
 * **Camera position.** Streamline's `cameraPos` is camera-relative (always 0), so the add-on integrates
   an absolute position every frame from `clipToPrevClip` (`camera_motion.hpp`); discontinuities bump
   `position_epoch`.
+* **Games without Streamline.** After 60 DLSS evaluations with no Streamline camera, each evaluation
+  publishes its depth and motion vectors as a frame marked `estimated`; the presenter works out the
+  camera (`camera_estimator.hpp`: a robust fit of rotation and translation to a 64x36 grid of motion
+  vectors, field of view learned by votes).
+* **DLSS output.** Only when *Find the HUD from the DLSS output* is on: copied right after DLSS writes
+  it (after `slEvaluateFeature` for Streamline games, after the NGX evaluation otherwise).
+* **Counters.** Presented images and rendered frames are counted for frame-generation detection.
 
 ## Presenter
 
@@ -57,7 +66,18 @@
 * **Never waits on the game GPU.** A slot is taken only when the game's shared fence has already
   completed (CPU check). Waiting on the GPU made every new frame cost 3 refreshes.
 * **Ingest.** Shared textures (opened by name per generation) are converted by a compute shader into
-  typed private textures (RGBA16F colour, R32F depth, zero RG16F motion) that Latewarp accepts.
+  typed private textures (RGBA16F colour, R32F depth, zero RG16F motion) that Latewarp accepts. A new
+  game frame is taken in between refreshes, as its own GPU submission, so a refresh only warps and
+  presents; one arriving too close to a refresh waits until just after it.
+* **No-warp mask** (R8, passed to Latewarp), built once per game frame:
+  * *character/weapon* (every game): pixels whose motion vectors the camera motion does not explain,
+    close to the camera, or stuck to the screen while the camera moves further out;
+  * *HUD* (games without HUD layers): learned from pixels that stay the same at the same place while
+    the camera moves the scene under them; or, with the option on, predicted per frame from the DLSS
+    output (tone curve per channel, highlight wash-out, smooth per-tile correction) - what the
+    prediction misses is HUD.
+* **Frame generation.** When the game presents 1.6 or more images per rendered frame for a second, the
+  presenter steps aside (overlay hidden, no GPU work) until the ratio is back near 1.
 * **Latewarp.** On a new game frame a throwaway `IsRenderedFrame=1` evaluation registers it, followed
   by the real evaluation with the predicted camera (Latewarp ignores the camera on rendered-frame
   evaluations). View matrices are built relative to the source camera position for precision.

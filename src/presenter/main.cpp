@@ -322,6 +322,11 @@ void render_thread() {
     std::vector<float> raw_samples;
     std::vector<MotionSample> motion_samples;
     double intake_ms = 4.0;  // how long taking in a new game frame takes (GPU span, smoothed)
+    // Frame generation detection: presented images vs rendered frames per half-second window.
+    bool frame_generation = false;
+    int fg_votes = 0;
+    LONG fg_presents = 0, fg_frames = 0;
+    std::int64_t fg_window_start = 0;
     std::uint64_t waiting_frame = 0;  // newest game frame seen while waiting for a refresh, and since when
     std::int64_t waiting_since = 0;
     std::uint64_t intakes = 0;
@@ -478,7 +483,7 @@ void render_thread() {
             // arrives too close to the refresh waits until just after it.
             const std::int64_t tick = v + compose - lead;
             const std::int64_t budget = static_cast<std::int64_t>((intake_ms + 1.0) * 1e-3 * f);
-            const bool can_take_in = g_app.visible && renderer.session_open(sh.session) &&
+            const bool can_take_in = g_app.visible && !frame_generation && renderer.session_open(sh.session) &&
                                      sh.backbuffer_width == renderer.width() && sh.backbuffer_height == renderer.height();
             for (;;) {
                 const std::int64_t t = qpc_now();
@@ -560,7 +565,29 @@ void render_thread() {
             } else ++it;
         }
 
-        if (!g_app.visible) {  // game not in front / disabled: don't compete with it for the GPU
+        // Frame generation (DLSS, FSR, XeSS - any kind) presents two or more images per rendered frame. It
+        // does the same job as FrameWarp and the two cannot be combined (generated images would be warped
+        // as if they were rendered ones): step aside and say so, and come back when it is turned off.
+        if (qpc_now() - fg_window_start >= g_qpc_frequency / 2) {
+            const LONG presents = sh.presents_total, frames = sh.frames_total;
+            const LONG dp = presents - fg_presents, df = frames - fg_frames;
+            fg_presents = presents; fg_frames = frames; fg_window_start = qpc_now();
+            if (df >= 5) {  // the game is rendering (menus and loading screens present without it)
+                const double ratio = double(dp) / double(df);
+                if (ratio >= 1.6) fg_votes = std::min(fg_votes + 1, 2);
+                else if (ratio <= 1.25) fg_votes = std::max(fg_votes - 1, -2);
+                if (!frame_generation && fg_votes >= 2) {
+                    frame_generation = true;
+                    logf("frame generation detected (%.1f presented images per rendered frame): stepping aside until it is off", ratio);
+                } else if (frame_generation && fg_votes <= -2) {
+                    frame_generation = false;
+                    logf("frame generation off: reprojecting again");
+                }
+            }
+            sh.presenter.frame_generation = frame_generation ? 1u : 0u;
+        }
+        if (!g_app.visible || frame_generation) {  // game not in front / disabled / frame generation: don't compete with it for the GPU
+            if (frame_generation) g_app.has_frames = false;
             source_frame = sh.latest_ready_frame;
             pacing_paused = true;
             Sleep(10);

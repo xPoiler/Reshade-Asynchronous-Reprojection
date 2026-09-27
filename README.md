@@ -6,18 +6,20 @@ moves at 120 Hz on a 120 Hz display.
 
 On every display refresh, FrameWarp takes the game's newest frame and re-projects it to where the
 camera is *now*, using NVIDIA's Reflex 2 Frame Warp engine. It runs as a ReShade add-on and reads the
-camera, depth and HUD data from the game's own NVIDIA Streamline (DLSS/Reflex) integration. It then
-draws the result in a click-through overlay above the game.
+camera, depth and HUD data from the game's own NVIDIA Streamline (DLSS/Reflex) integration. In games
+that call DLSS directly, without Streamline, it reads DLSS's depth and motion vectors and works out
+the camera's movement from them. It then draws the result in a click-through overlay above the game.
 
 ## Tested games
 
 | Game | Notes |
 |---|---|
-| *Clair Obscur: Expedition 33* (Steam) | Add the launch options `-slforcetagging -slviewextension` (see Install). The HUD stays still while the scene is warped. |
-| *Resident Evil Requiem* (Steam) | **Requires [REFramework](https://github.com/praydog/REFramework)**: without it the game's DRM crashes with ReShade. The game doesn't provide HUD layers, so FrameWarp detects the HUD itself (see *Detect HUD and first-person weapon*). |
-| *Cyberpunk 2077* (Steam) | No launch options needed. The game doesn't provide HUD layers: FrameWarp detects the HUD and V's weapon itself. Semi-transparent HUD panels may still move slightly. |
+| *Clair Obscur: Expedition 33* (Steam) | Add the launch options `-slforcetagging -slviewextension` (see Install). The game provides HUD layers, so the HUD stays still; FrameWarp also holds the character while the camera turns around it. |
+| *Resident Evil Requiem* (Steam) | **Requires [REFramework](https://github.com/praydog/REFramework)**: without it the game's DRM crashes with ReShade. The game doesn't provide HUD layers, so FrameWarp detects the HUD itself. **Recommended:** turn on *Find the HUD from the DLSS output*. |
+| *Cyberpunk 2077* (Steam) | No launch options needed. The game doesn't provide HUD layers: FrameWarp detects the HUD and V's weapon itself. Semi-transparent HUD panels may still move slightly. Leave *Find the HUD from the DLSS output* off here: it would also hold neon signs and bright lights. |
+| *Returnal* (Steam) | No launch options needed. The game calls DLSS without Streamline, so FrameWarp works out the camera from DLSS's motion vectors; turn the camera for a few seconds after loading while it calibrates. **Recommended:** turn on *Find the HUD from the DLSS output*. |
 
-Other games that use NVIDIA Streamline for DLSS may work but are untested.
+Other DLSS games, with or without Streamline, may work but are untested.
 
 ## Requirements
 
@@ -28,6 +30,9 @@ Other games that use NVIDIA Streamline for DLSS may work but are untested.
   panel warns you if it is off.
 * [ReShade](https://reshade.me) 6.x **with full add-on support**, installed for the game.
 * DLSS and Reflex enabled in the game.
+* **Frame generation off** (DLSS, FSR or XeSS frame generation). FrameWarp does the same job, filling
+  your display's refresh rate, and the two can't be combined. While a game has frame generation on,
+  FrameWarp pauses and says so in its panel.
 * **`nvngx_latewarp.dll`**, NVIDIA's Reflex 2 Frame Warp (Latewarp) DLL. It is NVIDIA's file and
   cannot be included. It comes bundled with software that uses Reflex 2 Frame Warp, such as
   community-made Reflex 2 demos, so search for it by file name. FrameWarp was tested with version
@@ -61,7 +66,7 @@ Advanced: both files also accept a game name or folder directly (`install.bat "E
 
 ## Use
 
-1. Run the game in **borderless** mode, with DLSS and Reflex on.
+1. Run the game in **borderless** mode, with DLSS and Reflex on and frame generation off.
 2. Open the ReShade overlay (Home key) and go to **Add-ons > FrameWarp**. The presenter starts
    automatically with the game.
 
@@ -72,7 +77,9 @@ Advanced: both files also accept a game name or folder directly (`install.bat "E
 | **Auto latency** | How far behind the newest game frame the displayed camera sits. **Auto** (default) uses 1/2 frame, or 1/4 frame in games without HUD layers, where a shorter warp keeps any undetected HUD steadier. You can also pick **1 frame** (smoothest), **1/2** or **1/4** (less latency, cleaner screen edges), or turn it **Off** to set the latency by hand. |
 | **Present lead (ms)** | How early each frame is rendered before the display refresh (default 6). Raise it if the output drops below your refresh rate. |
 | **Keep HUD still** | Warps the scene but not the HUD, using the HUD layers the game provides (Expedition 33). |
-| **Detect HUD and first-person weapon** | For games without HUD layers (on by default): finds the HUD from what stays put on screen while the camera moves, and a first-person weapon from its motion, and keeps both unwarped. It needs a few seconds of camera movement to learn. |
+| **Keep still** | What is not warped. **HUD + character/weapon** (default), **HUD only**, **Character/weapon only** or **Off**. *HUD*: in games without HUD layers, FrameWarp finds the HUD from what stays put on screen while the camera moves; it needs a few seconds of camera movement to learn. *Character/weapon*: what moves with the camera, such as a first-person weapon or a third-person character, found from the game's motion vectors in every game; it starts after a few seconds of turning the camera. |
+| **Find the HUD from the DLSS output** | Off by default, remembered per game. Finds the HUD in every frame by comparing the final picture with DLSS's own output, which has no HUD: sharper and instant, with nothing to learn. In some games, bright lights, neon or effects drawn after DLSS are kept still too, so check it with *Show the mask* and keep it where it looks right. |
+| **Show the mask** | Tints what is kept still (magenta) and HUD still being learned (green), to check the two options above. |
 | **Presenter GPU priority** | Keep **Realtime**. Lower priorities cannot hold the refresh rate while the game loads the GPU. |
 | **Reset camera model** | Re-learns how the game's camera responds to your mouse. This also happens automatically within seconds of play. |
 | **Start presenter** | Restarts the presenter if it was closed. |
@@ -85,11 +92,16 @@ diagnostics) are for fine-tuning and troubleshooting.
 * Frame rates that swing a lot degrade the result, because the camera model assumes a steady frame
   cadence.
 * During fast turns, the screen edges show fill for areas the game never rendered.
+* In games that call DLSS directly, the camera is estimated from motion vectors, which is a little
+  less exact than the camera data Streamline games provide.
 * Very fast motion goes beyond what re-projecting a single frame can hide.
 * The Expedition 33 support targets the current Steam build. It switches itself off safely if a game
   update changes the relevant code.
 
 ## Troubleshooting
+
+If the FrameWarp panel says frame generation is on, turn frame generation off in the game's graphics
+settings; FrameWarp resumes by itself.
 
 Logs are written to `FrameWarp\logs\`, next to the game's ReShade. The previous run is kept in
 `logs\previous\`. When something looks wrong in game, press **Ctrl+Shift+M** to mark that moment in

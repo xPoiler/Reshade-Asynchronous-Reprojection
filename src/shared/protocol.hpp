@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 29;
+constexpr std::uint32_t kVersion = 30;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -94,7 +94,8 @@ struct PresenterStatus {
     float output_fps, source_fps, warp_gpu_ms, source_age_ms;
     float gain_x, gain_y, delay_ms, fit_quality_x, fit_quality_y;
     std::uint32_t calibrated_x, calibrated_y;
-    std::uint32_t frames_presented, frames_warped, sources_consumed, pad1;
+    std::uint32_t frames_presented, frames_warped, sources_consumed;
+    std::uint32_t frame_generation;  // 1: the game presents more images than it renders (frame generation): stepped aside
     float tau_x_ms, tau_y_ms, latency_ms, orbit_cm;
     float frame_interval_ms, effective_prediction_ms;
     float display_hz;  // measured refresh rate of the display the overlay is on (0 = not measured yet)
@@ -165,6 +166,9 @@ struct Shared {
     NgxStats ngx;
     volatile LONG presents_without_frame;  // consecutive game presents with no captured frame (menus, loading)
     std::uint32_t pad_presents;
+    // Totals since start: images the game presented and frames it rendered (distinct frames with camera
+    // data). Frame generation presents two or more images per rendered frame.
+    volatile LONG presents_total, frames_total;
     volatile LONG64 timeline_count;
     TimelineEvent timeline[kTimeline];
 };

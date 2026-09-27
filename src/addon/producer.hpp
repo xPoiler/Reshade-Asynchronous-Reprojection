@@ -38,6 +38,7 @@ public:
     void set_message(const char* text);
 
 private:
+    std::uint64_t last_counted_frame_ = 0;  // frames_total counts each rendered frame once
     struct Texture {
         Microsoft::WRL::ComPtr<ID3D12Resource> resource;
         HANDLE handle = nullptr;
