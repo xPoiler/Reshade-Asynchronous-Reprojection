@@ -17,6 +17,10 @@
   learning, and it follows HUD that fades in and out. Very clean in Resident Evil Requiem and in games
   that call DLSS directly; in some games parts of the scenery (neon, strong bloom) may be kept still,
   so check it with the mask view.
+* **Keep still** dropdown: HUD + character/weapon (default), HUD only, character/weapon only, or off.
+  Character/weapon detection now works in every game, including games with their own HUD layers
+  (Clair Obscur: Expedition 33), and also holds a third-person character a few metres away when it
+  stays put on screen while the camera turns. Objects moving on their own keep warping.
 * New game frames are prepared between display refreshes instead of inside one, so taking in a frame
   no longer makes the output miss a refresh.
 * Debug option to show the no-warp mask on screen.

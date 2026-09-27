@@ -383,7 +383,8 @@ int main(int argc, char** argv) {
         int hud_patch_colour = 0;
         bool horizontal_bar = false;
         bool near_wall = false;
-        float weapon_mv = 0.0f;  // the weapon strip's own motion vector (uv): 0 = stuck to the screen, else animating
+        float weapon_mv = 0.0f;
+        float strip_depth = 0.5f;  // depth of the camera-attached strip (reversed-Z: near / distance)  // the weapon strip's own motion vector (uv): 0 = stuck to the screen, else animating
         bool repeating = false;  // scenery that repeats every 6 px (= the camera motion per frame): windows, railings  // a wall close to the camera behind the HUD patch (normal motion vectors)
         int scene_offset = -1;  // textured scene (vertical grey stripes) shifting every frame; >= 0 freezes it
         // The upscaler's output (games calling DLSS directly): the same scene before tone mapping (here
@@ -474,10 +475,12 @@ int main(int argc, char** argv) {
                 const D3D12_RECT wall{LONG(hx0 * DW / W) - 4, LONG(hy0 * DH / H) - 4, LONG(hx1 * DW / W) + 4, LONG(hy1 * DH / H) + 4};
                 list->ClearDepthStencilView(dsv_heap->GetCPUDescriptorHandleForHeapStart(), D3D12_CLEAR_FLAG_DEPTH, 0.5f, 0, 1, &wall);
             }
-            if (weapon && near_strip) {  // the weapon is close to the camera: depth 0.5 = 2x the near plane
+            if (weapon) {  // reversed-Z depth = near / distance: 0.5 = a weapon 2x the near plane away; the
+                           // "sky" variant is 10000x the near plane away
                 const LONG bx = LONG(DW / 2);
                 const D3D12_RECT strip{bx - 8, 0, bx + 8, LONG(DH)};
-                list->ClearDepthStencilView(dsv_heap->GetCPUDescriptorHandleForHeapStart(), D3D12_CLEAR_FLAG_DEPTH, 0.5f, 0, 1, &strip);
+                list->ClearDepthStencilView(dsv_heap->GetCPUDescriptorHandleForHeapStart(), D3D12_CLEAR_FLAG_DEPTH,
+                                            near_strip ? strip_depth : 1e-4f, 0, 1, &strip);
             }
             producer.on_tag(fid, kDepth, depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 0, 0, DW, DH, list.Get());
             producer.on_tag(fid, kMotion, motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 0, 0, DW, DH, list.Get());
@@ -531,7 +534,7 @@ int main(int argc, char** argv) {
             renderer.begin_frame();
             IngestedSource s = renderer.ingest(sh, s_slot);
             renderer.analyze_motion(s, moving_cam.clip_to_prev_clip, 1.0f, 1.0f, true);
-            renderer.build_no_warp_mask(s, moving_cam.clip_to_prev_clip, hud, weapon);
+            renderer.build_no_warp_mask(s, moving_cam.clip_to_prev_clip, hud, weapon, weapon);
             renderer.finish_frame(false, 0);
             renderer.wait_idle();
             return s;
@@ -553,7 +556,31 @@ int main(int argc, char** argv) {
         show(anim_src, yaw);
         const double anim_x1 = peak(px, w, h, true, 1);
         EXPECT(std::fabs(anim_x1 - anim_x0) < 2.0, "an animating first-person weapon is not warped (%.0f -> %.0f)", anim_x0, anim_x1);
-        // (A2) the same zero-motion strip far away (sky) is not a weapon: it must warp.
+        // (A1b) a third-person character: attached to the camera too, but a few metres away (300x the near
+        // plane). Held as well.
+        strip_depth = 1.0f / 300.0f;
+        IngestedSource third_src = ingest_frame(publish(220, 0.1f, 0, true, false), false, true);
+        strip_depth = 0.5f;
+        show(third_src, 0);
+        const double third_x0 = peak(px, w, h, true, 1);
+        show(third_src, yaw);
+        const double third_x1 = peak(px, w, h, true, 1);
+        EXPECT(std::fabs(third_x1 - third_x0) < 2.0, "a third-person character a few metres away is not warped (%.0f -> %.0f)", third_x0, third_x1);
+        // (A1c) something at that distance moving on its own while the camera turns (a car, a person): its
+        // motion is not the camera's and it is not stuck to the screen - it keeps warping.
+        strip_depth = 1.0f / 300.0f;
+        weapon_mv = -5.0f * shift;
+        IngestedSource mover_src = ingest_frame(publish(230, 0.1f, 0, true, false), false, true);
+        strip_depth = 0.5f;
+        weapon_mv = 0.0f;
+        show(mover_src, 0);
+        const double mover_x0 = peak(px, w, h, true, 1);
+        show(mover_src, yaw);
+        const double mover_x1 = peak(px, w, h, true, 1);
+        std::printf("attached: third-person character x %.0f -> %.0f; object moving on its own at that distance x %.0f -> %.0f\n",
+                    third_x0, third_x1, mover_x0, mover_x1);
+        EXPECT(std::fabs(mover_x1 - mover_x0) > 20.0, "an object moving on its own a few metres away still warps (%.0f -> %.0f)", mover_x0, mover_x1);
+        // (A2) the same zero-motion strip far away (sky, 10000x the near plane) is not attached: it must warp.
         renderer.reset_hud_detection();
         IngestedSource sky_src{};
         sky_src = ingest_frame(publish(251, 0.1f, 0, true, false, false), false, true);

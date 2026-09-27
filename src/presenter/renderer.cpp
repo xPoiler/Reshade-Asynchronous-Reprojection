@@ -86,8 +86,13 @@ groupshared float4 gs_a[64], gs_b[64];
                 // animation (aiming in/out while walking). Nearby walls move exactly as the camera predicts.
                 // Only near the camera (reversed-Z: d = near / distance, so d > 1/64 means closer than 64x the
                 // near plane): the sky and distant scenery often have motion vectors that ignore the camera too.
-                const bool attached = (flags & 1) && (flags & 16) && d > 1.0 / 64.0 &&
-                                      length(own) > max(1.0, 0.25 * length(cam_px));
+                // Further out (up to 4096x the near plane: a third-person character a few metres away) only what
+                // is stuck to the screen while the camera clearly moves - objects moving on their own (cars,
+                // people) do not do that, and they must keep warping.
+                const float2 screen_px = g * mv_scale * float2(rect.zw);
+                const bool attached = (flags & 1) && (flags & 16) &&
+                                      ((d > 1.0 / 64.0 && length(own) > max(1.0, 0.25 * length(cam_px))) ||
+                                       (d > 1.0 / 4096.0 && length(cam_px) >= 2.0 && length(screen_px) < 0.2 * length(cam_px)));
                 o = float4(own, d, attached ? 2 : (moving ? 1 : 0));
                 // The scale fit only uses pixels whose motion vector points along the camera motion (either
                 // sign per axis); attached or independently moving pixels would bias it.
@@ -961,7 +966,7 @@ ID3D12Resource* Renderer::extrapolate_objects(const IngestedSource& src, bool fr
 }
 
 ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const float clip_to_prev_clip[16], bool hud, bool attached,
-                                             bool depth_inverted) {
+                                             bool keep_attached, bool depth_inverted) {
     if (!src.has_depth || !private_[kPObject].texture) return nullptr;
     const UINT ow = private_[kPBackbuffer].width, oh = private_[kPBackbuffer].height;
     const bool new_score = !private_[kPHudScore].texture || private_[kPHudScore].width != ow || private_[kPHudScore].height != oh;
@@ -1025,7 +1030,7 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
     set_x_srv(kXMaskSrv + 1, kPObject);
     for (UINT i = 2; i < kXSrvCount; ++i) set_x_srv(kXMaskSrv + i, kPObject);
     set_x_uav(kXMaskUav + 0, kPMask); set_x_uav(kXMaskUav + 1, kPMask);
-    c.flags = (hud ? 4u : 0u) | (attached ? 8u : 0u);
+    c.flags = (hud ? 4u : 0u) | (attached && keep_attached ? 8u : 0u);
     transition(private_[kPMask], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     x_dispatch(cs_mask_.Get(), &c, kXMaskSrv, kXMaskUav, (ow + 7) / 8, (oh + 7) / 8);
     transition(private_[kPMask], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);

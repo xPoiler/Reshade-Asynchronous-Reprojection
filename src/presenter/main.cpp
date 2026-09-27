@@ -314,7 +314,7 @@ void render_thread() {
     bool device_loss_logged = false;
     MotionVectorScale mv_scale;
     double last_mv_log = 0;
-    bool game_has_hud_layers = false, mask_logged = false;
+    bool game_has_hud_layers = false, mask_logged = false, source_masked = false;
     CameraEstimator estimator;
     bool estimator_logged = false, fov_logged = false;
     double estimator_ms_sum = 0, flush_ms_sum = 0;
@@ -414,7 +414,12 @@ void render_thread() {
                     std::fputc('\n', g_app.csv_sources);
                 }
                 game_has_hud_layers = s.has_hudless && s.has_ui && settings.use_ui_tags;
-                const bool mask = settings.no_warp_mask && !game_has_hud_layers && s.has_depth;
+                // Two independent parts of the no-warp mask: the HUD (only games without HUD layers) and
+                // what moves with the camera (every game: third-person character, first-person weapon).
+                const bool hud_mask = settings.no_warp_mask && !game_has_hud_layers && s.has_depth;
+                const bool attached_mask = settings.keep_attached && s.has_depth && s.has_motion;
+                const bool mask = hud_mask || attached_mask;
+                source_masked = mask;
                 if ((settings.extrapolate_objects || mask) && s.has_motion)
                     renderer.analyze_motion(s, cam.clip_to_prev_clip, float(mv_scale.scale(0, s.depth_rect.w)),
                                             float(mv_scale.scale(1, s.depth_rect.h)), mv_scale.valid, cam.depth_inverted != 0);
@@ -423,7 +428,8 @@ void render_thread() {
                     // proven for every game); otherwise the learned HUD map, which works everywhere.
                     IngestedSource for_mask = s;
                     if (!settings.hud_from_scene) for_mask.has_scene = false;
-                    renderer.build_no_warp_mask(for_mask, cam.clip_to_prev_clip, true, s.has_motion && mv_scale.valid, cam.depth_inverted != 0);
+                    renderer.build_no_warp_mask(for_mask, cam.clip_to_prev_clip, hud_mask, s.has_motion && mv_scale.valid, attached_mask,
+                                                cam.depth_inverted != 0);
                     if (++mask_builds >= 300) {
                         mask_builds = 0;
                         const HudStats hs = renderer.take_hud_stats();
@@ -438,7 +444,7 @@ void render_thread() {
                             logf("HUD detection: %d frames, learned from %d (HUD-like share %.0f%%), %d with too little detail, %d held back by the guard",
                                  hs.frames, hs.learned, hs.learned ? 100.0 * hs.share_sum / hs.learned : 0.0, hs.too_little, hs.guarded);
                     }
-                    if (!mask_logged) { logf("no HUD layers from the game: detecting HUD and first-person weapon for the no-warp mask"); mask_logged = true; }
+                    if (!mask_logged) { logf("no-warp mask: %s%s", hud_mask ? "HUD (the game has no HUD layers)" : "", attached_mask ? (hud_mask ? " + character/weapon" : "character/weapon") : ""); mask_logged = true; }
                 }
                 first_eval = true;
                 const double present_t = seconds(m.qpc_present);
@@ -590,7 +596,7 @@ void render_thread() {
             std::memcpy(projection.data(), source_camera.view_to_clip, sizeof(projection));
             auto inputs = renderer.latewarp_inputs(source, settings.use_ui_tags != 0);
             inputs.depth_inverted = source_camera.depth_inverted != 0;
-            if (settings.no_warp_mask && !game_has_hud_layers) {
+            if (source_masked) {
                 inputs.no_warp_mask = renderer.no_warp_mask();
                 inputs.mask_rect = source.color_rect;
             }

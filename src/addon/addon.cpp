@@ -194,10 +194,18 @@ void draw_overlay(effect_runtime*) {
         if (ImGui::Checkbox("Invert warp (debug)", &invert)) s.invert_warp = invert;
         bool ui = s.use_ui_tags != 0;
         if (ImGui::Checkbox("Keep HUD still (HUD-less + UI tags)", &ui)) s.use_ui_tags = ui;
-        bool mask = s.no_warp_mask != 0;
-        if (ImGui::Checkbox("Detect HUD and first-person weapon (games without HUD layers)", &mask)) s.no_warp_mask = mask;
-        if (mask && p.mv_scale_x == 0.0f)
-            ImGui::TextDisabled("  weapon detection starts after a few seconds of turning the camera");
+        // What is kept unwarped: the HUD (detected in games without HUD layers) and what moves with the
+        // camera (third-person character, first-person weapon).
+        static const char* const kKeepStill[] = {"HUD + character/weapon (default)", "HUD only", "Character/weapon only", "Off"};
+        int keep = s.no_warp_mask ? (s.keep_attached ? 0 : 1) : (s.keep_attached ? 2 : 3);
+        if (ImGui::Combo("Keep still", &keep, kKeepStill, 4)) {
+            s.no_warp_mask = keep == 0 || keep == 1;
+            s.keep_attached = keep == 0 || keep == 2;
+        }
+        const bool mask = s.no_warp_mask != 0, attached = s.keep_attached != 0;
+        if (attached)
+            ImGui::TextDisabled("  what moves with the camera is not warped and moves at the game's frame rate%s",
+                                p.mv_scale_x == 0.0f ? "; starts after a few seconds of turning the camera" : "");
         if (mask) {
             bool scene = s.hud_from_scene != 0;
             if (ImGui::Checkbox("Find the HUD from the DLSS output", &scene)) {
@@ -205,6 +213,8 @@ void draw_overlay(effect_runtime*) {
                 reshade::set_config_value(nullptr, "FrameWarp", "HudFromDlssOutput", scene ? "1" : "0");
             }
             ImGui::TextDisabled("  sharper and instant, but in some games it may keep parts of the scenery still; check with the mask view");
+        }
+        if (mask || attached) {
             bool show = s.show_mask != 0;
             if (ImGui::Checkbox("Show the mask (debug: magenta = kept still, green = HUD being learned)", &show)) s.show_mask = show;
         }

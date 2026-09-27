@@ -104,12 +104,14 @@ public:
     bool take_motion_fit(MotionFit& fit);
     // HUD learning per game frame since the last call (read back a few frames later).
     HudStats take_hud_stats() { const HudStats s = hud_stats_; hud_stats_ = {}; return s; }
-    // Once per new game frame (after analyze_motion): the no-warp mask for games without HUD layers.
-    // hud: pixels that stay unchanged while the camera moves the scene under them (needs the previous
-    // colour, see set_keep_previous_colour); attached: pixels whose motion vectors ignore the camera
-    // (first-person weapon). Returns the R8 mask at output resolution, kept for the frame's outputs.
+    // Once per new game frame (after analyze_motion): the no-warp mask.
+    // hud: the HUD (games without HUD layers) - pixels that stay unchanged while the camera moves the
+    // scene under them (needs the previous colour, see set_keep_previous_colour), or from the upscaler's
+    // output when the source has it; attached: the motion analysis knows which pixels move with the
+    // camera (the motion-vector scale is known); keep_attached: keep those unwarped (third-person
+    // character, first-person weapon). Returns the R8 mask at output resolution, kept for the frame's outputs.
     ID3D12Resource* build_no_warp_mask(const IngestedSource& src, const float clip_to_prev_clip[16], bool hud, bool attached,
-                                       bool depth_inverted = true);
+                                       bool keep_attached, bool depth_inverted = true);
     // Camera estimation (games without a camera): motion vector (raw) and depth on a grid over the render
     // rect, 4 floats per sample (mv.x, mv.y, depth, valid). Submits the frame's work so far and waits.
     bool sample_motion(const IngestedSource& src, std::uint32_t grid_w, std::uint32_t grid_h, std::vector<float>& out);
