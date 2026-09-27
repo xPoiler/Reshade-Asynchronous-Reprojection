@@ -132,7 +132,7 @@ NVSDK_NGX_Result NVSDK_CONV hk_evaluate(ID3D12GraphicsCommandList* list, const N
                 g_producer->on_tag(frame, kDepth, depth, state, 0, 0, w, h, list);
                 g_producer->on_tag(frame, kMotion, motion, state, 0, 0, w, h, list);
                 ++s->frames_published;
-                if (params->Get(NVSDK_NGX_Parameter_Output, &output) == NVSDK_NGX_Result_Success && output) {
+                if (shared->settings.hud_from_scene && params->Get(NVSDK_NGX_Parameter_Output, &output) == NVSDK_NGX_Result_Success && output) {
                     published = frame; output_w = s->out_w; output_h = s->out_h;
                 }
             }

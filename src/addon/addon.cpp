@@ -86,6 +86,10 @@ void on_init_swapchain(swapchain* sc, bool) {
                               static_cast<DXGI_FORMAT>(desc.texture.format), to_dxgi_color_space(sc->get_color_space()));
     fw::install_streamline_hooks(g_producer.get());
     fw::install_ngx_hooks(g_producer.get());
+    // The one setting remembered per game (ReShade.ini, [FrameWarp]).
+    int from_scene = 0;
+    if (g_producer->shared() && reshade::get_config_value(nullptr, "FrameWarp", "HudFromDlssOutput", from_scene))
+        g_producer->shared()->settings.hud_from_scene = from_scene != 0;
 }
 
 // reshade_present runs after ReShade has drawn its effects and menu, so the captured frame (which
@@ -195,6 +199,12 @@ void draw_overlay(effect_runtime*) {
         if (mask && p.mv_scale_x == 0.0f)
             ImGui::TextDisabled("  weapon detection starts after a few seconds of turning the camera");
         if (mask) {
+            bool scene = s.hud_from_scene != 0;
+            if (ImGui::Checkbox("Find the HUD from the DLSS output", &scene)) {
+                s.hud_from_scene = scene;
+                reshade::set_config_value(nullptr, "FrameWarp", "HudFromDlssOutput", scene ? "1" : "0");
+            }
+            ImGui::TextDisabled("  sharper and instant, but in some games it may keep parts of the scenery still; check with the mask view");
             bool show = s.show_mask != 0;
             if (ImGui::Checkbox("Show the mask (debug: magenta = kept still, green = HUD being learned)", &show)) s.show_mask = show;
         }

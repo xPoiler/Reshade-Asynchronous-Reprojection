@@ -389,6 +389,10 @@ int main(int argc, char** argv) {
         // The upscaler's output (games calling DLSS directly): the same scene before tone mapping (here
         // frame = sqrt(scene / 4) per channel) and without the HUD.
         bool with_scene = false;
+        // A bright yellow-white surface the tone mapping washes out towards white (as filmic tone mappers
+        // do): scene (4, 4, 0.25) -> per channel (1, 1, 0.5), washed 80% towards its grey 0.964.
+        bool washed_patch = false;
+        const D3D12_RECT washed_rect{LONG(W * 3 / 4), LONG(H * 5 / 8), LONG(W * 3 / 4) + 64, LONG(H * 5 / 8) + 64};
         ComPtr<ID3D12Resource> scene_tex;
         ComPtr<ID3D12DescriptorHeap> scene_rtv;
         {
@@ -419,6 +423,10 @@ int main(int argc, char** argv) {
                 const float yellow[4] = {1, 1, 0, 1};
                 list->ClearRenderTargetView(rtv, yellow, 1, &segment);
             }
+            if (washed_patch) {
+                const float washed[4] = {0.971f, 0.971f, 0.871f, 1};
+                list->ClearRenderTargetView(rtv, washed, 1, &washed_rect);
+            }
             if (hud_patch) {  // textured like real HUD (text, icons): 2 px stripes
                 // 0: opaque green; 1: teal, shifted 2 px (the content changed); 2: green at 50% over the scene
                 const float blend[4] = {0.5f * bg, 0.5f * bg + 0.5f, 0.5f * bg, 1};
@@ -439,6 +447,10 @@ int main(int argc, char** argv) {
                     list->ClearRenderTargetView(srtv, sgrey, 1, &stripe);
                 }
                 list->ClearRenderTargetView(srtv, swhite, 1, &bar);
+                if (washed_patch) {
+                    const float swashed[4] = {4, 4, 0.25f, 1};
+                    list->ClearRenderTargetView(srtv, swashed, 1, &washed_rect);
+                }
             }
             std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
             list->ResourceBarrier(1, &b);
@@ -680,8 +692,30 @@ int main(int argc, char** argv) {
             for (double v : hs.scene_pass_ms) std::printf(" %.3f", v / n);
             std::printf("\n");
         }
+        // (N) Highlights the tone mapping washes out towards white are scenery, not HUD: they warp, while
+        // the HUD patch in the same frame is held.
+        washed_patch = true;
+        IngestedSource washed_src = ingest_frame(publish(730, 0.1f, 0, false, true), true, false);
+        washed_patch = false;
+        auto washed_x = [&]() {
+            double sum = 0, weight = 0;
+            for (std::uint32_t y = h * 5 / 8; y < h * 3 / 4; ++y)
+                for (std::uint32_t x = w / 2; x < w; ++x) {
+                    const std::size_t i = (std::size_t(y) * w + x) * 4;
+                    const float r = half_to_float(px[i]), g = half_to_float(px[i + 1]), bl = half_to_float(px[i + 2]);
+                    if (r > 0.93f && g > 0.93f && bl > 0.82f && bl < 0.92f) { sum += x; weight += 1; }
+                }
+            return weight > 0 ? sum / weight : -1.0;
+        };
+        show(washed_src, 0);
+        const double wp_x0 = washed_x(), wh_x0 = green_x();
+        show(washed_src, yaw);
+        const double wp_x1 = washed_x(), wh_x1 = green_x();
+        std::printf("washed-out highlight x %.1f -> %.1f; HUD patch next to it x %.1f -> %.1f\n", wp_x0, wp_x1, wh_x0, wh_x1);
+        EXPECT(wp_x0 > 0 && std::fabs(wp_x1 - wp_x0) > 20.0, "a highlight washed out by the tone mapping is not taken for HUD (%.1f -> %.1f)", wp_x0, wp_x1);
+        EXPECT(wh_x0 > 0 && std::fabs(wh_x1 - wh_x0) < 2.0, "the HUD next to it is still held (%.1f -> %.1f)", wh_x0, wh_x1);
         // (L) Without HUD, nothing of the scene is taken for HUD: the bar and the stripes all warp.
-        IngestedSource scene_clean = ingest_frame(publish(602, 0.1f, 0, false, false), true, false);
+        IngestedSource scene_clean = ingest_frame(publish(740, 0.1f, 0, false, false), true, false);
         show(scene_clean, 0);
         const double sc_x0 = peak(px, w, h, true, 1);
         show(scene_clean, yaw);

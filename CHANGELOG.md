@@ -12,8 +12,11 @@
 * The FrameWarp panel warns when Windows' hardware-accelerated GPU scheduling is off on the game's
   GPU. Without it, the output may not reach the refresh rate.
 * README: explains why an RTX GPU is required.
-* Games that call DLSS directly: the HUD is found in every frame by comparing the final picture with
-  DLSS's own output, which has no HUD. No learning, and it follows HUD that fades in and out.
+* New option **Find the HUD from the DLSS output** (off by default, remembered per game): the HUD is
+  found in every frame by comparing the final picture with DLSS's own output, which has no HUD. No
+  learning, and it follows HUD that fades in and out. Very clean in Resident Evil Requiem and in games
+  that call DLSS directly; in some games parts of the scenery (neon, strong bloom) may be kept still,
+  so check it with the mask view.
 * New game frames are prepared between display refreshes instead of inside one, so taking in a frame
   no longer makes the output miss a refresh.
 * Debug option to show the no-warp mask on screen.

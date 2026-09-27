@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 27;
+constexpr std::uint32_t kVersion = 28;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -81,7 +81,7 @@ struct Settings {
     std::uint32_t extrapolate_objects;  // shelved experiment (no UI): interpolate moving objects with the game's motion vectors
     std::uint32_t no_warp_mask;    // games without HUD layers: detect HUD + first-person weapon and keep them unwarped
     std::uint32_t show_mask;       // debug: tint the no-warp mask (magenta) and the HUD score still learning (green)
-    std::uint32_t pad_settings;
+    std::uint32_t hud_from_scene;  // opt-in: find the HUD from the upscaler's output (saved per game in ReShade.ini)
 };
 
 // Presenter status, displayed by the add-on UI.

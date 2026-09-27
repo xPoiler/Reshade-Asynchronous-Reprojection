@@ -419,17 +419,21 @@ void render_thread() {
                     renderer.analyze_motion(s, cam.clip_to_prev_clip, float(mv_scale.scale(0, s.depth_rect.w)),
                                             float(mv_scale.scale(1, s.depth_rect.h)), mv_scale.valid, cam.depth_inverted != 0);
                 if (mask) {
-                    renderer.build_no_warp_mask(s, cam.clip_to_prev_clip, true, s.has_motion && mv_scale.valid, cam.depth_inverted != 0);
+                    // HUD from the upscaler's output only when chosen (opt-in: its colour model cannot be
+                    // proven for every game); otherwise the learned HUD map, which works everywhere.
+                    IngestedSource for_mask = s;
+                    if (!settings.hud_from_scene) for_mask.has_scene = false;
+                    renderer.build_no_warp_mask(for_mask, cam.clip_to_prev_clip, true, s.has_motion && mv_scale.valid, cam.depth_inverted != 0);
                     if (++mask_builds >= 300) {
                         mask_builds = 0;
                         const HudStats hs = renderer.take_hud_stats();
-                        if (hs.scene_frames)
-                            logf("HUD from the upscaler's output: %d frames, %.1f%% of the screen on average; GPU ms per frame: "
-                                 "curves %.2f, tiles %.2f, final %.2f",
-                                 hs.scene_frames, 100.0 * hs.scene_share_sum / hs.scene_frames,
-                                 (hs.scene_pass_ms[0] + hs.scene_pass_ms[1] + hs.scene_pass_ms[2] + hs.scene_pass_ms[3] + hs.scene_pass_ms[4] +
-                                  hs.scene_pass_ms[6] + hs.scene_pass_ms[7]) / hs.scene_frames,
-                                 (hs.scene_pass_ms[5] + hs.scene_pass_ms[8]) / hs.scene_frames, hs.scene_pass_ms[9] / hs.scene_frames);
+                        if (hs.scene_frames) {
+                            double fits = 0;
+                            for (int i = 0; i + 1 < 18; ++i) fits += hs.scene_pass_ms[i];
+                            logf("HUD from the upscaler's output: %d frames, %.1f%% of the screen on average; GPU ms per frame: fits %.2f, final %.2f",
+                                 hs.scene_frames, 100.0 * hs.scene_share_sum / hs.scene_frames, fits / hs.scene_frames,
+                                 hs.scene_pass_ms[17] / hs.scene_frames);
+                        }
                         if (hs.frames)
                             logf("HUD detection: %d frames, learned from %d (HUD-like share %.0f%%), %d with too little detail, %d held back by the guard",
                                  hs.frames, hs.learned, hs.learned ? 100.0 * hs.share_sum / hs.learned : 0.0, hs.too_little, hs.guarded);

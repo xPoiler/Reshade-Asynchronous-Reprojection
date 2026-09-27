@@ -318,29 +318,36 @@ RWTexture2D<unorm float> mask_u : register(u0);
     mask_u[id.xy] = keep ? 1.0 : 0.0;
 }
 
-// HUD from the upscaler's output (games without HUD layers that call DLSS directly). The upscaler's
-// output is the scene before post-processing and HUD; the game's frame is that scene tone-mapped and
-// post-processed, plus the HUD. Predict the frame from the scene - a tone curve per channel over the
-// whole screen, then a smooth affine colour correction per 128 px tile (vignette, damage tint, bloom) -
-// and what the prediction misses is HUD, in this very frame. Fits sample every fourth pixel and leave
-// out, on refitting, the pixels the previous fit missed (the HUD must not bend them).
-// rect: x curve slot read, y slot or tile set written, z which pixels count (0 all, 1 near curve 0,
-// 2 near curve 1 + tile set 0); grid: tile counts.
+// HUD from the upscaler's output (opt-in). The upscaler's output is the scene before post-processing
+// and HUD; the game's frame is that scene tone-mapped and post-processed, plus the HUD. Predict the
+// frame from the scene and what the prediction misses is HUD, in this very frame. The model only holds
+// what tone mapping generally does:
+//  - a tone curve per channel over the whole screen;
+//  - highlights washing out towards grey/white (filmic and ACES-style tone mappers): per brightness
+//    level, how far the colour moves towards that level's grey - only in bright levels, where it
+//    happens; in dark ones HUD over dark scenery would teach it the HUD;
+//  - a smooth affine colour correction per 128 px tile (vignette, damage tint, bloom).
+// Fits sample every fourth pixel; each is fitted first from every pixel, then again without the
+// pixels the previous stage missed (the HUD must not bend them).
+// rect: x predictor/curve read, y slot or tile set written, z which pixels count (0 all, 1 near curve 0,
+// 2 near tile set 0 over predictor 1); grid: tile counts.
 Texture2D<float4> sc_frame_t : register(t0);
 Texture2D<float4> sc_scene_t : register(t1);
 RWTexture2D<float> sc_hud_u : register(u0);
 RWByteAddressBuffer sc_fit_u : register(u1);
 static const uint kBins = 64, kTile = 128, kMaxTiles = 4096;
-static const uint kMeanBase = 3 * kBins * 3 * 2 * 4, kTileBase = kMeanBase + 3 * kBins * 3 * 4;
+// Byte offsets in the fit buffer.
+static const uint kCurveAcc = 0;                                  // 3 curves x 3 ch x 64 bins x (sum, count)
+static const uint kMeanBase = kCurveAcc + 3 * kBins * 3 * 2 * 4;   // 3 curves x 3 ch x 64 means
+static const uint kDesatAcc = kMeanBase + 3 * kBins * 3 * 4;       // 2 x 64 bins x (grey sum, count, k num, k den)
+static const uint kDesatBase = kDesatAcc + 2 * kBins * 4 * 4;      // 2 x 64 bins x (grey, k)
+static const uint kTileBase = kDesatBase + 2 * kBins * 2 * 4;      // 2 tile sets x tiles x 3 ch x (a, b)
 static const uint kHudCount = kTileBase + 2 * kMaxTiles * 3 * 2 * 4;
+static const float3 kLuma = float3(0.2126, 0.7152, 0.0722);
+static const float kHighlight = 0.5;  // grey level (display) from which highlights may wash out
 float bin_pos(float v) { return (log2(max(v, 1.0 / 4096.0)) + 12.0) * (float(kBins) / 20.0); }
+uint bin_of(float v) { return min(uint(max(bin_pos(v), 0.0)), kBins - 1); }
 float mean_of(uint slot, uint c, int b) { return asfloat(sc_fit_u.Load(kMeanBase + ((slot * 3 + c) * kBins + uint(b)) * 4)); }
-float curve(uint slot, uint c, float v) {
-    const float f = bin_pos(v) - 0.5, fl = floor(f);
-    const int i0 = clamp(int(fl), 0, int(kBins) - 1), i1 = clamp(int(fl) + 1, 0, int(kBins) - 1);
-    return lerp(mean_of(slot, c, i0), mean_of(slot, c, i1), saturate(f - fl));
-}
-float3 curve3(uint slot, float3 s) { return float3(curve(slot, 0, s.r), curve(slot, 1, s.g), curve(slot, 2, s.b)); }
 // The curve and its slope per doubling of the scene value.
 float curve_slope(uint slot, uint c, float v, out float slope) {
     const float f = bin_pos(v) - 0.5, fl = floor(f);
@@ -349,6 +356,21 @@ float curve_slope(uint slot, uint c, float v, out float slope) {
     slope = (m1 - m0) * (float(kBins) / 20.0);
     return lerp(m0, m1, saturate(f - fl));
 }
+float curve(uint slot, uint c, float v) { float s; return curve_slope(slot, c, v, s); }
+float3 curve3(uint slot, float3 s) { return float3(curve(slot, 0, s.r), curve(slot, 1, s.g), curve(slot, 2, s.b)); }
+float grey_of(uint d, int b) { return asfloat(sc_fit_u.Load(kDesatBase + ((d * kBins + uint(b)) * 2) * 4)); }
+float wash_of(uint d, int b) { return asfloat(sc_fit_u.Load(kDesatBase + ((d * kBins + uint(b)) * 2 + 1) * 4)); }
+// Curve, then washed towards the grey of the scene's brightness level.
+float3 washed(uint d, uint slot, float3 s) {
+    const float3 a = curve3(slot, s);
+    const float f = bin_pos(dot(s, kLuma)) - 0.5, fl = floor(f);
+    const int i0 = clamp(int(fl), 0, int(kBins) - 1), i1 = clamp(int(fl) + 1, 0, int(kBins) - 1);
+    const float t = saturate(f - fl);
+    const float grey = lerp(grey_of(d, i0), grey_of(d, i1), t), k = lerp(wash_of(d, i0), wash_of(d, i1), t);
+    return a + k * (grey - a);
+}
+// Predictor 1: curve 1 + wash-out 0; predictor 2: curve 2 + wash-out 1.
+float3 predictor(uint sel, float3 s) { return sel == 1 ? washed(0, 1, s) : washed(1, 2, s); }
 // Tile correction (a, b per channel), bilinear between tile centres.
 void correction(uint set, uint2 p, out float3 a, out float3 b) {
     const float2 t = (float2(p) + 0.5) / float(kTile) - 0.5;
@@ -368,46 +390,101 @@ void correction(uint set, uint2 p, out float3 a, out float3 b) {
 float miss(float3 frame, float3 pred) { const float3 d = abs(frame - pred); return max(d.r, max(d.g, d.b)); }
 bool counts(uint rule, uint2 p, float3 frame, float3 scene) {
     if (rule == 1) return miss(frame, curve3(0, scene)) < 0.1;
-    if (rule == 2) { float3 a, b; correction(0, p, a, b); return miss(frame, a * curve3(1, scene) + b) < 0.08; }
+    if (rule == 2) { float3 a, b; correction(0, p, a, b); return miss(frame, a * predictor(1, scene) + b) < 0.08; }
     return true;
 }
 [numthreads(64, 1, 1)] void cs_scene_clear(uint3 id : SV_DispatchThreadID) {
-    for (uint i = id.x; i < 3 * kBins * 3 * 2; i += 64) sc_fit_u.Store(i * 4, 0);
+    for (uint i = id.x; i < 3 * kBins * 3 * 2; i += 64) sc_fit_u.Store(kCurveAcc + i * 4, 0);
+    for (uint j = id.x; j < 2 * kBins * 4; j += 64) sc_fit_u.Store(kDesatAcc + j * 4, 0);
     if (id.x == 0) sc_fit_u.Store(kHudCount, 0);
 }
+bool sample_at(uint3 id, out uint2 p, out float3 frame, out float3 scene) {
+    p = id.xy * 4;
+    frame = 0; scene = 0;
+    if (any(p >= out_size)) return false;
+    frame = sc_frame_t.Load(int3(p, 0)).rgb;
+    scene = max(sc_scene_t.Load(int3(p, 0)).rgb, 0);
+    return true;
+}
+// Tone curve rect.y: mean frame value per scene-value bin, per channel.
 groupshared uint sc_bins[kBins * 3 * 2];
 [numthreads(8, 8, 1)] void cs_scene_accum(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     for (uint i = gi; i < kBins * 3 * 2; i += 64) sc_bins[i] = 0;
     GroupMemoryBarrierWithGroupSync();
-    const uint2 p = id.xy * 4;
-    if (all(p < out_size)) {
-        const float3 frame = sc_frame_t.Load(int3(p, 0)).rgb, scene = max(sc_scene_t.Load(int3(p, 0)).rgb, 0);
-        if (counts(rect.z, p, frame, scene))
-            [unroll] for (uint c = 0; c < 3; ++c) {
-                const uint b = min(uint(max(bin_pos(scene[c]), 0.0)), kBins - 1);
-                InterlockedAdd(sc_bins[(c * kBins + b) * 2], uint(saturate(frame[c]) * 1024.0 + 0.5));
-                InterlockedAdd(sc_bins[(c * kBins + b) * 2 + 1], 1);
-            }
-    }
+    uint2 p; float3 frame, scene;
+    if (sample_at(id, p, frame, scene) && counts(rect.z, p, frame, scene))
+        [unroll] for (uint c = 0; c < 3; ++c) {
+            const uint b = bin_of(scene[c]);
+            InterlockedAdd(sc_bins[(c * kBins + b) * 2], uint(saturate(frame[c]) * 1024.0 + 0.5));
+            InterlockedAdd(sc_bins[(c * kBins + b) * 2 + 1], 1);
+        }
     GroupMemoryBarrierWithGroupSync();
     for (uint j = gi; j < kBins * 3 * 2; j += 64)
-        if (sc_bins[j]) sc_fit_u.InterlockedAdd((rect.y * kBins * 3 * 2 + j) * 4, sc_bins[j]);
+        if (sc_bins[j]) sc_fit_u.InterlockedAdd(kCurveAcc + (rect.y * kBins * 3 * 2 + j) * 4, sc_bins[j]);
 }
-// Mean per bin; empty bins take the line between their nearest filled neighbours.
-[numthreads(64, 3, 1)] void cs_scene_finish(uint3 id : SV_DispatchThreadID) {
-    const uint b = id.x, c = id.y, acc = rect.y * kBins * 3 * 2;
+// Mean per bin; empty bins take the line between their nearest filled neighbours. `acc`: word index of
+// bin 0's (sum, count) pair; `stride`: words between bins.
+float filled_mean(uint acc, uint stride, uint b) {
     int lo = -1, hi = -1;
-    for (int k = int(b); k >= 0; --k) if (sc_fit_u.Load((acc + (c * kBins + uint(k)) * 2 + 1) * 4)) { lo = k; break; }
-    for (int m = int(b); m < int(kBins); ++m) if (sc_fit_u.Load((acc + (c * kBins + uint(m)) * 2 + 1) * 4)) { hi = m; break; }
-    float v = 0;
-    if (lo >= 0 || hi >= 0) {
-        const int l = lo >= 0 ? lo : hi, h = hi >= 0 ? hi : lo;
-        const uint el = (acc + (c * kBins + uint(l)) * 2) * 4, eh = (acc + (c * kBins + uint(h)) * 2) * 4;
-        const float vl = float(sc_fit_u.Load(el)) / 1024.0 / float(sc_fit_u.Load(el + 4));
-        const float vh = float(sc_fit_u.Load(eh)) / 1024.0 / float(sc_fit_u.Load(eh + 4));
-        v = h > l ? lerp(vl, vh, float(int(b) - l) / float(h - l)) : vl;
-    }
+    for (int k = int(b); k >= 0; --k) if (sc_fit_u.Load((acc + uint(k) * stride + 1) * 4)) { lo = k; break; }
+    for (int m = int(b); m < int(kBins); ++m) if (sc_fit_u.Load((acc + uint(m) * stride + 1) * 4)) { hi = m; break; }
+    if (lo < 0 && hi < 0) return 0;
+    const int l = lo >= 0 ? lo : hi, h = hi >= 0 ? hi : lo;
+    const uint el = (acc + uint(l) * stride) * 4, eh = (acc + uint(h) * stride) * 4;
+    const float vl = float(sc_fit_u.Load(el)) / 1024.0 / float(sc_fit_u.Load(el + 4));
+    const float vh = float(sc_fit_u.Load(eh)) / 1024.0 / float(sc_fit_u.Load(eh + 4));
+    return h > l ? lerp(vl, vh, float(int(b) - l) / float(h - l)) : vl;
+}
+[numthreads(64, 3, 1)] void cs_scene_finish(uint3 id : SV_DispatchThreadID) {
+    const uint b = id.x, c = id.y;
+    const float v = filled_mean(kCurveAcc / 4 + (rect.y * 3 + c) * kBins * 2, 2, b);
     sc_fit_u.Store(kMeanBase + ((rect.y * 3 + c) * kBins + b) * 4, asuint(v));
+}
+// Wash-out rect.y, step 1: the frame's grey (luminance) per scene-luminance bin.
+groupshared uint sc_grey[kBins * 2];
+[numthreads(8, 8, 1)] void cs_scene_grey(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+    for (uint i = gi; i < kBins * 2; i += 64) sc_grey[i] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    uint2 p; float3 frame, scene;
+    if (sample_at(id, p, frame, scene) && counts(rect.z, p, frame, scene)) {
+        const uint b = bin_of(dot(scene, kLuma));
+        InterlockedAdd(sc_grey[b * 2], uint(saturate(dot(frame, kLuma)) * 1024.0 + 0.5));
+        InterlockedAdd(sc_grey[b * 2 + 1], 1);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for (uint j = gi; j < kBins * 2; j += 64)
+        if (sc_grey[j]) sc_fit_u.InterlockedAdd(kDesatAcc + ((rect.y * kBins + j / 2) * 4 + (j & 1)) * 4, sc_grey[j]);
+}
+[numthreads(64, 1, 1)] void cs_scene_grey_finish(uint3 id : SV_DispatchThreadID) {
+    const uint b = id.x;
+    const float grey = filled_mean(kDesatAcc / 4 + rect.y * kBins * 4, 4, b);
+    sc_fit_u.Store(kDesatBase + ((rect.y * kBins + b) * 2) * 4, asuint(grey));
+}
+// Step 2: per bin, how far the curve's colour moves towards that grey (least squares over channels).
+groupshared int sc_num[kBins];
+groupshared uint sc_den[kBins];
+[numthreads(8, 8, 1)] void cs_scene_wash(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+    sc_num[gi] = 0; sc_den[gi] = 0;  // 64 threads, 64 bins
+    GroupMemoryBarrierWithGroupSync();
+    uint2 p; float3 frame, scene;
+    if (sample_at(id, p, frame, scene) && counts(rect.z, p, frame, scene)) {
+        const uint b = bin_of(dot(scene, kLuma));
+        const float3 a = curve3(rect.x, scene), towards = grey_of(rect.y, int(b)) - a;
+        InterlockedAdd(sc_num[b], int(round(dot(frame - a, towards) * 1024.0)));
+        InterlockedAdd(sc_den[b], uint(dot(towards, towards) * 1024.0 + 0.5));
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (sc_den[gi]) {
+        sc_fit_u.InterlockedAdd(kDesatAcc + ((rect.y * kBins + gi) * 4 + 2) * 4, asuint(sc_num[gi]));
+        sc_fit_u.InterlockedAdd(kDesatAcc + ((rect.y * kBins + gi) * 4 + 3) * 4, sc_den[gi]);
+    }
+}
+[numthreads(64, 1, 1)] void cs_scene_wash_finish(uint3 id : SV_DispatchThreadID) {
+    const uint b = id.x, acc = kDesatAcc + (rect.y * kBins + b) * 16;
+    const float num = float(asint(sc_fit_u.Load(acc + 8))), den = float(sc_fit_u.Load(acc + 12));
+    float k = den > 0 ? saturate(num / den) : 0.0;
+    if (grey_of(rect.y, int(b)) < kHighlight) k = 0;
+    sc_fit_u.Store(kDesatBase + ((rect.y * kBins + b) * 2 + 1) * 4, asuint(k));
 }
 groupshared float sc_red[256];
 groupshared float sc_tot[13];
@@ -420,7 +497,7 @@ groupshared float sc_tot[13];
             if (any(p >= out_size)) continue;
             const float3 frame = sc_frame_t.Load(int3(p, 0)).rgb, scene = max(sc_scene_t.Load(int3(p, 0)).rgb, 0);
             if (!counts(rect.z, p, frame, scene)) continue;
-            const float3 pr = curve3(rect.x, scene);
+            const float3 pr = predictor(rect.x, scene);
             [unroll] for (uint c = 0; c < 3; ++c) {
                 v[c * 4] += pr[c]; v[c * 4 + 1] += frame[c]; v[c * 4 + 2] += pr[c] * pr[c]; v[c * 4 + 3] += pr[c] * frame[c];
             }
@@ -451,9 +528,9 @@ groupshared float sc_tot[13];
         sc_fit_u.Store(base + c * 8 + 4, asuint(b));
     }
 }
-// Final prediction (curve 2, tile set 1) at full resolution. The tolerance grows with the prediction's
-// own gradient (sharpening, sub-pixel differences between the two images): the curve's slope times the
-// scene's gradient, per channel.
+// Final prediction (predictor 2, tile set 1) at full resolution. The tolerance grows with the
+// prediction's own gradient (sharpening, sub-pixel differences between the two images): the tone
+// curve's slope times the scene's gradient, per channel.
 groupshared uint sc_hud_pixels;
 [numthreads(8, 8, 1)] void cs_scene_hud(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if (gi == 0) sc_hud_pixels = 0;
@@ -464,7 +541,8 @@ groupshared uint sc_hud_pixels;
         const int2 p = int2(id.xy), last = int2(out_size) - 1;
         const float3 scene = max(sc_scene_t.Load(int3(p, 0)).rgb, 0);
         float3 slope;
-        const float3 pred = a * float3(curve_slope(2, 0, scene.r, slope.r), curve_slope(2, 1, scene.g, slope.g), curve_slope(2, 2, scene.b, slope.b)) + b;
+        curve_slope(2, 0, scene.r, slope.r); curve_slope(2, 1, scene.g, slope.g); curve_slope(2, 2, scene.b, slope.b);
+        const float3 pred = a * predictor(2, scene) + b;
         float3 ls[4];
         const int2 offs[4] = {int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1)};
         [unroll] for (uint i = 0; i < 4; ++i)
@@ -503,11 +581,13 @@ constexpr UINT kXGatherSrvHudless = 82, kXGatherSrvBackbuffer = 88, kXGatherUav 
 constexpr UINT kXHudSrv = 96, kXHudUav = 102, kXMaskSrv = 104, kXMaskUav = 110, kXSampleSrv = 112, kXSampleUav = 118;
 constexpr UINT kXTintSrv = 120, kXTintUav = 126, kXSceneSrv = 128, kXSceneUav = 134;
 constexpr UINT kHeapSize = 136;
-// Scene HUD fit buffer (see cs_scene_*): 3 curve accumulators, 3 curves, 2 tile sets, HUD pixel count.
+// Scene HUD fit buffer (see cs_scene_*): curve accumulators and curves, wash-out accumulators and
+// values, 2 tile sets, HUD pixel count (same layout as the shader's constants).
 constexpr UINT kSceneBins = 64, kSceneTile = 128, kSceneMaxTiles = 4096;
-constexpr UINT kSceneHudCount = 3 * kSceneBins * 3 * 2 * 4 + 3 * kSceneBins * 3 * 4 + 2 * kSceneMaxTiles * 3 * 2 * 4;
+constexpr UINT kSceneHudCount = 3 * kSceneBins * 3 * 2 * 4 + 3 * kSceneBins * 3 * 4 + 2 * kSceneBins * 4 * 4 + 2 * kSceneBins * 2 * 4 +
+                                2 * kSceneMaxTiles * 3 * 2 * 4;
 constexpr UINT kSceneFitBytes = kSceneHudCount + 16;
-constexpr UINT kSceneStamps = 11;  // before the first pass and after each of the 10
+constexpr UINT kSceneStamps = 19;  // before the first pass and after each of the 18
 
 DXGI_FORMAT srv_format(DXGI_FORMAT f) {
     switch (f) {
@@ -709,7 +789,8 @@ bool Renderer::create_pipelines(std::string& error) {
         {"cs_hud", &cs_hud_}, {"cs_mask", &cs_mask_}, {"cs_clear_score", &cs_clear_score_},
         {"cs_hud_count", &cs_hud_count_}, {"cs_clear_counts", &cs_clear_counts_}, {"cs_sample", &cs_sample_}, {"cs_tint", &cs_tint_},
         {"cs_scene_clear", &cs_scene_clear_}, {"cs_scene_accum", &cs_scene_accum_}, {"cs_scene_finish", &cs_scene_finish_},
-        {"cs_scene_tiles", &cs_scene_tiles_}, {"cs_scene_hud", &cs_scene_hud_}};
+        {"cs_scene_tiles", &cs_scene_tiles_}, {"cs_scene_hud", &cs_scene_hud_}, {"cs_scene_grey", &cs_scene_grey_},
+        {"cs_scene_grey_finish", &cs_scene_grey_finish_}, {"cs_scene_wash", &cs_scene_wash_}, {"cs_scene_wash_finish", &cs_scene_wash_finish_}};
     for (auto& x : xs) {
         auto code = compile(x.entry, "cs_5_0", error, kShadersX);
         if (!code) return false;
@@ -985,10 +1066,18 @@ void Renderer::detect_hud_from_scene(const XConstants& base) {
     run(cs_scene_finish_.Get(), 0, 0, 0, 1, 1);
     run(cs_scene_accum_.Get(), 0, 1, 1, hx, hy);   // curve 1 without what curve 0 misses
     run(cs_scene_finish_.Get(), 0, 1, 0, 1, 1);
-    run(cs_scene_tiles_.Get(), 1, 0, 0, c.grid[0], c.grid[1]);  // tile set 0: every pixel (a tint over the scene)
-    run(cs_scene_accum_.Get(), 0, 2, 2, hx, hy);   // curve 2 without what curve 1 + tiles 0 miss
-    run(cs_scene_finish_.Get(), 0, 2, 0, 1, 1);
-    run(cs_scene_tiles_.Get(), 2, 1, 2, c.grid[0], c.grid[1]);  // tile set 1: without those pixels either
+    run(cs_scene_grey_.Get(), 0, 0, 0, hx, hy);    // wash-out 0 over curve 1, from every pixel (what the
+    run(cs_scene_grey_finish_.Get(), 0, 0, 0, 1, 1);  // curve misses systematically is what it must learn)
+    run(cs_scene_wash_.Get(), 1, 0, 0, hx, hy);
+    run(cs_scene_wash_finish_.Get(), 0, 0, 0, 1, 1);
+    run(cs_scene_tiles_.Get(), 1, 0, 0, c.grid[0], c.grid[1]);  // tile set 0 over predictor 1, every pixel
+    run(cs_scene_accum_.Get(), 0, 2, 2, hx, hy);   // then all again without what that still misses:
+    run(cs_scene_finish_.Get(), 0, 2, 0, 1, 1);    // curve 2,
+    run(cs_scene_grey_.Get(), 0, 1, 2, hx, hy);    // wash-out 1 over curve 2,
+    run(cs_scene_grey_finish_.Get(), 0, 1, 0, 1, 1);
+    run(cs_scene_wash_.Get(), 2, 1, 2, hx, hy);
+    run(cs_scene_wash_finish_.Get(), 0, 1, 0, 1, 1);
+    run(cs_scene_tiles_.Get(), 2, 1, 2, c.grid[0], c.grid[1]);  // tile set 1 over predictor 2
     run(cs_scene_hud_.Get(), 2, 1, 0, (ow + 7) / 8, (oh + 7) / 8);
     // The HUD pixel count goes to the log.
     auto to_copy = transition_barrier(scene_fit_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);

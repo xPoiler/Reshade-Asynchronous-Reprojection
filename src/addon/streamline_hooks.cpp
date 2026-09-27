@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 
 // Streamline 2.x ABI notes (sl.h / sl_consts.h), all structs derive from BaseStructure
 // { BaseStructure* next; StructType type (16 bytes); size_t version; } = 32 bytes:
@@ -25,16 +26,22 @@ using SetTagFn = int (*)(const void*, const void*, std::uint32_t, void*);
 using SetTagForFrameFn = int (*)(const void*, const void*, const void*, std::uint32_t, void*);
 using GetFeatureFunctionFn = int (*)(std::uint32_t, const char*, void*&);
 using MarkerFn = int (*)(std::uint32_t, const void*);
+using EvaluateFeatureFn = int (*)(std::uint32_t, const void*, const void**, std::uint32_t, void*);
 
 Producer* g_producer = nullptr;
-InlineHook g_constants_hook, g_tag_hook, g_tag_frame_hook, g_marker_hook;
+InlineHook g_constants_hook, g_tag_hook, g_tag_frame_hook, g_marker_hook, g_evaluate_hook;
+// The upscaler's output tagged for a frame: DLSS writes it during slEvaluateFeature, so it is copied
+// right after that call, not when tagged.
+struct PendingOutput { std::uint64_t frame = 0; ID3D12Resource* resource = nullptr; std::uint32_t state = 0, ext[4] = {}; };
+std::mutex g_output_mutex;
+PendingOutput g_output;
 std::atomic<std::uint64_t> g_current_frame{0};
 std::atomic<int> g_constants_base{-1}, g_tag_base{-1};
 std::atomic<std::uint32_t> g_pcl_attempts{0};
 
 enum Marker : std::uint32_t { kSimulationStart = 0, kSimulationEnd = 1, kRenderSubmitStart = 2, kRenderSubmitEnd = 3,
                               kPresentStart = 4, kPresentEnd = 5 };
-enum BufferType : std::uint32_t { kSlDepth = 0, kSlMotionVectors = 1, kSlHudless = 2, kSlUiColorAlpha = 23 };
+enum BufferType : std::uint32_t { kSlDepth = 0, kSlMotionVectors = 1, kSlHudless = 2, kSlScalingOutputColor = 4, kSlUiColorAlpha = 23 };
 
 HookStats* stats() { return g_producer && g_producer->shared() ? &g_producer->shared()->hooks : nullptr; }
 
@@ -222,6 +229,15 @@ void handle_tags(std::uint64_t frame, const void* tags_ptr, std::uint32_t count,
         // E33 (UE StreamlineCore): UI colour + alpha from the UI hint extraction pass, full-res BGRA8.
         else if (type == kSlUiColorAlpha && is_rgba8(desc.Format) && g_producer->shared() &&
                  desc.Width == g_producer->shared()->backbuffer_width) kind = kUi;
+        // The upscaler's output (the scene before post-processing and HUD): only when the HUD is to be found
+        // from it (opt-in) and the game has no HUD layers; kept until DLSS has written it.
+        if (type == kSlScalingOutputColor && g_producer->shared() && g_producer->shared()->settings.hud_from_scene &&
+            desc.Width == g_producer->shared()->backbuffer_width &&
+            s && s->tag_count[kSlHudless] == 0 && s->tag_count[kSlUiColorAlpha] == 0) {
+            std::lock_guard lock(g_output_mutex);
+            g_output = {frame, d3d, state, {ext[0], ext[1], ext[2], ext[3]}};
+            continue;
+        }
         if (kind == kTexCount) continue;
         // D3D12 state value: Streamline passes the native D3D12_RESOURCE_STATES of the tagged resource.
         g_producer->on_tag(frame, kind, d3d, static_cast<D3D12_RESOURCE_STATES>(state), ext[1], ext[0], ext[2], ext[3], list);
@@ -239,6 +255,24 @@ int hk_set_tag_for_frame(const void* frame, const void* viewport, const void* ta
     std::uint32_t id = 0;
     if (read_frame_token(frame, &id)) handle_tags(id, tags, count, cmd);
     return reinterpret_cast<SetTagForFrameFn>(g_tag_frame_hook.original())(frame, viewport, tags, count, cmd);
+}
+
+int hk_evaluate(std::uint32_t feature, const void* frame, const void** inputs, std::uint32_t count, void* cmd) {
+    if (auto* s = stats()) ++s->export_calls[3];
+    const int result = reinterpret_cast<EvaluateFeatureFn>(g_evaluate_hook.original())(feature, frame, inputs, count, cmd);
+    std::uint32_t id = 0;
+    if (g_producer && cmd && read_frame_token(frame, &id)) {
+        PendingOutput out;
+        {
+            std::lock_guard lock(g_output_mutex);
+            if (g_output.resource && g_output.frame == id) { out = g_output; g_output = {}; }
+        }
+        // Recorded after the evaluation on the same command list: the copy sees what DLSS wrote.
+        if (out.resource)
+            g_producer->on_tag(id, kScene, out.resource, static_cast<D3D12_RESOURCE_STATES>(out.state), out.ext[1], out.ext[0], out.ext[2],
+                               out.ext[3], static_cast<ID3D12GraphicsCommandList*>(cmd));
+    }
+    return result;
 }
 
 int hk_marker(std::uint32_t marker, const void* frame) {
@@ -307,10 +341,11 @@ void install_streamline_hooks(Producer* producer) {
         {g_constants_hook, "slSetConstants", reinterpret_cast<void*>(&hk_set_constants), 1},
         {g_tag_hook, "slSetTag", reinterpret_cast<void*>(&hk_set_tag), 2},
         {g_tag_frame_hook, "slSetTagForFrame", reinterpret_cast<void*>(&hk_set_tag_for_frame), 4},
+        {g_evaluate_hook, "slEvaluateFeature", reinterpret_cast<void*>(&hk_evaluate), 16},
     };
     static const auto generic = generic_table(std::make_integer_sequence<int, 12>{});
     for (int i = 0; i < kCountedExportCount; ++i) {
-        if (g_generic_hooks[i].installed()) continue;
+        if (g_generic_hooks[i].installed() || i == 3) continue;  // slEvaluateFeature has its own detour (counts too)
         if (void* target = reinterpret_cast<void*>(GetProcAddress(sl, kCountedExports[i])))
             g_generic_hooks[i].install(target, generic[i]);
     }

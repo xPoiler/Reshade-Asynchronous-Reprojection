@@ -30,7 +30,7 @@ struct HudStats {
     double share_sum = 0;  // HUD-like share of the telling pixels, over learned frames
     int scene_frames = 0;  // frames whose HUD came from the upscaler's output instead
     double scene_share_sum = 0;  // share of the screen found to be HUD, summed over those frames
-    double scene_pass_ms[10] = {};  // GPU time per pass, summed: clear, accum, finish, accum, finish, tiles, accum, finish, tiles, final
+    double scene_pass_ms[18] = {};  // GPU time per pass, summed (the last one is the full-resolution final pass)
 };
 
 // Least-squares sums relating the game's motion vectors g to the camera-only motion c (uv per frame,
@@ -163,7 +163,7 @@ private:
     const char* priority_name_ = "normal";
 
     ComPtr<ID3D12RootSignature> root_, root_x_;
-    ComPtr<ID3D12PipelineState> cs_analyze_, cs_reduce_, cs_clear_, cs_splat_, cs_gather_, cs_hud_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_;
+    ComPtr<ID3D12PipelineState> cs_analyze_, cs_reduce_, cs_clear_, cs_splat_, cs_gather_, cs_hud_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_;
     ComPtr<ID3D12Resource> samples_, samples_readback_;
     UINT samples_count_ = 0;
     float last_flush_ms_ = 0;
