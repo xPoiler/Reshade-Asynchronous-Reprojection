@@ -70,15 +70,16 @@ if ($GameDir) {
     Write-Host "Scanning Steam libraries..."
     $choices = @()
     foreach ($dir in @(Get-SteamGameDirs | Sort-Object FullName -Unique)) {
-        $found = @(Get-ChildItem -Recurse -Depth 8 -File -ErrorAction SilentlyContinue $dir.FullName -Include ($reshadeNames + "FrameWarp.addon64", "sl.interposer.dll"))
+        $found = @(Get-ChildItem -Recurse -Depth 8 -File -ErrorAction SilentlyContinue $dir.FullName -Include ($reshadeNames + "FrameWarp.addon64", "sl.interposer.dll", "nvngx_dlss.dll"))
         $hasReShade = [bool]($found | Where-Object { $reshadeNames -contains $_.Name } | Where-Object { Test-ReShade $_.FullName })
         # The installed add-on (not a staged copy): the one closest to the game folder.
         $installedAddon = $found | Where-Object { $_.Name -eq "FrameWarp.addon64" } | Sort-Object { $_.FullName.Split('\').Count } | Select-Object -First 1
         $hasFrameWarp = [bool]$installedAddon
         $installedVersion = if ($installedAddon) { Get-FrameWarpVersion $installedAddon.FullName } else { $null }
-        $hasStreamline = [bool]($found | Where-Object { $_.Name -eq "sl.interposer.dll" })
+        # DLSS through Streamline, or DLSS called directly (nvngx_dlss.dll): FrameWarp works with either.
+        $hasDlss = [bool]($found | Where-Object { $_.Name -eq "sl.interposer.dll" -or $_.Name -eq "nvngx_dlss.dll" })
         if (($Uninstall -and $hasFrameWarp) -or (-not $Uninstall -and $hasReShade)) {
-            $choices += [pscustomobject]@{ Name = $dir.Name; Path = $dir.FullName; FrameWarp = $hasFrameWarp; Version = $installedVersion; Streamline = $hasStreamline }
+            $choices += [pscustomobject]@{ Name = $dir.Name; Path = $dir.FullName; FrameWarp = $hasFrameWarp; Version = $installedVersion; Dlss = $hasDlss }
         }
     }
     Write-Host ""
@@ -91,7 +92,7 @@ if ($GameDir) {
             $notes = @()
             if (-not $Uninstall) {
                 if ($c.FrameWarp) { $notes += "FrameWarp $($c.Version) installed" }
-                if (-not $c.Streamline) { $notes += "no Streamline: will not work" }
+                if (-not $c.Dlss) { $notes += "no DLSS found: will not work" }
             }
             if ($Uninstall -and $c.Version) { $notes += "FrameWarp $($c.Version)" }
             Write-Host ("  {0,2}) {1}{2}" -f ($i + 1), $c.Name, $(if ($notes) { "   [" + ($notes -join ", ") + "]" } else { "" }))
@@ -231,7 +232,16 @@ if (-not (Test-Path (Join-Path $env:SystemRoot "System32\msvcp140.dll"))) {
     Write-Warning "Microsoft Visual C++ 2015-2022 Redistributable (x64) not found: the presenter needs it (https://aka.ms/vs/17/release/vc_redist.x64.exe)."
 }
 $previous = if (Test-Path $record) { Get-Content -Raw $record | ConvertFrom-Json } else { $null }
-New-Item -ItemType Directory -Force $target | Out-Null
+# Some game folders (for example ones installed by the Rockstar Games Launcher) only let administrators
+# write: say so plainly instead of failing halfway.
+try {
+    New-Item -ItemType Directory -Force $target -ErrorAction Stop | Out-Null
+    $probe = Join-Path $target ".write-test"
+    Set-Content -Path $probe -Value "" -ErrorAction Stop
+    Remove-Item -Force $probe
+} catch [System.UnauthorizedAccessException] {
+    throw "Windows does not allow writing to $binDir without administrator rights. Right-click install.bat and choose 'Run as administrator'."
+}
 Copy-Item -Force (Join-Path $build "FrameWarp.addon64") $binDir
 # Some games copy their DLLs into a staging folder at launch and load them from there (RE9: _storage_);
 # replace those copies too, so an update never depends on the game refreshing them.
@@ -249,10 +259,13 @@ if (Test-Path $old) {
 }
 Write-Host "Installed to $binDir (ReShade: $($reshade[0].Name))"
 
-# Streamline supplies the camera and depth/motion tags; without it the presenter has nothing to warp.
+# FrameWarp takes its data from DLSS: through Streamline (camera, depth, motion and HUD tags), or from
+# DLSS called directly (depth and motion vectors; the presenter works out the camera).
 $streamline = Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue $GameDir -Filter "sl.interposer.dll" | Select-Object -First 1
+$dlss = Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue $GameDir -Filter "nvngx_dlss.dll" | Select-Object -First 1
 if ($streamline) { Write-Host "Streamline: $($streamline.FullName)" }
-else { Write-Warning "No Streamline (sl.interposer.dll) found: FrameWarp needs a game that uses NVIDIA Streamline (DLSS/Reflex via SL)." }
+elseif ($dlss) { Write-Host "DLSS without Streamline: $($dlss.FullName) (the camera is worked out from DLSS's motion vectors)" }
+else { Write-Warning "No DLSS found (sl.interposer.dll or nvngx_dlss.dll): FrameWarp needs a game with NVIDIA DLSS." }
 
 $ini = $null
 if (-not $NoCvar) {
@@ -263,7 +276,7 @@ if (-not $NoCvar) {
     } elseif ((Split-Path -Leaf $binDir) -match '^Win64$|^WinGDK$') {
         Write-Warning "Looks like Unreal Engine but no user config folder was found (run the game once, or pass -EngineIni)."
     }
-    if ($ini -or (Split-Path -Leaf $binDir) -match '^Win64$|^WinGDK$') {
+    if ($streamline -and ($ini -or (Split-Path -Leaf $binDir) -match '^Win64$|^WinGDK$')) {
         Write-Host "Unreal Engine + Streamline: add launch options  -slforcetagging -slviewextension"
     }
 }

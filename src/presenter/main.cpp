@@ -41,6 +41,7 @@ struct App {
     std::atomic<std::uint32_t> client_w{0}, client_h{0};
     PoseModel model;
     std::filesystem::path base_dir, profile_path;
+    std::filesystem::path data_dir;  // logs, calibration, captures: base_dir, or %LOCALAPPDATA%\FrameWarp\<game folder> when that is read-only
     FILE* log = nullptr;
     // Analysis logs (all times are raw QPC ticks, same clock in both processes).
     FILE* csv_events = nullptr;   // game-side timeline
@@ -187,7 +188,8 @@ void load_profile() {
 void save_profile() {
     const auto &x = g_app.model.params(0), &y = g_app.model.params(1);
     if (!x.fitted && !y.fitted) return;
-    std::filesystem::create_directories(g_app.profile_path.parent_path());
+    std::error_code ec;
+    std::filesystem::create_directories(g_app.profile_path.parent_path(), ec);
     std::ofstream out(g_app.profile_path);
     out << 2 << ' ' << x.gain << ' ' << x.tau << ' ' << x.delay << ' ' << y.gain << ' ' << y.tau << ' ' << y.delay << '\n';
 }
@@ -290,7 +292,7 @@ void render_thread() {
     vram.init(sh.adapter);
     vram.poll(now_seconds(), "start");
     Latewarp12 latewarp;
-    if (!latewarp.initialize(renderer.device(), g_app.base_dir, g_app.base_dir / L"logs"))
+    if (!latewarp.initialize(renderer.device(), g_app.base_dir, g_app.data_dir / L"logs"))
         logf("latewarp unavailable: %s", latewarp.status().c_str());
     else
         logf("latewarp ready");
@@ -658,7 +660,7 @@ void render_thread() {
         const bool dump_down = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000) && (GetAsyncKeyState('D') & 0x8000);
         if (dump_down && !g_app.dump_was_down && source.valid) {
             static int captures = 0;
-            const auto dir = g_app.base_dir / L"captures";
+            const auto dir = g_app.data_dir / L"captures";
             std::error_code ec;
             std::filesystem::create_directories(dir, ec);
             const int n = ++captures;
@@ -847,19 +849,34 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     wchar_t exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     g_app.base_dir = std::filesystem::path(exe).parent_path();
-    std::filesystem::create_directories(g_app.base_dir / L"logs");
+    // Logs, calibration and captures go next to the presenter; some game folders only let administrators
+    // write (the game then runs as the user), so fall back to the user's local app data.
+    g_app.data_dir = g_app.base_dir;
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(g_app.base_dir / L"logs", ec);
+        const auto probe = g_app.base_dir / L"logs" / L".write-test";
+        FILE* written = _wfsopen(probe.c_str(), L"w", _SH_DENYNO);
+        if (written) { std::fclose(written); std::filesystem::remove(probe, ec); }
+        else {
+            wchar_t local[MAX_PATH]{};
+            if (GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH))
+                g_app.data_dir = std::filesystem::path(local) / L"FrameWarp" / g_app.base_dir.parent_path().filename();
+            std::filesystem::create_directories(g_app.data_dir / L"logs", ec);
+        }
+    }
     // Keep the previous run's logs: after a crash the user restarts the presenter, and that run is the one we need.
     {
         std::error_code ec;
-        const auto previous = g_app.base_dir / L"logs" / L"previous";
+        const auto previous = g_app.data_dir / L"logs" / L"previous";
         std::filesystem::remove_all(previous, ec);
         std::filesystem::create_directories(previous, ec);
-        for (const auto& entry : std::filesystem::directory_iterator(g_app.base_dir / L"logs", ec))
+        for (const auto& entry : std::filesystem::directory_iterator(g_app.data_dir / L"logs", ec))
             if (entry.is_regular_file(ec)) std::filesystem::rename(entry.path(), previous / entry.path().filename(), ec);
     }
-    g_app.log = _wfsopen((g_app.base_dir / L"logs" / L"presenter.log").c_str(), L"w", _SH_DENYNO);
+    g_app.log = _wfsopen((g_app.data_dir / L"logs" / L"presenter.log").c_str(), L"w", _SH_DENYNO);
     auto open_csv = [](const wchar_t* name, const char* header) {
-        FILE* f = _wfsopen((g_app.base_dir / L"logs" / name).c_str(), L"w", _SH_DENYNO);
+        FILE* f = _wfsopen((g_app.data_dir / L"logs" / name).c_str(), L"w", _SH_DENYNO);
         if (f) { std::setvbuf(f, nullptr, _IOFBF, 1 << 16); std::fprintf(f, "%s\n", header); }
         return f;
     };
@@ -874,6 +891,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     {
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
         logf("FrameWarp presenter " FW_VERSION ", qpc frequency %lld", fq.QuadPart);
+        if (g_app.data_dir != g_app.base_dir) logf("the FrameWarp folder is read-only: logs and calibration are kept in %ls", g_app.data_dir.c_str());
     }
     if (!g_app.pid) { logf("usage: FrameWarpPresenter --pid <game pid>"); return 1; }
 
@@ -885,9 +903,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     g_app.game_process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, g_app.pid);
     wchar_t game_exe[MAX_PATH]{}; DWORD len = MAX_PATH;
     if (g_app.game_process && QueryFullProcessImageNameW(g_app.game_process, 0, game_exe, &len))
-        g_app.profile_path = g_app.base_dir / L"profiles" / (std::filesystem::path(game_exe).stem().wstring() + L".txt");
+        g_app.profile_path = g_app.data_dir / L"profiles" / (std::filesystem::path(game_exe).stem().wstring() + L".txt");
     else
-        g_app.profile_path = g_app.base_dir / L"profiles" / L"default.txt";
+        g_app.profile_path = g_app.data_dir / L"profiles" / L"default.txt";
     if (!open_shared(g_app.pid)) { logf("shared memory from the game add-on not found"); return 1; }
     g_app.shared->presenter.pid = static_cast<LONG>(GetCurrentProcessId());
     g_app.game = reinterpret_cast<HWND>(g_app.shared->game_hwnd);

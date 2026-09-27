@@ -310,7 +310,30 @@ __declspec(dllexport) const char* NAME = "FrameWarp";
 __declspec(dllexport) const char* DESCRIPTION = "Asynchronous camera reprojection at display refresh rate with NVIDIA Latewarp, fed by Streamline data.";
 
 __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE reshade_module) noexcept {
-    if (!reshade::register_addon(addon_module, reshade_module)) return false;
+    if (!reshade::register_addon(addon_module, reshade_module)) {
+        // ReShade does not always log why it refused: note what we can see in
+        // %LOCALAPPDATA%\FrameWarp\addon-init.log so a failure to load can be diagnosed.
+        wchar_t local[MAX_PATH]{};
+        if (GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH)) {
+            const std::wstring dir = std::wstring(local) + L"\\FrameWarp";
+            CreateDirectoryW(dir.c_str(), nullptr);
+            FILE* f = nullptr;
+            if (_wfopen_s(&f, (dir + L"\\addon-init.log").c_str(), L"a") == 0 && f) {
+                wchar_t exe[MAX_PATH]{}, rs[MAX_PATH]{};
+                GetModuleFileNameW(nullptr, exe, MAX_PATH);
+                if (reshade_module) GetModuleFileNameW(reshade_module, rs, MAX_PATH);
+                const auto reg = reshade_module ? GetProcAddress(reshade_module, "ReShadeRegisterAddon") : nullptr;
+                using ImGuiTableFn = const void* (*)(std::uint32_t);
+                const auto imgui = reshade_module ? reinterpret_cast<ImGuiTableFn>(GetProcAddress(reshade_module, "ReShadeGetImGuiFunctionTable")) : nullptr;
+                std::fprintf(f, "FrameWarp " FW_VERSION " could not register with ReShade in %ls\n", exe);
+                std::fprintf(f, "  ReShade module %p (%ls): ReShadeRegisterAddon %p, ImGui table for version %d: %p\n",
+                             static_cast<void*>(reshade_module), rs, reinterpret_cast<void*>(reg), IMGUI_VERSION_NUM,
+                             imgui ? imgui(IMGUI_VERSION_NUM) : nullptr);
+                std::fclose(f);
+            }
+        }
+        return false;
+    }
     g_module = addon_module;
     // Inline hooks jump into this module; keep it loaded for the life of the process even when
     // ReShade unloads add-ons between device recreations.

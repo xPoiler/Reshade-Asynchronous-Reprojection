@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+* Game folders that only administrators may write to (some launchers install games that way): the
+  installer says to run it as administrator, and FrameWarp keeps its logs and calibration in
+  `%LOCALAPPDATA%\FrameWarp\<game folder>` instead.
+* Installer: DLSS games without Streamline are recognised (no more "Streamline not found" warning).
+* If ReShade refuses to load the add-on, the reason FrameWarp can see is written to
+  `%LOCALAPPDATA%\FrameWarpddon-init.log`.
+
 ## 1.3.0
 
 * **Returnal support**, and games that call DLSS directly without NVIDIA Streamline: FrameWarp reads
