@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 33;
+constexpr std::uint32_t kVersion = 35;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -84,6 +84,7 @@ struct Settings {
     std::uint32_t hud_from_scene;  // opt-in: find the HUD from the upscaler's output (saved per game in ReShade.ini)
     std::uint32_t keep_attached;   // keep what moves with the camera (third-person character, first-person weapon) unwarped, every game
     std::uint32_t warp_engine;     // 0: NVIDIA Latewarp, 1: own engine (default; also used when Latewarp is missing)
+    std::uint32_t record_diagnostics;  // opt-in: detailed CSV recordings in logs\ (saved per game in ReShade.ini)
 };
 
 // Presenter status, displayed by the add-on UI.
@@ -102,6 +103,7 @@ struct PresenterStatus {
     float mv_scale_x, mv_scale_y;  // fitted game motion vector -> uv scale (0: not fitted)
     float mv_fit_quality;          // R^2 of the fit on the latest frames
     float moving_fraction;         // share of pixels flagged as moving objects
+    std::uint32_t latewarp;        // NVIDIA Latewarp: 0 not known yet, 1 not available (no DLL, or not an NVIDIA GPU), 2 ready
     char message[256];
 };
 

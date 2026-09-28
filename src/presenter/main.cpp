@@ -55,6 +55,33 @@ struct App {
 };
 App g_app;
 
+// Detailed CSV recordings (opt-in): opened the first time they are switched on, written only while on,
+// closed at exit (the window thread writes mouse input too).
+std::atomic<bool> g_recording{false};
+FILE* rec(FILE* f) { return g_recording.load(std::memory_order_acquire) ? f : nullptr; }
+void open_recordings() {
+    static bool opened = false;
+    if (!opened) {
+        opened = true;
+        auto open_csv = [](const wchar_t* name, const char* header) {
+            FILE* f = _wfsopen((g_app.data_dir / L"logs" / name).c_str(), L"w", _SH_DENYNO);
+            if (f) { std::setvbuf(f, nullptr, _IOFBF, 1 << 16); std::fprintf(f, "%s\n", header); }
+            return f;
+        };
+        g_app.csv_events = open_csv(L"events.csv", "qpc,kind,tid,frame,extra");
+        g_app.csv_mouse = open_csv(L"mouse.csv", "qpc,dx,dy");
+        g_app.csv_motion = open_csv(L"motion.csv", "qpc,frame,samples,moving_fraction,agree_x,agree_y,render_w,render_h");
+        g_app.csv_sources = open_csv(L"sources.csv",
+            "frame,qpc_sim,qpc_constants,qpc_present,qpc_ingest,px,py,pz,fx,fy,fz,ux,uy,uz,rx,ry,rz,fov,aspect,reset,mouse_gate,has_depth,has_hudless,"
+            "p00,p01,p02,p03,p10,p11,p12,p13,p20,p21,p22,p23,p30,p31,p32,p33,"
+            "c00,c01,c02,c03,c10,c11,c12,c13,c20,c21,c22,c23,c30,c31,c32,c33");
+        g_app.csv_outputs = open_csv(L"outputs.csv",
+            "qpc,source_frame,warped,yaw,pitch,horizon_ms,gpu_ms,mark,t_submit,t_gpu_start,t_gpu_end,last_present,present_count,present_refresh,"
+            "sync_refresh,sync_qpc,stats_hr,t_wake,cam_x,cam_y,cam_z,cam_fx,cam_fy,cam_fz");
+    }
+    g_recording.store(true, std::memory_order_release);
+}
+
 void logf(const char* format, ...) {
     if (!g_app.log) return;
     va_list args; va_start(args, format);
@@ -465,7 +492,7 @@ void render_thread() {
                 source_frame = m.frame_id;
                 g_app.model.add_source(m.frame_id, source_time, seconds(qpc_now()), source_basis, cam.reset != 0, now_seconds(),
                                        cam.position_epoch);
-                if (g_app.csv_sources) {
+                if (rec(g_app.csv_sources)) {
                     const auto& c = cam;
                     std::fprintf(g_app.csv_sources,
                                  "%llu,%lld,%lld,%lld,%lld,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.5f,%.5f,%u,%d,%d,%d",
@@ -791,7 +818,7 @@ void render_thread() {
             logf("capture %d saved", n);
         }
         g_app.dump_was_down = dump_down;
-        if (g_app.csv_outputs) {
+        if (rec(g_app.csv_outputs)) {
             const auto tm = renderer.last_timing();
             const auto pstats = renderer.present_stats();
             // (the displayed camera too: position and forward, in the game's world)
@@ -803,7 +830,11 @@ void render_thread() {
                          dc.pos.x, dc.pos.y, dc.pos.z, dc.fwd.x, dc.fwd.y, dc.fwd.z);
         }
         // Dump the game-side timeline.
-        if (g_app.csv_events) {
+        if ((settings.record_diagnostics != 0) != g_recording.load()) {
+            if (settings.record_diagnostics) { open_recordings(); logf("detailed diagnostics: recording to the logs folder"); }
+            else { g_recording = false; logf("detailed diagnostics: off"); }
+        }
+        if (rec(g_app.csv_events)) {
             const std::int64_t count = sh.timeline_count;
             if (count - g_app.events_read > kTimeline) g_app.events_read = count - kTimeline;
             for (; g_app.events_read < count; ++g_app.events_read) {
@@ -819,7 +850,7 @@ void render_thread() {
             for (const auto& note : notes) logf("%s", note.c_str());
             MotionFit fit;
             const bool have_fit = renderer.take_motion_fit(fit);
-            if (have_fit && g_app.csv_motion) {
+            if (have_fit && rec(g_app.csv_motion)) {
                 // How well the game's motion vectors match the camera motion computed from depth (1: exactly, for
                 // the static scene), with the locked scale; a frame whose depth does not belong to its picture
                 // drops here. (Fits come back in order, a few frames later.)
@@ -856,6 +887,7 @@ void render_thread() {
                 ExitProcess(0);
             }
             auto& st = sh.presenter;
+            st.latewarp = latewarp.ready() ? 2u : 1u;
             st.output_fps = float(stat_frames / (now - stat_start));
             st.source_fps = source_interval > 0 ? float(1.0 / source_interval) : 0.0f;
             st.warp_gpu_ms = renderer.last_gpu_ms();
@@ -945,7 +977,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 const std::int64_t q = qpc_now();
                 // (not while the ReShade menu has the mouse: the game's camera does not move then)
                 if (!g_app.shared || !g_app.shared->overlay_open) g_app.model.mouse.add(seconds(q), raw.data.mouse.lLastX, raw.data.mouse.lLastY);
-                if (g_app.csv_mouse) std::fprintf(g_app.csv_mouse, "%lld,%ld,%ld\n", q, raw.data.mouse.lLastX, raw.data.mouse.lLastY);
+                if (rec(g_app.csv_mouse)) std::fprintf(g_app.csv_mouse, "%lld,%ld,%ld\n", q, raw.data.mouse.lLastX, raw.data.mouse.lLastY);
             }
             break;  // DefWindowProc must still run for WM_INPUT cleanup
         }
@@ -1017,20 +1049,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
             if (entry.is_regular_file(ec)) std::filesystem::rename(entry.path(), previous / entry.path().filename(), ec);
     }
     g_app.log = _wfsopen((g_app.data_dir / L"logs" / L"presenter.log").c_str(), L"w", _SH_DENYNO);
-    auto open_csv = [](const wchar_t* name, const char* header) {
-        FILE* f = _wfsopen((g_app.data_dir / L"logs" / name).c_str(), L"w", _SH_DENYNO);
-        if (f) { std::setvbuf(f, nullptr, _IOFBF, 1 << 16); std::fprintf(f, "%s\n", header); }
-        return f;
-    };
-    g_app.csv_events = open_csv(L"events.csv", "qpc,kind,tid,frame,extra");
-    g_app.csv_mouse = open_csv(L"mouse.csv", "qpc,dx,dy");
-    g_app.csv_motion = open_csv(L"motion.csv", "qpc,frame,samples,moving_fraction,agree_x,agree_y,render_w,render_h");
-    g_app.csv_sources = open_csv(L"sources.csv",
-        "frame,qpc_sim,qpc_constants,qpc_present,qpc_ingest,px,py,pz,fx,fy,fz,ux,uy,uz,rx,ry,rz,fov,aspect,reset,mouse_gate,has_depth,has_hudless,"
-        "p00,p01,p02,p03,p10,p11,p12,p13,p20,p21,p22,p23,p30,p31,p32,p33,"
-        "c00,c01,c02,c03,c10,c11,c12,c13,c20,c21,c22,c23,c30,c31,c32,c33");
-    g_app.csv_outputs = open_csv(L"outputs.csv",
-        "qpc,source_frame,warped,yaw,pitch,horizon_ms,gpu_ms,mark,t_submit,t_gpu_start,t_gpu_end,last_present,present_count,present_refresh,sync_refresh,sync_qpc,stats_hr,t_wake,cam_x,cam_y,cam_z,cam_fx,cam_fy,cam_fz");
     {
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
         logf("FrameWarp presenter " FW_VERSION ", qpc frequency %lld", fq.QuadPart);

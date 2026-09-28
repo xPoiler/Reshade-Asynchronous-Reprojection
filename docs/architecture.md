@@ -10,8 +10,8 @@
                         HUD-less / UI into slot textures        1. newest slot whose game fence completed
  PCL marker hook ─► sim-start time, present frame id            2. convert shared → private textures
  reshade_present ─► GPU copy of backbuffer (incl. ReShade UI)   3. PoseModel.predict(now)
-                    signal shared fence, publish slot           4. Latewarp (NGX, D3D12)
-                                                               5. blit → DirectComposition swapchain
+                    signal shared fence, publish slot           4. own warp engine, or NVIDIA Latewarp
+ NGX / FSR hooks ─► depth / MV / upscaler output               5. blit → DirectComposition swapchain
           ═══ shared memory "Local\FrameWarp_<pid>" ═══        GPU priority: realtime process class
           ═══ shared D3D12 textures + fence (NT handles) ═══     + HIGH queue
 ```
@@ -26,11 +26,12 @@
 | `src/addon/streamline_hooks.cpp` | Hooks for Streamline; runtime layout detection (BaseStructure size, ResourceTag stride); buffer classification. |
 | `src/addon/producer.cpp` | Slot management, GPU copies into shared textures, shared fence, camera position integration, event log. |
 | `src/addon/ngx_hooks.cpp` | Hooks on the driver's NGX exports (`CreateFeature`/`EvaluateFeature`): DLSS parameters, and for games without Streamline, depth, motion vectors and the DLSS output per evaluation. |
+| `src/addon/ffx_hooks.cpp` | Hooks on AMD FSR: the FFX API (`amd_fidelityfx_*_dx12.dll`, FSR 3.1/4), the FidelityFX SDK 1.0 upscaler (`ffx_fsr3upscaler_x64.dll`, FSR 3.0) and FSR 2 (`ffx_fsr2_api_x64.dll`). Depth, motion vectors and the upscaled output per dispatch. |
 | `src/addon/game_probe.cpp` | Byte-verified probes into Expedition 33's Unreal Streamline plugin (forces `ForceTagStreamlineBuffers()` true, counts calls). |
 | `src/common/inline_hook.cpp` | Minimal x64 inline hook (prologue relocation incl. RIP-relative, near relay, atomic patch). |
 | `src/presenter/main.cpp` | Presenter process: overlay window, raw input, render loop, logging, profile persistence. |
 | `src/presenter/renderer.cpp` | D3D12 device/queue, composition swapchain, shared-texture ingest + format conversion, blit, timing. |
-| `src/presenter/latewarp12.cpp` | NGX Latewarp on D3D12 (parameter names from `nvngx_latewarp.dll`). |
+| `src/presenter/latewarp12.cpp` | NGX Latewarp on D3D12 (parameter names from `nvngx_latewarp.dll`); optional. |
 | `src/presenter/pose.hpp` | Camera model: fitting, prediction/interpolation, handoff blending, cursor gate. |
 | `src/presenter/camera_estimator.hpp` | Games without camera data: rotation, translation and field of view fitted to the motion vectors. |
 
@@ -50,12 +51,15 @@
 * **Camera position.** Streamline's `cameraPos` is camera-relative (always 0), so the add-on integrates
   an absolute position every frame from `clipToPrevClip` (`camera_motion.hpp`); discontinuities bump
   `position_epoch`.
-* **Games without Streamline.** After 60 DLSS evaluations with no Streamline camera, each evaluation
-  publishes its depth and motion vectors as a frame marked `estimated`; the presenter works out the
-  camera (`camera_estimator.hpp`: a robust fit of rotation and translation to a 64x36 grid of motion
-  vectors, field of view learned by votes).
-* **DLSS output.** Only when *Find the HUD from the DLSS output* is on: copied right after DLSS writes
-  it (after `slEvaluateFeature` for Streamline games, after the NGX evaluation otherwise).
+* **Games without Streamline, and FSR.** After 60 upscaler calls with no Streamline camera, each DLSS
+  evaluation or FSR dispatch publishes its depth and motion vectors as a frame marked `estimated`; the
+  presenter works out the camera (`camera_estimator.hpp`: a robust fit of rotation and translation to
+  an 80x45 grid of motion vectors; the field of view learned by votes, or the one the game gives FSR
+  once checked against the picture). A game that keeps sending its Streamline camera but no Streamline
+  depth (Cyberpunk 2077 with FSR) gets FSR's depth and motion vectors attached to its own frames.
+* **Upscaler output.** Only when *Find the HUD from the upscaler output* is on: copied right after the
+  upscaler writes it (after `slEvaluateFeature` for Streamline games, after the NGX evaluation or the
+  FSR dispatch otherwise).
 * **Counters.** Presented images and rendered frames are counted for frame-generation detection.
 
 ## Presenter
@@ -66,10 +70,11 @@
 * **Never waits on the game GPU.** A slot is taken only when the game's shared fence has already
   completed (CPU check). Waiting on the GPU made every new frame cost 3 refreshes.
 * **Ingest.** Shared textures (opened by name per generation) are converted by a compute shader into
-  typed private textures (RGBA16F colour, R32F depth, zero RG16F motion) that Latewarp accepts. A new
+  typed private textures (colour in the game's own 4-byte format when it holds the values exactly,
+  RGBA16F otherwise; R32F depth; RG16F motion). A new
   game frame is taken in between refreshes, as its own GPU submission, so a refresh only warps and
   presents; one arriving too close to a refresh waits until just after it.
-* **No-warp mask** (R8, passed to Latewarp), built once per game frame:
+* **No-warp mask** (R8, used by the warp), built once per game frame:
   * *character/weapon* (every game): pixels whose motion vectors the camera motion does not explain,
     close to the camera, or stuck to the screen while the camera moves further out;
   * *HUD* (games without HUD layers): learned from pixels that stay the same at the same place while
@@ -78,9 +83,13 @@
     prediction misses is HUD.
 * **Frame generation.** When the game presents 1.6 or more images per rendered frame for a second, the
   presenter steps aside (overlay hidden, no GPU work) until the ratio is back near 1.
-* **Latewarp.** On a new game frame a throwaway `IsRenderedFrame=1` evaluation registers it, followed
-  by the real evaluation with the predicted camera (Latewarp ignores the camera on rendered-frame
-  evaluations). View matrices are built relative to the source camera position for precision.
+* **Warp engines.** The own engine (default, any D3D12 GPU): for each output pixel a short fixed-point
+  search finds the rendered pixel that lands there at its own depth; masked pixels stay put and are
+  never used as a source for others; revealed screen edges are filled with a short inward blend; no
+  work while the camera has not moved. NVIDIA Latewarp (optional, `nvngx_latewarp.dll`, NVIDIA GPUs):
+  on a new game frame a throwaway `IsRenderedFrame=1` evaluation registers it, followed by the real
+  evaluation with the predicted camera. View matrices are built relative to the source camera
+  position for precision.
 * **Pacing.** A vblank clock is built from our swapchain's DXGI frame statistics. With present lead
   > 0 (default 6 ms) the swapchain allows one queued frame and the render thread wakes `lead` ms
   before each DWM composition deadline (vblank + 2.5 ms), rendering one frame per refresh; the

@@ -21,6 +21,9 @@ $root = Split-Path -Parent $PSScriptRoot
 $build = if (Test-Path (Join-Path $PSScriptRoot "FrameWarp.addon64")) { $PSScriptRoot } else { Join-Path $root "build\Release" }
 $cvar = "r.Streamline.ForceTagging=1"
 $reshadeNames = @("dxgi.dll", "d3d12.dll", "d3d11.dll", "dinput8.dll", "ReShade64.dll")
+# Upscalers FrameWarp takes its data from: DLSS (Streamline, or called directly) and FSR 2 / 3 / 4 (their DLLs).
+$upscalerNames = @("sl.interposer.dll", "nvngx_dlss.dll", "amd_fidelityfx_dx12.dll", "amd_fidelityfx_loader_dx12.dll",
+                   "amd_fidelityfx_upscaler_dx12.dll", "ffx_fsr3upscaler_x64.dll", "ffx_fsr2_api_x64.dll")
 
 function Get-SteamGameDirs {
     $steam = (Get-ItemProperty -ErrorAction SilentlyContinue "HKCU:\Software\Valve\Steam").SteamPath
@@ -63,23 +66,19 @@ if ($GameDir) {
     $GameDir = $found[0].FullName
 } else {
     # No game given (double-clicked install.bat / uninstall.bat): list the Steam games that can be chosen.
-    if (-not $Uninstall -and -not ($Latewarp -and (Test-Path -PathType Leaf $Latewarp)) -and
-        -not (Test-Path (Join-Path $build "FrameWarp\nvngx_latewarp.dll")) -and -not (Test-Path (Join-Path $build "nvngx_latewarp.dll"))) {
-        Write-Warning "nvngx_latewarp.dll is not next to install.bat. Put it there first (see README.md); without it only an existing install can be updated."
-    }
     Write-Host "Scanning Steam libraries..."
     $choices = @()
     foreach ($dir in @(Get-SteamGameDirs | Sort-Object FullName -Unique)) {
-        $found = @(Get-ChildItem -Recurse -Depth 8 -File -ErrorAction SilentlyContinue $dir.FullName -Include ($reshadeNames + "FrameWarp.addon64", "sl.interposer.dll", "nvngx_dlss.dll"))
+        $found = @(Get-ChildItem -Recurse -Depth 8 -File -ErrorAction SilentlyContinue $dir.FullName -Include ($reshadeNames + $upscalerNames + "FrameWarp.addon64"))
         $hasReShade = [bool]($found | Where-Object { $reshadeNames -contains $_.Name } | Where-Object { Test-ReShade $_.FullName })
         # The installed add-on (not a staged copy): the one closest to the game folder.
         $installedAddon = $found | Where-Object { $_.Name -eq "FrameWarp.addon64" } | Sort-Object { $_.FullName.Split('\').Count } | Select-Object -First 1
         $hasFrameWarp = [bool]$installedAddon
         $installedVersion = if ($installedAddon) { Get-FrameWarpVersion $installedAddon.FullName } else { $null }
-        # DLSS through Streamline, or DLSS called directly (nvngx_dlss.dll): FrameWarp works with either.
-        $hasDlss = [bool]($found | Where-Object { $_.Name -eq "sl.interposer.dll" -or $_.Name -eq "nvngx_dlss.dll" })
+        # DLSS (through Streamline or called directly) or FSR (its DLLs): FrameWarp works with any of them.
+        $hasUpscaler = [bool]($found | Where-Object { $upscalerNames -contains $_.Name })
         if (($Uninstall -and $hasFrameWarp) -or (-not $Uninstall -and $hasReShade)) {
-            $choices += [pscustomobject]@{ Name = $dir.Name; Path = $dir.FullName; FrameWarp = $hasFrameWarp; Version = $installedVersion; Dlss = $hasDlss }
+            $choices += [pscustomobject]@{ Name = $dir.Name; Path = $dir.FullName; FrameWarp = $hasFrameWarp; Version = $installedVersion; Upscaler = $hasUpscaler }
         }
     }
     Write-Host ""
@@ -92,7 +91,7 @@ if ($GameDir) {
             $notes = @()
             if (-not $Uninstall) {
                 if ($c.FrameWarp) { $notes += "FrameWarp $($c.Version) installed" }
-                if (-not $c.Dlss) { $notes += "no DLSS found: will not work" }
+                if (-not $c.Upscaler) { $notes += "no DLSS or FSR found: will not work" }
             }
             if ($Uninstall -and $c.Version) { $notes += "FrameWarp $($c.Version)" }
             Write-Host ("  {0,2}) {1}{2}" -f ($i + 1), $c.Name, $(if ($notes) { "   [" + ($notes -join ", ") + "]" } else { "" }))
@@ -219,15 +218,15 @@ if ($Uninstall) {
 foreach ($f in @("FrameWarp.addon64", "FrameWarp\FrameWarpPresenter.exe")) {
     if (-not (Test-Path (Join-Path $build $f))) { throw "Missing $f in $build - build Release first." }
 }
-# nvngx_latewarp.dll is NVIDIA's and not redistributable: take it from -Latewarp, the package/build
-# folder, third_party\latewarp in the source tree, or an existing install.
+# NVIDIA Latewarp is optional (FrameWarp's own warp engine is used without it). nvngx_latewarp.dll is
+# NVIDIA's and not redistributable: take it from -Latewarp, the package/build folder,
+# third_party\latewarp in the source tree, or an existing install.
 $latewarpCandidates = @()
 if ($Latewarp) { $latewarpCandidates += $(if (Test-Path -PathType Container $Latewarp) { Join-Path $Latewarp "nvngx_latewarp.dll" } else { $Latewarp }) }
 $latewarpCandidates += @((Join-Path $build "FrameWarp\nvngx_latewarp.dll"), (Join-Path $build "nvngx_latewarp.dll"),
                          (Join-Path $root "third_party\latewarp\nvngx_latewarp.dll"),
                          (Join-Path $target "nvngx_latewarp.dll"))
 $latewarpDll = $latewarpCandidates | Where-Object { Test-Path -PathType Leaf $_ } | Select-Object -First 1
-if (-not $latewarpDll) { throw "nvngx_latewarp.dll not found. Put NVIDIA's Reflex 2 Frame Warp DLL (bundled with software that uses Reflex 2 Frame Warp; tested version 310.2.0.0) next to install.bat, or pass -Latewarp <path to the dll>." }
 if (-not (Test-Path (Join-Path $env:SystemRoot "System32\msvcp140.dll"))) {
     Write-Warning "Microsoft Visual C++ 2015-2022 Redistributable (x64) not found: the presenter needs it (https://aka.ms/vs/17/release/vc_redist.x64.exe)."
 }
@@ -250,7 +249,7 @@ Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue $GameDir -Filter "Fra
     ForEach-Object { Copy-Item -Force (Join-Path $build "FrameWarp.addon64") $_.FullName; Write-Host "Updated staged copy: $($_.FullName)" }
 Copy-Item -Force (Join-Path $build "FrameWarp\FrameWarpPresenter.exe") $target
 $latewarpTarget = Join-Path $target "nvngx_latewarp.dll"
-if ((Resolve-Path $latewarpDll).Path -ne $latewarpTarget) { Copy-Item -Force $latewarpDll $latewarpTarget }
+if ($latewarpDll -and (Resolve-Path $latewarpDll).Path -ne $latewarpTarget) { Copy-Item -Force $latewarpDll $latewarpTarget }
 # The previous prototype's add-on captures every frame through an effect; park it (reversible).
 $old = Join-Path $binDir "ReprojectionDiagnostics.addon64"
 if (Test-Path $old) {
@@ -258,14 +257,20 @@ if (Test-Path $old) {
     Move-Item -Force $old (Join-Path $target "disabled")
 }
 Write-Host "Installed to $binDir (ReShade: $($reshade[0].Name))"
+if ($latewarpDll) { Write-Host "NVIDIA Latewarp: installed (optional warp engine, NVIDIA GPUs)" }
+else { Write-Host "NVIDIA Latewarp: not included (optional) - FrameWarp's own warp engine is used" }
 
-# FrameWarp takes its data from DLSS: through Streamline (camera, depth, motion and HUD tags), or from
-# DLSS called directly (depth and motion vectors; the presenter works out the camera).
+# FrameWarp takes its data from DLSS (through Streamline: camera, depth, motion and HUD tags; or called
+# directly: depth and motion vectors, the presenter works out the camera) or from FSR (its DLLs).
 $streamline = Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue $GameDir -Filter "sl.interposer.dll" | Select-Object -First 1
 $dlss = Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue $GameDir -Filter "nvngx_dlss.dll" | Select-Object -First 1
+$fsr = @(Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue $GameDir -Include ($upscalerNames | Where-Object { $_ -match "fidelityfx|ffx_" })) | Select-Object -First 1
 if ($streamline) { Write-Host "Streamline: $($streamline.FullName)" }
 elseif ($dlss) { Write-Host "DLSS without Streamline: $($dlss.FullName) (the camera is worked out from DLSS's motion vectors)" }
-else { Write-Warning "No DLSS found (sl.interposer.dll or nvngx_dlss.dll): FrameWarp needs a game with NVIDIA DLSS." }
+if ($fsr) { Write-Host "FSR: $($fsr.FullName)" }
+if (-not $streamline -and -not $dlss -and -not $fsr) {
+    Write-Warning "No DLSS or FSR found: FrameWarp needs a game with DLSS, or with FSR 2 / 3 / 4 shipped as a DLL."
+}
 
 $ini = $null
 if (-not $NoCvar) {

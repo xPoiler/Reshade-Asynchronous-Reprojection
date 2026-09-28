@@ -1,10 +1,18 @@
 # Changelog
 
-## Unreleased
+## 1.4.0
 
+* **No NVIDIA RTX GPU or DLSS required any more:** FrameWarp works with DLSS and with AMD FSR, and its own
+  warp engine runs on any DirectX 12 GPU (tested on NVIDIA; AMD and Intel untested).
+* **NVIDIA Latewarp is optional.** The installer no longer asks for `nvngx_latewarp.dll`; with it,
+  Latewarp can be chosen in the **Warp engine** setting, which is locked to XPAR's engine otherwise.
+* The installer recognises FSR games too.
+* **Record detailed diagnostics** (new option, off by default, remembered per game): the frame-by-frame
+  recordings in the logs folder are only written when it is on. `presenter.log` is always written.
 * The ReShade panel, tab and add-on are now called **XPAR** (xPoiler's Asynchronous Reprojection).
   File names, folders and settings are unchanged.
-* **FSR support** (FSR 2, 3.0, 3.1 and 4): FrameWarp reads the depth and motion vectors FSR is given.
+* **FSR support** (FSR 3.0 and 3.1 tested; FSR 4, and FSR 2 where the game ships its DLL, should work
+  but are untested): FrameWarp reads the depth and motion vectors FSR is given.
   Games that still send their camera through Streamline with FSR (Cyberpunk 2077) keep their own
   camera; otherwise FrameWarp works out the camera's movement from the motion vectors. Switching
   between DLSS and FSR in a game's menu is followed on the fly. **Find the HUD from the upscaler

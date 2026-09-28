@@ -88,10 +88,12 @@ void on_init_swapchain(swapchain* sc, bool) {
     fw::install_streamline_hooks(g_producer.get());
     fw::install_ngx_hooks(g_producer.get());
     fw::install_ffx_hooks(g_producer.get());
-    // The one setting remembered per game (ReShade.ini, [FrameWarp]).
-    int from_scene = 0;
+    // The settings remembered per game (ReShade.ini, [FrameWarp]).
+    int from_scene = 0, record = 0;
     if (g_producer->shared() && reshade::get_config_value(nullptr, "FrameWarp", "HudFromDlssOutput", from_scene))
         g_producer->shared()->settings.hud_from_scene = from_scene != 0;
+    if (g_producer->shared() && reshade::get_config_value(nullptr, "FrameWarp", "RecordDiagnostics", record))
+        g_producer->shared()->settings.record_diagnostics = record != 0;
 }
 
 // The ReShade menu takes the mouse and is drawn on the final frame only (not in a game's HUD layers): while
@@ -205,11 +207,22 @@ void draw_overlay(effect_runtime*) {
         int priority = s.gpu_priority <= 2 ? static_cast<int>(s.gpu_priority) : 0;
         if (ImGui::Combo("Presenter GPU priority", &priority, kPriorities, 3)) s.gpu_priority = static_cast<std::uint32_t>(priority);
         static const char* const kEngines[] = {"NVIDIA Latewarp", "XPAR (default)"};
-        int engine = s.warp_engine == 1 ? 1 : 0;
+        // NVIDIA Latewarp is optional: only selectable once the presenter reports it ready.
+        const bool latewarp = sh.presenter.latewarp == 2;
+        int engine = latewarp && s.warp_engine != 1 ? 0 : 1;
+        ImGui::BeginDisabled(!latewarp);
         if (ImGui::Combo("Warp engine", &engine, kEngines, 2)) s.warp_engine = static_cast<std::uint32_t>(engine);
-        ImGui::TextDisabled("  NVIDIA Latewarp needs nvngx_latewarp.dll; without it XPAR's engine is used");
+        ImGui::EndDisabled();
+        if (!latewarp)
+            ImGui::TextDisabled("  NVIDIA Latewarp is not installed (optional: nvngx_latewarp.dll, NVIDIA GPUs only)");
         bool invert = s.invert_warp != 0;
         if (ImGui::Checkbox("Invert warp (debug)", &invert)) s.invert_warp = invert;
+        bool record = s.record_diagnostics != 0;
+        if (ImGui::Checkbox("Record detailed diagnostics (for troubleshooting)", &record)) {
+            s.record_diagnostics = record;
+            reshade::set_config_value(nullptr, "FrameWarp", "RecordDiagnostics", record ? "1" : "0");
+        }
+        ImGui::TextDisabled("  frame-by-frame recordings in the FrameWarp\\logs folder; remembered for this game");
         bool ui = s.use_ui_tags != 0;
         if (ImGui::Checkbox("Keep HUD still (HUD-less + UI tags)", &ui)) s.use_ui_tags = ui;
         // What is kept unwarped: the HUD (detected in games without HUD layers) and what moves with the
