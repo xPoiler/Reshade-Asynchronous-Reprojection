@@ -316,7 +316,7 @@ void render_thread() {
     bool device_loss_logged = false;
     MotionVectorScale mv_scale;
     bool have_source_kind = false, source_was_estimated = false;
-    double last_mv_log = 0;
+    double last_mv_log = 0, last_usage_log = 0;
     bool game_has_hud_layers = false, mask_logged = false, source_masked = false;
     CameraEstimator estimator;
     bool estimator_logged = false, fov_logged = false;
@@ -325,6 +325,12 @@ void render_thread() {
     double estimator_ms_sum = 0, flush_ms_sum = 0;
     int estimator_runs = 0, mask_builds = 0;
     std::vector<float> raw_samples;
+    double intake_wait_ms = 0;  // how long the refresh loop had to wait for motion samples (camera estimation)
+    double intake_cpu_ms = 0;   // CPU time of the first step of the frame being taken in
+    // A game frame taken in over two steps (see take_in_start / take_in_finish below).
+    struct Intake { int slot = -1; IngestedSource s; bool sampled = false; };
+    Intake intake;
+    std::uint64_t intake_fence = 0;  // submission carrying the motion samples of the frame in `intake`
     std::vector<MotionSample> motion_samples;
     double intake_ms = 4.0;  // how long taking in a new game frame takes (GPU span, smoothed)
     // Frame generation detection: presented images vs rendered frames per half-second window.
@@ -352,21 +358,34 @@ void render_thread() {
             }
             return newest;
         };
-        // Takes in a new game frame: converts it, estimates the camera, builds the no-warp mask. Recorded on
-        // the current command list; returns false if the slot was taken meanwhile.
-        auto take_in = [&](int newest) {
+        // Taking in a new game frame, in two steps. take_in_start converts it and, for games without a
+        // camera, records the motion samples the camera is estimated from; take_in_finish reads those,
+        // estimates the camera, builds the no-warp mask and makes the frame the source. Between refreshes
+        // the two steps are separate submissions, so the CPU never waits for the GPU in between.
+        auto take_in_start = [&](int newest) {
             if (InterlockedCompareExchange(&sh.slots[newest].state, kReading, kReady) != kReady) return false;
             const SlotMeta& m = sh.slots[newest];
-            // The previous frame's colour feeds the HUD detector (and the shelved object interpolation).
-            renderer.set_keep_previous_colour(settings.extrapolate_objects != 0 || (settings.no_warp_mask != 0 && !game_has_hud_layers));
-            // Games without a camera: sample the motion vectors as soon as depth/motion are recorded (the
-            // wait then covers only that work, not the 4K colour conversions).
-            bool sampled = false;
+            // The previous frame's colour feeds the learned HUD detector (and the shelved object
+            // interpolation); not needed while the HUD comes from the upscaler's output.
+            const bool hud_from_output = settings.hud_from_scene != 0 && m.tex[kScene].valid;
+            renderer.set_keep_previous_colour(settings.extrapolate_objects != 0 ||
+                                              (settings.no_warp_mask != 0 && !game_has_hud_layers && !hud_from_output));
+            intake = {};
+            intake.slot = newest;
             const bool wants_samples = m.camera.estimated != 0;
-            IngestedSource s = renderer.ingest(sh, newest, [&](const IngestedSource& early) {
-                if (wants_samples && early.has_depth && early.has_motion) sampled = renderer.sample_motion(early, 80, 45, raw_samples);
+            intake.s = renderer.ingest(sh, newest, [&](const IngestedSource& early) {
+                if (wants_samples && early.has_depth && early.has_motion) intake.sampled = renderer.record_motion_samples(early, 80, 45);
             });
             held.push_back({newest, renderer.submitted_value() + 1});
+            return true;
+        };
+        auto take_in_finish = [&]() {
+            const int newest = intake.slot;
+            intake.slot = -1;
+            if (newest < 0) return;
+            const SlotMeta& m = sh.slots[newest];
+            const IngestedSource s = intake.s;
+            const bool sampled = intake.sampled && renderer.read_motion_samples(raw_samples);
             if (s.valid) {
                 // Games without a camera (DLSS without Streamline): estimate it from the motion vectors.
                 Camera cam = m.camera;
@@ -401,7 +420,8 @@ void render_thread() {
                         const double t0 = now_seconds();
                         cam = estimator.update(motion_samples, rw, rh, m.camera);
                         estimator_ms_sum += (now_seconds() - t0) * 1000.0; ++estimator_runs;
-                        flush_ms_sum += renderer.last_flush_ms();
+                        flush_ms_sum += renderer.last_flush_ms() + intake_wait_ms;
+                        intake_wait_ms = 0;
                         if (estimator_runs >= 300) {
                             logf("camera estimation: %.2f ms CPU + %.2f ms waiting for the samples per game frame, residual %.2f px, field of view %.1f deg%s, "
                                  "%.0f%% of frames unexplained, depth %s",
@@ -494,6 +514,17 @@ void render_thread() {
                 last_source_present = present_t;
                 ++stat_sources;
             }
+        };
+        // Both steps on the current command list (the refresh itself, without pacing): the samples, if
+        // any, are waited for in between.
+        auto take_in = [&](int newest) {
+            if (!take_in_start(newest)) return false;
+            if (intake.sampled) {
+                const double w0 = now_seconds();
+                renderer.flush_and_wait();
+                intake_wait_ms += (now_seconds() - w0) * 1000.0;
+            }
+            take_in_finish();
             return true;
         };
         // DWM composes shortly after each vblank; a frame that is not finished by then waits a
@@ -524,6 +555,25 @@ void render_thread() {
                                      sh.backbuffer_width == renderer.width() && sh.backbuffer_height == renderer.height();
             for (;;) {
                 const std::int64_t t = qpc_now();
+                // A frame whose motion samples are on their way: finished as soon as the GPU has them, and
+                // before the refresh at the latest.
+                if (intake.slot >= 0) {
+                    if (renderer.completed(intake_fence) || t >= tick) {
+                        const double w0 = now_seconds();
+                        renderer.wait_for(intake_fence);
+                        const double w1 = now_seconds();
+                        intake_wait_ms += (w1 - w0) * 1000.0;
+                        renderer.begin_frame();
+                        take_in_finish();
+                        renderer.submit_work(true);
+                        const double sample_ms = intake_cpu_ms + (w1 - w0) * 1000.0 + (now_seconds() - w1) * 1000.0;
+                        intake_ms = std::clamp(0.8 * intake_ms + 0.2 * std::max<double>(renderer.last_intake_gpu_ms(), sample_ms), 2.0, 12.0);
+                        if (++intakes % 600 == 0) logf("game frames taken in between refreshes: %.1f ms each (smoothed)", intake_ms);
+                        continue;
+                    }
+                    sleep_until(std::min(tick, t + static_cast<std::int64_t>(2.5e-4 * double(g_qpc_frequency))));
+                    continue;
+                }
                 if (t >= tick) break;
                 const int newest = can_take_in ? find_newest() : -1;
                 if (newest >= 0 && sh.slots[newest].frame_id != waiting_frame) { waiting_frame = sh.slots[newest].frame_id; waiting_since = t; }
@@ -532,7 +582,14 @@ void render_thread() {
                 if (newest >= 0 && (t + budget < tick || overdue)) {
                     renderer.begin_frame();
                     const double t0 = now_seconds();
-                    const bool taken = take_in(newest);
+                    const bool taken = take_in_start(newest);
+                    if (taken && intake.sampled) {  // the rest once the samples are back (above)
+                        renderer.submit_work();
+                        intake_fence = renderer.submitted_value();
+                        intake_cpu_ms = (now_seconds() - t0) * 1000.0;
+                        continue;
+                    }
+                    if (taken) take_in_finish();
                     renderer.submit_work();
                     if (taken) {
                         intake_ms = std::clamp(0.8 * intake_ms + 0.2 * std::max<double>(renderer.last_intake_gpu_ms(), (now_seconds() - t0) * 1000.0), 2.0, 12.0);
@@ -549,7 +606,7 @@ void render_thread() {
         wake_qpc = qpc_now();
 
         if (!renderer.session_open(sh.session)) {
-            held.clear(); source = {}; source_frame = 0;
+            held.clear(); source = {}; source_frame = 0; intake.slot = -1;
             if (!renderer.open_session(sh.producer_pid, sh.session, error)) {
                 set_status("Waiting for game: %s", error.c_str());
                 Sleep(100); continue;
@@ -790,6 +847,19 @@ void render_thread() {
                 logf("objects: motion vectors %s, last fit quality %.3f, moving pixels %.1f%%",
                      mv_scale.pixel_units ? "in render pixels" : "in custom units", mv_scale.quality, mv_scale.moving_fraction * 100.0);
                 last_mv_log = now;
+            }
+            // What the presenter costs the GPU (shared with the game), every 10 s.
+            if (now - last_usage_log >= 10.0) {
+                const Renderer::GpuUsage u = renderer.take_gpu_usage();
+                const double span = last_usage_log > 0 ? now - last_usage_log : 0.0;
+                last_usage_log = now;
+                if (span > 0 && (u.intakes || u.warps)) {
+                    const double n = std::max<double>(1, u.split);
+                    logf("presenter GPU: %.0f%% of the time | game frames %.1f/s, %.2f ms each (reaching the game's textures %.2f, depth+motion %.2f, "
+                         "colour copies %.2f, HUD/masks/motion %.2f) | refreshes %.1f/s, warp %.2f ms each",
+                         (u.intake_ms + u.warp_ms) / (span * 10.0), u.intakes / span, u.intakes ? u.intake_ms / u.intakes : 0.0,
+                         u.access_ms / n, u.depth_ms / n, u.colour_ms / n, u.rest_ms / n, u.warps / span, u.warps ? u.warp_ms / u.warps : 0.0);
+                }
             }
             {
                 LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);

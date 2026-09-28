@@ -774,6 +774,10 @@ bool Renderer::init(const LUID& adapter_luid, HWND window, std::uint32_t width, 
     device_->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback_));
     queue_->GetTimestampFrequency(&timestamp_frequency_);
     queue_->GetClockCalibration(&calib_gpu_, &calib_cpu_);
+    D3D12_QUERY_HEAP_DESC stq{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 9, 0};
+    device_->CreateQueryHeap(&stq, IID_PPV_ARGS(&stage_stamps_));
+    bd.Width = 9 * 8;
+    device_->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&stage_readback_));
     // GPU time of each scene-HUD pass (one set per frame in flight), for the log.
     D3D12_QUERY_HEAP_DESC sq{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 3 * kSceneStamps, 0};
     device_->CreateQueryHeap(&sq, IID_PPV_ARGS(&scene_stamps_));
@@ -1238,7 +1242,7 @@ void Renderer::flush_and_wait() {
     list_->SetDescriptorHeaps(1, heaps);
 }
 
-bool Renderer::sample_motion(const IngestedSource& src, std::uint32_t grid_w, std::uint32_t grid_h, std::vector<float>& out) {
+bool Renderer::record_motion_samples(const IngestedSource& src, std::uint32_t grid_w, std::uint32_t grid_h) {
     if (!src.has_depth || !src.has_motion) return false;
     const UINT count = grid_w * grid_h, bytes = count * 16;
     if (!samples_ || samples_count_ < count) {
@@ -1274,17 +1278,37 @@ bool Renderer::sample_motion(const IngestedSource& src, std::uint32_t grid_w, st
     auto to_copy = transition_barrier(samples_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     list_->ResourceBarrier(1, &to_copy);
     list_->CopyBufferRegion(samples_readback_.Get(), 0, samples_.Get(), 0, bytes);
+    samples_pending_bytes_ = bytes;
+    last_flush_ms_ = 0;
+    return true;
+}
+
+bool Renderer::read_motion_samples(std::vector<float>& out) {
+    if (!samples_readback_ || !samples_pending_bytes_) return false;
+    const UINT bytes = samples_pending_bytes_;
+    samples_pending_bytes_ = 0;
+    float* mapped = nullptr;
+    D3D12_RANGE range{0, bytes};
+    if (FAILED(samples_readback_->Map(0, &range, reinterpret_cast<void**>(&mapped)))) return false;
+    out.assign(mapped, mapped + bytes / 4);
+    D3D12_RANGE none{0, 0};
+    samples_readback_->Unmap(0, &none);
+    return true;
+}
+
+bool Renderer::sample_motion(const IngestedSource& src, std::uint32_t grid_w, std::uint32_t grid_h, std::vector<float>& out) {
+    if (!record_motion_samples(src, grid_w, grid_h)) return false;
     LARGE_INTEGER a, b, f; QueryPerformanceCounter(&a);
     flush_and_wait();
     QueryPerformanceCounter(&b); QueryPerformanceFrequency(&f);
     last_flush_ms_ = float(double(b.QuadPart - a.QuadPart) * 1000.0 / double(f.QuadPart));
-    float* mapped = nullptr;
-    D3D12_RANGE range{0, bytes};
-    if (FAILED(samples_readback_->Map(0, &range, reinterpret_cast<void**>(&mapped)))) return false;
-    out.assign(mapped, mapped + count * 4);
-    D3D12_RANGE none{0, 0};
-    samples_readback_->Unmap(0, &none);
-    return true;
+    return read_motion_samples(out);
+}
+
+void Renderer::wait_for(std::uint64_t value) {
+    if (completed(value)) return;
+    fence_->SetEventOnCompletion(value, fence_event_);
+    WaitForSingleObject(fence_event_, 1000);
 }
 
 bool Renderer::take_motion_fit(MotionFit& fit) {
@@ -1294,6 +1318,22 @@ bool Renderer::take_motion_fit(MotionFit& fit) {
     return true;
 }
 
+
+DXGI_FORMAT Renderer::colour_format(DXGI_FORMAT source) {
+    DXGI_FORMAT compact = DXGI_FORMAT_UNKNOWN;
+    switch (srv_format(source)) {
+        case DXGI_FORMAT_R10G10B10A2_UNORM: compact = DXGI_FORMAT_R10G10B10A2_UNORM; break;
+        case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM: compact = DXGI_FORMAT_R8G8B8A8_UNORM; break;
+        case DXGI_FORMAT_R11G11B10_FLOAT: compact = DXGI_FORMAT_R11G11B10_FLOAT; break;
+        default: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    }
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{compact};
+    constexpr auto kNeed2 = D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD | D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
+    if (FAILED(device_->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))) ||
+        !(fs.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) || (fs.Support2 & kNeed2) != kNeed2)
+        return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    return compact;
+}
 
 bool Renderer::ensure_private(PrivateId id, std::uint32_t w, std::uint32_t h, DXGI_FORMAT format) {
     auto& p = private_[id];
@@ -1377,9 +1417,28 @@ ID3D12GraphicsCommandList* Renderer::begin_frame() {
             auto a = ts[frame_index_ * 2], b = ts[frame_index_ * 2 + 1];
             const float ms = b > a ? static_cast<float>(double(b - a) * 1000.0 / double(timestamp_frequency_)) : 0.0f;
             if (intake_slot_[frame_index_]) {  // a new game frame taken in between refreshes
-                if (b > a) intake_gpu_ms_ = ms;
+                if (b > a && continuation_slot_[frame_index_]) {
+                    intake_gpu_ms_ += ms;  // same frame, second submission
+                    usage_.intake_ms += ms; usage_.rest_ms += ms;
+                } else if (b > a) {
+                    intake_gpu_ms_ = ms;
+                    ++usage_.intakes; usage_.intake_ms += ms;
+                    std::uint64_t* st = nullptr;
+                    D3D12_RANGE sr{frame_index_ * 24, frame_index_ * 24 + 24};
+                    if (stage_valid_[frame_index_] && stage_readback_ && SUCCEEDED(stage_readback_->Map(0, &sr, reinterpret_cast<void**>(&st)))) {
+                        const std::uint64_t sa = st[frame_index_ * 3], s0 = st[frame_index_ * 3 + 1], s1 = st[frame_index_ * 3 + 2];
+                        if (a <= sa && sa <= s0 && s0 <= s1 && s1 <= b) {
+                            const double k = 1000.0 / double(timestamp_frequency_);
+                            ++usage_.split;
+                            usage_.access_ms += double(sa - a) * k;
+                            usage_.depth_ms += double(s0 - sa) * k; usage_.colour_ms += double(s1 - s0) * k; usage_.rest_ms += double(b - s1) * k;
+                        }
+                        D3D12_RANGE none0{0, 0};
+                        stage_readback_->Unmap(0, &none0);
+                    }
+                }
                 b = a;  // not a presented frame: no present timing from it
-            } else if (b > a) gpu_ms_ = ms;
+            } else if (b > a) { gpu_ms_ = ms; ++usage_.warps; usage_.warp_ms += ms; }
             // Convert GPU timestamps to CPU QPC with the calibration pair.
             LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);
             auto to_qpc = [&](std::uint64_t gpu) {
@@ -1443,6 +1502,8 @@ ID3D12GraphicsCommandList* Renderer::begin_frame() {
     allocators_[frame_index_]->Reset();
     list_->Reset(allocators_[frame_index_].Get(), nullptr);
     if (timestamps_) list_->EndQuery(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * 2);
+    stages_marked_ = 0;
+    stage_valid_[frame_index_] = false;
     ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
     list_->SetDescriptorHeaps(1, heaps);
     reading_.clear();
@@ -1491,6 +1552,7 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
     for (auto* r : sources)
         if (r) { barriers.push_back(transition_barrier(r, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)); reading_.push_back(r); }
     list_->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+    mark_stage();  // shared textures made readable
 
     const auto& dp = m.tex[kDepth];
     if (sources[kDepth]) {
@@ -1509,17 +1571,19 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
     // Depth and motion vectors are recorded first: a caller that needs them on the CPU (camera
     // estimation) can flush here and wait for this small amount of work, before the 4K colour work.
     if (after_depth) after_depth(out);
+    mark_stage();
 
     out.color_w = bb.width; out.color_h = bb.height;
     out.color_rect = {0, 0, bb.width, bb.height};
-    ensure_private(kPBackbuffer, bb.width, bb.height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    const DXGI_FORMAT colour = colour_format(static_cast<DXGI_FORMAT>(bb.format));
+    ensure_private(kPBackbuffer, bb.width, bb.height, colour);
     ensure_private(kPHudless, bb.width, bb.height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     ensure_private(kPUi, bb.width, bb.height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     ensure_private(kPZeroUi, bb.width, bb.height, DXGI_FORMAT_R16G16B16A16_FLOAT);
-    ensure_private(kPOutput, bb.width, bb.height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    ensure_private(kPOutput, bb.width, bb.height, colour);  // the warped frame: the same values as the game's
     if (keep_previous_ && ingested_) {
         const PrivateId from = last_had_hudless_ ? kPHudless : kPBackbuffer;
-        if (private_[from].texture && ensure_private(kPPrevious, private_[from].width, private_[from].height, DXGI_FORMAT_R16G16B16A16_FLOAT)) {
+        if (private_[from].texture && ensure_private(kPPrevious, private_[from].width, private_[from].height, private_[from].format)) {
             transition(private_[from], D3D12_RESOURCE_STATE_COPY_SOURCE);
             transition(private_[kPPrevious], D3D12_RESOURCE_STATE_COPY_DEST);
             list_->CopyResource(private_[kPPrevious].texture.Get(), private_[from].texture.Get());
@@ -1543,12 +1607,13 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
     }
     const auto& sc = m.tex[kScene];
     if (sources[kScene] && sc.width == bb.width && sc.height == bb.height &&
-        ensure_private(kPScene, bb.width, bb.height, DXGI_FORMAT_R16G16B16A16_FLOAT)) {
+        ensure_private(kPScene, bb.width, bb.height, colour_format(static_cast<DXGI_FORMAT>(sc.format)))) {
         convert(sources[kScene], static_cast<DXGI_FORMAT>(sc.format), slot, kScene, kPScene, bb.width, bb.height);
         out.has_scene = true;
     }
     ingested_ = true;
     last_had_hudless_ = out.has_hudless;
+    mark_stage();
     barriers.clear();
     for (auto* r : reading_) barriers.push_back(transition_barrier(r, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON));
     list_->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
@@ -1572,10 +1637,14 @@ LatewarpInputs Renderer::latewarp_inputs(const IngestedSource& src, bool use_ui_
     return in;
 }
 
-void Renderer::submit_work() {
+void Renderer::submit_work(bool continuation) {
     if (timestamps_) {
         list_->EndQuery(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * 2 + 1);
         list_->ResolveQueryData(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * 2, 2, readback_.Get(), frame_index_ * 16);
+    }
+    if (stages_marked_ == 3) {
+        list_->ResolveQueryData(stage_stamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * 3, 3, stage_readback_.Get(), frame_index_ * 24);
+        stage_valid_[frame_index_] = true;
     }
     list_->Close();
     if (pending_game_wait_ && fence_game_) { queue_->Wait(fence_game_.Get(), pending_game_wait_); pending_game_wait_ = 0; }
@@ -1584,6 +1653,7 @@ void Renderer::submit_work() {
     queue_->Signal(fence_.Get(), ++fence_value_);
     frame_values_[frame_index_] = fence_value_;
     intake_slot_[frame_index_] = true;
+    continuation_slot_[frame_index_] = continuation;
 }
 
 void Renderer::finish_frame(bool warped, int marker) {
@@ -1674,8 +1744,39 @@ bool Renderer::read_back(int which, std::vector<std::uint16_t>& pixels, std::uin
     pixels.resize(std::size_t(w) * h * 4);
     std::uint8_t* mapped = nullptr;
     if (FAILED(buffer->Map(0, nullptr, reinterpret_cast<void**>(&mapped)))) return false;
-    for (std::uint32_t y = 0; y < h; ++y)
-        std::memcpy(&pixels[std::size_t(y) * w * 4], mapped + fp.Offset + std::size_t(y) * fp.Footprint.RowPitch, std::size_t(w) * 8);
+    // Always handed out as half-float RGBA, whatever the private format.
+    auto to_half = [](float v) -> std::uint16_t {
+        std::uint32_t x; std::memcpy(&x, &v, 4);
+        const std::uint32_t sign = (x >> 16) & 0x8000u;
+        const int e = int((x >> 23) & 0xFF) - 127 + 15;
+        const std::uint32_t mant = x & 0x7FFFFFu;
+        if (e <= 0) return std::uint16_t(sign);
+        if (e >= 31) return std::uint16_t(sign | 0x7C00u);
+        return std::uint16_t(sign | (std::uint32_t(e) << 10) | ((mant + 0x1000u) >> 13));
+    };
+    auto small_float = [](std::uint32_t bits, int mant_bits) {  // R11G11B10: 5-bit exponent, no sign
+        const std::uint32_t e = bits >> mant_bits, m = bits & ((1u << mant_bits) - 1);
+        if (e == 0) return std::ldexp(float(m), -14 - mant_bits);
+        return std::ldexp(1.0f + float(m) / float(1u << mant_bits), int(e) - 15);
+    };
+    for (std::uint32_t y = 0; y < h; ++y) {
+        const std::uint8_t* row = mapped + fp.Offset + std::size_t(y) * fp.Footprint.RowPitch;
+        std::uint16_t* out = &pixels[std::size_t(y) * w * 4];
+        if (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) { std::memcpy(out, row, std::size_t(w) * 8); continue; }
+        for (std::uint32_t x = 0; x < w; ++x) {
+            std::uint32_t v; std::memcpy(&v, row + std::size_t(x) * 4, 4);
+            float c[4] = {0, 0, 0, 1};
+            if (desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM) {
+                for (int k = 0; k < 4; ++k) c[k] = float((v >> (8 * k)) & 0xFF) / 255.0f;
+            } else if (desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+                for (int k = 0; k < 3; ++k) c[k] = float((v >> (10 * k)) & 0x3FF) / 1023.0f;
+                c[3] = float(v >> 30) / 3.0f;
+            } else if (desc.Format == DXGI_FORMAT_R11G11B10_FLOAT) {
+                c[0] = small_float(v & 0x7FF, 6); c[1] = small_float((v >> 11) & 0x7FF, 6); c[2] = small_float(v >> 22, 5);
+            }
+            for (int k = 0; k < 4; ++k) out[std::size_t(x) * 4 + k] = to_half(c[k]);
+        }
+    }
     buffer->Unmap(0, nullptr);
     return true;
 }

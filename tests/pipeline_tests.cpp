@@ -45,6 +45,8 @@ int main(int argc, char** argv) {
     const std::uint32_t W = argc > 2 ? std::uint32_t(std::atoi(argv[1])) : 1280;
     const std::uint32_t H = argc > 2 ? std::uint32_t(std::atoi(argv[2])) : 720;
     const double depth_fraction = argc > 3 ? std::atof(argv[3]) : 0.75;
+    // [colour bits]: 10 makes the game's frame R10G10B10A2 (like HDR10 / 10-bit games), otherwise RGBA8.
+    const DXGI_FORMAT kColour = argc > 4 && std::atoi(argv[4]) == 10 ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
     const std::uint32_t DW = std::uint32_t(W * depth_fraction), DH = std::uint32_t(H * depth_fraction);
     ComPtr<IDXGIFactory6> factory;
     CreateDXGIFactory2(0, IID_PPV_ARGS(&factory));
@@ -69,12 +71,12 @@ int main(int argc, char** argv) {
 
     Producer producer;
     EXPECT(producer.attach(game.Get()), "producer attach");
-    producer.set_swapchain(window, W, H, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
+    producer.set_swapchain(window, W, H, kColour, 0);
 
     // Synthetic game frame: dark background, white vertical bar at the center column, red horizontal bar.
     D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC cd{}; cd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; cd.Width = W; cd.Height = H;
-    cd.DepthOrArraySize = 1; cd.MipLevels = 1; cd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; cd.SampleDesc.Count = 1;
+    cd.DepthOrArraySize = 1; cd.MipLevels = 1; cd.Format = kColour; cd.SampleDesc.Count = 1;
     cd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     ComPtr<ID3D12Resource> backbuffer, depth;
     game->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &cd, D3D12_RESOURCE_STATE_PRESENT, nullptr, IID_PPV_ARGS(&backbuffer));
@@ -127,7 +129,7 @@ int main(int argc, char** argv) {
 
     Renderer renderer;
     std::string error;
-    if (!renderer.init(sh.adapter, window, W, H, DXGI_FORMAT_R8G8B8A8_UNORM, 0, error)) { std::printf("FAIL renderer: %s\n", error.c_str()); return 1; }
+    if (!renderer.init(sh.adapter, window, W, H, kColour, 0, error)) { std::printf("FAIL renderer: %s\n", error.c_str()); return 1; }
     std::printf("presenter queue priority: %s\n", renderer.queue_priority());
     EXPECT(renderer.open_session(sh.producer_pid, sh.session, error), "open session: %s", error.c_str());
     Latewarp12 latewarp;
@@ -824,6 +826,33 @@ int main(int argc, char** argv) {
         const double sc_x0 = peak(px, w, h, true, 1);
         show(scene_clean, yaw);
         const double sc_x1 = peak(px, w, h, true, 1);
+        // GPU cost of taking in one game frame, split like the presenter's log (HUD from the upscaler's
+        // output, masks, motion analysis all on), with the GPU otherwise idle.
+        {
+            renderer.take_gpu_usage();
+            (void)renderer.take_hud_stats();
+            for (int i = 0; i < 24; ++i) {
+                const int bs = publish(900 + i, 0.1f, 0, true, true);
+                if (bs < 0) continue;
+                renderer.begin_frame();
+                IngestedSource s = renderer.ingest(sh, bs);
+                renderer.analyze_motion(s, moving_cam.clip_to_prev_clip, 1.0f, 1.0f, true);
+                renderer.build_no_warp_mask(s, moving_cam.clip_to_prev_clip, true, true, true);
+                renderer.submit_work();
+                renderer.wait_idle();
+                if (i == 3) { renderer.begin_frame(); renderer.finish_frame(false, 0); renderer.wait_idle(); renderer.take_gpu_usage(); }
+            }
+            for (int i = 0; i < 3; ++i) { renderer.begin_frame(); renderer.finish_frame(false, 0); renderer.wait_idle(); }
+            const Renderer::GpuUsage u = renderer.take_gpu_usage();
+            const HudStats hs = renderer.take_hud_stats();
+            double fits = 0;
+            for (int i = 0; i + 1 < 18; ++i) fits += hs.scene_pass_ms[i];
+            const double n = std::max<double>(1, u.split);
+            std::printf("intake GPU at %ux%u (depth %ux%u): %.3f ms per game frame (reaching the textures %.3f, depth+motion %.3f, colour copies %.3f, HUD/masks/motion %.3f); "
+                        "HUD from output: fits %.3f ms, final %.3f ms (%u frames)\n",
+                        W, H, DW, DH, u.intakes ? u.intake_ms / u.intakes : 0.0, u.access_ms / n, u.depth_ms / n, u.colour_ms / n, u.rest_ms / n,
+                        hs.scene_frames ? fits / hs.scene_frames : 0.0, hs.scene_frames ? hs.scene_pass_ms[17] / hs.scene_frames : 0.0, u.intakes);
+        }
         with_scene = false;
         scene_offset = -1;
         std::printf("HUD from the upscaler's output: patch x %.1f -> %.1f, bar x %.0f -> %.0f; semi-transparent patch x %.1f -> %.1f; "

@@ -73,8 +73,17 @@ public:
     void finish_frame(bool warped, int marker);
     // Submits the work recorded since begin_frame without presenting (a new game frame taken in between
     // refreshes, so the refresh itself only warps).
-    void submit_work();
+    // continuation: the second half of a frame taken in over two submissions (for the GPU usage log).
+    void submit_work(bool continuation = false);
     float last_intake_gpu_ms() const { return intake_gpu_ms_; }  // GPU span of the last such submission
+    // GPU time spent by the presenter since the last call, for the log: new game frames taken in (split
+    // into depth/motion incl. the camera-estimation readback, 4K colour copies, and the rest: HUD
+    // detection, masks, motion analysis) and warped refreshes.
+    struct GpuUsage {
+        std::uint32_t intakes = 0, warps = 0, split = 0;
+        double intake_ms = 0, access_ms = 0, depth_ms = 0, colour_ms = 0, rest_ms = 0, warp_ms = 0;
+    };
+    GpuUsage take_gpu_usage() { const GpuUsage u = usage_; usage_ = {}; return u; }
     // Debug: tints the no-warp mask and the HUD score onto the warped output (call after Latewarp).
     void tint_mask();
     // FrameWarp's own warp engine (experimental): writes the warped output like Latewarp would.
@@ -87,6 +96,8 @@ public:
     // Notes about shared buffers opened during ingest (size/format changes), drained for logging.
     std::vector<std::string> take_notes() { std::vector<std::string> n; n.swap(notes_); return n; }
     void wait_idle();
+    void wait_for(std::uint64_t value);
+    void flush_and_wait();  // submit what is recorded, wait for it, continue recording the same frame  // until the GPU completed `value` (see submitted_value)
     float last_gpu_ms() const { return gpu_ms_; }
     // Timing of the most recently completed presenter frame, all in CPU QPC ticks.
     struct FrameTiming { std::int64_t submit = 0, gpu_start = 0, gpu_end = 0; bool valid = false; };
@@ -118,6 +129,10 @@ public:
     // Camera estimation (games without a camera): motion vector (raw) and depth on a grid over the render
     // rect, 4 floats per sample (mv.x, mv.y, depth, valid). Submits the frame's work so far and waits.
     bool sample_motion(const IngestedSource& src, std::uint32_t grid_w, std::uint32_t grid_h, std::vector<float>& out);
+    // The same in two steps, without waiting: records the sampling and its readback on the current list;
+    // once that work has completed on the GPU, read_motion_samples returns them.
+    bool record_motion_samples(const IngestedSource& src, std::uint32_t grid_w, std::uint32_t grid_h);
+    bool read_motion_samples(std::vector<float>& out);
     float last_flush_ms() const { return last_flush_ms_; }  // how long sample_motion waited for the GPU
     ID3D12Resource* no_warp_mask() const { return mask_ready_ ? private_[kPMask].texture.Get() : nullptr; }
     void reset_hud_detection() { reset_hud_ = true; mask_ready_ = false; }
@@ -136,6 +151,10 @@ private:
     enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPDest, kPExtrap, kPPrevious, kPHudScore, kPMask, kPScene, kPCount };
 
     bool create_pipelines(std::string& error);
+    // The format a private copy of a game colour image is kept in: the game's own 4-byte format when it
+    // holds the values exactly (10-bit, 8-bit, R11G11B10 float), half-float RGBA otherwise or when the GPU
+    // cannot load/store that format in shaders. Half the memory traffic of half-float at the same values.
+    DXGI_FORMAT colour_format(DXGI_FORMAT source);
     bool ensure_private(PrivateId id, std::uint32_t w, std::uint32_t h, DXGI_FORMAT format);
     void transition(Private& p, D3D12_RESOURCE_STATES to);
     ID3D12Resource* shared_texture(int slot, int kind, std::uint32_t generation);
@@ -145,7 +164,6 @@ private:
     void create_swapchain_views();
     // HUD in this frame from the upscaler's output (into the HUD score texture, 1 = HUD).
     void detect_hud_from_scene(const struct XConstants& base);
-    void flush_and_wait();  // submit what is recorded, wait for it, continue recording the same frame
     void set_x_srv(UINT index, PrivateId id);
     void set_x_uav(UINT index, PrivateId id);
     void x_dispatch(ID3D12PipelineState* pso, const void* constants, UINT srv_table, UINT uav_table, UINT groups_x, UINT groups_y);
@@ -198,7 +216,18 @@ private:
     UINT frame_latency_ = 1;
     PresentStats present_stats_;
     float gpu_ms_ = 0, intake_gpu_ms_ = 0;
-    bool intake_slot_[3] = {};
+    bool intake_slot_[3] = {}, continuation_slot_[3] = {};
+    // Three stamps inside an intake (shared textures made readable, after depth/motion, after the colour
+    // copies), one set per frame in flight.
+    UINT samples_pending_bytes_ = 0;  // motion samples recorded, not read yet
+    ComPtr<ID3D12QueryHeap> stage_stamps_;
+    ComPtr<ID3D12Resource> stage_readback_;
+    int stages_marked_ = 0;
+    bool stage_valid_[3] = {};
+    GpuUsage usage_;
+    void mark_stage() {
+        if (stage_stamps_ && stages_marked_ < 3) list_->EndQuery(stage_stamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * 3 + stages_marked_++);
+    }
 
     Private private_[kPCount];
     DWORD pid_ = 0;

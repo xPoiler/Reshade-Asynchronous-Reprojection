@@ -14,6 +14,11 @@
   - it follows games whose depth runs the standard way round;
   - the field of view a game reports is checked against the picture, because some games report the
     horizontal one. Resident Evil Requiem with FSR was choppy in fast turns because of this.
+* **Lighter on the GPU:** FrameWarp keeps its copies of the game's picture in the game's own format
+  (half the memory traffic for 8- and 10-bit games, the same picture), no longer copies the previous
+  frame while the HUD comes from the upscaler output, and no longer stalls the GPU mid-frame when it
+  estimates the camera (FSR could miss the odd refresh because of this). The log now shows every
+  10 seconds how much of the GPU FrameWarp uses and on what.
 * Game folders that only administrators may write to (some launchers install games that way): the
   installer says to run it as administrator, and FrameWarp keeps its logs and calibration in
   `%LOCALAPPDATA%\FrameWarp\<game folder>` instead.
