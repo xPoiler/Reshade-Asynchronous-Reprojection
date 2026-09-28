@@ -852,6 +852,11 @@ int main(int argc, char** argv) {
                         "HUD from output: fits %.3f ms, final %.3f ms (%u frames)\n",
                         W, H, DW, DH, u.intakes ? u.intake_ms / u.intakes : 0.0, u.access_ms / n, u.depth_ms / n, u.colour_ms / n, u.rest_ms / n,
                         hs.scene_frames ? fits / hs.scene_frames : 0.0, hs.scene_frames ? hs.scene_pass_ms[17] / hs.scene_frames : 0.0, u.intakes);
+            if (hs.scene_frames) {
+                std::printf("HUD from output: %.6f%% of the screen; GPU ms per pass:", 100.0 * hs.scene_share_sum / hs.scene_frames);
+                for (int i = 0; i < 18; ++i) std::printf(" %.3f", hs.scene_pass_ms[i] / hs.scene_frames);
+                std::printf("\n");
+            }
         }
         with_scene = false;
         scene_offset = -1;

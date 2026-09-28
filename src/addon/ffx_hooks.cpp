@@ -41,8 +41,60 @@ struct ffxDispatchDescUpscale {
 static_assert(sizeof(FfxApiResource) == 48, "FfxApiResource layout");
 static_assert(offsetof(ffxDispatchDescUpscale, output) == 312 && offsetof(ffxDispatchDescUpscale, flags) == 428, "dispatch layout");
 constexpr ffxStructType_t kCreateUpscale = 0x00010000u, kDispatchUpscale = 0x00010001u;
-constexpr std::uint32_t kDepthInverted = 1u << 3;
-// FfxApiResourceState -> D3D12_RESOURCE_STATES.
+constexpr std::uint32_t kDepthInverted = 1u << 3;  // the same bit in both APIs' upscaler creation flags
+
+// FidelityFX SDK 1.0 (FSR 3.0; ffx_types.h and ffx_fsr3upscaler.h of tags fsr3-v3.0.3 / fsr3-v3.0.4),
+// called through ffx_fsr3upscaler_x64.dll. Its resource states use the same bits as the FFX API.
+struct FfxSdkResource { void* resource; FfxApiResourceDescription description; std::uint32_t state; wchar_t name[64]; };
+struct FfxSdkUpscalerContextDescription { std::uint32_t flags; FfxApiDimensions2D maxRenderSize, displaySize; };
+struct FfxSdkUpscalerDispatchDescription {
+    void* commandList;
+    FfxSdkResource color, depth, motionVectors, exposure, reactive, transparencyAndComposition, dilatedDepth, dilatedMotionVectors,
+        reconstructedPrevNearestDepth, output;
+    FfxApiFloatCoords2D jitterOffset, motionVectorScale;
+    FfxApiDimensions2D renderSize;
+    bool enableSharpening;
+    float sharpness, frameTimeDelta, preExposure;
+    bool reset;
+    float cameraNear, cameraFar, cameraFovAngleVertical, viewSpaceToMetersFactor;
+};
+static_assert(sizeof(FfxSdkResource) == 176, "FfxResource layout (SDK 1.0)");
+static_assert(offsetof(FfxSdkUpscalerDispatchDescription, output) == 1592 &&
+              offsetof(FfxSdkUpscalerDispatchDescription, cameraFovAngleVertical) == 1820, "dispatch layout (SDK 1.0)");
+
+// FSR 2 (FidelityFX-FSR2 v2.0.1 - v2.2.1, ffx_fsr2.h / ffx_types.h), called through ffx_fsr2_api_x64.dll. The
+// fields read here are the same in every release (2.2 only appends). FfxResource carries a name in 2.1 and
+// later; 2.0 release builds leave it out (the colour texture's width tells the two apart).
+struct Fsr2ResourceDescription { std::uint32_t type, format, width, height, depth, mipCount, flags; };
+struct Fsr2Resource21 { void* resource; wchar_t name[64]; Fsr2ResourceDescription description; std::uint32_t state; bool isDepth; std::uint64_t descriptorData; };
+struct Fsr2Resource20 { void* resource; Fsr2ResourceDescription description; std::uint32_t state; bool isDepth; std::uint64_t descriptorData; };
+template <typename R> struct Fsr2DispatchDescription {
+    void* commandList;
+    R color, depth, motionVectors, exposure, reactive, transparencyAndComposition, output;
+    FfxApiFloatCoords2D jitterOffset, motionVectorScale;
+    FfxApiDimensions2D renderSize;
+    bool enableSharpening;
+    float sharpness, frameTimeDelta, preExposure;
+    bool reset;
+    float cameraNear, cameraFar, cameraFovAngleVertical;
+};
+struct Fsr2ContextDescription { std::uint32_t flags; FfxApiDimensions2D maxRenderSize, displaySize; };
+static_assert(sizeof(Fsr2Resource21) == 184 && sizeof(Fsr2Resource20) == 56, "FfxResource layouts (FSR 2)");
+static_assert(offsetof(Fsr2DispatchDescription<Fsr2Resource21>, cameraFovAngleVertical) == 1348 &&
+              offsetof(Fsr2DispatchDescription<Fsr2Resource20>, cameraFovAngleVertical) == 452, "dispatch layouts (FSR 2)");
+// FSR 2's own resource states, as its DX12 backend maps them (ffxGetDX12StateFromResourceState).
+D3D12_RESOURCE_STATES fsr2_state(std::uint32_t s) {
+    switch (s) {
+        case (1u << 2) | (1u << 1): return D3D12_RESOURCE_STATE_GENERIC_READ;
+        case 1u << 0: return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        case 1u << 1: return D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        case 1u << 2: return D3D12_RESOURCE_STATE_COPY_SOURCE;
+        case 1u << 3: return D3D12_RESOURCE_STATE_COPY_DEST;
+        default: return D3D12_RESOURCE_STATE_COMMON;
+    }
+}
+
+// FfxApiResourceState / FfxResourceStates (FSR 3.x) -> D3D12_RESOURCE_STATES.
 D3D12_RESOURCE_STATES d3d12_state(std::uint32_t s) {
     switch (s) {
         case 1u << 1: return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -60,26 +112,37 @@ D3D12_RESOURCE_STATES d3d12_state(std::uint32_t s) {
 
 using CreateFn = ffxReturnCode_t (*)(ffxContext*, ffxApiHeader*, const void*);
 using DispatchFn = ffxReturnCode_t (*)(ffxContext*, const ffxApiHeader*);
+using SdkCreateFn = std::int32_t (*)(void*, const FfxSdkUpscalerContextDescription*);
+using SdkDispatchFn = std::int32_t (*)(void*, const FfxSdkUpscalerDispatchDescription*);
+using Fsr2CreateFn = std::int32_t (*)(void*, const Fsr2ContextDescription*);
+using Fsr2DispatchFn = std::int32_t (*)(void*, const void*);
 
 Producer* g_producer = nullptr;
 // One pair per DLL that exports the API (the FSR 4 loader forwards to the upscaler DLL, so both may be
 // hooked; only the outermost call is looked at).
 constexpr const wchar_t* kModules[] = {L"amd_fidelityfx_dx12.dll", L"amd_fidelityfx_loader_dx12.dll", L"amd_fidelityfx_upscaler_dx12.dll"};
 InlineHook g_create_hooks[3], g_dispatch_hooks[3];
+// FSR 3.0 (FidelityFX SDK 1.0): its own upscaler DLL and entry points.
+constexpr const wchar_t* kSdkModule = L"ffx_fsr3upscaler_x64.dll";
+InlineHook g_sdk_create_hook, g_sdk_dispatch_hook;
+// FSR 2: its API DLL.
+constexpr const wchar_t* kFsr2Module = L"ffx_fsr2_api_x64.dll";
+InlineHook g_fsr2_create_hook, g_fsr2_dispatch_hook;
+std::atomic<int> g_fsr2_layout{0};  // 0 not known yet, 21: 2.1 and later, 20: 2.0 release, -1: neither (not used)
 thread_local int t_depth = 0;
 
 FsrStats* stats() { return g_producer && g_producer->shared() ? &g_producer->shared()->fsr : nullptr; }
 
 // Upscale contexts and their creation flags (depth inverted, ...).
-struct ContextEntry { std::atomic<ffxContext> context{nullptr}; std::atomic<std::uint32_t> flags{0}; };
+struct ContextEntry { std::atomic<void*> context{nullptr}; std::atomic<std::uint32_t> flags{0}; };
 ContextEntry g_contexts[16];
-void remember(ffxContext c, std::uint32_t flags) {
+void remember(void* c, std::uint32_t flags) {
     for (auto& e : g_contexts) {
-        ffxContext expected = nullptr;
+        void* expected = nullptr;
         if (e.context.load() == c || e.context.compare_exchange_strong(expected, c)) { e.flags = flags; return; }
     }
 }
-bool flags_of(ffxContext c, std::uint32_t& flags) {
+bool flags_of(void* c, std::uint32_t& flags) {
     for (auto& e : g_contexts) if (e.context.load() == c) { flags = e.flags.load(); return true; }
     return false;
 }
@@ -89,6 +152,80 @@ const T* find_desc(const ffxApiHeader* h, ffxStructType_t type) {
     for (int guard = 0; h && guard < 16; h = h->pNext, ++guard)
         if (h->type == type) return reinterpret_cast<const T*>(h);
     return nullptr;
+}
+
+// One upscale call, whichever API it came through.
+struct Upscale {
+    void* context;
+    ID3D12GraphicsCommandList* list;
+    void* depth; std::uint32_t depth_state, depth_format;
+    void* motion; std::uint32_t motion_state, motion_format;
+    void* output; std::uint32_t output_state;
+    D3D12_RESOURCE_STATES depth_d3d, motion_d3d, output_d3d;  // the states above, in D3D12 terms
+    FfxApiFloatCoords2D jitter, mv_scale;
+    FfxApiDimensions2D render, upscale;
+    bool reset;
+    float near_plane, far_plane, fov;
+};
+
+// Before the upscaler records its work: statistics, and this frame's depth and motion vectors when nothing
+// else provides them (DLSS not publishing, Streamline sending no depth for the last second):
+//  - with the game's own Streamline camera when it still sends one (some games tag depth and motion
+//    vectors only for DLSS): they join the frame being rendered;
+//  - otherwise with a camera the presenter estimates (FSR tells it the field of view).
+// Switching back hands over again. Returns the frame published, or 0.
+std::uint64_t before_upscale(const Upscale& u) {
+    auto* s = stats();
+    if (!s) return 0;
+    ++s->upscale_dispatches;
+    s->render_w = u.render.width; s->render_h = u.render.height;
+    s->out_w = u.upscale.width; s->out_h = u.upscale.height;
+    s->depth_format = u.depth_format; s->mv_format = u.motion_format;
+    s->depth_state = u.depth_state; s->output_state = u.output_state;
+    s->jitter[0] = u.jitter.x; s->jitter[1] = u.jitter.y;
+    s->mv_scale[0] = u.mv_scale.x; s->mv_scale[1] = u.mv_scale.y;
+    s->near_plane = u.near_plane; s->far_plane = u.far_plane; s->fov = u.fov;
+    if (u.reset) ++s->resets;
+    std::uint32_t flags = 0;
+    const bool known = u.context && flags_of(u.context, flags);
+    if (known) s->create_flags = flags;
+    auto* shared = g_producer->shared();
+    if (!shared || dlss_publishing() || streamline_depth_recent() || s->upscale_dispatches <= 60 || !u.list || !u.depth || !u.motion)
+        return 0;
+    const std::uint32_t w = u.render.width, h = u.render.height;
+    if (streamline_camera_recent()) {
+        // The frame whose render work is being submitted (render-submit marker), else the newest camera's.
+        const std::uint64_t frame = g_producer->rendering_frame() ? g_producer->rendering_frame() : streamline_current_frame();
+        if (!frame) return 0;
+        g_producer->on_tag(frame, kDepth, static_cast<ID3D12Resource*>(u.depth), u.depth_d3d, 0, 0, w, h, u.list);
+        g_producer->on_tag(frame, kMotion, static_cast<ID3D12Resource*>(u.motion), u.motion_d3d, 0, 0, w, h, u.list);
+        ++s->frames_published;
+        return frame;
+    }
+    const std::uint64_t frame = next_estimated_frame();
+    Camera cam{};
+    cam.valid = 1;
+    cam.estimated = 1;
+    cam.reset = u.reset ? 1u : 0u;
+    cam.depth_inverted = (!known || (flags & kDepthInverted)) ? 1u : 0u;
+    cam.jitter[0] = u.jitter.x; cam.jitter[1] = u.jitter.y;
+    cam.mvec_scale[0] = u.mv_scale.x != 0 ? u.mv_scale.x : 1.0f;  // motion vector * scale = render pixels
+    cam.mvec_scale[1] = u.mv_scale.y != 0 ? u.mv_scale.y : 1.0f;
+    cam.fov = u.fov;
+    cam.near_plane = u.near_plane; cam.far_plane = u.far_plane;
+    g_producer->on_constants(frame, cam);
+    g_producer->on_tag(frame, kDepth, static_cast<ID3D12Resource*>(u.depth), u.depth_d3d, 0, 0, w, h, u.list);
+    g_producer->on_tag(frame, kMotion, static_cast<ID3D12Resource*>(u.motion), u.motion_d3d, 0, 0, w, h, u.list);
+    ++s->frames_published;
+    return frame;
+}
+
+// After it recorded its work: the upscaled scene (before post-processing and HUD).
+void after_upscale(const Upscale& u, std::uint64_t published) {
+    if (!published || !u.output || !g_producer->shared()->settings.hud_from_scene) return;
+    g_producer->on_tag(published, kScene, static_cast<ID3D12Resource*>(u.output), u.output_d3d, 0, 0, u.upscale.width,
+                       u.upscale.height, u.list);
+    if (auto* s = stats()) ++s->outputs_copied;
 }
 
 template <int I>
@@ -107,61 +244,124 @@ ffxReturnCode_t hk_create(ffxContext* context, ffxApiHeader* desc, const void* m
 
 template <int I>
 ffxReturnCode_t hk_dispatch(ffxContext* context, const ffxApiHeader* desc) {
-    const bool outer = t_depth == 0;
-    const ffxDispatchDescUpscale* up = outer ? find_desc<ffxDispatchDescUpscale>(desc, kDispatchUpscale) : nullptr;
+    const ffxDispatchDescUpscale* up = t_depth == 0 ? find_desc<ffxDispatchDescUpscale>(desc, kDispatchUpscale) : nullptr;
+    Upscale u{};
     std::uint64_t published = 0;
-    auto* list = up ? static_cast<ID3D12GraphicsCommandList*>(up->commandList) : nullptr;
     if (up) {
-        if (auto* s = stats()) {
-            ++s->upscale_dispatches;
-            s->render_w = up->renderSize.width; s->render_h = up->renderSize.height;
-            s->out_w = up->upscaleSize.width; s->out_h = up->upscaleSize.height;
-            s->depth_format = up->depth.description.format; s->mv_format = up->motionVectors.description.format;
-            s->depth_state = up->depth.state; s->output_state = up->output.state;
-            s->jitter[0] = up->jitterOffset.x; s->jitter[1] = up->jitterOffset.y;
-            s->mv_scale[0] = up->motionVectorScale.x; s->mv_scale[1] = up->motionVectorScale.y;
-            s->near_plane = up->cameraNear; s->far_plane = up->cameraFar; s->fov = up->cameraFovAngleVertical;
-            if (up->reset) ++s->resets;
-            std::uint32_t flags = 0;
-            const bool known = context && flags_of(*context, flags);
-            if (known) s->create_flags = flags;
-            auto* shared = g_producer->shared();
-            // No Streamline camera for the last second (never had one, or the game stopped sending it when
-            // FSR was selected) and DLSS not publishing: this frame's depth and motion vectors with a camera
-            // the presenter estimates (FSR tells it the field of view). Switching back hands over again.
-            if (shared && !streamline_camera_recent() && !dlss_publishing() && s->upscale_dispatches > 60 && list &&
-                up->depth.resource && up->motionVectors.resource) {
-                const std::uint64_t frame = next_estimated_frame();
-                Camera cam{};
-                cam.valid = 1;
-                cam.estimated = 1;
-                cam.reset = up->reset ? 1u : 0u;
-                cam.depth_inverted = (!known || (flags & kDepthInverted)) ? 1u : 0u;
-                cam.jitter[0] = up->jitterOffset.x; cam.jitter[1] = up->jitterOffset.y;
-                cam.mvec_scale[0] = up->motionVectorScale.x != 0 ? up->motionVectorScale.x : 1.0f;  // motion vector * scale = render pixels
-                cam.mvec_scale[1] = up->motionVectorScale.y != 0 ? up->motionVectorScale.y : 1.0f;
-                cam.fov = up->cameraFovAngleVertical;
-                cam.near_plane = up->cameraNear; cam.far_plane = up->cameraFar;
-                g_producer->on_constants(frame, cam);
-                const std::uint32_t w = up->renderSize.width, h = up->renderSize.height;
-                g_producer->on_tag(frame, kDepth, static_cast<ID3D12Resource*>(up->depth.resource), d3d12_state(up->depth.state), 0, 0, w, h, list);
-                g_producer->on_tag(frame, kMotion, static_cast<ID3D12Resource*>(up->motionVectors.resource),
-                                   d3d12_state(up->motionVectors.state), 0, 0, w, h, list);
-                ++s->frames_published;
-                published = frame;
-            }
-        }
+        u = {context ? *context : nullptr, static_cast<ID3D12GraphicsCommandList*>(up->commandList),
+             up->depth.resource, up->depth.state, up->depth.description.format,
+             up->motionVectors.resource, up->motionVectors.state, up->motionVectors.description.format,
+             up->output.resource, up->output.state,
+             d3d12_state(up->depth.state), d3d12_state(up->motionVectors.state), d3d12_state(up->output.state),
+             up->jitterOffset, up->motionVectorScale, up->renderSize, up->upscaleSize, up->reset,
+             up->cameraNear, up->cameraFar, up->cameraFovAngleVertical};
+        published = before_upscale(u);
     }
     ++t_depth;
     const ffxReturnCode_t result = reinterpret_cast<DispatchFn>(g_dispatch_hooks[I].original())(context, desc);
     --t_depth;
-    // The upscaled scene (before post-processing and HUD), copied after FSR recorded it on this list.
-    if (published && result == 0 && up->output.resource && g_producer->shared()->settings.hud_from_scene) {
-        g_producer->on_tag(published, kScene, static_cast<ID3D12Resource*>(up->output.resource), d3d12_state(up->output.state), 0, 0,
-                           up->upscaleSize.width, up->upscaleSize.height, list);
-        if (auto* s = stats()) ++s->outputs_copied;
+    if (up && result == 0) after_upscale(u, published);
+    return result;
+}
+
+std::int32_t hk_sdk_create(void* context, const FfxSdkUpscalerContextDescription* desc) {
+    ++t_depth;
+    const std::int32_t result = reinterpret_cast<SdkCreateFn>(g_sdk_create_hook.original())(context, desc);
+    --t_depth;
+    if (t_depth == 0 && result == 0 && context && desc) {
+        remember(context, desc->flags);
+        if (auto* s = stats()) { ++s->upscale_creates; s->create_flags = desc->flags; }
     }
     return result;
+}
+
+std::int32_t hk_sdk_dispatch(void* context, const FfxSdkUpscalerDispatchDescription* d) {
+    Upscale u{};
+    std::uint64_t published = 0;
+    const bool outer = t_depth == 0 && d;
+    if (outer) {
+        // No upscale size in SDK 1.0: the output's own size.
+        u = {context, static_cast<ID3D12GraphicsCommandList*>(d->commandList),
+             d->depth.resource, d->depth.state, d->depth.description.format,
+             d->motionVectors.resource, d->motionVectors.state, d->motionVectors.description.format,
+             d->output.resource, d->output.state,
+             d3d12_state(d->depth.state), d3d12_state(d->motionVectors.state), d3d12_state(d->output.state),
+             d->jitterOffset, d->motionVectorScale, d->renderSize, {d->output.description.width, d->output.description.height}, d->reset,
+             d->cameraNear, d->cameraFar, d->cameraFovAngleVertical};
+        published = before_upscale(u);
+    }
+    ++t_depth;
+    const std::int32_t result = reinterpret_cast<SdkDispatchFn>(g_sdk_dispatch_hook.original())(context, d);
+    --t_depth;
+    if (outer && result == 0) after_upscale(u, published);
+    return result;
+}
+
+std::int32_t hk_fsr2_create(void* context, const Fsr2ContextDescription* desc) {
+    ++t_depth;
+    const std::int32_t result = reinterpret_cast<Fsr2CreateFn>(g_fsr2_create_hook.original())(context, desc);
+    --t_depth;
+    if (t_depth == 0 && result == 0 && context && desc) {
+        remember(context, desc->flags);
+        if (auto* s = stats()) { ++s->upscale_creates; s->create_flags = desc->flags; }
+    }
+    return result;
+}
+
+// Which FfxResource layout the game's FSR 2 uses: the colour texture's real width must be where the
+// layout puts FfxResource::description.width (the resource pointer comes first in both).
+int fsr2_layout(const void* desc) {
+    const int known = g_fsr2_layout.load();
+    if (known != 0) return known;
+    const auto* raw = static_cast<const std::uint8_t*>(desc);
+    auto* color = *reinterpret_cast<ID3D12Resource* const*>(raw + offsetof(Fsr2DispatchDescription<Fsr2Resource21>, color));
+    if (!color) return 0;
+    const std::uint64_t width = color->GetDesc().Width;
+    auto width_at = [&](std::size_t offset) { std::uint32_t v; std::memcpy(&v, raw + offset, 4); return v; };
+    const std::size_t c21 = offsetof(Fsr2DispatchDescription<Fsr2Resource21>, color) + offsetof(Fsr2Resource21, description) +
+                            offsetof(Fsr2ResourceDescription, width);
+    const std::size_t c20 = offsetof(Fsr2DispatchDescription<Fsr2Resource20>, color) + offsetof(Fsr2Resource20, description) +
+                            offsetof(Fsr2ResourceDescription, width);
+    const int layout = width_at(c21) == width ? 21 : width_at(c20) == width ? 20 : -1;
+    g_fsr2_layout = layout;
+    return layout;
+}
+
+template <typename R>
+Upscale fsr2_upscale(void* context, const Fsr2DispatchDescription<R>* d) {
+    return {context, static_cast<ID3D12GraphicsCommandList*>(d->commandList),
+            d->depth.resource, d->depth.state, d->depth.description.format,
+            d->motionVectors.resource, d->motionVectors.state, d->motionVectors.description.format,
+            d->output.resource, d->output.state,
+            fsr2_state(d->depth.state), fsr2_state(d->motionVectors.state), fsr2_state(d->output.state),
+            d->jitterOffset, d->motionVectorScale, d->renderSize, {d->output.description.width, d->output.description.height}, d->reset,
+            d->cameraNear, d->cameraFar, d->cameraFovAngleVertical};
+}
+
+std::int32_t hk_fsr2_dispatch(void* context, const void* desc) {
+    Upscale u{};
+    std::uint64_t published = 0;
+    const int layout = t_depth == 0 && desc ? fsr2_layout(desc) : 0;
+    const bool known = layout == 21 || layout == 20;
+    if (layout == 21) u = fsr2_upscale(context, static_cast<const Fsr2DispatchDescription<Fsr2Resource21>*>(desc));
+    else if (layout == 20) u = fsr2_upscale(context, static_cast<const Fsr2DispatchDescription<Fsr2Resource20>*>(desc));
+    if (known) published = before_upscale(u);
+    ++t_depth;
+    const std::int32_t result = reinterpret_cast<Fsr2DispatchFn>(g_fsr2_dispatch_hook.original())(context, desc);
+    --t_depth;
+    if (known && result == 0) after_upscale(u, published);
+    return result;
+}
+
+void install(HMODULE module, const char* name, InlineHook& hook, void* detour, std::uint32_t bit, Producer* producer) {
+    if (hook.installed()) return;
+    void* target = reinterpret_cast<void*>(GetProcAddress(module, name));
+    if (!target) return;
+    if (hook.install(target, detour)) {
+        if (auto* s = stats()) s->hooks |= bit;
+    } else if (producer) {
+        producer->set_message((std::string("FSR ") + name + ": " + hook.error()).c_str());
+    }
 }
 
 }  // namespace
@@ -175,18 +375,19 @@ void install_ffx_hooks(Producer* producer) {
         if (g_create_hooks[i].installed() && g_dispatch_hooks[i].installed()) continue;
         HMODULE module = GetModuleHandleW(kModules[i]);
         if (!module) continue;
-        const char* names[2] = {"ffxCreateContext", "ffxDispatch"};
-        InlineHook* hooks[2] = {&g_create_hooks[i], &g_dispatch_hooks[i]};
-        void* detours[2] = {creates[i], dispatches[i]};
-        for (int k = 0; k < 2; ++k) {
-            if (hooks[k]->installed()) continue;
-            void* target = reinterpret_cast<void*>(GetProcAddress(module, names[k]));
-            if (!target) continue;
-            if (hooks[k]->install(target, detours[k])) {
-                if (auto* s = stats()) s->hooks |= 1u << (i * 2 + k);
-            } else if (producer) {
-                producer->set_message((std::string("FSR ") + names[k] + ": " + hooks[k]->error()).c_str());
-            }
+        install(module, "ffxCreateContext", g_create_hooks[i], creates[i], 1u << (i * 2), producer);
+        install(module, "ffxDispatch", g_dispatch_hooks[i], dispatches[i], 1u << (i * 2 + 1), producer);
+    }
+    if (!g_sdk_create_hook.installed() || !g_sdk_dispatch_hook.installed()) {
+        if (HMODULE module = GetModuleHandleW(kSdkModule)) {
+            install(module, "ffxFsr3UpscalerContextCreate", g_sdk_create_hook, reinterpret_cast<void*>(&hk_sdk_create), 1u << 6, producer);
+            install(module, "ffxFsr3UpscalerContextDispatch", g_sdk_dispatch_hook, reinterpret_cast<void*>(&hk_sdk_dispatch), 1u << 7, producer);
+        }
+    }
+    if (!g_fsr2_create_hook.installed() || !g_fsr2_dispatch_hook.installed()) {
+        if (HMODULE module = GetModuleHandleW(kFsr2Module)) {
+            install(module, "ffxFsr2ContextCreate", g_fsr2_create_hook, reinterpret_cast<void*>(&hk_fsr2_create), 1u << 8, producer);
+            install(module, "ffxFsr2ContextDispatch", g_fsr2_dispatch_hook, reinterpret_cast<void*>(&hk_fsr2_dispatch), 1u << 9, producer);
         }
     }
 }

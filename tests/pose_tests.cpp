@@ -27,6 +27,21 @@ static void rotation_conventions() {
     const Mat4 v = view_matrix(turned, {});
     const double z = turned.fwd.x * v[2] + turned.fwd.y * v[6] + turned.fwd.z * v[10];
     EXPECT(std::fabs(z - 1.0) < 1e-6, "forward maps to +z (%f)", z);
+    // An unmoved camera gives the identity in float (the own engine then shows the frame as it is), for
+    // reversed and standard depth, small and large near planes, cameras far from the world origin.
+    double worst = 0;
+    for (double znear : {0.01, 0.1, 10.0})
+        for (double fov : {0.6, 1.2, 1.9})
+            for (int standard = 0; standard < 2; ++standard) {
+                const float sy = float(1.0 / std::tan(fov * 0.5)), sx = sy / (16.0f / 9.0f), n = float(znear);
+                const Mat4 proj = standard ? Mat4{sx, 0, 0, 0, 0, sy, 0, 0, 0, 0, 1, 1, 0, 0, -n, 0}
+                                           : Mat4{sx, 0, 0, 0, 0, sy, 0, 0, 0, 0, 0, 1, 0, 0, n, 0};
+                CameraBasis cam = apply_rotation(base, kUp, 2.1, -0.4, base.pos);
+                cam.pos = {123456.0, -98765.0, 4321.0};
+                const Mat4 m = clip_source_to_target(proj, view_matrix(cam, cam.pos), view_matrix(cam, cam.pos));
+                for (int i = 0; i < 16; ++i) worst = std::max(worst, std::fabs(double(m[i]) - (i % 5 == 0 ? 1.0 : 0.0)));
+            }
+    EXPECT(worst < 2e-6, "unmoved camera: identity within 2e-6 (worst %.2e)", worst);
 }
 
 // Right-handed engines (RE Engine): Y up, the camera looks down view -z and the projection has

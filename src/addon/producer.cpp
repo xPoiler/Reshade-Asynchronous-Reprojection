@@ -37,6 +37,7 @@ Producer::Producer() {
     shared_->hooks.pcl_lookup_result = shared_->hooks.reflex_lookup_result = -1;
     auto& s = shared_->settings;
     s.enabled = 1; s.use_mouse = 1; s.use_ui_tags = 1;
+    s.warp_engine = 1;  // XPAR's own engine (NVIDIA Latewarp is the alternative)
     s.rotation_extrapolation = 1.0f; s.translation_extrapolation = 1.0f;
     s.orbit_distance = 0.0f; s.max_horizon_ms = 100.0f;
     s.prediction_ms = -16.0f;  // manual value, used when auto is off
@@ -270,7 +271,8 @@ void Producer::on_tag(std::uint64_t frame, Tex kind, ID3D12Resource* source, D3D
     if (!ext_w || !ext_h) { ext_x = ext_y = 0; ext_w = info.width; ext_h = info.height; }
     info.ext_x = ext_x; info.ext_y = ext_y; info.ext_w = ext_w; info.ext_h = ext_h;
     info.valid = 1;
-    push_event(shared_, kEvTag, frame, static_cast<std::uint64_t>(kind));
+    // extra: the buffer kind (low byte) and which game resource it came from (a game may alternate several).
+    push_event(shared_, kEvTag, frame, static_cast<std::uint64_t>(kind) | (static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(source)) << 8));
 }
 
 std::uint64_t Producer::begin_present(ID3D12Resource* backbuffer, ID3D12GraphicsCommandList* list) {

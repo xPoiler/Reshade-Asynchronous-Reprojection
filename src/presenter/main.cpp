@@ -11,6 +11,7 @@
 #include <wrl/client.h>
 #include <atomic>
 #include <cstdarg>
+#include <deque>
 #include <cstring>
 #include <share.h>
 #include <cstdio>
@@ -46,6 +47,7 @@ struct App {
     // Analysis logs (all times are raw QPC ticks, same clock in both processes).
     FILE* csv_events = nullptr;   // game-side timeline
     FILE* csv_mouse = nullptr;    // raw input
+    FILE* csv_motion = nullptr;   // per game frame: agreement of the motion vectors with depth + camera
     FILE* csv_sources = nullptr;  // ingested frames + camera
     FILE* csv_outputs = nullptr;  // presented frames + applied warp
     std::int64_t events_read = 0;
@@ -315,6 +317,7 @@ void render_thread() {
     bool pacing_paused = false;
     bool device_loss_logged = false;
     MotionVectorScale mv_scale;
+    std::deque<std::uint64_t> analyzed_frames;  // game frames whose motion fit is on its way back
     bool have_source_kind = false, source_was_estimated = false;
     double last_mv_log = 0, last_usage_log = 0;
     bool game_has_hud_layers = false, mask_logged = false, source_masked = false;
@@ -483,6 +486,8 @@ void render_thread() {
                 const bool mask = hud_mask || attached_mask;
                 source_masked = mask;
                 if ((settings.extrapolate_objects || mask) && s.has_motion)
+                    analyzed_frames.push_back(m.frame_id);
+                    if (analyzed_frames.size() > 16) analyzed_frames.pop_front();
                     renderer.analyze_motion(s, cam.clip_to_prev_clip, float(mv_scale.scale(0, s.depth_rect.w)),
                                             float(mv_scale.scale(1, s.depth_rect.h)), mv_scale.valid, cam.depth_inverted != 0);
                 if (mask) {
@@ -707,10 +712,11 @@ void render_thread() {
 
         const double now = now_seconds();
         bool warped = false;
+        bool unmoved = false;  // own engine: the displayed camera is the frame's own, the frame is shown as it is
         Prediction applied{};
         // FrameWarp's own warp engine when chosen, or when Latewarp is not available.
         const bool own_engine = settings.warp_engine == 1 || !latewarp.ready();
-        if (source.valid && settings.enabled && !settings.show_original && source.has_depth) {
+        if (source.valid && settings.enabled && !settings.show_original && !sh.overlay_open && source.has_depth) {
             Prediction p = g_app.model.predict(now);
             if (settings.invert_warp) p.camera = apply_rotation(source_basis, g_app.model.world_up(), -p.yaw, -p.pitch, source_basis.pos);
             applied = p;
@@ -737,7 +743,12 @@ void render_thread() {
             const double z_sign = view_z_sign(source_camera.view_to_clip);
             if (own_engine) {
                 const Mat4 m = clip_source_to_target(projection, view_matrix(source_basis, origin, z_sign), view_matrix(p.camera, origin, z_sign));
-                warped = renderer.own_warp(source, settings.use_ui_tags != 0, inputs.no_warp_mask != nullptr, m.data(), inputs.depth_inverted);
+                // Nothing moved since the frame (well under a hundredth of a pixel anywhere): every pixel stays
+                // where it is, so there is nothing to warp. (The mask's debug tint and the object extrapolation
+                // need the warp pass.)
+                unmoved = !settings.show_mask && !settings.extrapolate_objects;
+                for (int i = 0; i < 16 && unmoved; ++i) unmoved = std::fabs(m.data()[i] - (i % 5 == 0 ? 1.0f : 0.0f)) < 2e-6f;
+                warped = unmoved || renderer.own_warp(source, settings.use_ui_tags != 0, inputs.no_warp_mask != nullptr, m.data(), inputs.depth_inverted);
             } else {
                 warped = latewarp.evaluate(list, inputs, first_eval, view_matrix(p.camera, origin, z_sign),
                                            view_matrix(source_basis, origin, z_sign), projection);
@@ -748,7 +759,7 @@ void render_thread() {
         // Menus and loading screens often skip the game's usual frame (no DLSS call, no tags): when several
         // presents in a row bring no frame, step aside and let the game's own picture show.
         g_app.has_frames = source.valid && sh.presents_without_frame < 3;
-        renderer.finish_frame(warped, settings.overlay_debug ? (warped ? 1 : 2) : 0);
+        renderer.finish_frame(warped && !unmoved, settings.overlay_debug ? (warped ? 1 : 2) : 0);
         // Ctrl+Shift+M marks "it looks bad now" in the log.
         const bool mark_down = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000) && (GetAsyncKeyState('M') & 0x8000);
         const int mark = mark_down && !g_app.mark_was_down ? 1 : 0;
@@ -783,10 +794,13 @@ void render_thread() {
         if (g_app.csv_outputs) {
             const auto tm = renderer.last_timing();
             const auto pstats = renderer.present_stats();
-            std::fprintf(g_app.csv_outputs, "%lld,%llu,%d,%.6f,%.6f,%.4f,%.3f,%d,%lld,%lld,%lld,%u,%u,%u,%u,%lld,%ld,%lld\n", qpc_now(),
-                         static_cast<unsigned long long>(source_frame), int(warped), applied.yaw, applied.pitch, applied.horizon * 1000.0,
-                         renderer.last_gpu_ms(), mark, tm.submit, tm.gpu_start, tm.gpu_end, pstats.last_present_count, pstats.present_count,
-                         pstats.present_refresh, pstats.sync_refresh, pstats.sync_qpc, static_cast<long>(pstats.hr), wake_qpc);
+            // (the displayed camera too: position and forward, in the game's world)
+            const auto& dc = applied.camera;
+            std::fprintf(g_app.csv_outputs, "%lld,%llu,%d,%.6f,%.6f,%.4f,%.3f,%d,%lld,%lld,%lld,%u,%u,%u,%u,%lld,%ld,%lld,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f\n",
+                         qpc_now(), static_cast<unsigned long long>(source_frame), int(warped), applied.yaw, applied.pitch,
+                         applied.horizon * 1000.0, renderer.last_gpu_ms(), mark, tm.submit, tm.gpu_start, tm.gpu_end, pstats.last_present_count,
+                         pstats.present_count, pstats.present_refresh, pstats.sync_refresh, pstats.sync_qpc, static_cast<long>(pstats.hr), wake_qpc,
+                         dc.pos.x, dc.pos.y, dc.pos.z, dc.fwd.x, dc.fwd.y, dc.fwd.z);
         }
         // Dump the game-side timeline.
         if (g_app.csv_events) {
@@ -804,7 +818,22 @@ void render_thread() {
             const auto notes = renderer.take_notes();
             for (const auto& note : notes) logf("%s", note.c_str());
             MotionFit fit;
-            if (renderer.take_motion_fit(fit) && mv_scale.add(fit, source.depth_rect.w, source.depth_rect.h))
+            const bool have_fit = renderer.take_motion_fit(fit);
+            if (have_fit && g_app.csv_motion) {
+                // How well the game's motion vectors match the camera motion computed from depth (1: exactly, for
+                // the static scene), with the locked scale; a frame whose depth does not belong to its picture
+                // drops here. (Fits come back in order, a few frames later.)
+                const std::uint64_t f = analyzed_frames.empty() ? 0 : analyzed_frames.front();
+                if (!analyzed_frames.empty()) analyzed_frames.pop_front();
+                double agree[2] = {-1, -1};
+                for (int k = 0; k < 2 && mv_scale.valid; ++k) {
+                    const double sc = mv_scale.scale(k, k ? source.depth_rect.h : source.depth_rect.w);
+                    if (fit.cc[k] > 0) agree[k] = 1.0 - (sc * sc * fit.gg[k] - 2 * sc * fit.gc[k] + fit.cc[k]) / fit.cc[k];
+                }
+                std::fprintf(g_app.csv_motion, "%lld,%llu,%.0f,%.4f,%.4f,%.4f,%u,%u\n", qpc_now(), static_cast<unsigned long long>(f), fit.samples,
+                             fit.samples > 0 ? fit.moving / fit.samples : 0.0, agree[0], agree[1], source.depth_rect.w, source.depth_rect.h);
+            }
+            if (have_fit && mv_scale.add(fit, source.depth_rect.w, source.depth_rect.h))
                 logf("motion vectors locked: %s, scale %.4g x %.4g (sign %+.0f %+.0f), fit quality %.3f",
                      mv_scale.pixel_units ? "render pixels" : std::fabs(std::fabs(mv_scale.locked[0]) - 1) < 1e-9 ? "uv" :
                      std::fabs(std::fabs(mv_scale.locked[0]) - 0.5) < 1e-9 ? "ndc" : "custom units", mv_scale.scale(0, source.depth_rect.w),
@@ -823,7 +852,7 @@ void render_thread() {
                 for (const auto& entry : held) InterlockedCompareExchange(&sh.slots[entry.slot].state, kFree, kReading);
                 sh.presenter.pid = 0;
                 if (g_app.log) std::fflush(g_app.log);
-                for (FILE* csv : {g_app.csv_events, g_app.csv_mouse, g_app.csv_sources, g_app.csv_outputs}) if (csv) std::fflush(csv);
+                for (FILE* csv : {g_app.csv_events, g_app.csv_mouse, g_app.csv_sources, g_app.csv_outputs, g_app.csv_motion}) if (csv) std::fflush(csv);
                 ExitProcess(0);
             }
             auto& st = sh.presenter;
@@ -914,7 +943,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 (raw.data.mouse.lLastX || raw.data.mouse.lLastY))
             {
                 const std::int64_t q = qpc_now();
-                g_app.model.mouse.add(seconds(q), raw.data.mouse.lLastX, raw.data.mouse.lLastY);
+                // (not while the ReShade menu has the mouse: the game's camera does not move then)
+                if (!g_app.shared || !g_app.shared->overlay_open) g_app.model.mouse.add(seconds(q), raw.data.mouse.lLastX, raw.data.mouse.lLastY);
                 if (g_app.csv_mouse) std::fprintf(g_app.csv_mouse, "%lld,%ld,%ld\n", q, raw.data.mouse.lLastX, raw.data.mouse.lLastY);
             }
             break;  // DefWindowProc must still run for WM_INPUT cleanup
@@ -994,12 +1024,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     };
     g_app.csv_events = open_csv(L"events.csv", "qpc,kind,tid,frame,extra");
     g_app.csv_mouse = open_csv(L"mouse.csv", "qpc,dx,dy");
+    g_app.csv_motion = open_csv(L"motion.csv", "qpc,frame,samples,moving_fraction,agree_x,agree_y,render_w,render_h");
     g_app.csv_sources = open_csv(L"sources.csv",
         "frame,qpc_sim,qpc_constants,qpc_present,qpc_ingest,px,py,pz,fx,fy,fz,ux,uy,uz,rx,ry,rz,fov,aspect,reset,mouse_gate,has_depth,has_hudless,"
         "p00,p01,p02,p03,p10,p11,p12,p13,p20,p21,p22,p23,p30,p31,p32,p33,"
         "c00,c01,c02,c03,c10,c11,c12,c13,c20,c21,c22,c23,c30,c31,c32,c33");
     g_app.csv_outputs = open_csv(L"outputs.csv",
-        "qpc,source_frame,warped,yaw,pitch,horizon_ms,gpu_ms,mark,t_submit,t_gpu_start,t_gpu_end,last_present,present_count,present_refresh,sync_refresh,sync_qpc,stats_hr,t_wake");
+        "qpc,source_frame,warped,yaw,pitch,horizon_ms,gpu_ms,mark,t_submit,t_gpu_start,t_gpu_end,last_present,present_count,present_refresh,sync_refresh,sync_qpc,stats_hr,t_wake,cam_x,cam_y,cam_z,cam_fx,cam_fy,cam_fz");
     {
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
         logf("FrameWarp presenter " FW_VERSION ", qpc frequency %lld", fq.QuadPart);
@@ -1060,7 +1091,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     renderer.join();
     if (g_app.shared) g_app.shared->presenter.pid = 0;
     logf("exit");
-    for (FILE* csv : {g_app.csv_events, g_app.csv_mouse, g_app.csv_sources, g_app.csv_outputs}) if (csv) std::fclose(csv);
+    for (FILE* csv : {g_app.csv_events, g_app.csv_mouse, g_app.csv_sources, g_app.csv_outputs, g_app.csv_motion}) if (csv) std::fclose(csv);
     if (g_app.log) std::fclose(g_app.log);
     if (single) CloseHandle(single);
     return 0;

@@ -2,13 +2,20 @@
 
 ## Unreleased
 
-* **FSR support** (FSR 3.1 and FSR 4): FrameWarp reads the depth and motion vectors FSR is given and
-  works out the camera's movement from them, so games running FSR work too. Switching between DLSS
-  and FSR in a game's menu is followed on the fly. **Find the HUD from the upscaler output** now
-  works with FSR as well.
-* **FrameWarp warp engine** (experimental, new **Warp engine** setting): FrameWarp's own warp, used
-  automatically when NVIDIA Latewarp is not available. It uses depth, so near and far objects move
-  apart correctly when you strafe, and it keeps the HUD and character/weapon still like Latewarp.
+* The ReShade panel, tab and add-on are now called **XPAR** (xPoiler's Asynchronous Reprojection).
+  File names, folders and settings are unchanged.
+* **FSR support** (FSR 2, 3.0, 3.1 and 4): FrameWarp reads the depth and motion vectors FSR is given.
+  Games that still send their camera through Streamline with FSR (Cyberpunk 2077) keep their own
+  camera; otherwise FrameWarp works out the camera's movement from the motion vectors. Switching
+  between DLSS and FSR in a game's menu is followed on the fly. **Find the HUD from the upscaler
+  output** now works with FSR as well. (FSR built into a game's executable, like Cyberpunk 2077's
+  FSR 2.1, cannot be reached; FSR 2 is supported where the game ships its DLL.)
+* **XPAR warp engine** (new **Warp engine** setting, now the default): FrameWarp's own warp, also used
+  when NVIDIA Latewarp is not available. It uses depth, so near and far objects move apart correctly
+  when you strafe, keeps the HUD and character/weapon still like Latewarp, costs less GPU, and does no
+  work at all while the camera stands still. NVIDIA Latewarp stays available in the setting.
+* The ReShade menu stays visible while moving the mouse (Clair Obscur: Expedition 33): FrameWarp pauses
+  warping while the menu is open and ignores the mouse meanwhile.
 * Estimated camera (games without their own camera data):
   - zooming is no longer taken for moving forward or back;
   - it follows games whose depth runs the standard way round;
@@ -17,8 +24,10 @@
 * **Lighter on the GPU:** FrameWarp keeps its copies of the game's picture in the game's own format
   (half the memory traffic for 8- and 10-bit games, the same picture), no longer copies the previous
   frame while the HUD comes from the upscaler output, and no longer stalls the GPU mid-frame when it
-  estimates the camera (FSR could miss the odd refresh because of this). The log now shows every
-  10 seconds how much of the GPU FrameWarp uses and on what.
+  estimates the camera (FSR could miss the odd refresh because of this). HUD detection from the
+  upscaler output is about 20% cheaper for the same result, and textures a game does not use (HUD
+  layers, the empty UI layer) are no longer allocated (about 200 MB less VRAM at 4K). The log now
+  shows every 10 seconds how much of the GPU FrameWarp uses and on what.
 * Game folders that only administrators may write to (some launchers install games that way): the
   installer says to run it as administrator, and FrameWarp keeps its logs and calibration in
   `%LOCALAPPDATA%\FrameWarp\<game folder>` instead.

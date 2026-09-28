@@ -206,6 +206,7 @@ struct PoseSettings {
     double orbit_distance = 0.0;          // > 0: manual orbit pivot distance; 0: learned
     double translation_extrapolation = 1.0;
     bool blend_positions = false;
+    double blend_tau = 0.05;              // seconds over which a new frame's correction of the prediction fades in
     double latency_percentile = 0.9;      // of recent frame delays (0.5 = median); p90 halves how often a late frame forces extrapolation
     double max_horizon = 0.1;             // seconds
     double prediction = 0.0;              // seconds shown ahead of the game's own latency
@@ -362,7 +363,7 @@ public:
                 }
                 theta[0] = a.theta[0]; theta[1] = a.theta[1]; pos = a.pos; reached = a.t;
             }
-            const double fade = std::exp(-(now - blend_t_) / kBlendTau);
+            const double fade = std::exp(-(now - blend_t_) / std::max(settings_.blend_tau, 1e-4));
             for (int k = 0; k < 2; ++k) delta[k] = theta[k] - src_.theta[k] + blend_[k] * fade;
             const Vec3 pivot = src_.basis.pos + src_.basis.fwd * orbit();
             out.camera = apply_rotation(src_.basis, up_.get(), delta[0], delta[1], pivot);
@@ -381,14 +382,14 @@ public:
                 const double end = src_.t + h + d;
                 delta[k] += g * mouse.filtered(k, src_.t + d, std::min(now, end), end, tau);
             }
-            const double fade = std::exp(-(now - blend_t_) / kBlendTau);
+            const double fade = std::exp(-(now - blend_t_) / std::max(settings_.blend_tau, 1e-4));
             delta[k] += blend_[k] * fade;
         }
         const Vec3 world_up = up_.get();
         const Vec3 pivot = src_.basis.pos + src_.basis.fwd * orbit();
         out.camera = apply_rotation(src_.basis, world_up, delta[0], delta[1], pivot);
         out.camera.pos = out.camera.pos + velocity_ * (h * settings_.translation_extrapolation) +
-                         blend_pos_ * std::exp(-(now - blend_t_) / kBlendTau);
+                         blend_pos_ * std::exp(-(now - blend_t_) / std::max(settings_.blend_tau, 1e-4));
         out.yaw = delta[0]; out.pitch = delta[1]; out.horizon = h;
         return out;
     }
@@ -439,7 +440,6 @@ public:
     }
 
 private:
-    static constexpr double kBlendTau = 0.05;
     struct Frame {
         std::uint64_t id;
         double t;

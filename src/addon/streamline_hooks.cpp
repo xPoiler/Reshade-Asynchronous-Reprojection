@@ -36,7 +36,7 @@ struct PendingOutput { std::uint64_t frame = 0; ID3D12Resource* resource = nullp
 std::mutex g_output_mutex;
 PendingOutput g_output;
 std::atomic<std::uint64_t> g_current_frame{0};
-std::atomic<std::int64_t> g_last_constants_qpc{0};
+std::atomic<std::int64_t> g_last_constants_qpc{0}, g_last_depth_qpc{0};
 std::atomic<int> g_constants_base{-1}, g_tag_base{-1};
 std::atomic<std::uint32_t> g_pcl_attempts{0};
 
@@ -225,7 +225,7 @@ void handle_tags(std::uint64_t frame, const void* tags_ptr, std::uint32_t count,
         }
         // Only the buffer types whose numbers are certain; UI colour is identified from the logged list first.
         Tex kind = kTexCount;
-        if (type == kSlDepth && is_depth_format(desc.Format)) kind = kDepth;
+        if (type == kSlDepth && is_depth_format(desc.Format)) { kind = kDepth; g_last_depth_qpc = qpc_now(); }
         else if (type == kSlMotionVectors) kind = kMotion;
         else if (type == kSlHudless && is_rgba8(desc.Format)) kind = kHudless;
         // E33 (UE StreamlineCore): UI colour + alpha from the UI hint extraction pass, full-res BGRA8.
@@ -324,6 +324,12 @@ bool streamline_camera_recent() {
     const std::int64_t last = g_last_constants_qpc.load();
     return last && qpc_now() - last < f.QuadPart;
 }
+bool streamline_depth_recent() {
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+    const std::int64_t last = g_last_depth_qpc.load();
+    return last && qpc_now() - last < f.QuadPart;
+}
+std::uint64_t streamline_current_frame() { return g_current_frame.load(); }
 
 void probe_streamline_features() {
     HMODULE sl = GetModuleHandleW(L"sl.interposer.dll");

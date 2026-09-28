@@ -94,6 +94,13 @@ void on_init_swapchain(swapchain* sc, bool) {
         g_producer->shared()->settings.hud_from_scene = from_scene != 0;
 }
 
+// The ReShade menu takes the mouse and is drawn on the final frame only (not in a game's HUD layers): while
+// it is open the presenter shows the game's frame as it is and ignores the mouse.
+bool on_open_overlay(effect_runtime*, bool open, reshade::api::input_source) {
+    if (g_producer && g_producer->shared()) InterlockedExchange(&g_producer->shared()->overlay_open, open ? 1 : 0);
+    return false;  // never block the menu
+}
+
 // reshade_present runs after ReShade has drawn its effects and menu, so the captured frame (which
 // the presenter shows on top of the game) still contains the ReShade UI.
 void on_reshade_present(effect_runtime* runtime) {
@@ -140,7 +147,7 @@ void draw_overlay(effect_runtime*) {
     auto& s = sh.settings;
     auto& h = sh.hooks;
     auto& p = sh.presenter;
-    ImGui::TextDisabled("FrameWarp " FW_VERSION);
+    ImGui::TextDisabled("XPAR (xPoiler's Asynchronous Reprojection) " FW_VERSION);
 
     bool enabled = s.enabled != 0;
     // Label follows the refresh rate the presenter measures on the overlay's display.
@@ -160,8 +167,8 @@ void draw_overlay(effect_runtime*) {
                            "Turn it on in Windows Settings > System > Display > Graphics, then restart the PC.");
     if (alive && p.frame_generation)
         ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
-                           "Frame generation is on in the game. FrameWarp is paused: turn frame generation off -\n"
-                           "FrameWarp already fills your display's refresh rate, and the two cannot be combined.");
+                           "Frame generation is on in the game. XPAR is paused: turn frame generation off -\n"
+                           "XPAR already fills your display's refresh rate, and the two cannot be combined.");
     if (!alive && ImGui::Button("Start presenter")) { g_presenter_launched = false; launch_presenter(); }
     if (alive) {
         ImGui::Text("Output %.1f fps | game %.1f fps | warp GPU %.2f ms | source age %.1f ms",
@@ -197,10 +204,10 @@ void draw_overlay(effect_runtime*) {
         static const char* const kPriorities[] = {"Realtime (default)", "High", "Normal"};
         int priority = s.gpu_priority <= 2 ? static_cast<int>(s.gpu_priority) : 0;
         if (ImGui::Combo("Presenter GPU priority", &priority, kPriorities, 3)) s.gpu_priority = static_cast<std::uint32_t>(priority);
-        static const char* const kEngines[] = {"NVIDIA Latewarp (default)", "FrameWarp (experimental)"};
+        static const char* const kEngines[] = {"NVIDIA Latewarp", "XPAR (default)"};
         int engine = s.warp_engine == 1 ? 1 : 0;
         if (ImGui::Combo("Warp engine", &engine, kEngines, 2)) s.warp_engine = static_cast<std::uint32_t>(engine);
-        ImGui::TextDisabled("  FrameWarp's own engine is used automatically when nvngx_latewarp.dll is missing");
+        ImGui::TextDisabled("  NVIDIA Latewarp needs nvngx_latewarp.dll; without it XPAR's engine is used");
         bool invert = s.invert_warp != 0;
         if (ImGui::Checkbox("Invert warp (debug)", &invert)) s.invert_warp = invert;
         bool ui = s.use_ui_tags != 0;
@@ -246,10 +253,12 @@ void draw_overlay(effect_runtime*) {
         }
     }
 
-    if (ImGui::CollapsingHeader("FSR diagnostics (AMD FidelityFX 3.1 / 4)")) {
+    if (ImGui::CollapsingHeader("FSR diagnostics (AMD FidelityFX 2 / 3.0 / 3.1 / 4)")) {
         const auto& f = sh.fsr;
         ImGui::Text("Hooks: amd_fidelityfx_dx12 %s, loader %s, upscaler %s", (f.hooks & 3) ? "yes" : "no", (f.hooks & 12) ? "yes" : "no",
                     (f.hooks & 48) ? "yes" : "no");
+        ImGui::Text("Hooks: FSR 3.0 (ffx_fsr3upscaler_x64) %s, FSR 2 (ffx_fsr2_api_x64) %s", (f.hooks & 192) ? "yes" : "no",
+                    (f.hooks & 768) ? "yes" : "no");
         ImGui::Text("Calls: upscale contexts %u, upscale dispatches %u, resets %u", f.upscale_creates, f.upscale_dispatches, f.resets);
         ImGui::Text("Render %ux%u -> output %ux%u, context flags 0x%X%s", f.render_w, f.render_h, f.out_w, f.out_h, f.create_flags,
                     (f.create_flags & 8) ? " (depth inverted)" : "");
@@ -315,18 +324,20 @@ void draw_overlay(effect_runtime*) {
 void register_callbacks() {
     reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
     reshade::register_event<reshade::addon_event::reshade_present>(on_reshade_present);
-    reshade::register_overlay("FrameWarp", draw_overlay);
+    reshade::register_event<reshade::addon_event::reshade_open_overlay>(on_open_overlay);
+    reshade::register_overlay("XPAR", draw_overlay);
 }
 void unregister_callbacks() {
-    reshade::unregister_overlay("FrameWarp", draw_overlay);
+    reshade::unregister_overlay("XPAR", draw_overlay);
+    reshade::unregister_event<reshade::addon_event::reshade_open_overlay>(on_open_overlay);
     reshade::unregister_event<reshade::addon_event::reshade_present>(on_reshade_present);
     reshade::unregister_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
 }
 }  // namespace
 
 extern "C" {
-__declspec(dllexport) const char* NAME = "FrameWarp";
-__declspec(dllexport) const char* DESCRIPTION = "Asynchronous camera reprojection at display refresh rate with NVIDIA Latewarp, fed by Streamline data.";
+__declspec(dllexport) const char* NAME = "XPAR";
+__declspec(dllexport) const char* DESCRIPTION = "xPoiler's Asynchronous Reprojection: camera reprojection at the display's refresh rate, fed by DLSS or FSR data.";
 
 __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE reshade_module) noexcept {
     if (!reshade::register_addon(addon_module, reshade_module)) {

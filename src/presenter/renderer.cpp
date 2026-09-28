@@ -548,21 +548,56 @@ groupshared float sc_tot[13];
 // prediction's own gradient (sharpening, sub-pixel differences between the two images): the tone
 // curve's slope times the scene's gradient, per channel.
 groupshared uint sc_hud_pixels;
-[numthreads(8, 8, 1)] void cs_scene_hud(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+// What every pixel of the group reads, loaded once per group: curve 2, wash-out 1, and tile set 1 at the
+// group's four tile centres (a group of 8x8 never straddles a tile centre: 64 is a multiple of 8).
+groupshared float sh_mean[3 * kBins], sh_grey[kBins], sh_wash[kBins], sh_tile[4 * 6];
+float sh_curve_slope(uint c, float v, out float slope) {
+    const float f = bin_pos(v) - 0.5, fl = floor(f);
+    const int i0 = clamp(int(fl), 0, int(kBins) - 1), i1 = clamp(int(fl) + 1, 0, int(kBins) - 1);
+    const float m0 = sh_mean[c * kBins + uint(i0)], m1 = sh_mean[c * kBins + uint(i1)];
+    slope = (m1 - m0) * (float(kBins) / 20.0);
+    return lerp(m0, m1, saturate(f - fl));
+}
+float3 sh_predictor(float3 s) {  // predictor(2): curve 2, then wash-out 1
+    float unused;
+    const float3 a = float3(sh_curve_slope(0, s.r, unused), sh_curve_slope(1, s.g, unused), sh_curve_slope(2, s.b, unused));
+    const float f = bin_pos(dot(s, kLuma)) - 0.5, fl = floor(f);
+    const int i0 = clamp(int(fl), 0, int(kBins) - 1), i1 = clamp(int(fl) + 1, 0, int(kBins) - 1);
+    const float t = saturate(f - fl);
+    const float grey = lerp(sh_grey[i0], sh_grey[i1], t), k = lerp(sh_wash[i0], sh_wash[i1], t);
+    return a + k * (grey - a);
+}
+[numthreads(8, 8, 1)] void cs_scene_hud(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
     if (gi == 0) sc_hud_pixels = 0;
+    for (uint i = gi; i < 3 * kBins; i += 64) sh_mean[i] = mean_of(2, i / kBins, int(i % kBins));
+    sh_grey[gi] = grey_of(1, int(gi));  // 64 threads, 64 bins
+    sh_wash[gi] = wash_of(1, int(gi));
+    const float2 t0 = (float2(gid.xy * 8) + 0.5) / float(kTile) - 0.5;
+    const int2 fl0 = int2(floor(t0));
+    if (gi < 24) {  // corner k, channel c, a or b
+        const uint k = gi / 6, c = (gi % 6) / 2, ab = gi & 1;
+        const int2 q = clamp(fl0 + int2(k & 1, k >> 1), int2(0, 0), int2(grid) - 1);
+        sh_tile[gi] = asfloat(sc_fit_u.Load(kTileBase + ((1 * kMaxTiles + uint(q.y) * grid.x + uint(q.x)) * 3) * 8 + c * 8 + ab * 4));
+    }
     GroupMemoryBarrierWithGroupSync();
     if (all(id.xy < out_size)) {
-        float3 a, b;
-        correction(1, id.xy, a, b);
+        // Tile correction (set 1), bilinear between tile centres.
+        const float2 t = (float2(id.xy) + 0.5) / float(kTile) - 0.5;
+        const float2 f = saturate(t - floor(t));
+        float3 a = 0, b = 0;
+        [unroll] for (int k = 0; k < 4; ++k) {
+            const float w = ((k & 1) ? f.x : 1 - f.x) * ((k >> 1) ? f.y : 1 - f.y);
+            [unroll] for (uint c = 0; c < 3; ++c) { a[c] += w * sh_tile[k * 6 + c * 2]; b[c] += w * sh_tile[k * 6 + c * 2 + 1]; }
+        }
         const int2 p = int2(id.xy), last = int2(out_size) - 1;
         const float3 scene = max(sc_scene_t.Load(int3(p, 0)).rgb, 0);
         float3 slope;
-        curve_slope(2, 0, scene.r, slope.r); curve_slope(2, 1, scene.g, slope.g); curve_slope(2, 2, scene.b, slope.b);
-        const float3 pred = a * predictor(2, scene) + b;
+        sh_curve_slope(0, scene.r, slope.r); sh_curve_slope(1, scene.g, slope.g); sh_curve_slope(2, scene.b, slope.b);
+        const float3 pred = a * sh_predictor(scene) + b;
         float3 ls[4];
         const int2 offs[4] = {int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1)};
-        [unroll] for (uint i = 0; i < 4; ++i)
-            ls[i] = log2(max(sc_scene_t.Load(int3(clamp(p + offs[i], int2(0, 0), last), 0)).rgb, 1.0 / 4096.0));
+        [unroll] for (uint j = 0; j < 4; ++j)
+            ls[j] = log2(max(sc_scene_t.Load(int3(clamp(p + offs[j], int2(0, 0), last), 0)).rgb, 1.0 / 4096.0));
         const float3 g = max(abs(ls[1] - ls[0]), abs(ls[3] - ls[2]));
         const float gradient = dot(abs(a * slope) * g, float3(1, 1, 1) / 3.0);
         const bool hud = miss(sc_frame_t.Load(int3(p, 0)).rgb, pred) > 0.06 + 0.5 * gradient;
@@ -1231,7 +1266,7 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
     const bool no_depth = std::fabs(m[8]) <= 1e-6f * scale && std::fabs(m[9]) <= 1e-6f * scale && std::fabs(m[11]) <= 1e-6f * scale;
     c.flags = (split ? 1u : 0u) | (mask ? 2u : 0u) | (depth_inverted ? 16u : 0u) | (no_depth ? 32u : 0u);
     set_x_srv(kXOwnSrv + 0, split ? kPHudless : kPBackbuffer);
-    set_x_srv(kXOwnSrv + 1, split ? kPUi : kPZeroUi);
+    set_x_srv(kXOwnSrv + 1, split ? kPUi : kPBackbuffer);  // (only read with a UI layer)
     set_x_srv(kXOwnSrv + 2, mask ? kPMask : kPDepth);
     set_x_srv(kXOwnSrv + 3, kPDepth);
     for (UINT i = 4; i < kXSrvCount; ++i) set_x_srv(kXOwnSrv + i, kPBackbuffer);
@@ -1606,9 +1641,6 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
     out.color_rect = {0, 0, bb.width, bb.height};
     const DXGI_FORMAT colour = colour_format(static_cast<DXGI_FORMAT>(bb.format));
     ensure_private(kPBackbuffer, bb.width, bb.height, colour);
-    ensure_private(kPHudless, bb.width, bb.height, DXGI_FORMAT_R16G16B16A16_FLOAT);
-    ensure_private(kPUi, bb.width, bb.height, DXGI_FORMAT_R16G16B16A16_FLOAT);
-    ensure_private(kPZeroUi, bb.width, bb.height, DXGI_FORMAT_R16G16B16A16_FLOAT);
     ensure_private(kPOutput, bb.width, bb.height, colour);  // the warped frame: the same values as the game's
     if (keep_previous_ && ingested_) {
         const PrivateId from = last_had_hudless_ ? kPHudless : kPBackbuffer;
@@ -1625,12 +1657,14 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
     convert(sources[kBackbuffer], static_cast<DXGI_FORMAT>(bb.format), slot, kBackbuffer, kPBackbuffer, bb.width, bb.height);
 
     const auto& hl = m.tex[kHudless];
-    if (sources[kHudless] && hl.width == bb.width && hl.height == bb.height) {
+    // HUD layers (games that send them) in half-float: the UI's alpha needs more than 2 bits.
+    if (sources[kHudless] && hl.width == bb.width && hl.height == bb.height &&
+        ensure_private(kPHudless, bb.width, bb.height, DXGI_FORMAT_R16G16B16A16_FLOAT)) {
         convert(sources[kHudless], static_cast<DXGI_FORMAT>(hl.format), slot, kHudless, kPHudless, bb.width, bb.height);
         out.has_hudless = true;
     }
     const auto& ui = m.tex[kUi];
-    if (sources[kUi] && ui.width == bb.width && ui.height == bb.height) {
+    if (sources[kUi] && ui.width == bb.width && ui.height == bb.height && ensure_private(kPUi, bb.width, bb.height, DXGI_FORMAT_R16G16B16A16_FLOAT)) {
         convert(sources[kUi], static_cast<DXGI_FORMAT>(ui.format), slot, kUi, kPUi, bb.width, bb.height);
         out.has_ui = true;
     }
@@ -1656,6 +1690,9 @@ LatewarpInputs Renderer::latewarp_inputs(const IngestedSource& src, bool use_ui_
     const bool split = use_ui_tags && src.has_hudless && src.has_ui;
     in.backbuffer = private_[kPBackbuffer].texture.Get();
     in.hudless = split ? private_[kPHudless].texture.Get() : in.backbuffer;
+    // Latewarp always takes a UI layer: an empty one (zero-initialised, 8-bit) for games without.
+    if (!split && private_[kPBackbuffer].texture)
+        ensure_private(kPZeroUi, private_[kPBackbuffer].width, private_[kPBackbuffer].height, DXGI_FORMAT_R8G8B8A8_UNORM);
     in.ui = split ? private_[kPUi].texture.Get() : private_[kPZeroUi].texture.Get();
     in.depth = private_[kPDepth].texture.Get();
     in.motion = private_[kPMotion].texture.Get();
