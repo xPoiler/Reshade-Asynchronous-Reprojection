@@ -6,6 +6,8 @@ FrameWarp uses the following third-party components.
   `third_party/reshade/LICENSE.md` in the source repository. https://github.com/crosire/reshade
 * **Dear ImGui headers.** Copyright (c) 2014-2025 Omar Cornut. MIT License; see
   `third_party/imgui/LICENSE.txt`. https://github.com/ocornut/imgui
+* **Vulkan headers** (Khronos Vulkan-Headers). Copyright 2015-2024 The Khronos Group Inc. Apache License 2.0;
+  see `third_party/vulkan/LICENSE.md`. https://github.com/KhronosGroup/Vulkan-Headers
 * **NVIDIA NGX SDK** (the `nvsdk_ngx_d.lib` loader, linked into `FrameWarpPresenter.exe`). Copyright (c)
   NVIDIA Corporation, used under NVIDIA's SDK license terms. It is not part of this source repository;
   get it from https://github.com/NVIDIA/DLSS.

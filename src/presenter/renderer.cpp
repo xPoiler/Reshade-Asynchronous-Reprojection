@@ -88,10 +88,11 @@ groupshared float4 gs_a[64], gs_b[64];
                 // near plane): the sky and distant scenery often have motion vectors that ignore the camera too.
                 // Further out (up to 4096x the near plane: a third-person character a few metres away) only what
                 // is stuck to the screen while the camera clearly moves - objects moving on their own (cars,
-                // people) do not do that, and they must keep warping.
+                // people) do not do that, and they must keep warping. The near rule can be switched off (flag
+                // 64): with an estimated camera the nearby floor can miss the camera model while strafing.
                 const float2 screen_px = g * mv_scale * float2(rect.zw);
                 const bool attached = (flags & 1) && (flags & 16) &&
-                                      ((d > 1.0 / 64.0 && length(own) > max(1.0, 0.25 * length(cam_px))) ||
+                                      ((!(flags & 64) && d > 1.0 / 64.0 && length(own) > max(1.0, 0.25 * length(cam_px))) ||
                                        (d > 1.0 / 4096.0 && length(cam_px) >= 2.0 && length(screen_px) < 0.2 * length(cam_px)));
                 o = float4(own, d, attached ? 2 : (moving ? 1 : 0));
                 // The scale fit only uses pixels whose motion vector points along the camera motion (either
@@ -287,6 +288,41 @@ uint hud_classify(uint2 id, out float weight) {
     if (evidence + changed < 256 || evidence > 0.35 * (evidence + changed)) return;
     hud_score_u[id.xy] = lerp(hud_score_u[id.xy], 1.0, weight);
 }
+// Combined HUD detection (opt-in): what the upscaler-output detector finds is HUD only where the pixel
+// does not follow the world. Here hud_score_u is the world evidence: towards 1 where the pixel changed
+// exactly as the camera moved the scenery under it (post-processed scenery: bloom, lights, effects),
+// towards 0 where it stayed put while the camera moved (same evidence and guard as cs_hud).
+bool hud_follows_world(uint2 id) {
+    const float2 uv = (float2(id) + 0.5) / float2(out_size);
+    const int2 pr = int2(rect.xy) + int2(min(uint2(uv * float2(rect.zw)), rect.zw - 1));
+    const float depth = hud_depth_t.Load(int3(pr, 0));
+    const float4 pv = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, depth, 1), clip_to_prev);
+    if (pv.w <= 0) return false;
+    const float2 from = float2(id) + (float2(pv.x / pv.w * 0.5 + 0.5, 0.5 - pv.y / pv.w * 0.5) - uv) * float2(out_size);
+    if (length(from - float2(id)) < 3.0) return false;
+    // The camera rarely moves whole pixels: the best of the 4 pixels around where the scenery came from.
+    const float3 c = hud_current_t.Load(int3(id, 0)).rgb;
+    const int2 base = int2(floor(from - 0.5));
+    float best = 1e9;
+    [unroll] for (int i = 0; i < 4; ++i) {
+        const int2 q = clamp(base + int2(i & 1, i >> 1), int2(0, 0), int2(out_size) - 1);
+        const float3 d = abs(c - hud_previous_t.Load(int3(q, 0)).rgb);
+        best = min(best, max(d.r, max(d.g, d.b)));
+    }
+    return best < 0.04;
+}
+[numthreads(8, 8, 1)] void cs_hud_world(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= out_size) || !(flags & 2)) return;
+    float weight;
+    const uint kind = hud_classify(id.xy, weight);
+    if (kind == 1) {
+        const uint evidence = hud_counts_u.Load(0), changed = hud_counts_u.Load(4);
+        if (evidence + changed < 256 || evidence > 0.35 * (evidence + changed)) return;
+        hud_score_u[id.xy] = lerp(hud_score_u[id.xy], 0.0, weight);
+    } else if ((kind == 2 || kind == 4) && hud_follows_world(id.xy)) {
+        hud_score_u[id.xy] = lerp(hud_score_u[id.xy], 1.0, 0.5);
+    }
+}
 
 // Motion/depth samples on a grid (mv_size = grid size) over the render rect, for camera estimation.
 RWStructuredBuffer<float4> sample_u : register(u0);
@@ -317,14 +353,17 @@ RWTexture2D<unorm float> att_u : register(u0);
 // camera-attached pixels (widened by 1 render px, see cs_attached).
 Texture2D<float> mask_score_t : register(t0);
 Texture2D<float> mask_attached_t : register(t1);
+Texture2D<float> mask_world_t : register(t2);  // combined HUD detection (flag 64): world evidence, see cs_hud_world
 RWTexture2D<unorm float> mask_u : register(u0);
 [numthreads(8, 8, 1)] void cs_mask(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= out_size)) return;
     bool keep = false;
     if (flags & 4) {
         [unroll] for (int y = -1; y <= 1; ++y)
-            [unroll] for (int x = -1; x <= 1; ++x)
-                keep = keep || mask_score_t.Load(int3(clamp(int2(id.xy) + int2(x, y), int2(0, 0), int2(out_size) - 1), 0)) > 0.6;
+            [unroll] for (int x = -1; x <= 1; ++x) {
+                const int3 q = int3(clamp(int2(id.xy) + int2(x, y), int2(0, 0), int2(out_size) - 1), 0);
+                keep = keep || (mask_score_t.Load(q) > 0.6 && (!(flags & 64) || mask_world_t.Load(q) < 0.5));
+            }
     }
     if (!keep && (flags & 8)) {
         const float2 uv = (float2(id.xy) + 0.5) / float2(out_size);
@@ -714,8 +753,8 @@ constexpr UINT kXAnalyzeSrv = 64, kXAnalyzeUav = 70, kXReduceUav = 72, kXSplatSr
 constexpr UINT kXGatherSrvHudless = 82, kXGatherSrvBackbuffer = 88, kXGatherUav = 94;
 constexpr UINT kXHudSrv = 96, kXHudUav = 102, kXMaskSrv = 104, kXMaskUav = 110, kXSampleSrv = 112, kXSampleUav = 118;
 constexpr UINT kXTintSrv = 120, kXTintUav = 126, kXSceneSrv = 128, kXSceneUav = 134, kXOwnSrv = 136, kXOwnUav = 142;
-constexpr UINT kXAttSrv = 144, kXAttUav = 150;
-constexpr UINT kHeapSize = 152;
+constexpr UINT kXAttSrv = 144, kXAttUav = 150, kXWorldUav = 152;
+constexpr UINT kHeapSize = 154;
 // Scene HUD fit buffer (see cs_scene_*): curve accumulators and curves, wash-out accumulators and
 // values, 2 tile sets, HUD pixel count (same layout as the shader's constants).
 constexpr UINT kSceneBins = 64, kSceneTile = 128, kSceneMaxTiles = 4096;
@@ -931,7 +970,7 @@ bool Renderer::create_pipelines(std::string& error) {
     }
     struct { const char* entry; ComPtr<ID3D12PipelineState>* pso; } xs[] = {
         {"cs_analyze", &cs_analyze_}, {"cs_reduce", &cs_reduce_}, {"cs_clear", &cs_clear_}, {"cs_splat", &cs_splat_}, {"cs_gather", &cs_gather_},
-        {"cs_hud", &cs_hud_}, {"cs_mask", &cs_mask_}, {"cs_clear_score", &cs_clear_score_},
+        {"cs_hud", &cs_hud_}, {"cs_hud_world", &cs_hud_world_}, {"cs_mask", &cs_mask_}, {"cs_clear_score", &cs_clear_score_},
         {"cs_hud_count", &cs_hud_count_}, {"cs_clear_counts", &cs_clear_counts_}, {"cs_sample", &cs_sample_}, {"cs_tint", &cs_tint_},
         {"cs_scene_clear", &cs_scene_clear_}, {"cs_scene_accum", &cs_scene_accum_}, {"cs_scene_finish", &cs_scene_finish_},
         {"cs_scene_tiles", &cs_scene_tiles_}, {"cs_scene_hud", &cs_scene_hud_}, {"cs_scene_grey", &cs_scene_grey_},
@@ -1010,7 +1049,7 @@ struct XConstants {
 static_assert(sizeof(XConstants) == 32 * 4, "root constants");
 
 void Renderer::analyze_motion(const IngestedSource& src, const float clip_to_prev_clip[16], float scale_x, float scale_y, bool scale_valid,
-                              bool depth_inverted) {
+                              bool depth_inverted, bool near_rule) {
     if (!src.has_depth || !src.has_motion) return;
     const auto& depth = private_[kPDepth];
     const UINT w = depth.width, h = depth.height, gx = (w + 7) / 8, gy = (h + 7) / 8;
@@ -1049,7 +1088,7 @@ void Renderer::analyze_motion(const IngestedSource& src, const float clip_to_pre
     c.mv_scale[0] = scale_x; c.mv_scale[1] = scale_y;
     c.threshold = 1.0f;
     c.groups_x = gx;
-    c.flags = (scale_valid ? 1u : 0u) | (depth_inverted ? 16u : 0u);
+    c.flags = (scale_valid ? 1u : 0u) | (depth_inverted ? 16u : 0u) | (near_rule ? 0u : 64u);
     transition(private_[kPObject], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     x_dispatch(cs_analyze_.Get(), &c, kXAnalyzeSrv, kXAnalyzeUav, gx, gy);
     D3D12_RESOURCE_BARRIER uav{}; uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; uav.UAV.pResource = partials_.Get();
@@ -1107,7 +1146,7 @@ ID3D12Resource* Renderer::extrapolate_objects(const IngestedSource& src, bool fr
 }
 
 ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const float clip_to_prev_clip[16], bool hud, bool attached,
-                                             bool keep_attached, bool depth_inverted) {
+                                             bool keep_attached, bool depth_inverted, bool combined) {
     if (!src.has_depth || !private_[kPObject].texture) return nullptr;
     const UINT ow = private_[kPBackbuffer].width, oh = private_[kPBackbuffer].height;
     const bool new_score = !private_[kPHudScore].texture || private_[kPHudScore].width != ow || private_[kPHudScore].height != oh;
@@ -1121,7 +1160,8 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
     c.out_size[0] = ow; c.out_size[1] = oh;
     const bool previous = previous_valid_ && !previous_from_hudless_ && private_[kPPrevious].texture &&
                           private_[kPPrevious].width == ow && private_[kPPrevious].height == oh;
-    if (new_score || reset_hud_) {
+    const bool reset = new_score || reset_hud_;
+    if (reset) {
         // New or resized score: start from "not HUD".
         reset_hud_ = false;
         transition(private_[kPHudScore], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1138,6 +1178,40 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
         // The upscaler's output stopped coming: the learned map starts over.
         hud_from_scene_ = false;
         reset_hud_ = true;
+    }
+    // Combined detection: where the pixels follow the world (world evidence, cs_hud_world), from the
+    // previous colour. Its own UAV table: the score's may already be in use for this frame's clear.
+    bool world = false;
+    if (from_scene && combined && previous) {
+        const bool new_world = !private_[kPWorld].texture || private_[kPWorld].width != ow || private_[kPWorld].height != oh;
+        if (ensure_private(kPWorld, ow, oh, DXGI_FORMAT_R32_FLOAT)) {
+            world = true;
+            set_x_srv(kXHudSrv + 0, kPBackbuffer);
+            set_x_srv(kXHudSrv + 1, kPPrevious);
+            set_x_srv(kXHudSrv + 2, kPDepth);
+            set_x_srv(kXHudSrv + 3, kPObject);
+            for (UINT i = 4; i < kXSrvCount; ++i) set_x_srv(kXHudSrv + i, kPDepth);
+            set_x_uav(kXWorldUav + 0, kPWorld);
+            D3D12_UNORDERED_ACCESS_VIEW_DESC raw{};
+            raw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; raw.Format = DXGI_FORMAT_R32_TYPELESS;
+            raw.Buffer.NumElements = 4; raw.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+            device_->CreateUnorderedAccessView(hud_counts_.Get(), nullptr, &raw, cpu(kXWorldUav + 1));
+            transition(private_[kPWorld], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            D3D12_RESOURCE_BARRIER uav{}; uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; uav.UAV.pResource = private_[kPWorld].texture.Get();
+            if (new_world || reset) {
+                XConstants z = c; z.flags = 0;
+                x_dispatch(cs_clear_score_.Get(), &z, kXHudSrv, kXWorldUav, (ow + 7) / 8, (oh + 7) / 8);
+                list_->ResourceBarrier(1, &uav);
+            }
+            c.flags = 2u | (depth_inverted ? 16u : 0u) | (attached ? 32u : 0u);
+            D3D12_RESOURCE_BARRIER counts{}; counts.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; counts.UAV.pResource = hud_counts_.Get();
+            x_dispatch(cs_clear_counts_.Get(), &c, kXHudSrv, kXWorldUav, 1, 1);
+            list_->ResourceBarrier(1, &counts);
+            x_dispatch(cs_hud_count_.Get(), &c, kXHudSrv, kXWorldUav, (ow + 7) / 8, (oh + 7) / 8);
+            list_->ResourceBarrier(1, &counts);
+            x_dispatch(cs_hud_world_.Get(), &c, kXHudSrv, kXWorldUav, (ow + 7) / 8, (oh + 7) / 8);
+            transition(private_[kPWorld], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
     }
     if (hud && previous && !from_scene) {
         set_x_srv(kXHudSrv + 0, kPBackbuffer);
@@ -1178,9 +1252,10 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
     }
     set_x_srv(kXMaskSrv + 0, kPHudScore);
     set_x_srv(kXMaskSrv + 1, keep_att ? kPAttached : kPHudScore);
-    for (UINT i = 2; i < kXSrvCount; ++i) set_x_srv(kXMaskSrv + i, kPHudScore);
+    set_x_srv(kXMaskSrv + 2, world ? kPWorld : kPHudScore);
+    for (UINT i = 3; i < kXSrvCount; ++i) set_x_srv(kXMaskSrv + i, kPHudScore);
     set_x_uav(kXMaskUav + 0, kPMask); set_x_uav(kXMaskUav + 1, kPMask);
-    c.flags = (hud ? 4u : 0u) | (keep_att ? 8u : 0u);
+    c.flags = (hud ? 4u : 0u) | (keep_att ? 8u : 0u) | (world ? 64u : 0u);
     transition(private_[kPMask], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     x_dispatch(cs_mask_.Get(), &c, kXMaskSrv, kXMaskUav, (ow + 7) / 8, (oh + 7) / 8);
     transition(private_[kPMask], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);

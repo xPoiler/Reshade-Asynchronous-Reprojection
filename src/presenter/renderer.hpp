@@ -108,8 +108,9 @@ public:
     // Moving-object extrapolation (experimental). Once per new game frame: per-pixel object motion
     // (scaled game motion vectors minus the camera-only motion from depth + clipToPrevClip), plus the
     // motion-vector scale fit (read back a few frames later, see take_motion_fit).
+    // near_rule: pixels near the camera that move against the camera model count as attached (see cs_analyze).
     void analyze_motion(const IngestedSource& src, const float clip_to_prev_clip[16], float scale_x, float scale_y, bool scale_valid,
-                        bool depth_inverted = true);
+                        bool depth_inverted = true, bool near_rule = true);
     // Per output frame: moves object pixels `alpha` game frames forward (negative: back) into a copy of
     // the hud-less colour (or the backbuffer). Returns the result, or nullptr when unavailable.
     ID3D12Resource* extrapolate_objects(const IngestedSource& src, bool from_hudless, float alpha, const float clip_to_prev_clip[16]);
@@ -123,9 +124,11 @@ public:
     // scene under them (needs the previous colour, see set_keep_previous_colour), or from the upscaler's
     // output when the source has it; attached: the motion analysis knows which pixels move with the
     // camera (the motion-vector scale is known); keep_attached: keep those unwarped (third-person
-    // character, first-person weapon). Returns the R8 mask at output resolution, kept for the frame's outputs.
+    // character, first-person weapon); combined: with the upscaler's output, HUD only where the pixels do
+    // not follow the world while the camera moves (needs the previous colour). Returns the R8 mask at
+    // output resolution, kept for the frame's outputs.
     ID3D12Resource* build_no_warp_mask(const IngestedSource& src, const float clip_to_prev_clip[16], bool hud, bool attached,
-                                       bool keep_attached, bool depth_inverted = true);
+                                       bool keep_attached, bool depth_inverted = true, bool combined = false);
     // Camera estimation (games without a camera): motion vector (raw) and depth on a grid over the render
     // rect, 4 floats per sample (mv.x, mv.y, depth, valid). Submits the frame's work so far and waits.
     bool sample_motion(const IngestedSource& src, std::uint32_t grid_w, std::uint32_t grid_h, std::vector<float>& out);
@@ -148,7 +151,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     };
-    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPDest, kPExtrap, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPCount };
+    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPDest, kPExtrap, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPCount };
 
     bool create_pipelines(std::string& error);
     // The format a private copy of a game colour image is kept in: the game's own 4-byte format when it
@@ -186,7 +189,7 @@ private:
     const char* priority_name_ = "normal";
 
     ComPtr<ID3D12RootSignature> root_, root_x_;
-    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_clear_, cs_splat_, cs_gather_, cs_hud_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_;
+    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_clear_, cs_splat_, cs_gather_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_;
     ComPtr<ID3D12Resource> samples_, samples_readback_;
     UINT samples_count_ = 0;
     float last_flush_ms_ = 0;

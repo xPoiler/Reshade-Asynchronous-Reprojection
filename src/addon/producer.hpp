@@ -3,12 +3,17 @@
 // Game-side half of the transport. Runs inside the game process and only ever records
 // barriers + copies into the game's own command lists, then signals a shared fence at present.
 #include "shared/protocol.hpp"
+#include "addon/vk_image.hpp"
 #include <d3d12.h>
 #include <wrl/client.h>
+#include <memory>
 #include <mutex>
 #include <vector>
 
+namespace reshade::api { struct device; struct command_queue; }
+
 namespace fw {
+class VkTransport;
 
 class Producer {
 public:
@@ -22,6 +27,11 @@ public:
 
     // First D3D12 device seen (the game's). Creates the shared fence.
     bool attach(ID3D12Device* device);
+    // Vulkan games: a D3D12 device of our own on the game's GPU creates the shared textures, which are
+    // imported into the game's Vulkan device (see vk_transport.hpp). detach_vulkan before the device goes.
+    bool attach_vulkan(reshade::api::device* device);
+    void detach_vulkan();
+    bool vulkan() const { return vk_ != nullptr; }
     void set_swapchain(HWND hwnd, std::uint32_t width, std::uint32_t height, DXGI_FORMAT format, std::uint32_t color_space);
 
     void on_constants(std::uint64_t frame, const Camera& camera);
@@ -40,6 +50,13 @@ public:
     // on `queue`; finish_present() signals the fence afterwards.
     std::uint64_t begin_present(ID3D12Resource* backbuffer, ID3D12GraphicsCommandList* list);
     void finish_present(ID3D12CommandQueue* queue, std::uint64_t frame);
+    // The same for Vulkan games (Vulkan handles as integers: VkImage, VkFormat, VkImageLayout, VkCommandBuffer).
+    // `aspect` is the view's aspect mask; the image's own width/height are copied (ext_* is the valid region).
+    void on_tag_vk(std::uint64_t frame, Tex kind, std::uint64_t image, std::uint32_t vk_format, std::uint32_t aspect, std::uint32_t mip,
+                   std::uint32_t layer, std::uint32_t layout, std::uint32_t width, std::uint32_t height, std::uint32_t ext_x,
+                   std::uint32_t ext_y, std::uint32_t ext_w, std::uint32_t ext_h, void* command_buffer);
+    std::uint64_t begin_present_vk(std::uint64_t image, DXGI_FORMAT format, std::uint32_t width, std::uint32_t height, void* command_buffer);
+    void finish_present_vk(reshade::api::command_queue* queue, std::uint64_t token);
 
     void set_message(const char* text);
 
@@ -52,11 +69,14 @@ private:
         HANDLE handle = nullptr;
         std::uint32_t generation = 0;
         D3D12_RESOURCE_DESC desc{};
+        VkSharedImage vk;  // Vulkan games: the same texture imported into the game's device
     };
-    struct Retired { Microsoft::WRL::ComPtr<ID3D12Resource> resource; HANDLE handle; std::uint64_t after_fence; };
+    struct Retired { Microsoft::WRL::ComPtr<ID3D12Resource> resource; HANDLE handle; std::uint64_t after_fence; VkSharedImage vk; };
 
     int slot_for_frame(std::uint64_t frame, bool create);
-    bool ensure_texture(int slot, Tex kind, const D3D12_RESOURCE_DESC& source_desc);
+    bool ensure_texture(int slot, Tex kind, const D3D12_RESOURCE_DESC& source_desc, std::uint32_t vk_depth_bytes = 0);
+    int present_slot();  // the slot being presented (marks it, releases older ones); -1: none
+    void release_textures();
     void copy_into(ID3D12GraphicsCommandList* list, ID3D12Resource* source, D3D12_RESOURCE_STATES state, ID3D12Resource* target);
     void collect_retired();
 
@@ -64,6 +84,8 @@ private:
     HANDLE mapping_ = nullptr;
     Shared* shared_ = nullptr;
     Microsoft::WRL::ComPtr<ID3D12Device> device_;
+    Microsoft::WRL::ComPtr<ID3D12Device> own_device_;  // Vulkan games
+    std::unique_ptr<VkTransport> vk_;
     Microsoft::WRL::ComPtr<ID3D12Fence> fence_;
     HANDLE fence_handle_ = nullptr;
     std::uint64_t fence_value_ = 0;

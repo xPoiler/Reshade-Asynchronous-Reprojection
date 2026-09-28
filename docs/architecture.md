@@ -57,7 +57,7 @@
   an 80x45 grid of motion vectors; the field of view learned by votes, or the one the game gives FSR
   once checked against the picture). A game that keeps sending its Streamline camera but no Streamline
   depth (Cyberpunk 2077 with FSR) gets FSR's depth and motion vectors attached to its own frames.
-* **Upscaler output.** Only when *Find the HUD from the upscaler output* is on: copied right after the
+* **Upscaler output.** Unless *Find the HUD* is set to *Learned from camera motion*: copied right after the
   upscaler writes it (after `slEvaluateFeature` for Streamline games, after the NGX evaluation or the
   FSR dispatch otherwise).
 * **Counters.** Presented images and rendered frames are counted for frame-generation detection.

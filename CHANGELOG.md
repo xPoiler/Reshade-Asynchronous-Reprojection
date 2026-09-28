@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+* **Find the HUD** (replaces the *Find the HUD from the upscaler output* checkbox, remembered per game):
+  the new default, **Upscaler output + camera motion check**, finds the HUD from the upscaler's output
+  and leaves out what is seen moving with the world when the camera turns, so bright lights, neon and
+  effects drawn after upscaling keep warping. *From the upscaler output* and *Learned from camera
+  motion* remain; without an upscaler output the learned detection is used.
+* **Keep near-camera motion still** (new option, on by default, remembered per game): turn it off if
+  the floor near the camera is kept still while strafing.
+* **Vulkan support** (tested with DOOM Eternal, DLSS): depth, motion vectors and the frame are passed
+  from Vulkan games to the presenter.
+* The camera model keeps what it learned while the mouse barely moves (menus, standing still, the
+  ReShade menu open) instead of dropping the mouse input until it is learned again.
+
 ## 1.4.0
 
 * **No NVIDIA RTX GPU or DLSS required any more:** FrameWarp works with DLSS and with AMD FSR, and its own

@@ -457,6 +457,12 @@ int main(int argc, char** argv) {
         // A bright yellow-white surface the tone mapping washes out towards white (as filmic tone mappers
         // do): scene (4, 4, 0.25) -> per channel (1, 1, 0.5), washed 80% towards its grey 0.964.
         bool washed_patch = false;
+        // Scenery the upscaler's output does not have (post-processing after upscaling: neon, bloom,
+        // effects): magenta 2 px stripes in the frame only, at this x (< 0: none).
+        LONG neon_x = -1;
+        const LONG neon_y0 = LONG(H * 3 / 8), neon_y1 = LONG(H / 2);
+        bool combined_hud = false;  // HUD from the upscaler's output + camera-motion check
+        bool near_rule = true;      // attached: near-camera pixels moving against the camera model count
         const D3D12_RECT washed_rect{LONG(W * 3 / 4), LONG(H * 5 / 8), LONG(W * 3 / 4) + 64, LONG(H * 5 / 8) + 64};
         ComPtr<ID3D12Resource> scene_tex;
         ComPtr<ID3D12DescriptorHeap> scene_rtv;
@@ -491,6 +497,13 @@ int main(int argc, char** argv) {
             if (washed_patch) {
                 const float washed[4] = {0.971f, 0.971f, 0.871f, 1};
                 list->ClearRenderTargetView(rtv, washed, 1, &washed_rect);
+            }
+            if (neon_x >= 0) {
+                const float magenta[4] = {1, 0, 1, 1};
+                for (LONG x = neon_x; x < neon_x + 48; x += 4) {
+                    const D3D12_RECT stripe{x, neon_y0, x + 2, neon_y1};
+                    list->ClearRenderTargetView(rtv, magenta, 1, &stripe);
+                }
             }
             if (hud_patch) {  // textured like real HUD (text, icons): 2 px stripes
                 // 0: opaque green; 1: teal, shifted 2 px (the content changed); 2: green at 50% over the scene
@@ -603,8 +616,8 @@ int main(int argc, char** argv) {
             renderer.set_keep_previous_colour(true);
             renderer.begin_frame();
             IngestedSource s = renderer.ingest(sh, s_slot);
-            renderer.analyze_motion(s, moving_cam.clip_to_prev_clip, 1.0f, 1.0f, true);
-            renderer.build_no_warp_mask(s, moving_cam.clip_to_prev_clip, hud, weapon, weapon);
+            renderer.analyze_motion(s, moving_cam.clip_to_prev_clip, 1.0f, 1.0f, true, true, near_rule);
+            renderer.build_no_warp_mask(s, moving_cam.clip_to_prev_clip, hud, weapon, weapon, true, combined_hud);
             renderer.finish_frame(false, 0);
             renderer.wait_idle();
             return s;
@@ -626,6 +639,16 @@ int main(int argc, char** argv) {
         show(anim_src, yaw);
         const double anim_x1 = peak(px, w, h, true, 1);
         EXPECT(std::fabs(anim_x1 - anim_x0) < 2.0, "an animating first-person weapon is not warped (%.0f -> %.0f)", anim_x0, anim_x1);
+        // Near-camera rule off (the floor band option): a weapon stuck to the screen is still held.
+        near_rule = false;
+        IngestedSource far_rule_src = ingest_frame(publish(211, 0.1f, 0, true, false), false, true);
+        near_rule = true;
+        show(far_rule_src, 0);
+        const double nr_x0 = peak(px, w, h, true, 1);
+        show(far_rule_src, yaw);
+        const double nr_x1 = peak(px, w, h, true, 1);
+        std::printf("near-camera rule off: weapon stuck to the screen x %.0f -> %.0f\n", nr_x0, nr_x1);
+        EXPECT(std::fabs(nr_x1 - nr_x0) < 2.0, "near-camera rule off: a weapon stuck to the screen is still held (%.0f -> %.0f)", nr_x0, nr_x1);
         // (A1b) a third-person character: attached to the camera too, but a few metres away (300x the near
         // plane). Held as well.
         strip_depth = 1.0f / 300.0f;
@@ -820,6 +843,43 @@ int main(int argc, char** argv) {
         std::printf("washed-out highlight x %.1f -> %.1f; HUD patch next to it x %.1f -> %.1f\n", wp_x0, wp_x1, wh_x0, wh_x1);
         EXPECT(wp_x0 > 0 && std::fabs(wp_x1 - wp_x0) > 20.0, "a highlight washed out by the tone mapping is not taken for HUD (%.1f -> %.1f)", wp_x0, wp_x1);
         EXPECT(wh_x0 > 0 && std::fabs(wh_x1 - wh_x0) < 2.0, "the HUD next to it is still held (%.1f -> %.1f)", wh_x0, wh_x1);
+        // (O) Combined HUD detection. Scenery missing from the upscaler's output is taken for HUD from the
+        // output alone; with the camera-motion check it warps, as it follows the world while the camera
+        // moves (6 px per frame here). The HUD patch in the same frames stays held.
+        auto magenta_x = [&]() {
+            double sum = 0, weight = 0;
+            for (std::uint32_t y = std::uint32_t(neon_y0); y < std::uint32_t(neon_y1); ++y)
+                for (std::uint32_t x = 0; x < w; ++x) {
+                    const std::size_t i = (std::size_t(y) * w + x) * 4;
+                    const float m = std::min(half_to_float(px[i]), half_to_float(px[i + 2])) - half_to_float(px[i + 1]);
+                    if (m > 0.5f) { sum += x * m; weight += m; }
+                }
+            return weight > 0 ? sum / weight : -1.0;
+        };
+        renderer.reset_hud_detection();
+        combined_hud = true;
+        IngestedSource neon_src{};
+        for (int k = 0; k < 4; ++k) {
+            neon_x = LONG(W * 5 / 8) - 6 * k;
+            neon_src = ingest_frame(publish(731 + k, 0.1f, 0, false, true), true, false);
+        }
+        show(neon_src, 0);
+        const double cn_x0 = magenta_x(), ch_x0 = green_x();
+        show(neon_src, yaw);
+        const double cn_x1 = magenta_x(), ch_x1 = green_x();
+        combined_hud = false;
+        neon_x = LONG(W * 5 / 8) - 24;
+        IngestedSource neon_only = ingest_frame(publish(735, 0.1f, 0, false, true), true, false);
+        neon_x = -1;
+        show(neon_only, 0);
+        const double on_x0 = magenta_x();
+        show(neon_only, yaw);
+        const double on_x1 = magenta_x();
+        std::printf("combined HUD detection: post-processed scenery x %.1f -> %.1f (output only: %.1f -> %.1f), HUD patch x %.1f -> %.1f\n",
+                    cn_x0, cn_x1, on_x0, on_x1, ch_x0, ch_x1);
+        EXPECT(on_x0 > 0 && std::fabs(on_x1 - on_x0) < 2.0, "the test scenery is taken for HUD from the upscaler's output alone (%.1f -> %.1f)", on_x0, on_x1);
+        EXPECT(cn_x0 > 0 && std::fabs(cn_x1 - cn_x0) > 20.0, "combined: scenery that follows the world warps (%.1f -> %.1f)", cn_x0, cn_x1);
+        EXPECT(ch_x0 > 0 && std::fabs(ch_x1 - ch_x0) < 2.0, "combined: the HUD is still held (%.1f -> %.1f)", ch_x0, ch_x1);
         // (L) Without HUD, nothing of the scene is taken for HUD: the bar and the stripes all warp.
         IngestedSource scene_clean = ingest_frame(publish(740, 0.1f, 0, false, false), true, false);
         show(scene_clean, 0);

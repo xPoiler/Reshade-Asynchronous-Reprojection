@@ -29,10 +29,11 @@ target_compile_definitions(fw_options INTERFACE WIN32_LEAN_AND_MEAN NOMINMAX UNI
 target_include_directories(fw_options INTERFACE src)
 
 # In-game ReShade add-on (static CRT so it has no runtime dependency inside the game).
-add_library(FrameWarpAddon SHARED src/addon/addon.cpp src/addon/producer.cpp src/addon/streamline_hooks.cpp src/addon/ngx_hooks.cpp src/addon/ffx_hooks.cpp
-            src/addon/game_probe.cpp src/common/inline_hook.cpp)
-target_link_libraries(FrameWarpAddon PRIVATE fw_options d3d12)
-target_include_directories(FrameWarpAddon SYSTEM PRIVATE third_party/reshade/include third_party/imgui "${FW_NGX_INCLUDE}")  # NGX headers only (no library)
+add_library(FrameWarpAddon SHARED src/addon/addon.cpp src/addon/producer.cpp src/addon/vk_transport.cpp src/addon/streamline_hooks.cpp
+            src/addon/ngx_hooks.cpp src/addon/ffx_hooks.cpp src/addon/game_probe.cpp src/common/inline_hook.cpp)
+target_link_libraries(FrameWarpAddon PRIVATE fw_options d3d12 dxgi)
+# NGX headers only (no library); Khronos Vulkan headers for Vulkan games.
+target_include_directories(FrameWarpAddon SYSTEM PRIVATE third_party/reshade/include third_party/imgui third_party/vulkan/include "${FW_NGX_INCLUDE}")
 set_target_properties(FrameWarpAddon PROPERTIES OUTPUT_NAME "FrameWarp" PREFIX "" SUFFIX ".addon64"
                       MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
@@ -71,8 +72,9 @@ if(BUILD_TESTING)
   add_test(NAME inline_hook COMMAND hook_tests)
 
   # End-to-end on the real GPU: producer on one device, presenter renderer + Latewarp on another.
-  add_executable(pipeline_tests tests/pipeline_tests.cpp src/addon/producer.cpp)
-  target_link_libraries(pipeline_tests PRIVATE fw_presenter_core user32)
+  add_executable(pipeline_tests tests/pipeline_tests.cpp src/addon/producer.cpp src/addon/vk_transport.cpp)
+  target_link_libraries(pipeline_tests PRIVATE fw_presenter_core user32 dxgi)
+  target_include_directories(pipeline_tests SYSTEM PRIVATE third_party/reshade/include third_party/vulkan/include)
   set_target_properties(pipeline_tests PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreadedDLL"
                         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>/FrameWarp")
   add_test(NAME pipeline COMMAND pipeline_tests WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>/FrameWarp")

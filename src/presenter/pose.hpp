@@ -409,6 +409,7 @@ public:
         static constexpr double kDelays[] = {-0.01, 0.0, 0.01, 0.02, 0.03};
         for (int k = 0; k < 2; ++k) {
             double best_rms = 1e30, best_tau = params_[k].tau, best_delay = params_[k].delay, best_gain = 0, hold_rms = 0;
+            bool informative = false;  // enough mouse movement in the history to judge a gain
             for (double tau : kTaus)
                 for (double d : kDelays) {
                     double suy = 0, suu = 0, syy = 0, excitation = 0, hold = 0;
@@ -427,10 +428,14 @@ public:
                     if (n < 30) continue;
                     double g = suu > 0 ? suy / suu : 0;
                     if (excitation < 200) g = 0;  // not enough mouse movement to trust a gain
+                    else informative = true;
                     const double sse = syy - 2 * g * suy + g * g * suu;
                     const double rms = std::sqrt(std::max(0.0, sse) / n);
                     if (rms < best_rms) { best_rms = rms; best_tau = tau; best_delay = d; best_gain = g; hold_rms = std::sqrt(hold / n); }
                 }
+            // Too little mouse movement lately (standing still, menus, the ReShade menu open): keep what was
+            // learned instead of dropping to no mouse at all until the next movement is learned again.
+            if (!informative && params_[k].fitted) continue;
             if (best_rms < 1e29) {
                 params_[k].tau = best_tau; params_[k].delay = best_delay; params_[k].gain = best_gain;
                 params_[k].quality = hold_rms > 0 ? 1.0 - best_rms / hold_rms : 0;

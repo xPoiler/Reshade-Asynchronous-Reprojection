@@ -80,18 +80,28 @@ bool presenter_running() {
 
 void on_init_swapchain(swapchain* sc, bool) {
     device* dev = sc->get_device();
-    if (dev->get_api() != device_api::d3d12 || !g_producer) return;
-    if (!g_producer->attach(reinterpret_cast<ID3D12Device*>(dev->get_native()))) return;
+    if (!g_producer) return;
+    if (dev->get_api() == device_api::d3d12) {
+        if (!g_producer->attach(reinterpret_cast<ID3D12Device*>(dev->get_native()))) return;
+    } else if (dev->get_api() == device_api::vulkan) {
+        if (!g_producer->attach_vulkan(dev)) return;
+    } else {
+        return;
+    }
     const auto desc = dev->get_resource_desc(sc->get_current_back_buffer());
     g_producer->set_swapchain(static_cast<HWND>(sc->get_hwnd()), desc.texture.width, desc.texture.height,
                               static_cast<DXGI_FORMAT>(desc.texture.format), to_dxgi_color_space(sc->get_color_space()));
-    fw::install_streamline_hooks(g_producer.get());
     fw::install_ngx_hooks(g_producer.get());
-    fw::install_ffx_hooks(g_producer.get());
+    if (dev->get_api() == device_api::d3d12) {  // (Streamline and FSR: D3D12 only for now)
+        fw::install_streamline_hooks(g_producer.get());
+        fw::install_ffx_hooks(g_producer.get());
+    }
     // The settings remembered per game (ReShade.ini, [FrameWarp]).
-    int from_scene = 0, record = 0;
+    int from_scene = 2, record = 0, near_rule = 1;
     if (g_producer->shared() && reshade::get_config_value(nullptr, "FrameWarp", "HudFromDlssOutput", from_scene))
-        g_producer->shared()->settings.hud_from_scene = from_scene != 0;
+        g_producer->shared()->settings.hud_from_scene = from_scene == 2 ? 2 : (from_scene != 0 ? 1 : 0);
+    if (g_producer->shared() && reshade::get_config_value(nullptr, "FrameWarp", "NearCameraRule", near_rule))
+        g_producer->shared()->settings.near_camera_rule = near_rule != 0;
     if (g_producer->shared() && reshade::get_config_value(nullptr, "FrameWarp", "RecordDiagnostics", record))
         g_producer->shared()->settings.record_diagnostics = record != 0;
 }
@@ -103,11 +113,47 @@ bool on_open_overlay(effect_runtime*, bool open, reshade::api::input_source) {
     return false;  // never block the menu
 }
 
+// Vulkan games: what the add-on copies must allow copies (transfer source). Games rarely give that to depth
+// buffers and motion vectors, which they only sample; add it where DLSS takes its inputs from.
+bool on_create_resource(device* dev, resource_desc& desc, subresource_data*, resource_usage) {
+    if (dev->get_api() != device_api::vulkan || desc.type != resource_type::texture_2d || desc.texture.samples != 1) return false;
+    if ((desc.usage & resource_usage::copy_source) != 0) return false;
+    const bool depth = (desc.usage & resource_usage::depth_stencil) != 0;
+    const bool two_channel = desc.texture.format == format::r16g16_float || desc.texture.format == format::r32g32_float;
+    const bool storage = (desc.usage & resource_usage::unordered_access) != 0;  // upscaler outputs
+    if (!depth && !two_channel && !storage) return false;
+    desc.usage |= resource_usage::copy_source;
+    return true;
+}
+
+// Vulkan: the images imported into the game's device go before the device does.
+void on_destroy_device(device* dev) {
+    if (g_producer && dev->get_api() == device_api::vulkan) g_producer->detach_vulkan();
+}
+
+// Vulkan games: copies into the ReShade queue's immediate command buffer, then a timeline signal.
+void present_vulkan(effect_runtime* runtime, command_queue* queue) {
+    fw::install_ngx_hooks(g_producer.get());
+    const resource bb = runtime->get_current_back_buffer();
+    const auto desc = queue->get_device()->get_resource_desc(bb);
+    command_list* cl = queue->get_immediate_command_list();
+    const auto token = g_producer->begin_present_vk(bb.handle, static_cast<DXGI_FORMAT>(desc.texture.format), desc.texture.width,
+                                                    desc.texture.height, reinterpret_cast<void*>(cl->get_native()));
+    queue->flush_immediate_command_list();
+    g_producer->finish_present_vk(queue, token);
+    if (token && g_producer->shared()->settings.enabled && !presenter_running()) launch_presenter();
+}
+
 // reshade_present runs after ReShade has drawn its effects and menu, so the captured frame (which
 // the presenter shows on top of the game) still contains the ReShade UI.
 void on_reshade_present(effect_runtime* runtime) {
     command_queue* queue = runtime->get_command_queue();
-    if (!g_producer || !g_producer->ready() || !queue || queue->get_device()->get_api() != device_api::d3d12) return;
+    if (!g_producer || !g_producer->ready() || !queue) return;
+    if (queue->get_device()->get_api() == device_api::vulkan) {
+        if (g_producer->vulkan()) present_vulkan(runtime, queue);
+        return;
+    }
+    if (queue->get_device()->get_api() != device_api::d3d12) return;
     fw::install_streamline_hooks(g_producer.get());  // no-op once everything is hooked
     fw::install_ngx_hooks(g_producer.get());
     fw::install_ffx_hooks(g_producer.get());
@@ -234,16 +280,31 @@ void draw_overlay(effect_runtime*) {
             s.keep_attached = keep == 0 || keep == 2;
         }
         const bool mask = s.no_warp_mask != 0, attached = s.keep_attached != 0;
-        if (attached)
+        if (attached) {
             ImGui::TextDisabled("  what moves with the camera is not warped and moves at the game's frame rate%s",
                                 p.mv_scale_x == 0.0f ? "; starts after a few seconds of turning the camera" : "");
-        if (mask) {
-            bool scene = s.hud_from_scene != 0;
-            if (ImGui::Checkbox("Find the HUD from the upscaler output (DLSS or FSR)", &scene)) {
-                s.hud_from_scene = scene;
-                reshade::set_config_value(nullptr, "FrameWarp", "HudFromDlssOutput", scene ? "1" : "0");
+            bool near_rule = s.near_camera_rule != 0;
+            if (ImGui::Checkbox("Keep near-camera motion still (weapon animations, hands)", &near_rule)) {
+                s.near_camera_rule = near_rule;
+                reshade::set_config_value(nullptr, "FrameWarp", "NearCameraRule", near_rule ? "1" : "0");
             }
-            ImGui::TextDisabled("  sharper and instant, but in some games it may keep parts of the scenery still; check with the mask view");
+            ImGui::TextDisabled("  turn off if the floor near the camera is kept still while strafing");
+        }
+        if (mask) {
+            static const char* const kHudFind[] = {"Learned from camera motion", "From the upscaler output (DLSS or FSR)",
+                                                   "Upscaler output + camera motion check (default)"};
+            int find = s.hud_from_scene > 2 ? 2 : int(s.hud_from_scene);
+            if (ImGui::Combo("Find the HUD", &find, kHudFind, 3)) {
+                s.hud_from_scene = find;
+                static const char* const kValues[] = {"0", "1", "2"};
+                reshade::set_config_value(nullptr, "FrameWarp", "HudFromDlssOutput", kValues[find]);
+            }
+            if (find == 0)
+                ImGui::TextDisabled("  learns what stays put while the camera moves; the only choice without an upscaler output");
+            else if (find == 1)
+                ImGui::TextDisabled("  sharper and instant, but in some games it may keep parts of the scenery still; check with the mask view");
+            else if (find == 2)
+                ImGui::TextDisabled("  from the upscaler output, minus what is seen moving with the world when the camera turns; check with the mask view");
         }
         if (mask || attached) {
             bool show = s.show_mask != 0;
@@ -282,7 +343,8 @@ void draw_overlay(effect_runtime*) {
     }
     if (ImGui::CollapsingHeader("NGX diagnostics (DLSS without Streamline)")) {
         const auto& n = sh.ngx;
-        ImGui::Text("Hooks: CreateFeature %s, EvaluateFeature %s", (n.hooks & 1) ? "yes" : "no", (n.hooks & 2) ? "yes" : "no");
+        ImGui::Text("Hooks: D3D12 CreateFeature %s, EvaluateFeature %s | Vulkan CreateFeature %s, EvaluateFeature %s",
+                    (n.hooks & 1) ? "yes" : "no", (n.hooks & 2) ? "yes" : "no", (n.hooks & 12) ? "yes" : "no", (n.hooks & 16) ? "yes" : "no");
         ImGui::Text("Calls: create %u (DLSS %u), evaluate %u (DLSS %u, unknown handle %u), resets %u", n.create_calls, n.dlss_creates,
                     n.evaluate_calls, n.dlss_calls, n.unknown_handle_calls, n.resets);
         for (int i = 0; i < 16; ++i)
@@ -337,12 +399,16 @@ void draw_overlay(effect_runtime*) {
 void register_callbacks() {
     reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
     reshade::register_event<reshade::addon_event::reshade_present>(on_reshade_present);
+    reshade::register_event<reshade::addon_event::create_resource>(on_create_resource);
+    reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
     reshade::register_event<reshade::addon_event::reshade_open_overlay>(on_open_overlay);
     reshade::register_overlay("XPAR", draw_overlay);
 }
 void unregister_callbacks() {
     reshade::unregister_overlay("XPAR", draw_overlay);
     reshade::unregister_event<reshade::addon_event::reshade_open_overlay>(on_open_overlay);
+    reshade::unregister_event<reshade::addon_event::destroy_device>(on_destroy_device);
+    reshade::unregister_event<reshade::addon_event::create_resource>(on_create_resource);
     reshade::unregister_event<reshade::addon_event::reshade_present>(on_reshade_present);
     reshade::unregister_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
 }

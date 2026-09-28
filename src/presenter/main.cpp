@@ -397,7 +397,7 @@ void render_thread() {
             const SlotMeta& m = sh.slots[newest];
             // The previous frame's colour feeds the learned HUD detector (and the shelved object
             // interpolation); not needed while the HUD comes from the upscaler's output.
-            const bool hud_from_output = settings.hud_from_scene != 0 && m.tex[kScene].valid;
+            const bool hud_from_output = settings.hud_from_scene == 1 && m.tex[kScene].valid;  // (combined: 2 needs it)
             renderer.set_keep_previous_colour(settings.extrapolate_objects != 0 ||
                                               (settings.no_warp_mask != 0 && !game_has_hud_layers && !hud_from_output));
             intake = {};
@@ -516,14 +516,15 @@ void render_thread() {
                     analyzed_frames.push_back(m.frame_id);
                     if (analyzed_frames.size() > 16) analyzed_frames.pop_front();
                     renderer.analyze_motion(s, cam.clip_to_prev_clip, float(mv_scale.scale(0, s.depth_rect.w)),
-                                            float(mv_scale.scale(1, s.depth_rect.h)), mv_scale.valid, cam.depth_inverted != 0);
+                                            float(mv_scale.scale(1, s.depth_rect.h)), mv_scale.valid, cam.depth_inverted != 0,
+                                            settings.near_camera_rule != 0);
                 if (mask) {
                     // HUD from the upscaler's output only when chosen (opt-in: its colour model cannot be
                     // proven for every game); otherwise the learned HUD map, which works everywhere.
                     IngestedSource for_mask = s;
                     if (!settings.hud_from_scene) for_mask.has_scene = false;
                     renderer.build_no_warp_mask(for_mask, cam.clip_to_prev_clip, hud_mask, s.has_motion && mv_scale.valid, attached_mask,
-                                                cam.depth_inverted != 0);
+                                                cam.depth_inverted != 0, settings.hud_from_scene == 2);
                     if (++mask_builds >= 300) {
                         mask_builds = 0;
                         const HudStats hs = renderer.take_hud_stats();

@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 35;
+constexpr std::uint32_t kVersion = 36;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -81,10 +81,13 @@ struct Settings {
     std::uint32_t extrapolate_objects;  // shelved experiment (no UI): interpolate moving objects with the game's motion vectors
     std::uint32_t no_warp_mask;    // games without HUD layers: detect the HUD and keep it unwarped
     std::uint32_t show_mask;       // debug: tint the no-warp mask (magenta) and the HUD score still learning (green)
-    std::uint32_t hud_from_scene;  // opt-in: find the HUD from the upscaler's output (saved per game in ReShade.ini)
+    std::uint32_t hud_from_scene;  // HUD detection, saved per game in ReShade.ini: 0 learned, 1 from the upscaler's output,
+                                   // 2 (default) from the upscaler's output where the pixels do not follow the world (combined);
+                                   // without an upscaler output the learned detection is used
     std::uint32_t keep_attached;   // keep what moves with the camera (third-person character, first-person weapon) unwarped, every game
     std::uint32_t warp_engine;     // 0: NVIDIA Latewarp, 1: own engine (default; also used when Latewarp is missing)
     std::uint32_t record_diagnostics;  // opt-in: detailed CSV recordings in logs\ (saved per game in ReShade.ini)
+    std::uint32_t near_camera_rule;    // character/weapon detection: near-camera pixels moving against the camera count (default on, saved per game)
 };
 
 // Presenter status, displayed by the add-on UI.
