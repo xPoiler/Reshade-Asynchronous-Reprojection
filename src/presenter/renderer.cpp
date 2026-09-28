@@ -298,10 +298,25 @@ RWStructuredBuffer<float4> sample_u : register(u0);
 
 [numthreads(8, 8, 1)] void cs_clear_score(uint3 id : SV_DispatchThreadID) { if (all(id.xy < out_size)) hud_score_u[id.xy] = 0; }
 
+// Camera-attached pixels widened by 1 render px, at render resolution (R8), for the mask below.
+Texture2D<float4> att_object_t : register(t0);
+RWTexture2D<unorm float> att_u : register(u0);
+[numthreads(8, 8, 1)] void cs_attached(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= rect.zw)) return;
+    const int2 pr = int2(rect.xy + id.xy);
+    bool keep = false;
+    [unroll] for (int y = -1; y <= 1; ++y)
+        [unroll] for (int x = -1; x <= 1; ++x) {
+            const int2 q = clamp(pr + int2(x, y), int2(rect.xy), int2(rect.xy + rect.zw) - 1);
+            keep = keep || att_object_t.Load(int3(q, 0)).w > 1.5;
+        }
+    att_u[pr] = keep ? 1.0 : 0.0;
+}
+
 // No-warp mask (output resolution, R8): HUD (score, widened by 1 px for anti-aliased edges) and
-// camera-attached pixels (widened by 1 render px).
+// camera-attached pixels (widened by 1 render px, see cs_attached).
 Texture2D<float> mask_score_t : register(t0);
-Texture2D<float4> mask_object_t : register(t1);
+Texture2D<float> mask_attached_t : register(t1);
 RWTexture2D<unorm float> mask_u : register(u0);
 [numthreads(8, 8, 1)] void cs_mask(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= out_size)) return;
@@ -314,11 +329,7 @@ RWTexture2D<unorm float> mask_u : register(u0);
     if (!keep && (flags & 8)) {
         const float2 uv = (float2(id.xy) + 0.5) / float2(out_size);
         const int2 pr = int2(rect.xy) + int2(min(uint2(uv * float2(rect.zw)), rect.zw - 1));
-        [unroll] for (int y = -1; y <= 1; ++y)
-            [unroll] for (int x = -1; x <= 1; ++x) {
-                const int2 q = clamp(pr + int2(x, y), int2(rect.xy), int2(rect.xy + rect.zw) - 1);
-                keep = keep || mask_object_t.Load(int3(q, 0)).w > 1.5;
-            }
+        keep = mask_attached_t.Load(int3(pr, 0)) > 0.5;
     }
     mask_u[id.xy] = keep ? 1.0 : 0.0;
 }
@@ -573,19 +584,17 @@ groupshared uint sc_hud_pixels;
 // with a short blend. No-warp mask pixels stay where they are, and warped pixels never take their colour
 // from under the mask (they step past it to the nearest scene pixel). Games with HUD layers get their UI
 // composited on top afterwards.
-// rect: the valid depth region; grid: depth texture size. flags: 1 UI layer, 2 mask, 16 depth inverted.
+// rect: the valid depth region; grid: depth texture size. flags: 1 UI layer, 2 mask, 16 depth inverted,
+// 32 depth-independent (rotation only).
 Texture2D<float4> ow_color_t : register(t0);
 Texture2D<float4> ow_ui_t : register(t1);
 Texture2D<float> ow_mask_t : register(t2);
 Texture2D<float> ow_depth_t : register(t3);
 RWTexture2D<float4> ow_out_u : register(u0);
-float4 ow_bilinear(float2 uv) {
-    const float2 p = uv * float2(out_size) - 0.5, fl = floor(p), f = p - fl;
-    const int2 last = int2(out_size) - 1, a = clamp(int2(fl), int2(0, 0), last), b = clamp(int2(fl) + 1, int2(0, 0), last);
-    return lerp(lerp(ow_color_t.Load(int3(a.x, a.y, 0)), ow_color_t.Load(int3(b.x, a.y, 0)), f.x),
-                lerp(ow_color_t.Load(int3(a.x, b.y, 0)), ow_color_t.Load(int3(b.x, b.y, 0)), f.x), f.y);
-}
+SamplerState ow_linear : register(s0);  // bilinear, clamped to the edge
+float4 ow_bilinear(float2 uv) { return ow_color_t.SampleLevel(ow_linear, uv, 0); }
 float ow_depth(float2 uv) {
+    if (flags & 32) return 0;  // the warp does not depend on depth (the camera only turns): no reads
     const uint2 p = rect.xy + min(uint2(saturate(uv) * float2(rect.zw)), rect.zw - 1);
     return ow_depth_t.Load(int3(p, 0));
 }
@@ -670,7 +679,8 @@ constexpr UINT kXAnalyzeSrv = 64, kXAnalyzeUav = 70, kXReduceUav = 72, kXSplatSr
 constexpr UINT kXGatherSrvHudless = 82, kXGatherSrvBackbuffer = 88, kXGatherUav = 94;
 constexpr UINT kXHudSrv = 96, kXHudUav = 102, kXMaskSrv = 104, kXMaskUav = 110, kXSampleSrv = 112, kXSampleUav = 118;
 constexpr UINT kXTintSrv = 120, kXTintUav = 126, kXSceneSrv = 128, kXSceneUav = 134, kXOwnSrv = 136, kXOwnUav = 142;
-constexpr UINT kHeapSize = 144;
+constexpr UINT kXAttSrv = 144, kXAttUav = 150;
+constexpr UINT kHeapSize = 152;
 // Scene HUD fit buffer (see cs_scene_*): curve accumulators and curves, wash-out accumulators and
 // values, 2 tile sets, HUD pixel count (same layout as the shader's constants).
 constexpr UINT kSceneBins = 64, kSceneTile = 128, kSceneMaxTiles = 4096;
@@ -872,7 +882,13 @@ bool Renderer::create_pipelines(std::string& error) {
     xp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; xp[0].Constants = {0, 0, 32};
     xp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; xp[1].DescriptorTable = {1, &xsrv};
     xp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; xp[2].DescriptorTable = {1, &xuav};
-    D3D12_ROOT_SIGNATURE_DESC xrs{3, xp, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    D3D12_STATIC_SAMPLER_DESC linear{};
+    linear.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    linear.AddressU = linear.AddressV = linear.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    linear.MaxLOD = D3D12_FLOAT32_MAX;
+    linear.ShaderRegister = 0;
+    linear.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC xrs{3, xp, 1, &linear, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     blob.Reset(); err.Reset();
     if (FAILED(D3D12SerializeRootSignature(&xrs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err)) ||
         FAILED(device_->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root_x_)))) {
@@ -885,7 +901,7 @@ bool Renderer::create_pipelines(std::string& error) {
         {"cs_scene_clear", &cs_scene_clear_}, {"cs_scene_accum", &cs_scene_accum_}, {"cs_scene_finish", &cs_scene_finish_},
         {"cs_scene_tiles", &cs_scene_tiles_}, {"cs_scene_hud", &cs_scene_hud_}, {"cs_scene_grey", &cs_scene_grey_},
         {"cs_scene_grey_finish", &cs_scene_grey_finish_}, {"cs_scene_wash", &cs_scene_wash_}, {"cs_scene_wash_finish", &cs_scene_wash_finish_},
-        {"cs_own_warp", &cs_own_warp_}};
+        {"cs_own_warp", &cs_own_warp_}, {"cs_attached", &cs_attached_}};
     for (auto& x : xs) {
         auto code = compile(x.entry, "cs_5_0", error, kShadersX);
         if (!code) return false;
@@ -1116,11 +1132,20 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
         hud_pending_[frame_index_] = true;
     }
     transition(private_[kPHudScore], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    // Camera-attached pixels, widened once at render resolution (the mask reads one value per pixel).
+    const bool keep_att = attached && keep_attached && ensure_private(kPAttached, w, h, DXGI_FORMAT_R8_UNORM);
+    if (keep_att) {
+        for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXAttSrv + i, kPObject);
+        set_x_uav(kXAttUav + 0, kPAttached); set_x_uav(kXAttUav + 1, kPAttached);
+        transition(private_[kPAttached], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        x_dispatch(cs_attached_.Get(), &c, kXAttSrv, kXAttUav, (c.rect[2] + 7) / 8, (c.rect[3] + 7) / 8);
+        transition(private_[kPAttached], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
     set_x_srv(kXMaskSrv + 0, kPHudScore);
-    set_x_srv(kXMaskSrv + 1, kPObject);
-    for (UINT i = 2; i < kXSrvCount; ++i) set_x_srv(kXMaskSrv + i, kPObject);
+    set_x_srv(kXMaskSrv + 1, keep_att ? kPAttached : kPHudScore);
+    for (UINT i = 2; i < kXSrvCount; ++i) set_x_srv(kXMaskSrv + i, kPHudScore);
     set_x_uav(kXMaskUav + 0, kPMask); set_x_uav(kXMaskUav + 1, kPMask);
-    c.flags = (hud ? 4u : 0u) | (attached && keep_attached ? 8u : 0u);
+    c.flags = (hud ? 4u : 0u) | (keep_att ? 8u : 0u);
     transition(private_[kPMask], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     x_dispatch(cs_mask_.Get(), &c, kXMaskSrv, kXMaskUav, (ow + 7) / 8, (oh + 7) / 8);
     transition(private_[kPMask], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -1200,7 +1225,11 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
     const Rect2 r = src.depth_rect.w ? src.depth_rect : Rect2{0, 0, dw, dh};
     c.rect[0] = r.x; c.rect[1] = r.y; c.rect[2] = std::min(r.w, dw - r.x); c.rect[3] = std::min(r.h, dh - r.y);
     c.grid[0] = dw; c.grid[1] = dh;
-    c.flags = (split ? 1u : 0u) | (mask ? 2u : 0u) | (depth_inverted ? 16u : 0u);
+    // Row 2 (the rendered depth) does not reach x, y or w: a pure turn, the same for every depth.
+    const float* m = source_to_target;
+    const float scale = std::max({std::fabs(m[0]), std::fabs(m[5]), std::fabs(m[12]), std::fabs(m[13]), std::fabs(m[14]), std::fabs(m[15]), 1e-6f});
+    const bool no_depth = std::fabs(m[8]) <= 1e-6f * scale && std::fabs(m[9]) <= 1e-6f * scale && std::fabs(m[11]) <= 1e-6f * scale;
+    c.flags = (split ? 1u : 0u) | (mask ? 2u : 0u) | (depth_inverted ? 16u : 0u) | (no_depth ? 32u : 0u);
     set_x_srv(kXOwnSrv + 0, split ? kPHudless : kPBackbuffer);
     set_x_srv(kXOwnSrv + 1, split ? kPUi : kPZeroUi);
     set_x_srv(kXOwnSrv + 2, mask ? kPMask : kPDepth);

@@ -148,7 +148,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     };
-    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPDest, kPExtrap, kPPrevious, kPHudScore, kPMask, kPScene, kPCount };
+    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPDest, kPExtrap, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPCount };
 
     bool create_pipelines(std::string& error);
     // The format a private copy of a game colour image is kept in: the game's own 4-byte format when it
@@ -186,7 +186,7 @@ private:
     const char* priority_name_ = "normal";
 
     ComPtr<ID3D12RootSignature> root_, root_x_;
-    ComPtr<ID3D12PipelineState> cs_analyze_, cs_reduce_, cs_clear_, cs_splat_, cs_gather_, cs_hud_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_;
+    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_clear_, cs_splat_, cs_gather_, cs_hud_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_;
     ComPtr<ID3D12Resource> samples_, samples_readback_;
     UINT samples_count_ = 0;
     float last_flush_ms_ = 0;
