@@ -86,13 +86,16 @@ groupshared float4 gs_a[64], gs_b[64];
                 // animation (aiming in/out while walking). Nearby walls move exactly as the camera predicts.
                 // Only near the camera (reversed-Z: d = near / distance, so d > 1/64 means closer than 64x the
                 // near plane): the sky and distant scenery often have motion vectors that ignore the camera too.
+                // Near the camera the same threshold as "moving": with a separate, higher one, the band of a
+                // weapon whose motion vectors differ from the camera model by between the two (DOOM Eternal:
+                // an oval over the gun) was neither kept still nor warped as scenery.
                 // Further out (up to 4096x the near plane: a third-person character a few metres away) only what
                 // is stuck to the screen while the camera clearly moves - objects moving on their own (cars,
                 // people) do not do that, and they must keep warping. The near rule can be switched off (flag
                 // 64): with an estimated camera the nearby floor can miss the camera model while strafing.
                 const float2 screen_px = g * mv_scale * float2(rect.zw);
                 const bool attached = (flags & 1) && (flags & 16) &&
-                                      ((!(flags & 64) && d > 1.0 / 64.0 && length(own) > max(1.0, 0.25 * length(cam_px))) ||
+                                      ((!(flags & 64) && d > 1.0 / 64.0 && moving) ||
                                        (d > 1.0 / 4096.0 && length(cam_px) >= 2.0 && length(screen_px) < 0.2 * length(cam_px)));
                 o = float4(own, d, attached ? 2 : (moving ? 1 : 0));
                 // The scale fit only uses pixels whose motion vector points along the camera motion (either
@@ -288,17 +291,34 @@ uint hud_classify(uint2 id, out float weight) {
     if (evidence + changed < 256 || evidence > 0.35 * (evidence + changed)) return;
     hud_score_u[id.xy] = lerp(hud_score_u[id.xy], 1.0, weight);
 }
-// Combined HUD detection (opt-in): what the upscaler-output detector finds is HUD only where the pixel
-// does not follow the world. Here hud_score_u is the world evidence: towards 1 where the pixel changed
-// exactly as the camera moved the scenery under it (post-processed scenery: bloom, lights, effects),
-// towards 0 where it stayed put while the camera moved (same evidence and guard as cs_hud).
-bool hud_follows_world(uint2 id) {
+// Combined HUD detection: what the upscaler-output detector finds is HUD only where the pixel does not
+// follow the world. Two things per pixel, packed in one float (world evidence in the fraction, see
+// pack_world):
+//  - world evidence: towards 1 where the pixel changed exactly as the camera moved the scenery under it
+//    (post-processed scenery: bloom, lights, effects), towards 0 where it stayed put while the camera
+//    moved (same evidence and guard as cs_hud);
+//  - persistence: how far (px) the camera has moved while the detector kept finding HUD at this very
+//    spot. The HUD stays where it is on screen; scenery the detector catches moves on and loses it. A
+//    see-through HUD panel changes with the world behind it and can look like it follows the world, but
+//    it stays found at the same spot: past 1/12 of the screen width of camera movement it is HUD whatever
+//    the world evidence says. When the detector stops finding it, the persistence halves every frame.
+Texture2D<float> hud_found_t : register(t4);  // the upscaler-output detector's result this frame
+float world_part(float v) { return frac(v); }
+float persist_part(float v) { return floor(v); }
+float pack_world(float persist, float world) { return floor(clamp(persist, 0.0, 4095.0)) + clamp(world, 0.0, 0.999); }
+// Where the scenery at this pixel was in the previous frame (output px); z <= 0: unknown.
+float3 hud_came_from(uint2 id) {
     const float2 uv = (float2(id) + 0.5) / float2(out_size);
     const int2 pr = int2(rect.xy) + int2(min(uint2(uv * float2(rect.zw)), rect.zw - 1));
     const float depth = hud_depth_t.Load(int3(pr, 0));
     const float4 pv = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, depth, 1), clip_to_prev);
-    if (pv.w <= 0) return false;
-    const float2 from = float2(id) + (float2(pv.x / pv.w * 0.5 + 0.5, 0.5 - pv.y / pv.w * 0.5) - uv) * float2(out_size);
+    if (pv.w <= 0) return float3(0, 0, 0);
+    return float3(float2(id) + (float2(pv.x / pv.w * 0.5 + 0.5, 0.5 - pv.y / pv.w * 0.5) - uv) * float2(out_size), 1);
+}
+bool hud_follows_world(uint2 id) {
+    const float3 came = hud_came_from(id);
+    if (came.z <= 0) return false;
+    const float2 from = came.xy;
     if (length(from - float2(id)) < 3.0) return false;
     // The camera rarely moves whole pixels: the best of the 4 pixels around where the scenery came from.
     const float3 c = hud_current_t.Load(int3(id, 0)).rgb;
@@ -313,15 +333,20 @@ bool hud_follows_world(uint2 id) {
 }
 [numthreads(8, 8, 1)] void cs_hud_world(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= out_size) || !(flags & 2)) return;
+    const float packed = hud_score_u[id.xy];
+    float world = world_part(packed), persist = persist_part(packed);
+    const float3 came = hud_came_from(id.xy);
+    const float moved = came.z > 0 ? length(came.xy - float2(id.xy)) : 0.0;
+    persist = hud_found_t.Load(int3(id.xy, 0)) > 0.5 ? persist + moved : floor(persist * 0.5);
     float weight;
     const uint kind = hud_classify(id.xy, weight);
     if (kind == 1) {
         const uint evidence = hud_counts_u.Load(0), changed = hud_counts_u.Load(4);
-        if (evidence + changed < 256 || evidence > 0.35 * (evidence + changed)) return;
-        hud_score_u[id.xy] = lerp(hud_score_u[id.xy], 0.0, weight);
+        if (evidence + changed >= 256 && evidence <= 0.35 * (evidence + changed)) world = lerp(world, 0.0, weight);
     } else if ((kind == 2 || kind == 4) && hud_follows_world(id.xy)) {
-        hud_score_u[id.xy] = lerp(hud_score_u[id.xy], 1.0, 0.5);
+        world = lerp(world, 1.0, 0.5);
     }
+    hud_score_u[id.xy] = pack_world(persist, world);
 }
 
 // Motion/depth samples on a grid (mv_size = grid size) over the render rect, for camera estimation.
@@ -353,7 +378,11 @@ RWTexture2D<unorm float> att_u : register(u0);
 // camera-attached pixels (widened by 1 render px, see cs_attached).
 Texture2D<float> mask_score_t : register(t0);
 Texture2D<float> mask_attached_t : register(t1);
-Texture2D<float> mask_world_t : register(t2);  // combined HUD detection (flag 64): world evidence, see cs_hud_world
+Texture2D<float> mask_world_t : register(t2);  // combined HUD detection (flag 64): see cs_hud_world
+bool mask_follows_world(int3 q) {
+    const float v = mask_world_t.Load(q);
+    return world_part(v) >= 0.5 && persist_part(v) < float(out_size.x) / 12.0;
+}
 RWTexture2D<unorm float> mask_u : register(u0);
 [numthreads(8, 8, 1)] void cs_mask(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= out_size)) return;
@@ -362,7 +391,7 @@ RWTexture2D<unorm float> mask_u : register(u0);
         [unroll] for (int y = -1; y <= 1; ++y)
             [unroll] for (int x = -1; x <= 1; ++x) {
                 const int3 q = int3(clamp(int2(id.xy) + int2(x, y), int2(0, 0), int2(out_size) - 1), 0);
-                keep = keep || (mask_score_t.Load(q) > 0.6 && (!(flags & 64) || mask_world_t.Load(q) < 0.5));
+                keep = keep || (mask_score_t.Load(q) > 0.6 && (!(flags & 64) || !mask_follows_world(q)));
             }
     }
     if (!keep && (flags & 8)) {
@@ -606,8 +635,7 @@ float3 sh_predictor(float3 s) {  // predictor(2): curve 2, then wash-out 1
     const float grey = lerp(sh_grey[i0], sh_grey[i1], t), k = lerp(sh_wash[i0], sh_wash[i1], t);
     return a + k * (grey - a);
 }
-[numthreads(8, 8, 1)] void cs_scene_hud(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
-    if (gi == 0) sc_hud_pixels = 0;
+void sh_load(uint3 gid, uint gi) {
     for (uint i = gi; i < 3 * kBins; i += 64) sh_mean[i] = mean_of(2, i / kBins, int(i % kBins));
     sh_grey[gi] = grey_of(1, int(gi));  // 64 threads, 64 bins
     sh_wash[gi] = wash_of(1, int(gi));
@@ -618,16 +646,24 @@ float3 sh_predictor(float3 s) {  // predictor(2): curve 2, then wash-out 1
         const int2 q = clamp(fl0 + int2(k & 1, k >> 1), int2(0, 0), int2(grid) - 1);
         sh_tile[gi] = asfloat(sc_fit_u.Load(kTileBase + ((1 * kMaxTiles + uint(q.y) * grid.x + uint(q.x)) * 3) * 8 + c * 8 + ab * 4));
     }
+}
+// Tile correction (set 1), bilinear between tile centres.
+void sh_tile_ab(uint2 id, out float3 a, out float3 b) {
+    const float2 t = (float2(id) + 0.5) / float(kTile) - 0.5;
+    const float2 f = saturate(t - floor(t));
+    a = 0; b = 0;
+    [unroll] for (int k = 0; k < 4; ++k) {
+        const float w = ((k & 1) ? f.x : 1 - f.x) * ((k >> 1) ? f.y : 1 - f.y);
+        [unroll] for (uint c = 0; c < 3; ++c) { a[c] += w * sh_tile[k * 6 + c * 2]; b[c] += w * sh_tile[k * 6 + c * 2 + 1]; }
+    }
+}
+[numthreads(8, 8, 1)] void cs_scene_hud(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
+    if (gi == 0) sc_hud_pixels = 0;
+    sh_load(gid, gi);
     GroupMemoryBarrierWithGroupSync();
     if (all(id.xy < out_size)) {
-        // Tile correction (set 1), bilinear between tile centres.
-        const float2 t = (float2(id.xy) + 0.5) / float(kTile) - 0.5;
-        const float2 f = saturate(t - floor(t));
-        float3 a = 0, b = 0;
-        [unroll] for (int k = 0; k < 4; ++k) {
-            const float w = ((k & 1) ? f.x : 1 - f.x) * ((k >> 1) ? f.y : 1 - f.y);
-            [unroll] for (uint c = 0; c < 3; ++c) { a[c] += w * sh_tile[k * 6 + c * 2]; b[c] += w * sh_tile[k * 6 + c * 2 + 1]; }
-        }
+        float3 a, b;
+        sh_tile_ab(id.xy, a, b);
         const int2 p = int2(id.xy), last = int2(out_size) - 1;
         const float3 scene = max(sc_scene_t.Load(int3(p, 0)).rgb, 0);
         float3 slope;
@@ -646,6 +682,29 @@ float3 sh_predictor(float3 s) {  // predictor(2): curve 2, then wash-out 1
     GroupMemoryBarrierWithGroupSync();
     if (gi == 0 && sc_hud_pixels) sc_fit_u.InterlockedAdd(kHudCount, sc_hud_pixels);
 }
+// Fill behind the HUD (opt-in): where the HUD was found, the same prediction - the scene the HUD covers,
+// in the frame's colours - for the warp to show where the HUD moves away from (instead of stretching the
+// surroundings). Effects the game adds after upscaling (bloom, grain) are only there as far as the
+// colour model holds them.
+Texture2D<float> sc_score_t : register(t2);
+RWTexture2D<float4> sc_fill_u : register(u0);
+// The HUD as the mask holds it: found here or next to it (the mask widens the HUD by 1 px, cs_mask).
+bool hud_near(Texture2D<float> score, int2 p) {
+    bool near = false;
+    [unroll] for (int y = -1; y <= 1; ++y)
+        [unroll] for (int x = -1; x <= 1; ++x)
+            near = near || score.Load(int3(clamp(p + int2(x, y), int2(0, 0), int2(out_size) - 1), 0)) > 0.5;
+    return near;
+}
+[numthreads(8, 8, 1)] void cs_scene_fill(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
+    sh_load(gid, gi);
+    GroupMemoryBarrierWithGroupSync();
+    if (any(id.xy >= out_size) || !hud_near(sc_score_t, int2(id.xy))) return;
+    float3 a, b;
+    sh_tile_ab(id.xy, a, b);
+    const float3 scene = max(sc_scene_t.Load(int3(id.xy, 0)).rgb, 0);
+    sc_fill_u[id.xy] = float4(max(a * sh_predictor(scene) + b, 0), 1);
+}
 
 // FrameWarp's own warp engine (experimental; used when chosen, or when NVIDIA's Latewarp is not available).
 // clip_to_prev here maps the rendered frame's clip space (with depth) to the displayed camera's: rotation
@@ -658,12 +717,16 @@ float3 sh_predictor(float3 s) {  // predictor(2): curve 2, then wash-out 1
 // with a short blend. No-warp mask pixels stay where they are, and warped pixels never take their colour
 // from under the mask (they step past it to the nearest scene pixel). Games with HUD layers get their UI
 // composited on top afterwards.
-// rect: the valid depth region; grid: depth texture size. flags: 1 UI layer, 2 mask, 16 depth inverted,
-// 32 depth-independent (rotation only).
+// With the fill behind the HUD (flag 4), a warped pixel landing on the HUD takes the scene predicted
+// there from the upscaler's output instead (see cs_scene_fill).
+// rect: the valid depth region; grid: depth texture size. flags: 1 UI layer, 2 mask, 4 fill behind the
+// HUD, 8 HUD found from the upscaler's output (t4), 16 depth inverted, 32 depth-independent (rotation only).
 Texture2D<float4> ow_color_t : register(t0);
 Texture2D<float4> ow_ui_t : register(t1);
 Texture2D<float> ow_mask_t : register(t2);
 Texture2D<float> ow_depth_t : register(t3);
+Texture2D<float> ow_score_t : register(t4);  // HUD found from the upscaler's output (> 0.5)
+Texture2D<float4> ow_fill_t : register(t5);  // the scene behind it
 RWTexture2D<float4> ow_out_u : register(u0);
 SamplerState ow_linear : register(s0);  // bilinear, clamped to the edge
 float4 ow_bilinear(float2 uv) { return ow_color_t.SampleLevel(ow_linear, uv, 0); }
@@ -701,14 +764,20 @@ float3 ow_forward(float2 uv) {
             // weapon to a second, moving place. Step past them along the warp to the nearest scene pixel.
             if (flags & 2) {
                 const int2 last = int2(out_size) - 1;
-                if (ow_mask_t.Load(int3(clamp(int2(src * float2(out_size)), int2(0, 0), last), 0)) > 0.5) {
+                const int3 si = int3(clamp(int2(src * float2(out_size)), int2(0, 0), last), 0);
+                if ((flags & 4) && ow_mask_t.Load(si) > 0.5 && hud_near(ow_score_t, si.xy)) {
+                    c = ow_fill_t.Load(si);
+                } else if (ow_mask_t.Load(si) > 0.5) {
                     const float2 away = normalize((src - uv) * float2(out_size) + float2(1e-3, 0));
                     bool found = false;
                     [loop] for (int k = 1; k <= 48 && !found; ++k)
                         [unroll] for (int side = 0; side < 2; ++side) {
                             const float2 q = src * float2(out_size) + away * (side ? -k : k) * 2.0;
                             const int2 qi = clamp(int2(q), int2(0, 0), last);
-                            if (!found && ow_mask_t.Load(int3(qi, 0)) <= 0.5) { c = ow_color_t.Load(int3(qi, 0)); found = true; }
+                            if (!found && ow_mask_t.Load(int3(qi, 0)) <= 0.5) {
+                                c = ow_color_t.Load(int3(qi, 0));
+                                found = true;
+                            }
                         }
                 }
             }
@@ -730,7 +799,8 @@ float3 ow_forward(float2 uv) {
     ow_out_u[id.xy] = float4(c.rgb, 1);
 }
 
-// Debug view on the warped output: masked pixels magenta, HUD score still below the threshold green.
+// Debug view on the warped output: masked pixels magenta, HUD score still below the threshold green
+// (learned HUD only, flag 1: with the upscaler's output there is nothing being learned).
 Texture2D<unorm float> tint_mask_t : register(t0);
 Texture2D<float> tint_score_t : register(t1);
 RWTexture2D<float4> tint_u : register(u0);
@@ -739,22 +809,23 @@ RWTexture2D<float4> tint_u : register(u0);
     const float m = tint_mask_t.Load(int3(id.xy, 0)), s = tint_score_t.Load(int3(id.xy, 0));
     const float4 c = tint_u[id.xy];
     if (m > 0.5) tint_u[id.xy] = float4(lerp(c.rgb, float3(1, 0, 1), 0.5), c.a);
-    else if (s > 0.05) tint_u[id.xy] = float4(lerp(c.rgb, float3(0, 1, 0), 0.5 * saturate(s / 0.6)), c.a);
+    else if ((flags & 1) && s > 0.05) tint_u[id.xy] = float4(lerp(c.rgb, float3(0, 1, 0), 0.5 * saturate(s / 0.6)), c.a);
 }
 )";
 
 // Descriptor layout in the shader-visible heap.
 constexpr UINT kSrcSrv = 0;         // + slot * kTexCount + kind: shared textures
 constexpr UINT kPrivUav = 32;       // + private id
-constexpr UINT kPrivSrv = 48;       // + private id
+constexpr UINT kPrivSrv = 64;       // + private id
 // Extrapolation tables (6 SRVs t0-t5, 2 UAVs u0-u1 each).
 constexpr UINT kXSrvCount = 6;
-constexpr UINT kXAnalyzeSrv = 64, kXAnalyzeUav = 70, kXReduceUav = 72, kXSplatSrv = 74, kXSplatUav = 80;
-constexpr UINT kXGatherSrvHudless = 82, kXGatherSrvBackbuffer = 88, kXGatherUav = 94;
-constexpr UINT kXHudSrv = 96, kXHudUav = 102, kXMaskSrv = 104, kXMaskUav = 110, kXSampleSrv = 112, kXSampleUav = 118;
-constexpr UINT kXTintSrv = 120, kXTintUav = 126, kXSceneSrv = 128, kXSceneUav = 134, kXOwnSrv = 136, kXOwnUav = 142;
-constexpr UINT kXAttSrv = 144, kXAttUav = 150, kXWorldUav = 152;
-constexpr UINT kHeapSize = 154;
+constexpr UINT kX = 96;  // first table
+constexpr UINT kXAnalyzeSrv = kX + 0, kXAnalyzeUav = kX + 6, kXReduceUav = kX + 8, kXSplatSrv = kX + 10, kXSplatUav = kX + 16;
+constexpr UINT kXGatherSrvHudless = kX + 18, kXGatherSrvBackbuffer = kX + 24, kXGatherUav = kX + 30;
+constexpr UINT kXHudSrv = kX + 32, kXHudUav = kX + 38, kXMaskSrv = kX + 40, kXMaskUav = kX + 46, kXSampleSrv = kX + 48, kXSampleUav = kX + 54;
+constexpr UINT kXTintSrv = kX + 56, kXTintUav = kX + 62, kXSceneSrv = kX + 64, kXSceneUav = kX + 70, kXOwnSrv = kX + 72, kXOwnUav = kX + 78;
+constexpr UINT kXAttSrv = kX + 80, kXAttUav = kX + 86, kXWorldUav = kX + 88, kXFillSrv = kX + 90, kXFillUav = kX + 96;
+constexpr UINT kHeapSize = kX + 98;
 // Scene HUD fit buffer (see cs_scene_*): curve accumulators and curves, wash-out accumulators and
 // values, 2 tile sets, HUD pixel count (same layout as the shader's constants).
 constexpr UINT kSceneBins = 64, kSceneTile = 128, kSceneMaxTiles = 4096;
@@ -841,6 +912,8 @@ bool Renderer::init(const LUID& adapter_luid, HWND window, std::uint32_t width, 
     if (FAILED(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)))) { error = "fence"; return false; }
     fence_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
+    static_assert(kSrcSrv + kSlots * kTexCount <= kPrivUav && kPrivUav + kPCount <= kPrivSrv && kPrivSrv + kPCount <= kX,
+                  "descriptor ranges overlap");
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kHeapSize, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     if (FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap_)))) { error = "descriptor heap"; return false; }
     D3D12_DESCRIPTOR_HEAP_DESC rd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
@@ -973,7 +1046,7 @@ bool Renderer::create_pipelines(std::string& error) {
         {"cs_hud", &cs_hud_}, {"cs_hud_world", &cs_hud_world_}, {"cs_mask", &cs_mask_}, {"cs_clear_score", &cs_clear_score_},
         {"cs_hud_count", &cs_hud_count_}, {"cs_clear_counts", &cs_clear_counts_}, {"cs_sample", &cs_sample_}, {"cs_tint", &cs_tint_},
         {"cs_scene_clear", &cs_scene_clear_}, {"cs_scene_accum", &cs_scene_accum_}, {"cs_scene_finish", &cs_scene_finish_},
-        {"cs_scene_tiles", &cs_scene_tiles_}, {"cs_scene_hud", &cs_scene_hud_}, {"cs_scene_grey", &cs_scene_grey_},
+        {"cs_scene_tiles", &cs_scene_tiles_}, {"cs_scene_hud", &cs_scene_hud_}, {"cs_scene_fill", &cs_scene_fill_}, {"cs_scene_grey", &cs_scene_grey_},
         {"cs_scene_grey_finish", &cs_scene_grey_finish_}, {"cs_scene_wash", &cs_scene_wash_}, {"cs_scene_wash_finish", &cs_scene_wash_finish_},
         {"cs_own_warp", &cs_own_warp_}, {"cs_attached", &cs_attached_}};
     for (auto& x : xs) {
@@ -1146,7 +1219,7 @@ ID3D12Resource* Renderer::extrapolate_objects(const IngestedSource& src, bool fr
 }
 
 ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const float clip_to_prev_clip[16], bool hud, bool attached,
-                                             bool keep_attached, bool depth_inverted, bool combined) {
+                                             bool keep_attached, bool depth_inverted, bool combined, bool fill) {
     if (!src.has_depth || !private_[kPObject].texture) return nullptr;
     const UINT ow = private_[kPBackbuffer].width, oh = private_[kPBackbuffer].height;
     const bool new_score = !private_[kPHudScore].texture || private_[kPHudScore].width != ow || private_[kPHudScore].height != oh;
@@ -1170,10 +1243,11 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
         for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXHudSrv + i, kPBackbuffer);
         x_dispatch(cs_clear_score_.Get(), &z, kXHudSrv, kXHudUav, (ow + 7) / 8, (oh + 7) / 8);
     }
+    fill_ready_ = false;
     const bool from_scene = hud && src.has_scene && private_[kPScene].texture && private_[kPScene].width == ow && private_[kPScene].height == oh;
     if (from_scene) {
         hud_from_scene_ = true;
-        detect_hud_from_scene(c);
+        detect_hud_from_scene(c, fill);
     } else if (hud_from_scene_) {
         // The upscaler's output stopped coming: the learned map starts over.
         hud_from_scene_ = false;
@@ -1190,7 +1264,9 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
             set_x_srv(kXHudSrv + 1, kPPrevious);
             set_x_srv(kXHudSrv + 2, kPDepth);
             set_x_srv(kXHudSrv + 3, kPObject);
-            for (UINT i = 4; i < kXSrvCount; ++i) set_x_srv(kXHudSrv + i, kPDepth);
+            set_x_srv(kXHudSrv + 4, kPHudScore);
+            for (UINT i = 5; i < kXSrvCount; ++i) set_x_srv(kXHudSrv + i, kPDepth);
+            transition(private_[kPHudScore], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             set_x_uav(kXWorldUav + 0, kPWorld);
             D3D12_UNORDERED_ACCESS_VIEW_DESC raw{};
             raw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; raw.Format = DXGI_FORMAT_R32_TYPELESS;
@@ -1263,7 +1339,7 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
     return private_[kPMask].texture.Get();
 }
 
-void Renderer::detect_hud_from_scene(const XConstants& base) {
+void Renderer::detect_hud_from_scene(const XConstants& base, bool fill) {
     const UINT ow = private_[kPBackbuffer].width, oh = private_[kPBackbuffer].height;
     XConstants c = base;
     c.grid[0] = (ow + kSceneTile - 1) / kSceneTile; c.grid[1] = (oh + kSceneTile - 1) / kSceneTile;
@@ -1309,6 +1385,20 @@ void Renderer::detect_hud_from_scene(const XConstants& base) {
     run(cs_scene_wash_finish_.Get(), 0, 1, 0, 1, 1);
     run(cs_scene_tiles_.Get(), 2, 1, 2, c.grid[0], c.grid[1]);  // tile set 1 over predictor 2
     run(cs_scene_hud_.Get(), 2, 1, 0, (ow + 7) / 8, (oh + 7) / 8);
+    if (fill && ensure_private(kPFill, ow, oh, private_[kPBackbuffer].format)) {
+        transition(private_[kPHudScore], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        set_x_srv(kXFillSrv + 0, kPBackbuffer);
+        set_x_srv(kXFillSrv + 1, kPScene);
+        set_x_srv(kXFillSrv + 2, kPHudScore);
+        for (UINT i = 3; i < kXSrvCount; ++i) set_x_srv(kXFillSrv + i, kPScene);
+        set_x_uav(kXFillUav + 0, kPFill);
+        device_->CreateUnorderedAccessView(scene_fit_.Get(), nullptr, &raw, cpu(kXFillUav + 1));
+        transition(private_[kPFill], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        c.rect[0] = 2; c.rect[1] = 1; c.rect[2] = 0; c.rect[3] = 0;
+        x_dispatch(cs_scene_fill_.Get(), &c, kXFillSrv, kXFillUav, (ow + 7) / 8, (oh + 7) / 8);
+        transition(private_[kPFill], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        fill_ready_ = true;
+    }
     // The HUD pixel count goes to the log.
     auto to_copy = transition_barrier(scene_fit_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     list_->ResourceBarrier(1, &to_copy);
@@ -1339,12 +1429,16 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
     const float* m = source_to_target;
     const float scale = std::max({std::fabs(m[0]), std::fabs(m[5]), std::fabs(m[12]), std::fabs(m[13]), std::fabs(m[14]), std::fabs(m[15]), 1e-6f});
     const bool no_depth = std::fabs(m[8]) <= 1e-6f * scale && std::fabs(m[9]) <= 1e-6f * scale && std::fabs(m[11]) <= 1e-6f * scale;
-    c.flags = (split ? 1u : 0u) | (mask ? 2u : 0u) | (depth_inverted ? 16u : 0u) | (no_depth ? 32u : 0u);
+    const bool found = mask && !split && hud_from_scene_ && private_[kPHudScore].width == ow && private_[kPHudScore].height == oh;
+    const bool fill = found && fill_ready_ && private_[kPFill].width == ow && private_[kPFill].height == oh;
+    c.flags = (split ? 1u : 0u) | (mask ? 2u : 0u) | (fill ? 4u : 0u) | (found ? 8u : 0u) | (depth_inverted ? 16u : 0u) |
+              (no_depth ? 32u : 0u);
     set_x_srv(kXOwnSrv + 0, split ? kPHudless : kPBackbuffer);
     set_x_srv(kXOwnSrv + 1, split ? kPUi : kPBackbuffer);  // (only read with a UI layer)
     set_x_srv(kXOwnSrv + 2, mask ? kPMask : kPDepth);
     set_x_srv(kXOwnSrv + 3, kPDepth);
-    for (UINT i = 4; i < kXSrvCount; ++i) set_x_srv(kXOwnSrv + i, kPBackbuffer);
+    set_x_srv(kXOwnSrv + 4, found ? kPHudScore : kPDepth);
+    set_x_srv(kXOwnSrv + 5, fill ? kPFill : kPBackbuffer);
     set_x_uav(kXOwnUav + 0, kPOutput); set_x_uav(kXOwnUav + 1, kPOutput);
     transition(private_[kPOutput], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     x_dispatch(cs_own_warp_.Get(), &c, kXOwnSrv, kXOwnUav, (ow + 7) / 8, (oh + 7) / 8);
@@ -1357,6 +1451,7 @@ void Renderer::tint_mask() {
     if (private_[kPMask].width != ow || private_[kPMask].height != oh) return;
     XConstants c{};
     c.out_size[0] = ow; c.out_size[1] = oh;
+    c.flags = hud_from_scene_ ? 0u : 1u;
     set_x_srv(kXTintSrv + 0, kPMask);
     set_x_srv(kXTintSrv + 1, kPHudScore);
     for (UINT i = 2; i < kXSrvCount; ++i) set_x_srv(kXTintSrv + i, kPMask);
@@ -1856,7 +1951,9 @@ void Renderer::finish_frame(bool warped, int marker) {
 }
 
 bool Renderer::read_back(int which, std::vector<std::uint16_t>& pixels, std::uint32_t& w, std::uint32_t& h) {
-    auto& p = private_[which == 1 ? kPOutput : which == 2 ? kPScene : kPBackbuffer];
+    static const PrivateId kWhich[] = {kPBackbuffer, kPOutput, kPScene, kPDepth, kPMotion, kPObject, kPMask, kPHudScore, kPWorld, kPFill};
+    if (which < 0 || which >= int(std::size(kWhich))) return false;
+    auto& p = private_[kWhich[which]];
     if (!p.texture) return false;
     wait_idle();
     const auto desc = p.texture->GetDesc();
@@ -1904,11 +2001,23 @@ bool Renderer::read_back(int which, std::vector<std::uint16_t>& pixels, std::uin
         const std::uint8_t* row = mapped + fp.Offset + std::size_t(y) * fp.Footprint.RowPitch;
         std::uint16_t* out = &pixels[std::size_t(y) * w * 4];
         if (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) { std::memcpy(out, row, std::size_t(w) * 8); continue; }
+        if (desc.Format == DXGI_FORMAT_R16G16_FLOAT) {
+            for (std::uint32_t x = 0; x < w; ++x) {
+                std::memcpy(out + std::size_t(x) * 4, row + std::size_t(x) * 4, 4);
+                out[std::size_t(x) * 4 + 2] = 0; out[std::size_t(x) * 4 + 3] = 0x3C00;
+            }
+            continue;
+        }
         for (std::uint32_t x = 0; x < w; ++x) {
-            std::uint32_t v; std::memcpy(&v, row + std::size_t(x) * 4, 4);
+            std::uint32_t v = 0;
+            if (desc.Format == DXGI_FORMAT_R8_UNORM) v = row[x];
+            else std::memcpy(&v, row + std::size_t(x) * 4, 4);
             float c[4] = {0, 0, 0, 1};
-            if (desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM) {
+            if (desc.Format == DXGI_FORMAT_R32_FLOAT) std::memcpy(&c[0], &v, 4);
+            else if (desc.Format == DXGI_FORMAT_R8_UNORM) c[0] = float(v) / 255.0f;
+            else if (desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM || desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM) {
                 for (int k = 0; k < 4; ++k) c[k] = float((v >> (8 * k)) & 0xFF) / 255.0f;
+                if (desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM) std::swap(c[0], c[2]);
             } else if (desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM) {
                 for (int k = 0; k < 3; ++k) c[k] = float((v >> (10 * k)) & 0x3FF) / 1023.0f;
                 c[3] = float(v >> 30) / 3.0f;

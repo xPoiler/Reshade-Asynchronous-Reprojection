@@ -7,12 +7,35 @@
   and leaves out what is seen moving with the world when the camera turns, so bright lights, neon and
   effects drawn after upscaling keep warping. *From the upscaler output* and *Learned from camera
   motion* remain; without an upscaler output the learned detection is used.
+* **Fill behind the HUD from the upscaler output** (new option, off by default, remembered per game, XPAR
+  engine): the scenery the HUD covered is shown from the upscaler's output when the camera turns, instead
+  of a smeared trail.
 * **Keep near-camera motion still** (new option, on by default, remembered per game): turn it off if
   the floor near the camera is kept still while strafing.
+* Estimated camera: a first-person weapon no longer counts as scenery when working out the camera's
+  movement. It made up a small camera move tied to turning, which left holes in the weapon's mask,
+  held parts of the nearby floor, and could get the strafing direction wrong.
+* A weapon or character close to the camera whose motion only slightly differs from the camera's is now
+  kept still too (it could show holes in the mask).
+* Vulkan: frames are copied only after the game has finished drawing them (the lower part of the picture
+  could come from another frame, and the ReShade menu could flicker).
 * **Vulkan support** (tested with DOOM Eternal, DLSS): depth, motion vectors and the frame are passed
   from Vulkan games to the presenter.
 * The camera model keeps what it learned while the mouse barely moves (menus, standing still, the
   ReShade menu open) instead of dropping the mouse input until it is learned again.
+* See-through HUD panels stay held with the camera motion check: the scenery moving behind them could
+  make parts of them look like world and warp (doubled numbers, HUD colours in the gaps around the weapon).
+* Estimated camera: the camera shook when facing certain parts of a room after a few minutes of play (its
+  sense of "up" slowly drifted); it now follows the drift. In menus before any turning the estimated camera
+  no longer warps slightly.
+* The mouse is no longer applied while the game's camera clearly does not follow it (menus with a cursor
+  the game draws itself). Low mouse sensitivity and gamepads are not affected.
+* Returning to a game's main menu no longer freezes the view until alt-tab (games whose frame numbers
+  start over there).
+* The presenter writes its log, recordings and camera profile in the background: a slow disk no longer
+  costs refreshes.
+* **Ctrl+Shift+D** (development) also saves depth, motion vectors, the masks and the fill behind the HUD.
+* **Show the mask**: green (HUD being learned) only with *Learned from camera motion*.
 
 ## 1.4.0
 

@@ -97,9 +97,11 @@ void on_init_swapchain(swapchain* sc, bool) {
         fw::install_ffx_hooks(g_producer.get());
     }
     // The settings remembered per game (ReShade.ini, [FrameWarp]).
-    int from_scene = 2, record = 0, near_rule = 1;
+    int from_scene = 2, record = 0, near_rule = 1, fill = 0;
     if (g_producer->shared() && reshade::get_config_value(nullptr, "FrameWarp", "HudFromDlssOutput", from_scene))
         g_producer->shared()->settings.hud_from_scene = from_scene == 2 ? 2 : (from_scene != 0 ? 1 : 0);
+    if (g_producer->shared() && reshade::get_config_value(nullptr, "FrameWarp", "FillBehindHud", fill))
+        g_producer->shared()->settings.hud_fill = fill != 0;
     if (g_producer->shared() && reshade::get_config_value(nullptr, "FrameWarp", "NearCameraRule", near_rule))
         g_producer->shared()->settings.near_camera_rule = near_rule != 0;
     if (g_producer->shared() && reshade::get_config_value(nullptr, "FrameWarp", "RecordDiagnostics", record))
@@ -126,12 +128,26 @@ bool on_create_resource(device* dev, resource_desc& desc, subresource_data*, res
     return true;
 }
 
+// Vulkan: the frame copied at reshade_present, signalled at finish_present (see present_vulkan).
+struct PendingVk { command_queue* queue = nullptr; std::uint64_t token = 0; };
+PendingVk g_pending_vk;
+bool g_finish_present_seen = false;
+
 // Vulkan: the images imported into the game's device go before the device does.
 void on_destroy_device(device* dev) {
-    if (g_producer && dev->get_api() == device_api::vulkan) g_producer->detach_vulkan();
+    if (g_producer && dev->get_api() == device_api::vulkan) {
+        g_pending_vk = {};
+        g_producer->detach_vulkan();
+    }
 }
 
-// Vulkan games: copies into the ReShade queue's immediate command buffer, then a timeline signal.
+// Vulkan games: the copy goes into the ReShade queue's immediate command buffer, which ReShade submits
+// right before the present, waiting for the game's rendering (the present's wait semaphores). Flushing
+// it here instead would submit the copy (and ReShade's own drawing) without that wait: the copy could
+// read a backbuffer still being rendered (torn frames). So the timeline signal that tells the presenter
+// the frame is complete follows in finish_present, after ReShade's submission. (Until finish_present is
+// seen, e.g. an older ReShade without it, the copy is flushed here as before.)
+
 void present_vulkan(effect_runtime* runtime, command_queue* queue) {
     fw::install_ngx_hooks(g_producer.get());
     const resource bb = runtime->get_current_back_buffer();
@@ -139,9 +155,24 @@ void present_vulkan(effect_runtime* runtime, command_queue* queue) {
     command_list* cl = queue->get_immediate_command_list();
     const auto token = g_producer->begin_present_vk(bb.handle, static_cast<DXGI_FORMAT>(desc.texture.format), desc.texture.width,
                                                     desc.texture.height, reinterpret_cast<void*>(cl->get_native()));
-    queue->flush_immediate_command_list();
-    g_producer->finish_present_vk(queue, token);
+    if (g_finish_present_seen) {
+        // (a present that failed has no finish_present: its copy was submitted with it all the same)
+        if (g_pending_vk.token) g_producer->finish_present_vk(g_pending_vk.queue, g_pending_vk.token);
+        g_pending_vk = {queue, token};
+    } else {
+        queue->flush_immediate_command_list();
+        g_producer->finish_present_vk(queue, token);
+    }
     if (token && g_producer->shared()->settings.enabled && !presenter_running()) launch_presenter();
+}
+
+void on_finish_present(command_queue* queue, swapchain*) {
+    if (!queue || queue->get_device()->get_api() != device_api::vulkan) return;
+    g_finish_present_seen = true;
+    const PendingVk pending = g_pending_vk;
+    g_pending_vk = {};
+    // Signalled on the queue the copy was submitted to (ReShade's), after that submission.
+    if (g_producer && pending.token) g_producer->finish_present_vk(pending.queue, pending.token);
 }
 
 // reshade_present runs after ReShade has drawn its effects and menu, so the captured frame (which
@@ -305,10 +336,18 @@ void draw_overlay(effect_runtime*) {
                 ImGui::TextDisabled("  sharper and instant, but in some games it may keep parts of the scenery still; check with the mask view");
             else if (find == 2)
                 ImGui::TextDisabled("  from the upscaler output, minus what is seen moving with the world when the camera turns; check with the mask view");
+            if (find != 0) {
+                bool fill = s.hud_fill != 0;
+                if (ImGui::Checkbox("Fill behind the HUD from the upscaler output (XPAR engine)", &fill)) {
+                    s.hud_fill = fill;
+                    reshade::set_config_value(nullptr, "FrameWarp", "FillBehindHud", fill ? "1" : "0");
+                }
+                ImGui::TextDisabled("  shows the scenery the HUD covers when the camera turns, instead of a smeared trail");
+            }
         }
         if (mask || attached) {
             bool show = s.show_mask != 0;
-            if (ImGui::Checkbox("Show the mask (debug: magenta = kept still, green = HUD being learned)", &show)) s.show_mask = show;
+            if (ImGui::Checkbox("Show the mask (debug: magenta = kept still; learned HUD: green = being learned)", &show)) s.show_mask = show;
         }
         ImGui::Separator();
         ImGui::Text("Camera model  yaw: %s gain %.3g mrad/count, smoothing %.0f ms, quality %.2f",
@@ -399,6 +438,7 @@ void draw_overlay(effect_runtime*) {
 void register_callbacks() {
     reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
     reshade::register_event<reshade::addon_event::reshade_present>(on_reshade_present);
+    reshade::register_event<reshade::addon_event::finish_present>(on_finish_present);
     reshade::register_event<reshade::addon_event::create_resource>(on_create_resource);
     reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
     reshade::register_event<reshade::addon_event::reshade_open_overlay>(on_open_overlay);
@@ -409,6 +449,7 @@ void unregister_callbacks() {
     reshade::unregister_event<reshade::addon_event::reshade_open_overlay>(on_open_overlay);
     reshade::unregister_event<reshade::addon_event::destroy_device>(on_destroy_device);
     reshade::unregister_event<reshade::addon_event::create_resource>(on_create_resource);
+    reshade::unregister_event<reshade::addon_event::finish_present>(on_finish_present);
     reshade::unregister_event<reshade::addon_event::reshade_present>(on_reshade_present);
     reshade::unregister_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
 }

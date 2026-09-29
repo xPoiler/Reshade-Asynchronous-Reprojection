@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 36;
+constexpr std::uint32_t kVersion = 37;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -87,6 +87,7 @@ struct Settings {
     std::uint32_t keep_attached;   // keep what moves with the camera (third-person character, first-person weapon) unwarped, every game
     std::uint32_t warp_engine;     // 0: NVIDIA Latewarp, 1: own engine (default; also used when Latewarp is missing)
     std::uint32_t record_diagnostics;  // opt-in: detailed CSV recordings in logs\ (saved per game in ReShade.ini)
+    std::uint32_t hud_fill;            // opt-in (own warp, HUD from the upscaler's output): fill what the HUD covers from the upscaler's output (saved per game)
     std::uint32_t near_camera_rule;    // character/weapon detection: near-camera pixels moving against the camera count (default on, saved per game)
 };
 

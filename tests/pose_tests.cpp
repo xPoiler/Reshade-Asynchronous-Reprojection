@@ -80,11 +80,12 @@ struct Game {
     std::vector<Out> truth;  // camera at every 1 ms step
     PoseModel* model = nullptr;
     bool feed_model = true;
+    bool menu = false;  // the mouse moves a cursor the game draws itself: the camera stays put
     // Advances 1 ms: mouse event, camera integration, maybe a rendered frame.
     void step(long dx, long dy) {
         t += 0.001;
         if (dx || dy) model->mouse.add(t, dx, dy);
-        target[0] += gain_x * dx; target[1] += gain_y * dy;
+        if (!menu) { target[0] += gain_x * dx; target[1] += gain_y * dy; }
         // The game applies input with `delay`, smoothing continuously.
         const double a = 1.0 - std::exp(-0.001 / tau);
         cam[0] += (target_at_delay(0) - cam[0]) * a;
@@ -217,11 +218,50 @@ static void auto_latency_tracks_frame_interval() {
     EXPECT(worst < 0.02, "auto mode output continuous (worst step %.4f rad)", worst);
 }
 
+// A menu with a cursor the game draws itself: the mouse moves, the camera does not. The mouse must stop
+// being applied within a fraction of a second, and apply again once the camera follows it.
+static void mouse_ignored_in_menus() {
+    PoseModel model;
+    Game g; g.model = &model;
+    for (int i = 0; i < 20000; ++i) g.step(pattern_x(g.t), pattern_y(g.t));  // learn
+    const bool before = model.camera_follows_mouse();
+    g.menu = true;
+    for (int i = 0; i < 1500; ++i) g.step(pattern_x(g.t), pattern_y(g.t));
+    const bool in_menu = model.camera_follows_mouse();
+    const double yaw_in_menu = std::fabs(model.predict(g.t).yaw);
+    g.menu = false;
+    for (int i = 0; i < 1500; ++i) g.step(pattern_x(g.t), pattern_y(g.t));
+    const bool after = model.camera_follows_mouse();
+    std::printf("mouse in a menu: follows before %d, in the menu %d (predicted turn %.4f rad), after %d\n", before, in_menu,
+                yaw_in_menu, after);
+    EXPECT(before && !in_menu && after, "mouse ignored only while the camera does not follow it");
+    EXPECT(yaw_in_menu < 1e-3, "no predicted turn in the menu (%.4f rad)", yaw_in_menu);
+}
+
 static void world_up_detection() {
     WorldUp up;
     for (int i = 0; i < 20; ++i) up.add(camera_at(i * 0.3, 0.1 * std::sin(i)));
     const Vec3 u = up.get();
     EXPECT(u.z == 1.0 && u.x == 0.0 && u.y == 0.0, "world up %f %f %f", u.x, u.y, u.z);
+    // An estimated camera whose up has drifted 30 degrees off the coordinate axes (turning around it,
+    // looking up and down): followed, not snapped back to z.
+    const double tilt = 30.0 * 3.14159265358979 / 180.0;
+    const Vec3 true_up{std::sin(tilt), 0, std::cos(tilt)}, a{std::cos(tilt), 0, -std::sin(tilt)}, b{0, 1, 0};  // a, b span the horizontal
+    WorldUp drifted;
+    for (int i = 0; i < 400; ++i) {
+        const double heading = 0.02 * i, pitch = 0.4 * std::sin(0.05 * i);
+        CameraBasis c{};
+        const Vec3 level = a * std::cos(heading) + b * std::sin(heading);  // horizontal forward
+        c.right = a * std::sin(heading) - b * std::cos(heading);           // horizontal, perpendicular to it
+        c.fwd = level * std::cos(pitch) + true_up * std::sin(pitch);
+        c.up = true_up * std::cos(pitch) - level * std::sin(pitch);
+        drifted.add(c);
+    }
+    const Vec3 d = drifted.get();
+    const double err = std::acos(std::min(1.0, dot(d, true_up))) * 180.0 / 3.14159265358979;
+    std::printf("world up of a drifted estimated camera: %.3f %.3f %.3f (true %.3f %.3f %.3f), error %.2f deg\n", d.x, d.y, d.z,
+                true_up.x, true_up.y, true_up.z, err);
+    EXPECT(err < 0.5, "a drifted up axis is followed (error %.2f deg)", err);
 }
 
 int main() {
@@ -232,6 +272,7 @@ int main() {
     cursor_gate_blocks_mouse();
     auto_latency_tracks_frame_interval();
     world_up_detection();
+    mouse_ignored_in_menus();
     if (failures) { std::printf("%d failure(s)\n", failures); return 1; }
     std::printf("pose tests passed\n");
     return 0;

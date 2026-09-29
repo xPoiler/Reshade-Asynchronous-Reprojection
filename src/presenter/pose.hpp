@@ -163,27 +163,94 @@ private:
     std::deque<Sample> samples_;
 };
 
-// Picks the world axis the camera's right vector is always perpendicular to (no-roll cameras).
+// The world's up axis: the direction the camera's right vector stays perpendicular to (cameras do not
+// roll). A game's own camera has it along a coordinate axis. An estimated camera's up drifts slowly (the
+// frame-to-frame estimate adds up small errors: 30 degrees over a few minutes in DOOM Eternal), and mouse
+// turns applied around a stale axis go wrong by an amount that depends on the heading. So it is followed
+// from the last several seconds of right vectors: the direction they spread least along. Within 2 degrees
+// of a coordinate axis it is that axis exactly; until the camera has turned enough to tell (right vectors
+// all alike), the coordinate axis the right vector is most perpendicular to, or the last one found.
 class WorldUp {
 public:
     void add(const CameraBasis& c) {
-        const double comps[3] = {std::fabs(c.right.x), std::fabs(c.right.y), std::fabs(c.right.z)};
-        const double ups[3] = {c.up.x, c.up.y, c.up.z};
-        for (int i = 0; i < 3; ++i) { sum_[i] += comps[i]; sign_[i] += ups[i]; }
+        const double r[3] = {c.right.x, c.right.y, c.right.z}, u[3] = {c.up.x, c.up.y, c.up.z};
+        weight_ = kKeep * weight_ + 1.0;
+        for (int i = 0; i < 3; ++i) {
+            sum_[i] = kKeep * sum_[i] + std::fabs(r[i]);
+            sign_[i] = kKeep * sign_[i] + u[i];
+            for (int j = 0; j < 3; ++j) m_[i][j] = kKeep * m_[i][j] + r[i] * r[j];
+        }
         ++count_;
+        update();
     }
-    Vec3 get() const {
-        if (count_ < 8) return {0, 0, 1};  // Unreal default until enough evidence
+    Vec3 get() const { return up_; }
+
+private:
+    static constexpr double kKeep = 0.998;  // per game frame: about the last 10 s at 50 fps
+    // Eigenvector of the smallest eigenvalue of the symmetric 3x3 m (cyclic Jacobi); also the two
+    // smallest eigenvalues.
+    static void smallest(const double m[3][3], double v[3], double& l0, double& l1) {
+        double a[3][3], e[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+        for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) a[i][j] = m[i][j];
+        for (int sweep = 0; sweep < 12; ++sweep)
+            for (int p = 0; p < 2; ++p)
+                for (int q = p + 1; q < 3; ++q) {
+                    if (std::fabs(a[p][q]) < 1e-15) continue;
+                    const double th = 0.5 * std::atan2(2 * a[p][q], a[q][q] - a[p][p]);
+                    const double c = std::cos(th), s = std::sin(th);
+                    for (int k = 0; k < 3; ++k) {  // a = J^T a J
+                        const double akp = a[k][p], akq = a[k][q];
+                        a[k][p] = c * akp - s * akq; a[k][q] = s * akp + c * akq;
+                    }
+                    for (int k = 0; k < 3; ++k) {
+                        const double apk = a[p][k], aqk = a[q][k];
+                        a[p][k] = c * apk - s * aqk; a[q][k] = s * apk + c * aqk;
+                    }
+                    for (int k = 0; k < 3; ++k) {
+                        const double ekp = e[k][p], ekq = e[k][q];
+                        e[k][p] = c * ekp - s * ekq; e[k][q] = s * ekp + c * ekq;
+                    }
+                }
+        int order[3] = {0, 1, 2};
+        std::sort(order, order + 3, [&](int x, int y) { return a[x][x] < a[y][y]; });
+        for (int k = 0; k < 3; ++k) v[k] = e[k][order[0]];
+        l0 = a[order[0]][order[0]]; l1 = a[order[1]][order[1]];
+    }
+    void update() {
+        if (count_ < 8) { up_ = {0, 0, 1}; return; }  // Unreal default until enough evidence
+        double v[3], l0, l1;
+        smallest(m_, v, l0, l1);
+        const double trace = m_[0][0] + m_[1][1] + m_[2][2];
+        if (l1 > 1e-3 * trace && l1 > 25.0 * std::max(l0, 0.0)) {
+            // The right vectors spread over a plane: its normal is up.
+            if (v[0] * sign_[0] + v[1] * sign_[1] + v[2] * sign_[2] < 0) for (double& x : v) x = -x;
+            int axis = 0;
+            for (int i = 1; i < 3; ++i) if (std::fabs(v[i]) > std::fabs(v[axis])) axis = i;
+            if (std::fabs(v[axis]) > std::cos(2.0 * 3.14159265358979 / 180.0)) {
+                for (int i = 0; i < 3; ++i) v[i] = i == axis ? (v[i] > 0 ? 1.0 : -1.0) : 0.0;
+            }
+            up_ = {v[0], v[1], v[2]};
+            found_ = true;
+            return;
+        }
+        if (found_) return;  // not enough turning lately: keep the last one found
+        // The coordinate axes the right vector is (nearly) perpendicular to; with no turning yet there are
+        // two of them (the camera's up and its forward): the one closest to the camera's up. (Picking the
+        // forward one made "turning around up" undefined: estimation noise became visible turns.)
         int best = 0;
         for (int i = 1; i < 3; ++i) if (sum_[i] < sum_[best]) best = i;
-        Vec3 v{};
+        const double weight = std::max(weight_, 1e-9);
+        for (int i = 0; i < 3; ++i)
+            if (sum_[i] / weight < sum_[best] / weight + 0.2 && std::fabs(sign_[i]) > std::fabs(sign_[best])) best = i;
+        Vec3 axis{};
         const double s = sign_[best] >= 0 ? 1.0 : -1.0;
-        (best == 0 ? v.x : best == 1 ? v.y : v.z) = s;
-        return v;
+        (best == 0 ? axis.x : best == 1 ? axis.y : axis.z) = s;
+        up_ = axis;
     }
-private:
-    double sum_[3] = {0, 0, 0}, sign_[3] = {0, 0, 0};
+    double sum_[3] = {0, 0, 0}, sign_[3] = {0, 0, 0}, m_[3][3] = {}, weight_ = 0;
     int count_ = 0;
+    bool found_ = false;
+    Vec3 up_{0, 0, 1};
 };
 
 // Parameters of one axis of the camera model.
@@ -228,6 +295,8 @@ public:
     void configure(const PoseSettings& s) { settings_ = s; }
     void set_mouse_gate(bool open) { gate_ = open; }
     bool mouse_gate() const { return gate_; }
+    // false while the game's camera does not follow the mouse (see update_follows).
+    bool camera_follows_mouse() const { return follows_; }
     const AxisParams& params(int axis) const { return params_[axis]; }
     double latency() const { return latency_; }
     // Median of the recent game frame intervals (0 until measured).
@@ -245,7 +314,7 @@ public:
     // The camera source changed (the game's own camera <-> one estimated from motion vectors): their
     // orientations have nothing in common, so the history starts over. The fitted calibration stays.
     void reset_history() {
-        frames_.clear(); since_fit_ = 0; up_ = WorldUp{}; have_source_ = false;
+        frames_.clear(); since_fit_ = 0; up_ = WorldUp{}; have_source_ = false; follows_ = true;
         blend_[0] = blend_[1] = 0; blend_pos_ = {}; velocity_ = {};
         orbit_num_ = orbit_den_ = orbit_fit_ = 0; intervals_.clear(); frame_interval_ = 0; latencies_.clear();
     }
@@ -317,6 +386,8 @@ public:
             latency_ = sorted[static_cast<std::size_t>(q * double(sorted.size() - 1))];
         }
 
+        update_follows();
+        frames_.back().gate = frames_.back().gate && follows_;  // (the fit learns only from mouse the camera follows)
         if (++since_fit_ >= 30) { fit(); since_fit_ = 0; }
 
         // Blend: keep the output continuous across the source change.
@@ -376,7 +447,7 @@ public:
             const double tau = p.tau;
             delta[k] = velocity_term(tau, src_.w[k], h) * settings_.rotation_extrapolation;
             const double g = gain(k);
-            if (settings_.use_mouse && gate_ && g != 0.0) {
+            if (settings_.use_mouse && gate_ && follows_ && g != 0.0) {
                 const double d = settings_.manual_gain ? settings_.manual_delay : p.delay;
                 // Input after the source's cutoff up to the displayed camera time, smoothed like the game.
                 const double end = src_.t + h + d;
@@ -392,6 +463,37 @@ public:
                          blend_pos_ * std::exp(-(now - blend_t_) / std::max(settings_.blend_tau, 1e-4));
         out.yaw = delta[0]; out.pitch = delta[1]; out.horizon = h;
         return out;
+    }
+
+    // Does the game's camera follow the mouse? In menus, map screens and the like, a cursor the game draws
+    // itself (which the Windows cursor check cannot see) takes the mouse and the camera stays put: mouse
+    // input is then not applied until the camera follows it again. Judged over the last half second of
+    // frames, only on clear evidence: from mouse movement worth at least 3 degrees at the fitted gains, a
+    // camera standing still (less than half a degree, and under a tenth of what the mouse is worth) does
+    // not follow; one turning more than a third of it does. A gain slightly off, low sensitivity or a
+    // gamepad never look like that (the camera turns, or the mouse is too still to judge); without a
+    // fitted gain nothing can be judged and the mouse counts as followed.
+    void update_follows() {
+        if (gain(0) == 0.0 && gain(1) == 0.0) { follows_ = true; return; }
+        if (!gate_ || frames_.size() < 2) return;
+        const Frame& b = frames_.back();
+        std::size_t i = frames_.size() - 1;
+        while (i > 0 && frames_[i].consecutive && b.t - frames_[i - 1].t <= 0.5) --i;
+        const Frame& a = frames_[i];
+        if (b.t - a.t < 0.3) return;  // not enough contiguous history to judge
+        double expected = 0, observed = 0;
+        for (int k = 0; k < 2; ++k) {
+            const double g = gain(k);
+            if (g == 0.0) continue;
+            const double d = settings_.manual_gain ? settings_.manual_delay : params_[k].delay;
+            const double e = g * mouse.filtered(k, a.t + d, b.t + d, b.t + d, params_[k].tau);
+            expected += e * e;
+            observed += (b.theta[k] - a.theta[k]) * (b.theta[k] - a.theta[k]);
+        }
+        expected = std::sqrt(expected); observed = std::sqrt(observed);
+        if (expected < 3.0 * 3.14159265358979 / 180.0) return;
+        if (observed < 0.1 * expected && observed < 0.5 * 3.14159265358979 / 180.0) follows_ = false;
+        else if (observed > (1.0 / 3.0) * expected) follows_ = true;
     }
 
     double gain(int axis) const {
@@ -469,6 +571,7 @@ private:
     Source src_;
     bool have_source_ = false;
     bool gate_ = true;
+    bool follows_ = true;  // the game's camera follows the mouse (update_follows)
     double latency_ = 0;
     std::deque<double> latencies_;
     double blend_[2] = {0, 0}, blend_t_ = 0;

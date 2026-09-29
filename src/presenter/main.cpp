@@ -10,13 +10,16 @@
 #include <pdh.h>
 #include <wrl/client.h>
 #include <atomic>
+#include <condition_variable>
 #include <cstdarg>
+#include <mutex>
 #include <deque>
 #include <cstring>
 #include <share.h>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <thread>
 
@@ -55,6 +58,79 @@ struct App {
 };
 App g_app;
 
+// Files (the log and the recordings) are written by a background thread. A disk write can take several
+// ms (a slow or busy drive, antivirus), and the refresh loop must never wait for one: written in place, a
+// full 64 KB recording buffer went to disk on the refresh thread about once a second and cost a refresh
+// each time. Text is handed over here and written out a few times a second.
+class FileWriter {
+public:
+    void write(FILE* f, const char* text, std::size_t n) {
+        if (!f || !n) return;
+        std::lock_guard lock(mutex_);
+        for (auto& p : pending_) if (p.first == f) { p.second.append(text, n); return; }
+        pending_.emplace_back(f, std::string(text, n));
+    }
+    void vprintf(FILE* f, const char* format, va_list args) {
+        char buffer[1024];
+        const int n = std::vsnprintf(buffer, sizeof(buffer), format, args);
+        if (n > 0) write(f, buffer, std::min<std::size_t>(std::size_t(n), sizeof(buffer) - 1));
+    }
+    // A whole small file to (re)write (the camera profile); the newest text for a path wins.
+    void replace(const std::filesystem::path& path, std::string text) {
+        std::lock_guard lock(mutex_);
+        for (auto& r : replace_) if (r.first == path) { r.second = std::move(text); return; }
+        replace_.emplace_back(path, std::move(text));
+    }
+    // Writes everything handed over so far, on the calling thread (exit, device loss).
+    void flush_now() {
+        std::lock_guard io(io_mutex_);
+        std::vector<std::pair<FILE*, std::string>> batch;
+        std::vector<std::pair<std::filesystem::path, std::string>> files;
+        { std::lock_guard lock(mutex_); batch.swap(pending_); files.swap(replace_); }
+        for (auto& [f, text] : batch) { std::fwrite(text.data(), 1, text.size(), f); std::fflush(f); }
+        for (auto& [path, text] : files) {
+            std::error_code ec;
+            std::filesystem::create_directories(path.parent_path(), ec);
+            std::ofstream out(path, std::ios::binary);
+            out << text;
+        }
+    }
+    void start() {
+        if (thread_.joinable()) return;
+        thread_ = std::thread([this] {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            for (;;) {
+                {
+                    std::unique_lock lock(stop_mutex_);
+                    if (wake_.wait_for(lock, std::chrono::milliseconds(250), [this] { return stop_; })) return;
+                }
+                flush_now();
+            }
+        });
+    }
+    void stop() {
+        if (!thread_.joinable()) return;
+        { std::lock_guard lock(stop_mutex_); stop_ = true; }
+        wake_.notify_one();
+        thread_.join();
+        flush_now();
+    }
+private:
+    std::mutex mutex_, io_mutex_, stop_mutex_;
+    std::condition_variable wake_;
+    bool stop_ = false;
+    std::vector<std::pair<FILE*, std::string>> pending_;
+    std::vector<std::pair<std::filesystem::path, std::string>> replace_;
+    std::thread thread_;
+};
+FileWriter g_files;
+void wr(FILE* f, const char* format, ...) {
+    if (!f) return;
+    va_list args; va_start(args, format);
+    g_files.vprintf(f, format, args);
+    va_end(args);
+}
+
 // Detailed CSV recordings (opt-in): opened the first time they are switched on, written only while on,
 // closed at exit (the window thread writes mouse input too).
 std::atomic<bool> g_recording{false};
@@ -65,7 +141,7 @@ void open_recordings() {
         opened = true;
         auto open_csv = [](const wchar_t* name, const char* header) {
             FILE* f = _wfsopen((g_app.data_dir / L"logs" / name).c_str(), L"w", _SH_DENYNO);
-            if (f) { std::setvbuf(f, nullptr, _IOFBF, 1 << 16); std::fprintf(f, "%s\n", header); }
+            if (f) { std::setvbuf(f, nullptr, _IOFBF, 1 << 16); wr(f, "%s\n", header); }
             return f;
         };
         g_app.csv_events = open_csv(L"events.csv", "qpc,kind,tid,frame,extra");
@@ -84,12 +160,14 @@ void open_recordings() {
 
 void logf(const char* format, ...) {
     if (!g_app.log) return;
+    char line[1100];
+    int n = std::snprintf(line, 32, "[%.3f] ", now_seconds());
     va_list args; va_start(args, format);
-    std::fprintf(g_app.log, "[%.3f] ", now_seconds());
-    std::vfprintf(g_app.log, format, args);
-    std::fputc('\n', g_app.log);
-    std::fflush(g_app.log);
+    const int m = std::vsnprintf(line + n, sizeof(line) - n - 1, format, args);
     va_end(args);
+    if (m > 0) n += std::min(m, int(sizeof(line)) - n - 2);
+    line[n++] = '\n';
+    g_files.write(g_app.log, line, std::size_t(n));
 }
 
 void set_status(const char* format, ...) {
@@ -217,10 +295,9 @@ void load_profile() {
 void save_profile() {
     const auto &x = g_app.model.params(0), &y = g_app.model.params(1);
     if (!x.fitted && !y.fitted) return;
-    std::error_code ec;
-    std::filesystem::create_directories(g_app.profile_path.parent_path(), ec);
-    std::ofstream out(g_app.profile_path);
+    std::ostringstream out;
     out << 2 << ' ' << x.gain << ' ' << x.tau << ' ' << x.delay << ' ' << y.gain << ' ' << y.tau << ' ' << y.delay << '\n';
+    g_files.replace(g_app.profile_path, out.str());  // (written by the file thread: see FileWriter)
 }
 
 // Predicts vblanks from DXGI frame statistics of our own swapchain (the display it is shown on).
@@ -386,6 +463,21 @@ void render_thread() {
                 if (m.state == kReady && m.frame_id > source_frame && m.camera.valid && m.fence_value <= game_done &&
                     (newest < 0 || m.frame_id > sh.slots[newest].frame_id)) newest = i;
             }
+            if (newest >= 0 || !source_frame) return newest;
+            // Frame numbers that come from the game (Streamline, FSR) can start over, e.g. when it returns to
+            // its main menu and recreates the upscaler: a frame rendered after the current one but numbered
+            // lower. Follow the game's new count (otherwise the view stays frozen until something resets it).
+            for (int i = 0; i < kSlots; ++i) {
+                const auto& m = sh.slots[i];
+                const std::int64_t q = m.qpc_sim_start ? m.qpc_sim_start : m.qpc_constants;
+                if (m.state == kReady && m.frame_id < source_frame && m.camera.valid && m.fence_value <= game_done &&
+                    seconds(q) > source_time && (newest < 0 || m.frame_id > sh.slots[newest].frame_id)) newest = i;
+            }
+            if (newest >= 0) {
+                logf("the game's frame numbers started over (%llu after %llu): following them",
+                     static_cast<unsigned long long>(sh.slots[newest].frame_id), static_cast<unsigned long long>(source_frame));
+                source_frame = 0;
+            }
             return newest;
         };
         // Taking in a new game frame, in two steps. take_in_start converts it and, for games without a
@@ -494,16 +586,16 @@ void render_thread() {
                                        cam.position_epoch);
                 if (rec(g_app.csv_sources)) {
                     const auto& c = cam;
-                    std::fprintf(g_app.csv_sources,
+                    wr(g_app.csv_sources,
                                  "%llu,%lld,%lld,%lld,%lld,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.5f,%.5f,%u,%d,%d,%d",
                                  static_cast<unsigned long long>(m.frame_id), m.qpc_sim_start, m.qpc_constants, m.qpc_present, qpc_now(),
                                  c.pos[0], c.pos[1], c.pos[2], c.fwd[0], c.fwd[1], c.fwd[2], c.up[0], c.up[1], c.up[2],
                                  c.right[0], c.right[1], c.right[2], c.fov, c.aspect, c.reset, int(g_app.model.mouse_gate()),
                                  int(s.has_depth), int(s.has_hudless));
                     // Projection and the game's frame-to-frame reprojection (same line, appended).
-                    for (float v : c.view_to_clip) std::fprintf(g_app.csv_sources, ",%.7g", v);
-                    for (float v : c.clip_to_prev_clip) std::fprintf(g_app.csv_sources, ",%.7g", v);
-                    std::fputc('\n', g_app.csv_sources);
+                    for (float v : c.view_to_clip) wr(g_app.csv_sources, ",%.7g", v);
+                    for (float v : c.clip_to_prev_clip) wr(g_app.csv_sources, ",%.7g", v);
+                    wr(g_app.csv_sources, "\n");
                 }
                 game_has_hud_layers = s.has_hudless && s.has_ui && settings.use_ui_tags;
                 // Two independent parts of the no-warp mask: the HUD (only games without HUD layers) and
@@ -524,7 +616,8 @@ void render_thread() {
                     IngestedSource for_mask = s;
                     if (!settings.hud_from_scene) for_mask.has_scene = false;
                     renderer.build_no_warp_mask(for_mask, cam.clip_to_prev_clip, hud_mask, s.has_motion && mv_scale.valid, attached_mask,
-                                                cam.depth_inverted != 0, settings.hud_from_scene == 2);
+                                                cam.depth_inverted != 0, settings.hud_from_scene == 2,
+                                                settings.hud_fill != 0 && (settings.warp_engine == 1 || !latewarp.ready()));
                     if (++mask_builds >= 300) {
                         mask_builds = 0;
                         const HudStats hs = renderer.take_hud_stats();
@@ -793,8 +886,9 @@ void render_thread() {
         const int mark = mark_down && !g_app.mark_was_down ? 1 : 0;
         g_app.mark_was_down = mark_down;
         if (mark) logf("MARK (user flagged a bad moment)");
-        // Ctrl+Shift+D (development): saves the game's frame and the upscaler's output of the newest frame
-        // (half-float RGBA, 8-byte header: width, height) to captures\.
+        // Ctrl+Shift+D (development): saves the newest game frame, the warped output, the upscaler's output,
+        // depth, motion vectors, the motion analysis and the masks (half-float RGBA, 8-byte header: width,
+        // height) to captures\.
         const bool dump_down = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000) && (GetAsyncKeyState('D') & 0x8000);
         if (dump_down && !g_app.dump_was_down && source.valid) {
             static int captures = 0;
@@ -802,7 +896,9 @@ void render_thread() {
             std::error_code ec;
             std::filesystem::create_directories(dir, ec);
             const int n = ++captures;
-            for (const auto& [which, name] : {std::pair{0, L"frame"}, std::pair{2, L"scene"}}) {
+            for (const auto& [which, name] : {std::pair{0, L"frame"}, std::pair{1, L"output"}, std::pair{2, L"scene"}, std::pair{3, L"depth"},
+                                              std::pair{4, L"motion"}, std::pair{5, L"object"}, std::pair{6, L"mask"}, std::pair{7, L"hudscore"},
+                                              std::pair{8, L"world"}, std::pair{9, L"fill"}}) {
                 std::vector<std::uint16_t> px;
                 std::uint32_t cw = 0, ch = 0;
                 if (which == 2 && !source.has_scene) { logf("capture %d: no upscaler output this frame", n); continue; }
@@ -824,7 +920,7 @@ void render_thread() {
             const auto pstats = renderer.present_stats();
             // (the displayed camera too: position and forward, in the game's world)
             const auto& dc = applied.camera;
-            std::fprintf(g_app.csv_outputs, "%lld,%llu,%d,%.6f,%.6f,%.4f,%.3f,%d,%lld,%lld,%lld,%u,%u,%u,%u,%lld,%ld,%lld,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f\n",
+            wr(g_app.csv_outputs, "%lld,%llu,%d,%.6f,%.6f,%.4f,%.3f,%d,%lld,%lld,%lld,%u,%u,%u,%u,%lld,%ld,%lld,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f\n",
                          qpc_now(), static_cast<unsigned long long>(source_frame), int(warped), applied.yaw, applied.pitch,
                          applied.horizon * 1000.0, renderer.last_gpu_ms(), mark, tm.submit, tm.gpu_start, tm.gpu_end, pstats.last_present_count,
                          pstats.present_count, pstats.present_refresh, pstats.sync_refresh, pstats.sync_qpc, static_cast<long>(pstats.hr), wake_qpc,
@@ -840,7 +936,7 @@ void render_thread() {
             if (count - g_app.events_read > kTimeline) g_app.events_read = count - kTimeline;
             for (; g_app.events_read < count; ++g_app.events_read) {
                 const auto& e = sh.timeline[g_app.events_read % kTimeline];
-                std::fprintf(g_app.csv_events, "%lld,%u,%u,%llu,%llu\n", e.qpc, e.kind, e.tid,
+                wr(g_app.csv_events, "%lld,%u,%u,%llu,%llu\n", e.qpc, e.kind, e.tid,
                              static_cast<unsigned long long>(e.frame), static_cast<unsigned long long>(e.extra));
             }
         }
@@ -862,7 +958,7 @@ void render_thread() {
                     const double sc = mv_scale.scale(k, k ? source.depth_rect.h : source.depth_rect.w);
                     if (fit.cc[k] > 0) agree[k] = 1.0 - (sc * sc * fit.gg[k] - 2 * sc * fit.gc[k] + fit.cc[k]) / fit.cc[k];
                 }
-                std::fprintf(g_app.csv_motion, "%lld,%llu,%.0f,%.4f,%.4f,%.4f,%u,%u\n", qpc_now(), static_cast<unsigned long long>(f), fit.samples,
+                wr(g_app.csv_motion, "%lld,%llu,%.0f,%.4f,%.4f,%.4f,%u,%u\n", qpc_now(), static_cast<unsigned long long>(f), fit.samples,
                              fit.samples > 0 ? fit.moving / fit.samples : 0.0, agree[0], agree[1], source.depth_rect.w, source.depth_rect.h);
             }
             if (have_fit && mv_scale.add(fit, source.depth_rect.w, source.depth_rect.h))
@@ -883,8 +979,7 @@ void render_thread() {
                 // touching the GPU again (device/NGX teardown can block on a lost device).
                 for (const auto& entry : held) InterlockedCompareExchange(&sh.slots[entry.slot].state, kFree, kReading);
                 sh.presenter.pid = 0;
-                if (g_app.log) std::fflush(g_app.log);
-                for (FILE* csv : {g_app.csv_events, g_app.csv_mouse, g_app.csv_sources, g_app.csv_outputs, g_app.csv_motion}) if (csv) std::fflush(csv);
+                g_files.flush_now();
                 ExitProcess(0);
             }
             auto& st = sh.presenter;
@@ -936,7 +1031,7 @@ void render_thread() {
             else if (!source.has_depth) set_status("No depth tag from the game: showing unwarped frames");
             else set_status("%s | queue %s, process %s | HUD split %s | mouse %s | %s", warped ? "warping" : "passthrough", renderer.queue_priority(), g_gpu_priority,
                             (source.has_hudless && source.has_ui) ? "yes" : "no",
-                            g_app.model.mouse_gate() ? "camera" : "cursor visible (ignored)", latewarp.status().c_str());
+                            !g_app.model.mouse_gate() ? "cursor visible (ignored)" : g_app.model.camera_follows_mouse() ? "camera" : "camera not following (ignored)", latewarp.status().c_str());
             stat_frames = stat_sources = 0; stat_start = now;
             if (now - last_profile_save > 10.0) { save_profile(); last_profile_save = now; }
         }
@@ -978,7 +1073,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 const std::int64_t q = qpc_now();
                 // (not while the ReShade menu has the mouse: the game's camera does not move then)
                 if (!g_app.shared || !g_app.shared->overlay_open) g_app.model.mouse.add(seconds(q), raw.data.mouse.lLastX, raw.data.mouse.lLastY);
-                if (rec(g_app.csv_mouse)) std::fprintf(g_app.csv_mouse, "%lld,%ld,%ld\n", q, raw.data.mouse.lLastX, raw.data.mouse.lLastY);
+                if (rec(g_app.csv_mouse)) wr(g_app.csv_mouse, "%lld,%ld,%ld\n", q, raw.data.mouse.lLastX, raw.data.mouse.lLastY);
             }
             break;  // DefWindowProc must still run for WM_INPUT cleanup
         }
@@ -1050,6 +1145,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
             if (entry.is_regular_file(ec)) std::filesystem::rename(entry.path(), previous / entry.path().filename(), ec);
     }
     g_app.log = _wfsopen((g_app.data_dir / L"logs" / L"presenter.log").c_str(), L"w", _SH_DENYNO);
+    g_files.start();
     {
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
         logf("FrameWarp presenter " FW_VERSION ", qpc frequency %lld", fq.QuadPart);
@@ -1060,7 +1156,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     // One presenter per game.
     const std::wstring mutex_name = L"Local\\FrameWarpPresenter_" + std::to_wstring(g_app.pid);
     HANDLE single = CreateMutexW(nullptr, TRUE, mutex_name.c_str());
-    if (GetLastError() == ERROR_ALREADY_EXISTS) { logf("presenter already running"); return 0; }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) { logf("presenter already running"); g_files.stop(); return 0; }
 
     g_app.game_process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, g_app.pid);
     wchar_t game_exe[MAX_PATH]{}; DWORD len = MAX_PATH;
@@ -1110,6 +1206,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     renderer.join();
     if (g_app.shared) g_app.shared->presenter.pid = 0;
     logf("exit");
+    g_files.stop();
     for (FILE* csv : {g_app.csv_events, g_app.csv_mouse, g_app.csv_sources, g_app.csv_outputs, g_app.csv_motion}) if (csv) std::fclose(csv);
     if (g_app.log) std::fclose(g_app.log);
     if (single) CloseHandle(single);

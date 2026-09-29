@@ -15,7 +15,8 @@ static const double kW = 1920, kH = 1080, kPi = 3.14159265358979;
 // vertical field of view `fov` (`fov_prev` in the previous frame: zooming; 0 = the same); `outliers` of
 // them get random motion (moving objects).
 static std::vector<MotionSample> make(const CameraEstimator::V3& omega, double fov, double outliers, std::mt19937& rng,
-                                      const CameraEstimator::V3& T = {0, 0, 0}, double fov_prev = 0, int gw = 64, int gh = 36) {
+                                      const CameraEstimator::V3& T = {0, 0, 0}, double fov_prev = 0, int gw = 64, int gh = 36,
+                                      double near_max = 0.5) {
     const double f = (kH * 0.5) / std::tan(fov * 0.5), fp = (kH * 0.5) / std::tan((fov_prev > 0 ? fov_prev : fov) * 0.5);
     const auto R = CameraEstimator::rotation(omega);
     std::uniform_real_distribution<double> u(0, 1), noise(-0.1, 0.1), wild(-40, 40);
@@ -26,7 +27,7 @@ static std::vector<MotionSample> make(const CameraEstimator::V3& omega, double f
             p.x = float((gx + 0.5) * kW / gw); p.y = float((gy + 0.5) * kH / gh);
             const double X = (p.x - kW * 0.5) / f, Y = -(p.y - kH * 0.5) / f;
             // depth = 1 / distance: a mix of far scenery and near geometry (0.5 = two units away)
-            p.depth = float(u(rng) < 0.5 ? 0.001 + 0.01 * u(rng) : 0.05 + 0.45 * u(rng));
+            p.depth = float(u(rng) < 0.5 ? 0.001 + 0.01 * u(rng) : near_max * (0.1 + 0.9 * u(rng)));
             const double c0 = R[0][0] * X + R[0][1] * Y + R[0][2] + T[0] * p.depth, c1 = R[1][0] * X + R[1][1] * Y + R[1][2] + T[1] * p.depth,
                          c2 = R[2][0] * X + R[2][1] * Y + R[2][2] + T[2] * p.depth;
             p.mx = float(kW * 0.5 + fp * c0 / c2 - p.x + noise(rng));
@@ -65,6 +66,33 @@ int main() {
         std::printf("rotation+translation: T (%.3f %.3f %.3f) fitted (%.4f %.4f %.4f), rotation error %.1e, translation error %.1e\n",
                     case_.second[0], case_.second[1], case_.second[2], t[0], t[1], t[2], eo, et);
         EXPECT(eo < 3e-4 && et < 3e-3, "rotation and translation recovered (%g, %g)", eo, et);
+    }
+    // First-person weapon: a fifth of the screen right in front of the camera (0.3 = 3.3x the near plane),
+    // carried with the camera (no motion on screen), with the world no nearer than 30x the near plane.
+    // It must not count as scenery in the translation fit (it would invent a camera move).
+    {
+        CameraEstimator carried;
+        Camera g{};
+        g.depth_inverted = 1;
+        g.fov = float(fov);
+        std::mt19937 r(3);
+        auto with_weapon = [&](const CameraEstimator::V3& o, const CameraEstimator::V3& t) {
+            auto s = make(o, fov, 0.0, r, t, 0, 64, 36, 0.03);
+            for (auto& p : s)
+                if (p.x > kW * 0.55 && p.y > kH * 0.6) { p.depth = 0.3f; p.mx = 0; p.my = 0; }
+            return s;
+        };
+        for (int i = 0; i < 40; ++i) carried.update(with_weapon({0, 0.02, 0}, {0, 0, 0}), kW, kH, g);
+        const auto t0 = carried.last_translation();
+        carried.update(with_weapon({0, 0.02, 0}, {0.05, 0, 0}), kW, kH, g);
+        const auto t1 = carried.last_translation();
+        std::printf("with a carried weapon: turning T (%.4f %.4f %.4f) (true 0), strafing T (%.4f %.4f %.4f) (true 0.05 0 0)\n",
+                    t0[0], t0[1], t0[2], t1[0], t1[1], t1[2]);
+        EXPECT(std::fabs(t0[0]) < 0.005 && std::fabs(t0[1]) < 0.005 && std::fabs(t0[2]) < 0.005, "a carried weapon invents no camera move");
+        EXPECT(std::fabs(t1[0] - 0.05) < 0.005 && std::fabs(t1[1]) < 0.005 && std::fabs(t1[2]) < 0.005, "strafing is still found with a carried weapon");
+        // Without a gap (near geometry at every depth up to the weapon's), nothing is left out.
+        std::vector<MotionSample> all = make({0, 0.02, 0}, fov, 0.0, r);
+        EXPECT(CameraEstimator::without_carried(all).size() == all.size(), "no samples left out without a depth gap");
     }
     // Full estimator: learns the field of view from turning frames with 10% outliers, then tracks.
     CameraEstimator est;

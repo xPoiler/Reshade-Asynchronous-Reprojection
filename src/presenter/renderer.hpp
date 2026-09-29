@@ -125,10 +125,11 @@ public:
     // output when the source has it; attached: the motion analysis knows which pixels move with the
     // camera (the motion-vector scale is known); keep_attached: keep those unwarped (third-person
     // character, first-person weapon); combined: with the upscaler's output, HUD only where the pixels do
-    // not follow the world while the camera moves (needs the previous colour). Returns the R8 mask at
-    // output resolution, kept for the frame's outputs.
+    // not follow the world while the camera moves (needs the previous colour); fill: with the upscaler's
+    // output, also predict the scene behind the HUD for the own warp. Returns the R8 mask at output
+    // resolution, kept for the frame's outputs.
     ID3D12Resource* build_no_warp_mask(const IngestedSource& src, const float clip_to_prev_clip[16], bool hud, bool attached,
-                                       bool keep_attached, bool depth_inverted = true, bool combined = false);
+                                       bool keep_attached, bool depth_inverted = true, bool combined = false, bool fill = false);
     // Camera estimation (games without a camera): motion vector (raw) and depth on a grid over the render
     // rect, 4 floats per sample (mv.x, mv.y, depth, valid). Submits the frame's work so far and waits.
     bool sample_motion(const IngestedSource& src, std::uint32_t grid_w, std::uint32_t grid_h, std::vector<float>& out);
@@ -151,7 +152,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     };
-    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPDest, kPExtrap, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPCount };
+    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPDest, kPExtrap, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPCount };
 
     bool create_pipelines(std::string& error);
     // The format a private copy of a game colour image is kept in: the game's own 4-byte format when it
@@ -166,7 +167,7 @@ private:
     void convert(ID3D12Resource* source, DXGI_FORMAT source_format, int slot, int kind, PrivateId target, std::uint32_t w, std::uint32_t h);
     void create_swapchain_views();
     // HUD in this frame from the upscaler's output (into the HUD score texture, 1 = HUD).
-    void detect_hud_from_scene(const struct XConstants& base);
+    void detect_hud_from_scene(const struct XConstants& base, bool fill);
     void set_x_srv(UINT index, PrivateId id);
     void set_x_uav(UINT index, PrivateId id);
     void x_dispatch(ID3D12PipelineState* pso, const void* constants, UINT srv_table, UINT uav_table, UINT groups_x, UINT groups_y);
@@ -189,7 +190,7 @@ private:
     const char* priority_name_ = "normal";
 
     ComPtr<ID3D12RootSignature> root_, root_x_;
-    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_clear_, cs_splat_, cs_gather_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_;
+    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_clear_, cs_splat_, cs_gather_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_;
     ComPtr<ID3D12Resource> samples_, samples_readback_;
     UINT samples_count_ = 0;
     float last_flush_ms_ = 0;
@@ -199,6 +200,7 @@ private:
     double hud_scene_pixels_ = 1;
     HudStats hud_stats_;
     bool mask_ready_ = false, reset_hud_ = false;
+    bool fill_ready_ = false;  // the scene behind the HUD was predicted for the current source (own warp)
     ComPtr<ID3D12Resource> partials_, sums_, fit_readback_;
     UINT partial_groups_ = 0;
     bool fit_pending_[3] = {};

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <functional>
 #include <vector>
 
 namespace fw {
@@ -204,6 +205,7 @@ public:
         if (ok) {
             std::vector<MotionSample> valid;
             for (const auto& p : all) if (p.valid > 0.5f) valid.push_back(p);
+            valid = without_carried(valid);
             const double f = focal(h), fp = (h * 0.5) / std::tan((follow_zoom ? fprev_fov : fov_) * 0.5);
             V3 o = omega, t{};
             double e = fit_motion(valid, w, h, f, o, t, fp);
@@ -240,6 +242,29 @@ public:
         const Camera out = synthesize(w, h, R, T, game, (h * 0.5) / std::tan((follow_zoom ? prev_fov_ : fov_) * 0.5));
         prev_fov_ = fov_;
         if (learned_locked_ && game_v_ > 0 && game_fov_mode_ == 0) decide_game_fov();
+        return out;
+    }
+
+    // A first-person weapon (or hands) moves with the camera, not with the world: in the translation fit
+    // its samples would be explained by an invented camera move (tiny in the world, but tied to the
+    // rotation), which leaves the weapon looking like scenery and the nearby floor slightly off. It is
+    // recognised by depth: the nearest samples, all within 16x the near plane, separated from everything
+    // else by a gap (nothing at all between 1x and 4x their distance), and less than half of the samples.
+    // Only those are left out; without such a gap (walking up to a wall) every sample counts.
+    static std::vector<MotionSample> without_carried(const std::vector<MotionSample>& s) {
+        std::vector<float> d;
+        for (const auto& p : s) d.push_back(p.depth);
+        if (d.size() < 32) return s;
+        std::sort(d.begin(), d.end(), std::greater<float>());
+        const float kNear = 1.0f / 16.0f;
+        std::size_t n = 0;  // size of the nearest cluster
+        while (n + 1 < d.size() && d[n] > kNear && d[n + 1] * 4.0f >= d[n]) ++n;
+        if (d[n] <= kNear) return s;  // the nearest samples reach out past 16x the near plane without a gap
+        ++n;
+        if (n >= d.size() / 2 || d[n] * 4.0f >= d[n - 1]) return s;
+        const float cut = d[n - 1];
+        std::vector<MotionSample> out;
+        for (const auto& p : s) if (p.depth < cut) out.push_back(p);
         return out;
     }
 

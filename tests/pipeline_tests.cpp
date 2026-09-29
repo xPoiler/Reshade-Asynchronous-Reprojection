@@ -462,6 +462,7 @@ int main(int argc, char** argv) {
         LONG neon_x = -1;
         const LONG neon_y0 = LONG(H * 3 / 8), neon_y1 = LONG(H / 2);
         bool combined_hud = false;  // HUD from the upscaler's output + camera-motion check
+        bool hud_fill = false;      // own warp: fill behind the HUD from the upscaler's output
         bool near_rule = true;      // attached: near-camera pixels moving against the camera model count
         const D3D12_RECT washed_rect{LONG(W * 3 / 4), LONG(H * 5 / 8), LONG(W * 3 / 4) + 64, LONG(H * 5 / 8) + 64};
         ComPtr<ID3D12Resource> scene_tex;
@@ -617,7 +618,7 @@ int main(int argc, char** argv) {
             renderer.begin_frame();
             IngestedSource s = renderer.ingest(sh, s_slot);
             renderer.analyze_motion(s, moving_cam.clip_to_prev_clip, 1.0f, 1.0f, true, true, near_rule);
-            renderer.build_no_warp_mask(s, moving_cam.clip_to_prev_clip, hud, weapon, weapon, true, combined_hud);
+            renderer.build_no_warp_mask(s, moving_cam.clip_to_prev_clip, hud, weapon, weapon, true, combined_hud, hud_fill);
             renderer.finish_frame(false, 0);
             renderer.wait_idle();
             return s;
@@ -820,6 +821,38 @@ int main(int argc, char** argv) {
             std::printf("scene HUD GPU ms per frame at %ux%u (%d frames):", W, H, hs.scene_frames);
             for (double v : hs.scene_pass_ms) std::printf(" %.3f", v / n);
             std::printf("\n");
+        }
+        // (P) Fill behind the HUD (own engine): where the turn uncovers what the HUD patch hid, the scenery
+        // predicted from the upscaler's output, close to the same scenery rendered without the HUD, and
+        // closer than stepping past the HUD to its surroundings.
+        {
+            own_engine = true;
+            auto band_error = [&](const std::vector<std::uint16_t>& a, const std::vector<std::uint16_t>& b) {
+                double sum = 0; int n = 0;
+                for (LONG y = hy0 + 2; y < hy1 - 2; ++y)
+                    for (LONG x = std::max<LONG>(0, hx0 - 48); x < hx1 + 48; ++x) {
+                        if (x >= hx0 - 2 && x < hx1 + 2) continue;  // the held HUD itself
+                        const std::size_t i = (std::size_t(y) * w + std::size_t(x)) * 4;
+                        for (int k = 0; k < 3; ++k) sum += std::fabs(half_to_float(a[i + k]) - half_to_float(b[i + k]));
+                        n += 3;
+                    }
+                return n ? sum / n : 0.0;
+            };
+            IngestedSource clean_src = ingest_frame(publish(604, 0.1f, 0, false, false), true, false);
+            show(clean_src, yaw);
+            const std::vector<std::uint16_t> truth = px;
+            hud_fill = true;
+            IngestedSource fill_src = ingest_frame(publish(605, 0.1f, 0, false, true), true, false);
+            show(fill_src, yaw);
+            const double filled = band_error(px, truth), fp_x = green_x();
+            hud_fill = false;
+            IngestedSource step_src = ingest_frame(publish(606, 0.1f, 0, false, true), true, false);
+            show(step_src, yaw);
+            const double stepped = band_error(px, truth);
+            own_engine = false;
+            std::printf("fill behind the HUD: error where the HUD moved off %.4f (stepping past it %.4f), patch x %.1f\n", filled, stepped, fp_x);
+            EXPECT(filled < 0.02 && filled < 0.5 * stepped, "the fill shows the scenery behind the HUD (%.4f vs %.4f)", filled, stepped);
+            EXPECT(std::fabs(fp_x - op_x0) < 2.0, "with the fill the HUD itself is still held (%.1f)", fp_x);
         }
         // (N) Highlights the tone mapping washes out towards white are scenery, not HUD: they warp, while
         // the HUD patch in the same frame is held.
