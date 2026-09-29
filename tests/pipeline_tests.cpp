@@ -464,6 +464,14 @@ int main(int argc, char** argv) {
         const LONG neon_y0 = LONG(H * 3 / 8), neon_y1 = LONG(H / 2);
         bool combined_hud = false;  // HUD from the upscaler's output + camera-motion check
         bool turn_rule = false;     // attached: what stays nearly still on screen while the camera turns
+        bool memory = false;        // background memory: updated at ingest, used by the own warp
+        LONG strip_half = 8;        // half width of the weapon strip (render px)
+        // The weapon's visible outline reaching past what its motion vectors mark: a white band just left of
+        // the strip, at the weapon's depth, with the scenery's motion vectors.
+        bool fringe = false;
+        int stretch = 0;            // render px the scenery around the character/weapon stretches over
+        bool memory_consecutive = false;
+        LONG stripe_phase = -1;     // >= 0: the scenery stripes at this phase (moving with the camera)
         const Camera* analyze_cam = &moving_cam;  // the camera motion the analysis gets
         bool hud_fill = false;      // own warp: fill behind the HUD from the upscaler's output
         bool near_rule = true;      // attached: near-camera pixels moving against the camera model count
@@ -486,13 +494,18 @@ int main(int argc, char** argv) {
             list->ClearRenderTargetView(rtv, back, 0, nullptr);
             // Real scenes are textured: grey stripes that change every frame like scenery under a moving camera.
             const float grey[4] = {bg + 0.15f, bg + 0.15f, bg + 0.15f, 1};
-            const LONG phase = scene_offset >= 0 ? scene_offset : LONG((fid * 5) % 16);
+            const LONG phase = stripe_phase >= 0 ? stripe_phase : scene_offset >= 0 ? scene_offset : LONG((fid * 5) % 16);
             for (LONG x = phase; x < LONG(W); x += 16) {
                 const D3D12_RECT stripe{x, 0, x + 4, LONG(H)};
                 list->ClearRenderTargetView(rtv, grey, 1, &stripe);
             }
             const D3D12_RECT bar{LONG(W / 2) - 4 + bar_dx, 0, LONG(W / 2) + 4 + bar_dx, LONG(H)};
             list->ClearRenderTargetView(rtv, white, 1, &bar);
+            if (fringe) {
+                const LONG fx = LONG(DW / 2);
+                const D3D12_RECT band{LONG((fx - 12) * W / DW), 0, LONG((fx - 9) * W / DW), LONG(H)};
+                list->ClearRenderTargetView(rtv, white, 1, &band);
+            }
             if (horizontal_bar) {
                 const D3D12_RECT segment{LONG(W / 2 - W / 8), LONG(H * 3 / 4), LONG(W / 2 + W / 8), LONG(H * 3 / 4) + 6};
                 const float yellow[4] = {1, 1, 0, 1};
@@ -541,7 +554,7 @@ int main(int argc, char** argv) {
             list->ClearRenderTargetView(mv_rtv->GetCPUDescriptorHandleForHeapStart(), scene_mv, 0, nullptr);
             if (weapon) {
                 const LONG bx = LONG(DW / 2);
-                const D3D12_RECT strip{bx - 8, 0, bx + 8, LONG(DH)};
+                const D3D12_RECT strip{bx - strip_half, 0, bx + strip_half, LONG(DH)};
                 list->ClearRenderTargetView(mv_rtv->GetCPUDescriptorHandleForHeapStart(), none, 1, &strip);
             }
             producer.on_constants(fid, moving_cam);
@@ -559,9 +572,13 @@ int main(int argc, char** argv) {
             if (weapon) {  // reversed-Z depth = near / distance: 0.5 = a weapon 2x the near plane away; the
                            // "sky" variant is 10000x the near plane away
                 const LONG bx = LONG(DW / 2);
-                const D3D12_RECT strip{bx - 8, 0, bx + 8, LONG(DH)};
+                const D3D12_RECT strip{bx - strip_half, 0, bx + strip_half, LONG(DH)};
                 list->ClearDepthStencilView(dsv_heap->GetCPUDescriptorHandleForHeapStart(), D3D12_CLEAR_FLAG_DEPTH,
                                             near_strip ? strip_depth : 1e-4f, 0, 1, &strip);
+                if (fringe) {
+                    const D3D12_RECT band{bx - 12, 0, bx - 9, LONG(DH)};
+                    list->ClearDepthStencilView(dsv_heap->GetCPUDescriptorHandleForHeapStart(), D3D12_CLEAR_FLAG_DEPTH, strip_depth, 0, 1, &band);
+                }
             }
             producer.on_tag(fid, kDepth, depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 0, 0, DW, DH, list.Get());
             producer.on_tag(fid, kMotion, motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 0, 0, DW, DH, list.Get());
@@ -607,7 +624,7 @@ int main(int argc, char** argv) {
             const CameraBasis target = apply_rotation(source, {0, 0, 1}, turn, 0, source.pos);
             if (own_engine) {
                 const Mat4 m = clip_source_to_target(projection, view_matrix(source, {}), view_matrix(target, {}));
-                renderer.own_warp(s, true, inputs.no_warp_mask != nullptr, m.data(), true);
+                renderer.own_warp(s, true, inputs.no_warp_mask != nullptr, m.data(), true, memory);
             } else {
                 latewarp.evaluate(lf, inputs, turn == 0, view_matrix(target, {}), view_matrix(source, {}), projection);
             }
@@ -621,7 +638,8 @@ int main(int argc, char** argv) {
             renderer.begin_frame();
             IngestedSource s = renderer.ingest(sh, s_slot);
             renderer.analyze_motion(s, analyze_cam->clip_to_prev_clip, 1.0f, 1.0f, true, true, near_rule, turn_rule);
-            renderer.build_no_warp_mask(s, moving_cam.clip_to_prev_clip, hud, weapon, weapon, true, combined_hud, hud_fill);
+            renderer.build_no_warp_mask(s, moving_cam.clip_to_prev_clip, hud, weapon, weapon, true, combined_hud, hud_fill, stretch);
+            if (memory) renderer.update_memory(s, analyze_cam->clip_to_prev_clip, true, memory_consecutive);
             renderer.finish_frame(false, 0);
             renderer.wait_idle();
             return s;
@@ -688,6 +706,47 @@ int main(int argc, char** argv) {
             EXPECT(std::fabs(p1 - p0) > 20.0, "the orbited character follows the camera model: not held by the other rules (%.0f -> %.0f)", p0, p1);
             EXPECT(std::fabs(h1 - h0) < 2.0, "the turn rule holds the orbited character (%.0f -> %.0f)", h0, h1);
             EXPECT(std::fabs(t1 - t0) > 20.0, "with a plain turn the turn rule holds no scenery (%.0f -> %.0f)", t0, t1);
+        }
+        // (A1d) Background memory: the camera turns (the scenery moves 6 px left per frame) past the held
+        // weapon strip, so what is behind the strip now was visible to its right a few frames ago. What the
+        // turn then uncovers beside the strip comes from memory: close to the real scenery (the same frame
+        // rendered without the strip), much closer than the stretch fill.
+        {
+            own_engine = true;
+            auto gap_error = [&](const std::vector<std::uint16_t>& a, const std::vector<std::uint16_t>& b) {
+                const LONG x0 = LONG(DW / 2 * W / DW) - LONG(34 * W / 1280), x1 = LONG(DW / 2 * W / DW) - LONG(20 * W / 1280);  // left of the held strip (the turn's shift grows with W)
+                double sum = 0; int n = 0;
+                for (std::uint32_t y = h / 4; y < h * 3 / 4; y += 2)
+                    for (LONG x = x0; x < x1; ++x) {
+                        const std::size_t i = (std::size_t(y) * w + std::size_t(x)) * 4;
+                        for (int k = 0; k < 3; ++k) sum += std::fabs(half_to_float(a[i + k]) - half_to_float(b[i + k]));
+                        n += 3;
+                    }
+                return n ? sum / n : 0.0;
+            };
+            auto phase_at = [&](int frame) { return LONG(((12 + 6 * (3 - frame)) % 16 + 16) % 16); };  // frame 3 at phase 12
+            stripe_phase = phase_at(3);
+            IngestedSource truth_src = ingest_frame(publish(215, 0.1f, -400, false, false), false, true);
+            show(truth_src, yaw);
+            const std::vector<std::uint16_t> truth = px;
+            renderer.reset_hud_detection();  // (also starts the memory over)
+            memory = true;
+            IngestedSource last{};
+            for (int f = 0; f < 4; ++f) {
+                stripe_phase = phase_at(f);
+                memory_consecutive = f > 0;
+                last = ingest_frame(publish(216 + f, 0.1f, -400, true, false), false, true);
+            }
+            show(last, yaw);
+            const double remembered = gap_error(px, truth);
+            memory = false;
+            show(last, yaw);
+            const double stretched = gap_error(px, truth);
+            stripe_phase = -1;
+            memory_consecutive = false;
+            own_engine = false;
+            std::printf("background memory: error beside the held strip %.4f (stretch fill %.4f)\n", remembered, stretched);
+            EXPECT(remembered < 0.5 * stretched, "the background memory shows what was behind the held strip (%.4f vs %.4f)", remembered, stretched);
         }
         // (A1b) a third-person character: attached to the camera too, but a few metres away (300x the near
         // plane). Held as well.
@@ -990,6 +1049,30 @@ int main(int argc, char** argv) {
                 std::printf("\n");
             }
         }
+        // GPU cost of the background memory: the same intake with and without it (the difference is the pass).
+        {
+            auto intake_rest = [&](bool with_memory, std::uint64_t first_id) {
+                renderer.take_gpu_usage();
+                for (int i = 0; i < 12; ++i) {
+                    const int bs = publish(first_id + i, 0.1f, 0, true, true);
+                    if (bs < 0) continue;
+                    renderer.begin_frame();
+                    IngestedSource s = renderer.ingest(sh, bs);
+                    renderer.analyze_motion(s, moving_cam.clip_to_prev_clip, 1.0f, 1.0f, true);
+                    renderer.build_no_warp_mask(s, moving_cam.clip_to_prev_clip, true, true, true);
+                    if (with_memory) renderer.update_memory(s, moving_cam.clip_to_prev_clip, true, i > 0);
+                    renderer.submit_work();
+                    renderer.wait_idle();
+                    if (i == 3) { renderer.begin_frame(); renderer.finish_frame(false, 0); renderer.wait_idle(); renderer.take_gpu_usage(); }
+                }
+                for (int i = 0; i < 3; ++i) { renderer.begin_frame(); renderer.finish_frame(false, 0); renderer.wait_idle(); }
+                const Renderer::GpuUsage u = renderer.take_gpu_usage();
+                return u.split ? u.rest_ms / u.split : 0.0;
+            };
+            const double without = intake_rest(false, 930), with = intake_rest(true, 942);
+            std::printf("background memory GPU at %ux%u: %.3f ms per game frame (HUD/masks/motion %.3f with it, %.3f without)\n",
+                        W, H, with - without, with, without);
+        }
         // (Q) Split queues: frames taken in on the intake (compute) queue into one set of textures while
         // the warp reads the shown set; the warp switches only once the new set is complete and shown.
         {
@@ -1041,6 +1124,52 @@ int main(int argc, char** argv) {
             EXPECT(std::fabs(b_turned - b_x) > 20.0, "the shown frame warps (%.0f -> %.0f)", b_x, b_turned);
             EXPECT(std::fabs(plain_x - b_x) < 1.0, "an unwarped refresh shows the shown frame (%.0f)", plain_x);
             EXPECT(back && std::fabs(after_x - b_x) < 1.0, "back on one queue the shown frame stays (%.0f)", after_x);
+            // Without the background memory, a held area wider than the fill's search reach keeps its own colour
+            // where nothing unheld is found - never anything read from the memory's slot (a red depth value).
+            own_engine = true;
+            strip_half = 150;
+            IngestedSource wide = ingest_frame(publish(962, 0.1f, -400, true, false), false, true);
+            strip_half = 8;
+            show(wide, yaw * 4.0);  // (a gap wider than the fill's 96 px search reach)
+            own_engine = false;
+            int reddish = 0;
+            for (std::size_t i = 0; i + 3 < px.size(); i += 4)
+                if (half_to_float(px[i]) > 0.004f && half_to_float(px[i + 1]) < 0.002f && half_to_float(px[i + 2]) < 0.002f) ++reddish;
+            std::printf("wide held area without the background memory: red pixels %d\n", reddish);
+            // The stretch: a weapon outline the motion vectors miss slides away from the weapon as a ghost
+            // (white pixels left of the strip after the turn) without it; with it, it stays with the weapon.
+            own_engine = true;
+            fringe = true;
+            IngestedSource edge1 = ingest_frame(publish(963, 0.1f, -400, true, false), false, true);
+            show(edge1, yaw);
+            const LONG strip_l = LONG((DW / 2 - 12) * W / DW);
+            auto ghost = [&]() {
+                int n = 0;
+                for (std::uint32_t y = h / 4; y < h * 3 / 4; ++y)
+                    for (LONG x = std::max<LONG>(0, strip_l - LONG(60 * W / 1280)); x < strip_l - 12; ++x) {
+                        const std::size_t i = (std::size_t(y) * w + std::size_t(x)) * 4;
+                        if (half_to_float(px[i]) > 0.8f && half_to_float(px[i + 1]) > 0.8f && half_to_float(px[i + 2]) > 0.8f) ++n;
+                    }
+                return n;
+            };
+            const int ghost1 = ghost();
+            auto dump = [&](const char* name) {  // (FW_DUMP: the output as raw half floats, for a look)
+                if (!std::getenv("FW_DUMP")) return;
+                if (FILE* f = std::fopen(name, "wb")) { std::fwrite(&w, 4, 1, f); std::fwrite(&h, 4, 1, f); std::fwrite(px.data(), 2, px.size(), f); std::fclose(f); }
+            };
+            dump("stretch_off.f16");
+            stretch = 16;
+            IngestedSource stretched = ingest_frame(publish(964, 0.1f, -400, true, false), false, true);
+            stretch = 0;
+            fringe = false;
+            show(stretched, yaw);
+            const int ghost4 = ghost();
+            dump("stretch_on.f16");
+            own_engine = false;
+            std::printf("stretch: ghost outline pixels %d without, %d with 16 render px\n", ghost1, ghost4);
+            EXPECT(ghost1 > 0, "the test outline slides away as a ghost without the stretch (%d)", ghost1);
+            EXPECT(ghost4 == 0, "with the stretch the outline stays with the weapon (%d)", ghost4);
+            EXPECT(reddish == 0, "without the memory nothing is read from its slot (%d red pixels)", reddish);
             if (std::getenv("FW_D3D_DEBUG")) EXPECT(renderer.print_debug_messages() == 0, "no D3D12 debug-layer errors");
         }
         with_scene = false;

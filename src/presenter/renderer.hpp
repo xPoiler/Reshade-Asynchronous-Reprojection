@@ -108,7 +108,15 @@ public:
     void tint_mask();
     // FrameWarp's own warp engine (experimental): writes the warped output like Latewarp would.
     // source_to_target maps the rendered frame's clip space (with depth) to the displayed camera's (row vectors).
-    bool own_warp(const IngestedSource& src, bool use_ui_tags, bool use_mask, const float source_to_target[16], bool depth_inverted);
+    // memory: what the warp uncovers beside held pixels and at the frame's edges comes from the background
+    // memory when it holds that spot (see update_memory).
+    bool own_warp(const IngestedSource& src, bool use_ui_tags, bool use_mask, const float source_to_target[16], bool depth_inverted,
+                  bool memory = false);
+    // Background memory (once per game frame, after the no-warp mask): the scenery around the view as last
+    // seen, behind held pixels and just beyond the frame, carried along with the camera (clip_to_prev_clip
+    // of this frame) and forgotten after about a second. consecutive: the previous frame taken in was the
+    // game's previous frame (otherwise the memory starts over). False: none for this frame.
+    bool update_memory(const IngestedSource& src, const float clip_to_prev_clip[16], bool depth_inverted, bool consecutive);
     // Signalled value that completes all realtime-queue work recorded so far.
     std::uint64_t submitted_value() const { return fence_values_[0]; }
     bool completed(std::uint64_t value) const { return fences_[0]->GetCompletedValue() >= value; }
@@ -150,7 +158,8 @@ public:
     // output, also predict the scene behind the HUD for the own warp. Returns the R8 mask at output
     // resolution, kept for the frame's outputs.
     ID3D12Resource* build_no_warp_mask(const IngestedSource& src, const float clip_to_prev_clip[16], bool hud, bool attached,
-                                       bool keep_attached, bool depth_inverted = true, bool combined = false, bool fill = false);
+                                       bool keep_attached, bool depth_inverted = true, bool combined = false, bool fill = false,
+                                       int stretch = 0);  // render px the scenery around the character/weapon stretches over (0: off)
     // Camera estimation (games without a camera): motion vector (raw) and depth on a grid over the render
     // rect, 4 floats per sample (mv.x, mv.y, depth, valid). Submits the frame's work so far and waits.
     bool sample_motion(const IngestedSource& src, std::uint32_t grid_w, std::uint32_t grid_h, std::vector<float>& out);
@@ -163,7 +172,7 @@ public:
         if (split_) return shown_mask_ ? front_[kPMask].texture.Get() : nullptr;
         return mask_ready_ ? private_[kPMask].texture.Get() : nullptr;
     }
-    void reset_hud_detection() { reset_hud_ = true; mask_ready_ = false; shown_mask_ = false; }
+    void reset_hud_detection() { reset_hud_ = true; mask_ready_ = false; shown_mask_ = false; mem_last_ = -1; }
 
     // Test/diagnostic helper: synchronously reads back the warped output (RGBA16F) or private backbuffer.
     // which: 0 the game's frame, 1 the warped output, 2 the upscaler's output (scene before HUD).
@@ -176,7 +185,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     };
-    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPDest, kPExtrap, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPCount };
+    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPDest, kPExtrap, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPCount };
 
     bool create_pipelines(std::string& error);
     // The format a private copy of a game colour image is kept in: the game's own 4-byte format when it
@@ -186,7 +195,7 @@ private:
     bool ensure_private(PrivateId id, std::uint32_t w, std::uint32_t h, DXGI_FORMAT format);
     // The textures the warp reads, kept twice with split queues (front_: the shown set).
     static bool shown_id(PrivateId id) {
-        return id == kPBackbuffer || id == kPHudless || id == kPUi || id == kPDepth || id == kPMask || id == kPFill;
+        return id == kPBackbuffer || id == kPHudless || id == kPUi || id == kPDepth || id == kPMask || id == kPFill || id == kPWarpMask;
     }
     const Private& shown(PrivateId id) const { return split_ && shown_id(id) ? front_[id] : private_[id]; }
     void swap_shown();  // exchanges the two sets (and the per-texture descriptors)
@@ -221,7 +230,8 @@ private:
     bool split_ = false;
     std::uint64_t pending_show_ = 0;   // intake fence value after which the written set can be shown
     std::uint64_t release_wait_ = 0;   // realtime fence value the intake waits for before rewriting (swap)
-    bool built_mask_ = false, shown_mask_ = false, shown_fill_ = false;
+    bool built_mask_ = false, shown_mask_ = false, shown_fill_ = false, stretch_built_ = false, shown_stretch_ = false;
+    int mem_last_ = -1, mem_shown_ = -1, mem_pending_ = -1;  // background memory buffer written last / read by the warp / of the frame to show
     ID3D12CommandQueue* context_queue() const { return context_ ? iqueue_.Get() : queue_.Get(); }
     ComPtr<IDXGIFactory4> factory_;
     ComPtr<IDXGISwapChain3> swapchain_;
@@ -234,7 +244,7 @@ private:
     const char* priority_name_ = "normal";
 
     ComPtr<ID3D12RootSignature> root_, root_x_;
-    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_clear_, cs_splat_, cs_gather_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_;
+    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_clear_, cs_splat_, cs_gather_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_memory_, cs_ramp_rows_, cs_ramp_;
     ComPtr<ID3D12Resource> samples_, samples_readback_;
     UINT samples_count_ = 0;
     float last_flush_ms_ = 0;

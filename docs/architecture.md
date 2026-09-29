@@ -96,7 +96,14 @@
 * **Warp engines.** The own engine (default, any D3D12 GPU): for each output pixel a short fixed-point
   search finds the rendered pixel that lands there at its own depth; masked pixels stay put and are
   never used as a source for others; revealed screen edges are filled with a short inward blend; no
-  work while the camera has not moved. NVIDIA Latewarp (optional, `nvngx_latewarp.dll`, NVIDIA GPUs):
+  work while the camera has not moved. Around the character/weapon the scenery follows the warp less
+  and less towards it (the stretch: a distance ramp from the camera-attached pixels at render
+  resolution, in two separable passes, stored with the held pixels in a second, XPAR-only mask), so the
+  gap the warp uncovers beside it is covered by stretched scenery and the outline its motion vectors
+  miss stays with it. Uncovered areas elsewhere come from the background memory when it holds them: a
+  half-resolution colour + depth picture of the scenery last seen behind held pixels and just beyond the
+  frame, updated once per game frame on the intake side and carried along with the camera at its
+  remembered depth, forgotten after 60 game frames. NVIDIA Latewarp (optional, `nvngx_latewarp.dll`, NVIDIA GPUs):
   on a new game frame a throwaway `IsRenderedFrame=1` evaluation registers it, followed by the real
   evaluation with the predicted camera. View matrices are built relative to the source camera
   position for precision.

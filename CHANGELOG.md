@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.6.0
 
 * After an update, the settings remembered per game are reset to the defaults on the first launch (the
   ReShade log says so), so every improvement to the defaults applies right after installing.
@@ -8,6 +8,15 @@
   game): over-the-shoulder cameras circle the character, so it barely moves on screen while the room
   swings around it, and the warp broke it up (Resident Evil Requiem, Expedition 33). What moves less than
   a fifth of what the camera's turn alone would move it is now kept still while turning.
+* **Background memory for uncovered areas** (new option, on by default, remembered per game, XPAR
+  engine): the scenery last seen beside the character or weapon is remembered for up to a second, so
+  when the camera turns the area the warp uncovers shows what was there instead of stretched edge
+  pixels. Costs about 80 MB of video memory at 4K and about 0.1 ms of GPU time per game frame, on the
+  intake queue.
+* **Stretch around character/weapon** (new setting, 0-32 render pixels, 1 by default, remembered per
+  game, XPAR engine): the scenery beside the character or weapon follows the warp less and less towards
+  it, so what the warp uncovers there when strafing or turning is covered by slightly stretched scenery
+  instead of streaks, and the outline its motion vectors miss stays with it instead of smearing away.
 
 ## 1.5.0
 

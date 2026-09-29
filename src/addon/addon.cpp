@@ -9,7 +9,9 @@
 #include "addon/ngx_hooks.hpp"
 #include "addon/ffx_hooks.hpp"
 #include <d3d12.h>
+#include <algorithm>
 #include <cstdio>
+#include <string>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -102,7 +104,8 @@ void on_init_swapchain(swapchain* sc, bool) {
     // a new version apply right after installing it.
     struct Saved { const char* key; int default_value; };
     static constexpr Saved kSaved[] = {{"HudFromDlssOutput", 2}, {"FillBehindHud", 1}, {"HoldOrbitedCharacter", 1},
-                                       {"NearCameraRule", 1}, {"RecordDiagnostics", 0}};
+                                       {"NearCameraRule", 1}, {"RecordDiagnostics", 0}, {"BackgroundMemory", 1},
+                                       {"StretchWidth", 1}};
     char saved_version[32] = "";
     size_t size = sizeof(saved_version);
     if (!reshade::get_config_value(nullptr, "FrameWarp", "SettingsVersion", saved_version, &size) ||
@@ -132,6 +135,8 @@ void on_init_swapchain(swapchain* sc, bool) {
         shared->settings.turn_rule = saved("HoldOrbitedCharacter") != 0;
         shared->settings.near_camera_rule = saved("NearCameraRule") != 0;
         shared->settings.record_diagnostics = saved("RecordDiagnostics") != 0;
+        shared->settings.background_memory = saved("BackgroundMemory") != 0;
+        shared->settings.stretch_width = static_cast<std::uint32_t>(std::clamp(saved("StretchWidth"), 0, 32));
     }
 }
 
@@ -317,6 +322,12 @@ void draw_overlay(effect_runtime*) {
         ImGui::BeginDisabled(!latewarp);
         if (ImGui::Combo("Warp engine", &engine, kEngines, 2)) s.warp_engine = static_cast<std::uint32_t>(engine);
         ImGui::EndDisabled();
+        bool memory = s.background_memory != 0;
+        if (ImGui::Checkbox("Background memory for uncovered areas (XPAR engine)", &memory)) {
+            s.background_memory = memory;
+            reshade::set_config_value(nullptr, "FrameWarp", "BackgroundMemory", memory ? "1" : "0");
+        }
+        ImGui::TextDisabled("  beside the character/weapon and at the screen edges: the scenery as last seen there, when recent");
         if (!latewarp)
             ImGui::TextDisabled("  NVIDIA Latewarp is not installed (optional: nvngx_latewarp.dll, NVIDIA GPUs only)");
         bool invert = s.invert_warp != 0;
@@ -347,6 +358,13 @@ void draw_overlay(effect_runtime*) {
                 reshade::set_config_value(nullptr, "FrameWarp", "NearCameraRule", near_rule ? "1" : "0");
             }
             ImGui::TextDisabled("  turn off if the floor near the camera is kept still while strafing");
+            int stretch = static_cast<int>(std::min(s.stretch_width, 32u));
+            if (ImGui::SliderInt("Stretch around character/weapon (render px, XPAR engine)", &stretch, 0, 32, stretch ? "%d" : "off")) {
+                s.stretch_width = static_cast<std::uint32_t>(stretch);
+                const std::string value = std::to_string(stretch);
+                reshade::set_config_value(nullptr, "FrameWarp", "StretchWidth", value.c_str());
+            }
+            ImGui::TextDisabled("  the scenery beside it stretches instead of tearing into streaks when strafing or turning");
             bool orbited = s.turn_rule != 0;
             if (ImGui::Checkbox("Keep still what the camera turns around (third-person)", &orbited)) {
                 s.turn_rule = orbited;

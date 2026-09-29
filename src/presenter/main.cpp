@@ -410,6 +410,7 @@ void render_thread() {
     CameraBasis source_basis{};
     double source_time = 0;
     std::uint64_t source_frame = 0;
+    std::uint64_t memory_frame = 0;  // game frame the background memory was last updated with
     bool first_eval = false;
     // With split queues a frame taken in becomes the source the warp uses only once the GPU has finished
     // it (Renderer::show_intake): until then the warp keeps the previous one, textures and camera together.
@@ -627,7 +628,14 @@ void render_thread() {
                     if (!settings.hud_from_scene) for_mask.has_scene = false;
                     renderer.build_no_warp_mask(for_mask, cam.clip_to_prev_clip, hud_mask, s.has_motion && mv_scale.valid, attached_mask,
                                                 cam.depth_inverted != 0, settings.hud_from_scene == 2,
-                                                settings.hud_fill != 0 && (settings.warp_engine == 1 || !latewarp.ready()));
+                                                settings.hud_fill != 0 && (settings.warp_engine == 1 || !latewarp.ready()),
+                                                settings.warp_engine == 1 || !latewarp.ready() ? static_cast<int>(settings.stretch_width) : 0);
+                    // Background memory (option, XPAR engine): the scenery last seen behind held pixels and just
+                    // beyond the frame, for what the warp uncovers there.
+                    if (settings.background_memory && (settings.warp_engine == 1 || !latewarp.ready())) {
+                        renderer.update_memory(s, cam.clip_to_prev_clip, cam.depth_inverted != 0, m.frame_id == memory_frame + 1);
+                        memory_frame = m.frame_id;
+                    }
                     if (++mask_builds >= 300) {
                         mask_builds = 0;
                         const HudStats hs = renderer.take_hud_stats();
@@ -905,7 +913,8 @@ void render_thread() {
                 // need the warp pass.)
                 unmoved = !settings.show_mask && !settings.extrapolate_objects;
                 for (int i = 0; i < 16 && unmoved; ++i) unmoved = std::fabs(m.data()[i] - (i % 5 == 0 ? 1.0f : 0.0f)) < 2e-6f;
-                warped = unmoved || renderer.own_warp(source, settings.use_ui_tags != 0, inputs.no_warp_mask != nullptr, m.data(), inputs.depth_inverted);
+                warped = unmoved || renderer.own_warp(source, settings.use_ui_tags != 0, inputs.no_warp_mask != nullptr, m.data(), inputs.depth_inverted,
+                                                     settings.background_memory != 0);
             } else {
                 warped = latewarp.evaluate(list, inputs, first_eval, view_matrix(p.camera, origin, z_sign),
                                            view_matrix(source_basis, origin, z_sign), projection);
