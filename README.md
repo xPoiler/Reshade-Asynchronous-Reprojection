@@ -70,6 +70,9 @@ To check the version, right-click the file and open Properties > Details.
    -slforcetagging -slviewextension
    ```
 
+After an update, the settings XPAR remembers per game go back to the defaults on the first launch, so
+the new version's improved defaults apply right away (the learned camera model is kept).
+
 To uninstall, double-click `uninstall.bat` and choose the game. It reverts everything the installer
 changed.
 

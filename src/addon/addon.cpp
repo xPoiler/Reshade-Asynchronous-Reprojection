@@ -10,6 +10,7 @@
 #include "addon/ffx_hooks.hpp"
 #include <d3d12.h>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <string>
 
@@ -96,18 +97,42 @@ void on_init_swapchain(swapchain* sc, bool) {
         fw::install_streamline_hooks(g_producer.get());
         fw::install_ffx_hooks(g_producer.get());
     }
-    // The settings remembered per game (ReShade.ini, [FrameWarp]).
-    int from_scene = 2, record = 0, near_rule = 1, fill = 1, turn_rule = 1;
-    if (g_producer->shared() && reshade::get_config_value(nullptr, "FrameWarp", "HudFromDlssOutput", from_scene))
-        g_producer->shared()->settings.hud_from_scene = from_scene == 2 ? 2 : (from_scene != 0 ? 1 : 0);
-    if (g_producer->shared() && reshade::get_config_value(nullptr, "FrameWarp", "FillBehindHud", fill))
-        g_producer->shared()->settings.hud_fill = fill != 0;
-    if (g_producer->shared() && reshade::get_config_value(nullptr, "FrameWarp", "HoldOrbitedCharacter", turn_rule))
-        g_producer->shared()->settings.turn_rule = turn_rule != 0;
-    if (g_producer->shared() && reshade::get_config_value(nullptr, "FrameWarp", "NearCameraRule", near_rule))
-        g_producer->shared()->settings.near_camera_rule = near_rule != 0;
-    if (g_producer->shared() && reshade::get_config_value(nullptr, "FrameWarp", "RecordDiagnostics", record))
-        g_producer->shared()->settings.record_diagnostics = record != 0;
+    // The settings remembered per game (ReShade.ini, [FrameWarp]). They belong to the version that saved
+    // them: after an update (any version change) they go back to the defaults, so the improved defaults of
+    // a new version apply right after installing it.
+    struct Saved { const char* key; int default_value; };
+    static constexpr Saved kSaved[] = {{"HudFromDlssOutput", 2}, {"FillBehindHud", 1}, {"HoldOrbitedCharacter", 1},
+                                       {"NearCameraRule", 1}, {"RecordDiagnostics", 0}};
+    char saved_version[32] = "";
+    size_t size = sizeof(saved_version);
+    if (!reshade::get_config_value(nullptr, "FrameWarp", "SettingsVersion", saved_version, &size) ||
+        std::strcmp(saved_version, FW_VERSION) != 0) {
+        for (const auto& k : kSaved) {
+            char value[8];
+            std::snprintf(value, sizeof(value), "%d", k.default_value);
+            reshade::set_config_value(nullptr, "FrameWarp", k.key, static_cast<const char*>(value));
+        }
+        reshade::set_config_value(nullptr, "FrameWarp", "SettingsVersion", static_cast<const char*>(FW_VERSION));
+        if (saved_version[0]) {
+            char text[128];
+            std::snprintf(text, sizeof(text), "XPAR updated from %s to " FW_VERSION ": settings reset to the defaults", saved_version);
+            reshade::log::message(reshade::log::level::info, text);
+        }
+    }
+    auto saved = [&](const char* key) {
+        int value = 0;
+        for (const auto& k : kSaved) if (std::strcmp(k.key, key) == 0) value = k.default_value;
+        reshade::get_config_value(nullptr, "FrameWarp", key, value);
+        return value;
+    };
+    if (auto* shared = g_producer->shared()) {
+        const int from_scene = saved("HudFromDlssOutput");
+        shared->settings.hud_from_scene = from_scene == 2 ? 2 : (from_scene != 0 ? 1 : 0);
+        shared->settings.hud_fill = saved("FillBehindHud") != 0;
+        shared->settings.turn_rule = saved("HoldOrbitedCharacter") != 0;
+        shared->settings.near_camera_rule = saved("NearCameraRule") != 0;
+        shared->settings.record_diagnostics = saved("RecordDiagnostics") != 0;
+    }
 }
 
 // The ReShade menu takes the mouse and is drawn on the final frame only (not in a game's HUD layers): while

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+* After an update, the settings remembered per game are reset to the defaults on the first launch (the
+  ReShade log says so), so every improvement to the defaults applies right after installing.
 * **Keep still what the camera turns around (third-person)** (new option, on by default, remembered per
   game): over-the-shoulder cameras circle the character, so it barely moves on screen while the room
   swings around it, and the warp broke it up (Resident Evil Requiem, Expedition 33). What moves less than
