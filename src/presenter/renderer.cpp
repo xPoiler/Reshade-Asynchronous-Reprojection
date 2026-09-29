@@ -1,4 +1,5 @@
 #include "presenter/renderer.hpp"
+#include <cstdlib>
 #include <d3dcompiler.h>
 #include <cstdio>
 #include <algorithm>
@@ -699,7 +700,9 @@ bool hud_near(Texture2D<float> score, int2 p) {
 [numthreads(8, 8, 1)] void cs_scene_fill(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
     sh_load(gid, gi);
     GroupMemoryBarrierWithGroupSync();
-    if (any(id.xy >= out_size) || !hud_near(sc_score_t, int2(id.xy))) return;
+    if (any(id.xy >= out_size)) return;
+    // Every pixel is written (alpha 1: filled here), so the warp needs nothing but this texture.
+    if (!hud_near(sc_score_t, int2(id.xy))) { sc_fill_u[id.xy] = float4(0, 0, 0, 0); return; }
     float3 a, b;
     sh_tile_ab(id.xy, a, b);
     const float3 scene = max(sc_scene_t.Load(int3(id.xy, 0)).rgb, 0);
@@ -718,15 +721,14 @@ bool hud_near(Texture2D<float> score, int2 p) {
 // from under the mask (they step past it to the nearest scene pixel). Games with HUD layers get their UI
 // composited on top afterwards.
 // With the fill behind the HUD (flag 4), a warped pixel landing on the HUD takes the scene predicted
-// there from the upscaler's output instead (see cs_scene_fill).
+// there from the upscaler's output instead (see cs_scene_fill; alpha 1 where filled).
 // rect: the valid depth region; grid: depth texture size. flags: 1 UI layer, 2 mask, 4 fill behind the
-// HUD, 8 HUD found from the upscaler's output (t4), 16 depth inverted, 32 depth-independent (rotation only).
+// HUD, 16 depth inverted, 32 depth-independent (rotation only).
 Texture2D<float4> ow_color_t : register(t0);
 Texture2D<float4> ow_ui_t : register(t1);
 Texture2D<float> ow_mask_t : register(t2);
 Texture2D<float> ow_depth_t : register(t3);
-Texture2D<float> ow_score_t : register(t4);  // HUD found from the upscaler's output (> 0.5)
-Texture2D<float4> ow_fill_t : register(t5);  // the scene behind it
+Texture2D<float4> ow_fill_t : register(t5);  // the scene behind the HUD (alpha 1 where filled)
 RWTexture2D<float4> ow_out_u : register(u0);
 SamplerState ow_linear : register(s0);  // bilinear, clamped to the edge
 float4 ow_bilinear(float2 uv) { return ow_color_t.SampleLevel(ow_linear, uv, 0); }
@@ -765,8 +767,9 @@ float3 ow_forward(float2 uv) {
             if (flags & 2) {
                 const int2 last = int2(out_size) - 1;
                 const int3 si = int3(clamp(int2(src * float2(out_size)), int2(0, 0), last), 0);
-                if ((flags & 4) && ow_mask_t.Load(si) > 0.5 && hud_near(ow_score_t, si.xy)) {
-                    c = ow_fill_t.Load(si);
+                const float4 filled = (flags & 4) ? ow_fill_t.Load(si) : float4(0, 0, 0, 0);
+                if (filled.a > 0.5 && ow_mask_t.Load(si) > 0.5) {
+                    c = float4(filled.rgb, 1);
                 } else if (ow_mask_t.Load(si) > 0.5) {
                     const float2 away = normalize((src - uv) * float2(out_size) + float2(1e-3, 0));
                     bool found = false;
@@ -878,7 +881,7 @@ D3D12_RESOURCE_BARRIER transition_barrier(ID3D12Resource* r, D3D12_RESOURCE_STAT
 }  // namespace
 
 Renderer::~Renderer() {
-    if (queue_ && fence_) wait_idle();
+    if (queue_ && fences_[0]) wait_idle();
     if (fence_event_) CloseHandle(fence_event_);
     if (waitable_) CloseHandle(waitable_);
 }
@@ -892,6 +895,11 @@ D3D12_GPU_DESCRIPTOR_HANDLE Renderer::gpu(UINT index) const {
 
 bool Renderer::init(const LUID& adapter_luid, HWND window, std::uint32_t width, std::uint32_t height, DXGI_FORMAT game_format,
                     std::uint32_t color_space, std::string& error) {
+    // Development: FW_D3D_DEBUG=1 enables the D3D12 debug layer (errors printed by print_debug_messages).
+    if (std::getenv("FW_D3D_DEBUG")) {
+        ComPtr<ID3D12Debug> debug;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) debug->EnableDebugLayer();
+    }
     if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory_)))) { error = "DXGI factory"; return false; }
     ComPtr<IDXGIAdapter1> adapter;
     if (FAILED(factory_->EnumAdapterByLuid(adapter_luid, IID_PPV_ARGS(&adapter)))) { error = "game adapter not found"; return false; }
@@ -905,11 +913,24 @@ bool Renderer::init(const LUID& adapter_luid, HWND window, std::uint32_t width, 
         qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH; priority_name_ = "high";
         if (FAILED(device_->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue_)))) { error = "command queue"; return false; }
     }
-    for (auto& a : allocators_)
-        if (FAILED(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a)))) { error = "allocator"; return false; }
-    if (FAILED(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators_[0].Get(), nullptr, IID_PPV_ARGS(&list_)))) { error = "command list"; return false; }
-    list_->Close();
-    if (FAILED(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)))) { error = "fence"; return false; }
+    // The intake queue (split queues): compute, normal priority - the realtime queue's warp goes first.
+    // Without it (creation failed) everything stays on the realtime queue.
+    D3D12_COMMAND_QUEUE_DESC iqd{};
+    iqd.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    iqd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+    if (FAILED(device_->CreateCommandQueue(&iqd, IID_PPV_ARGS(&iqueue_)))) iqueue_.Reset();
+    for (int i = 0; i < kRing; ++i) {
+        const auto type = i < 3 ? D3D12_COMMAND_LIST_TYPE_DIRECT : D3D12_COMMAND_LIST_TYPE_COMPUTE;
+        if (i >= 3 && !iqueue_) break;
+        if (FAILED(device_->CreateCommandAllocator(type, IID_PPV_ARGS(&allocators_[i])))) { error = "allocator"; return false; }
+    }
+    if (FAILED(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators_[0].Get(), nullptr, IID_PPV_ARGS(&lists_[0])))) { error = "command list"; return false; }
+    lists_[0]->Close();
+    if (iqueue_ && FAILED(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, allocators_[3].Get(), nullptr, IID_PPV_ARGS(&lists_[1])))) iqueue_.Reset();
+    if (lists_[1]) lists_[1]->Close();
+    list_ = lists_[0];
+    for (auto& f : fences_)
+        if (FAILED(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f)))) { error = "fence"; return false; }
     fence_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
     static_assert(kSrcSrv + kSlots * kTexCount <= kPrivUav && kPrivUav + kPCount <= kPrivSrv && kPrivSrv + kPCount <= kX,
@@ -923,22 +944,24 @@ bool Renderer::init(const LUID& adapter_luid, HWND window, std::uint32_t width, 
     swap_format_ = swapchain_format(game_format);
     if (!create_pipelines(error)) return false;
 
-    D3D12_QUERY_HEAP_DESC qh{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 6, 0};
+    D3D12_QUERY_HEAP_DESC qh{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 2 * kRing, 0};
     device_->CreateQueryHeap(&qh, IID_PPV_ARGS(&timestamps_));
     D3D12_HEAP_PROPERTIES rb{}; rb.Type = D3D12_HEAP_TYPE_READBACK;
-    D3D12_RESOURCE_DESC bd{}; bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = 6 * 8; bd.Height = 1;
+    D3D12_RESOURCE_DESC bd{}; bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = 2 * kRing * 8; bd.Height = 1;
     bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     device_->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback_));
     queue_->GetTimestampFrequency(&timestamp_frequency_);
+    timestamp_frequencies_[0] = timestamp_frequency_;
+    if (!iqueue_ || FAILED(iqueue_->GetTimestampFrequency(&timestamp_frequencies_[1]))) timestamp_frequencies_[1] = timestamp_frequency_;
     queue_->GetClockCalibration(&calib_gpu_, &calib_cpu_);
-    D3D12_QUERY_HEAP_DESC stq{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 9, 0};
+    D3D12_QUERY_HEAP_DESC stq{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 3 * kRing, 0};
     device_->CreateQueryHeap(&stq, IID_PPV_ARGS(&stage_stamps_));
-    bd.Width = 9 * 8;
+    bd.Width = 3 * kRing * 8;
     device_->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&stage_readback_));
     // GPU time of each scene-HUD pass (one set per frame in flight), for the log.
-    D3D12_QUERY_HEAP_DESC sq{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 3 * kSceneStamps, 0};
+    D3D12_QUERY_HEAP_DESC sq{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, kRing * kSceneStamps, 0};
     device_->CreateQueryHeap(&sq, IID_PPV_ARGS(&scene_stamps_));
-    bd.Width = 3 * kSceneStamps * 8;
+    bd.Width = kRing * kSceneStamps * 8;
     device_->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&scene_stamps_readback_));
 
     // Composition swapchain: DWM composites it over the game without taking focus or input.
@@ -1073,22 +1096,22 @@ bool Renderer::create_pipelines(std::string& error) {
         error = "scene HUD buffer"; return false;
     }
     D3D12_HEAP_PROPERTIES rbh{}; rbh.Type = D3D12_HEAP_TYPE_READBACK;
-    bd.Width = 3 * 2 * 16; bd.Flags = D3D12_RESOURCE_FLAG_NONE;
+    bd.Width = kRing * 2 * 16; bd.Flags = D3D12_RESOURCE_FLAG_NONE;
     if (FAILED(device_->CreateCommittedResource(&rbh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&fit_readback_)))) {
         error = "motion fit readback"; return false;
     }
-    bd.Width = 3 * 16;
+    bd.Width = kRing * 16;
     if (FAILED(device_->CreateCommittedResource(&rbh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&hud_readback_)))) {
         error = "HUD counter readback"; return false;
     }
     return true;
 }
 
-void Renderer::set_x_srv(UINT index, PrivateId id) {
+void Renderer::set_x_srv(UINT index, PrivateId id, bool from_shown) {
     D3D12_SHADER_RESOURCE_VIEW_DESC d{};
     d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D; d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     d.Texture2D.MipLevels = 1;
-    const auto& p = private_[id];
+    const auto& p = from_shown ? shown(id) : private_[id];
     d.Format = p.texture ? p.format : DXGI_FORMAT_R8G8B8A8_UNORM;
     device_->CreateShaderResourceView(p.texture.Get(), &d, cpu(index));
 }
@@ -1336,6 +1359,7 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
     x_dispatch(cs_mask_.Get(), &c, kXMaskSrv, kXMaskUav, (ow + 7) / 8, (oh + 7) / 8);
     transition(private_[kPMask], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     mask_ready_ = true;
+    built_mask_ = true;
     return private_[kPMask].texture.Get();
 }
 
@@ -1385,7 +1409,10 @@ void Renderer::detect_hud_from_scene(const XConstants& base, bool fill) {
     run(cs_scene_wash_finish_.Get(), 0, 1, 0, 1, 1);
     run(cs_scene_tiles_.Get(), 2, 1, 2, c.grid[0], c.grid[1]);  // tile set 1 over predictor 2
     run(cs_scene_hud_.Get(), 2, 1, 0, (ow + 7) / 8, (oh + 7) / 8);
-    if (fill && ensure_private(kPFill, ow, oh, private_[kPBackbuffer].format)) {
+    // (alpha marks the filled pixels: the game's format when it has one, half-float otherwise)
+    const DXGI_FORMAT fill_format = private_[kPBackbuffer].format == DXGI_FORMAT_R11G11B10_FLOAT ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                                                                                                : private_[kPBackbuffer].format;
+    if (fill && ensure_private(kPFill, ow, oh, fill_format)) {
         transition(private_[kPHudScore], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         set_x_srv(kXFillSrv + 0, kPBackbuffer);
         set_x_srv(kXFillSrv + 1, kPScene);
@@ -1413,15 +1440,17 @@ void Renderer::detect_hud_from_scene(const XConstants& base, bool fill) {
 }
 
 bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_mask, const float source_to_target[16], bool depth_inverted) {
-    if (!src.valid || !src.has_depth || !private_[kPOutput].texture || !private_[kPDepth].texture) return false;
-    const bool split = use_ui_tags && src.has_hudless && src.has_ui && private_[kPHudless].texture && private_[kPUi].texture;
-    const bool mask = use_mask && mask_ready_ && private_[kPMask].texture && private_[kPMask].width == private_[kPOutput].width &&
-                      private_[kPMask].height == private_[kPOutput].height;
+    // (the shown set with split queues)
+    if (!src.valid || !src.has_depth || !private_[kPOutput].texture || !shown(kPDepth).texture) return false;
+    const bool split = use_ui_tags && src.has_hudless && src.has_ui && shown(kPHudless).texture && shown(kPUi).texture;
+    const bool mask_ready = split_ ? shown_mask_ : mask_ready_;
+    const bool mask = use_mask && mask_ready && shown(kPMask).texture && shown(kPMask).width == private_[kPOutput].width &&
+                      shown(kPMask).height == private_[kPOutput].height;
     const UINT ow = private_[kPOutput].width, oh = private_[kPOutput].height;
     XConstants c{};
     std::memcpy(c.clip_to_prev, source_to_target, sizeof(c.clip_to_prev));
     c.out_size[0] = ow; c.out_size[1] = oh;
-    const UINT dw = private_[kPDepth].width, dh = private_[kPDepth].height;
+    const UINT dw = shown(kPDepth).width, dh = shown(kPDepth).height;
     const Rect2 r = src.depth_rect.w ? src.depth_rect : Rect2{0, 0, dw, dh};
     c.rect[0] = r.x; c.rect[1] = r.y; c.rect[2] = std::min(r.w, dw - r.x); c.rect[3] = std::min(r.h, dh - r.y);
     c.grid[0] = dw; c.grid[1] = dh;
@@ -1429,16 +1458,15 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
     const float* m = source_to_target;
     const float scale = std::max({std::fabs(m[0]), std::fabs(m[5]), std::fabs(m[12]), std::fabs(m[13]), std::fabs(m[14]), std::fabs(m[15]), 1e-6f});
     const bool no_depth = std::fabs(m[8]) <= 1e-6f * scale && std::fabs(m[9]) <= 1e-6f * scale && std::fabs(m[11]) <= 1e-6f * scale;
-    const bool found = mask && !split && hud_from_scene_ && private_[kPHudScore].width == ow && private_[kPHudScore].height == oh;
-    const bool fill = found && fill_ready_ && private_[kPFill].width == ow && private_[kPFill].height == oh;
-    c.flags = (split ? 1u : 0u) | (mask ? 2u : 0u) | (fill ? 4u : 0u) | (found ? 8u : 0u) | (depth_inverted ? 16u : 0u) |
-              (no_depth ? 32u : 0u);
-    set_x_srv(kXOwnSrv + 0, split ? kPHudless : kPBackbuffer);
-    set_x_srv(kXOwnSrv + 1, split ? kPUi : kPBackbuffer);  // (only read with a UI layer)
-    set_x_srv(kXOwnSrv + 2, mask ? kPMask : kPDepth);
-    set_x_srv(kXOwnSrv + 3, kPDepth);
-    set_x_srv(kXOwnSrv + 4, found ? kPHudScore : kPDepth);
-    set_x_srv(kXOwnSrv + 5, fill ? kPFill : kPBackbuffer);
+    const bool fill_ready = split_ ? shown_fill_ : fill_ready_;
+    const bool fill = mask && !split && fill_ready && shown(kPFill).width == ow && shown(kPFill).height == oh;
+    c.flags = (split ? 1u : 0u) | (mask ? 2u : 0u) | (fill ? 4u : 0u) | (depth_inverted ? 16u : 0u) | (no_depth ? 32u : 0u);
+    set_x_srv(kXOwnSrv + 0, split ? kPHudless : kPBackbuffer, true);
+    set_x_srv(kXOwnSrv + 1, split ? kPUi : kPBackbuffer, true);  // (only read with a UI layer)
+    set_x_srv(kXOwnSrv + 2, mask ? kPMask : kPDepth, true);
+    set_x_srv(kXOwnSrv + 3, kPDepth, true);
+    set_x_srv(kXOwnSrv + 4, kPDepth, true);
+    set_x_srv(kXOwnSrv + 5, fill ? kPFill : kPBackbuffer, true);
     set_x_uav(kXOwnUav + 0, kPOutput); set_x_uav(kXOwnUav + 1, kPOutput);
     transition(private_[kPOutput], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     x_dispatch(cs_own_warp_.Get(), &c, kXOwnSrv, kXOwnUav, (ow + 7) / 8, (oh + 7) / 8);
@@ -1446,15 +1474,17 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
 }
 
 void Renderer::tint_mask() {
-    if (!mask_ready_ || !private_[kPOutput].texture || !private_[kPHudScore].texture) return;
+    // (with split queues the HUD score belongs to the intake queue: magenta only)
+    if (!(split_ ? shown_mask_ : mask_ready_) || !private_[kPOutput].texture || !private_[kPHudScore].texture) return;
     const UINT ow = private_[kPOutput].width, oh = private_[kPOutput].height;
-    if (private_[kPMask].width != ow || private_[kPMask].height != oh) return;
+    if (shown(kPMask).width != ow || shown(kPMask).height != oh) return;
     XConstants c{};
     c.out_size[0] = ow; c.out_size[1] = oh;
-    c.flags = hud_from_scene_ ? 0u : 1u;
-    set_x_srv(kXTintSrv + 0, kPMask);
-    set_x_srv(kXTintSrv + 1, kPHudScore);
-    for (UINT i = 2; i < kXSrvCount; ++i) set_x_srv(kXTintSrv + i, kPMask);
+    c.flags = hud_from_scene_ || split_ ? 0u : 1u;
+    set_x_srv(kXTintSrv + 0, kPMask, true);
+    if (split_) set_x_srv(kXTintSrv + 1, kPMask, true);
+    else set_x_srv(kXTintSrv + 1, kPHudScore);
+    for (UINT i = 2; i < kXSrvCount; ++i) set_x_srv(kXTintSrv + i, kPMask, true);
     set_x_uav(kXTintUav + 0, kPOutput); set_x_uav(kXTintUav + 1, kPOutput);
     transition(private_[kPOutput], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     D3D12_RESOURCE_BARRIER written{}; written.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; written.UAV.pResource = private_[kPOutput].texture.Get();
@@ -1462,13 +1492,25 @@ void Renderer::tint_mask() {
     x_dispatch(cs_tint_.Get(), &c, kXTintSrv, kXTintUav, (ow + 7) / 8, (oh + 7) / 8);
 }
 
-void Renderer::flush_and_wait() {
+void Renderer::execute() {
     list_->Close();
-    if (pending_game_wait_ && fence_game_) { queue_->Wait(fence_game_.Get(), pending_game_wait_); pending_game_wait_ = 0; }
+    ID3D12CommandQueue* q = context_queue();
+    std::uint64_t& game_wait = pending_game_waits_[context_];
+    if (game_wait && fence_game_) { q->Wait(fence_game_.Get(), game_wait); game_wait = 0; }
+    // The intake rewrites the set the warp showed until the last swap: after the warps that read it.
+    if (context_ == 1 && release_wait_) q->Wait(fences_[0].Get(), release_wait_);
     ID3D12CommandList* lists[] = {list_.Get()};
-    queue_->ExecuteCommandLists(1, lists);
-    queue_->Signal(fence_.Get(), ++fence_value_);
-    frame_values_[frame_index_] = fence_value_;
+    q->ExecuteCommandLists(1, lists);
+}
+
+void Renderer::signal() {
+    context_queue()->Signal(fences_[context_].Get(), ++fence_values_[context_]);
+    frame_values_[frame_index_] = fence_values_[context_];
+}
+
+void Renderer::flush_and_wait() {
+    execute();
+    signal();
     wait_idle();
     allocators_[frame_index_]->Reset();
     list_->Reset(allocators_[frame_index_].Get(), nullptr);
@@ -1541,8 +1583,99 @@ bool Renderer::sample_motion(const IngestedSource& src, std::uint32_t grid_w, st
 
 void Renderer::wait_for(std::uint64_t value) {
     if (completed(value)) return;
-    fence_->SetEventOnCompletion(value, fence_event_);
+    fences_[0]->SetEventOnCompletion(value, fence_event_);
     WaitForSingleObject(fence_event_, 1000);
+}
+
+int Renderer::print_debug_messages() {
+    ComPtr<ID3D12InfoQueue> info;
+    if (!device_ || FAILED(device_.As(&info))) { std::printf("D3D12 debug layer: not available\n"); return 0; }
+    int errors = 0;
+    const UINT64 n = info->GetNumStoredMessages();
+    for (UINT64 i = 0; i < n; ++i) {
+        SIZE_T size = 0;
+        info->GetMessage(i, nullptr, &size);
+        std::vector<char> buffer(size);
+        auto* m = reinterpret_cast<D3D12_MESSAGE*>(buffer.data());
+        if (FAILED(info->GetMessage(i, m, &size))) continue;
+        if (m->Severity > D3D12_MESSAGE_SEVERITY_ERROR) continue;
+        ++errors;
+        if (errors <= 20) std::printf("D3D12 %s: %s\n", m->Severity == D3D12_MESSAGE_SEVERITY_CORRUPTION ? "CORRUPTION" : "ERROR", m->pDescription);
+    }
+    std::printf("D3D12 debug layer: %llu messages, %d errors\n", static_cast<unsigned long long>(n), errors);
+    info->ClearStoredMessages();
+    return errors;
+}
+
+void Renderer::wait_for_intake(std::uint64_t value) {
+    ID3D12Fence* f = fences_[split_ ? 1 : 0].Get();
+    if (f->GetCompletedValue() >= value) return;
+    f->SetEventOnCompletion(value, fence_event_);
+    WaitForSingleObject(fence_event_, 1000);
+}
+
+// ---- split queues
+void Renderer::swap_shown() {
+    for (int i = 0; i < kPCount; ++i) {
+        const auto id = static_cast<PrivateId>(i);
+        if (!shown_id(id)) continue;
+        std::swap(private_[id], front_[id]);
+        // The per-texture descriptors describe the texture the intake writes next.
+        if (private_[id].texture) {
+            device_->CreateUnorderedAccessView(private_[id].texture.Get(), nullptr, nullptr, cpu(kPrivUav + id));
+            device_->CreateShaderResourceView(private_[id].texture.Get(), nullptr, cpu(kPrivSrv + id));
+        }
+    }
+}
+
+bool Renderer::set_split(bool on) {
+    if (on && !iqueue_) on = false;
+    if (on == split_) return false;
+    wait_idle();
+    // Turning on: what was taken in so far becomes the shown set. Turning off: the shown set goes back to
+    // where the single queue reads everything.
+    swap_shown();
+    if (on) { shown_mask_ = mask_ready_; shown_fill_ = fill_ready_; }
+    else { mask_ready_ = shown_mask_; fill_ready_ = shown_fill_; }
+    private_[kPPrevious] = Private{};  // (with split queues an alias of a shown texture)
+    previous_valid_ = false;
+    pending_show_ = 0; release_wait_ = 0;
+    split_ = on;
+    return true;
+}
+
+ID3D12GraphicsCommandList* Renderer::begin_intake() {
+    if (!split_) return begin_frame();
+    built_mask_ = false;
+    fill_ready_ = false;
+    return begin(1);
+}
+
+bool Renderer::show_intake() {
+    if (!split_ || !pending_show_ || fences_[1]->GetCompletedValue() < pending_show_) return false;
+    swap_shown();
+    shown_mask_ = built_mask_;
+    shown_fill_ = fill_ready_;
+    // Warps recorded so far may still read the set the intake writes next.
+    release_wait_ = fence_values_[0];
+    pending_show_ = 0;
+    return true;
+}
+
+void Renderer::copy_shown_to_output() {
+    // An unwarped refresh: the shown frame as it is, through the warp shader with the identity (the
+    // shown textures stay in the shader-read state both queues use).
+    const auto& bb = shown(kPBackbuffer);
+    if (!bb.texture || !private_[kPOutput].texture || bb.width != private_[kPOutput].width || bb.height != private_[kPOutput].height) return;
+    XConstants c{};
+    for (int i = 0; i < 16; ++i) c.clip_to_prev[i] = (i % 5 == 0) ? 1.0f : 0.0f;
+    c.out_size[0] = bb.width; c.out_size[1] = bb.height;
+    c.rect[2] = c.rect[3] = 1; c.grid[0] = c.grid[1] = 1;
+    c.flags = 32u;  // depth-independent: no depth reads
+    for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXOwnSrv + i, kPBackbuffer, true);
+    set_x_uav(kXOwnUav + 0, kPOutput); set_x_uav(kXOwnUav + 1, kPOutput);
+    transition(private_[kPOutput], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    x_dispatch(cs_own_warp_.Get(), &c, kXOwnSrv, kXOwnUav, (bb.width + 7) / 8, (bb.height + 7) / 8);
 }
 
 bool Renderer::take_motion_fit(MotionFit& fit) {
@@ -1595,6 +1728,7 @@ void Renderer::transition(Private& p, D3D12_RESOURCE_STATES to) {
 
 bool Renderer::open_session(DWORD pid, std::uint64_t session, std::string& error) {
     wait_idle();
+    pending_show_ = 0; release_wait_ = 0; shown_mask_ = shown_fill_ = false;
     fence_game_.Reset();
     for (auto& slot : shared_) for (auto& t : slot) t = SharedTex{};
     std::fill(std::begin(srv_resource_), std::end(srv_resource_), nullptr);
@@ -1637,10 +1771,16 @@ ID3D12Resource* Renderer::shared_texture(int slot, int kind, std::uint32_t gener
     return t.resource.Get();
 }
 
-ID3D12GraphicsCommandList* Renderer::begin_frame() {
-    frame_index_ = (frame_index_ + 1) % 3;
-    if (!completed(frame_values_[frame_index_])) {
-        fence_->SetEventOnCompletion(frame_values_[frame_index_], fence_event_);
+ID3D12GraphicsCommandList* Renderer::begin_frame() { return begin(0); }
+
+ID3D12GraphicsCommandList* Renderer::begin(int context) {
+    context_ = context;
+    list_ = lists_[context];
+    ring_pos_[context] = (ring_pos_[context] + 1) % 3;
+    frame_index_ = static_cast<std::uint32_t>(context * 3 + ring_pos_[context]);
+    const std::uint64_t timestamp_frequency_ = timestamp_frequencies_[context];  // (this slot's queue)
+    if (fences_[context]->GetCompletedValue() < frame_values_[frame_index_]) {
+        fences_[context]->SetEventOnCompletion(frame_values_[frame_index_], fence_event_);
         WaitForSingleObject(fence_event_, 1000);
     }
     // GPU time of the frame that last used this allocator.
@@ -1779,7 +1919,7 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
     for (int k = 0; k < kTexCount; ++k)
         if (m.tex[k].valid) sources[k] = shared_texture(slot, k, m.tex[k].generation);
     if (!sources[kBackbuffer]) return out;
-    pending_game_wait_ = std::max(pending_game_wait_, m.fence_value);
+    pending_game_waits_[context_] = std::max(pending_game_waits_[context_], m.fence_value);
 
     // Shared textures live in COMMON between the two devices' queues.
     std::vector<D3D12_RESOURCE_BARRIER> barriers;
@@ -1812,7 +1952,15 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
     const DXGI_FORMAT colour = colour_format(static_cast<DXGI_FORMAT>(bb.format));
     ensure_private(kPBackbuffer, bb.width, bb.height, colour);
     ensure_private(kPOutput, bb.width, bb.height, colour);  // the warped frame: the same values as the game's
-    if (keep_previous_ && ingested_) {
+    if (keep_previous_ && ingested_ && split_) {
+        // Split queues: the previous frame is the shown one - read in place (both queues only read it).
+        const PrivateId from = last_had_hudless_ ? kPHudless : kPBackbuffer;
+        if (front_[from].texture) {
+            private_[kPPrevious] = front_[from];
+            previous_valid_ = true;
+            previous_from_hudless_ = last_had_hudless_;
+        }
+    } else if (keep_previous_ && ingested_) {
         const PrivateId from = last_had_hudless_ ? kPHudless : kPBackbuffer;
         if (private_[from].texture && ensure_private(kPPrevious, private_[from].width, private_[from].height, private_[from].format)) {
             transition(private_[from], D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1882,18 +2030,17 @@ void Renderer::submit_work(bool continuation) {
         list_->ResolveQueryData(stage_stamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * 3, 3, stage_readback_.Get(), frame_index_ * 24);
         stage_valid_[frame_index_] = true;
     }
-    list_->Close();
-    if (pending_game_wait_ && fence_game_) { queue_->Wait(fence_game_.Get(), pending_game_wait_); pending_game_wait_ = 0; }
-    ID3D12CommandList* lists[] = {list_.Get()};
-    queue_->ExecuteCommandLists(1, lists);
-    queue_->Signal(fence_.Get(), ++fence_value_);
-    frame_values_[frame_index_] = fence_value_;
+    execute();
+    signal();
     intake_slot_[frame_index_] = true;
     continuation_slot_[frame_index_] = continuation;
 }
 
 void Renderer::finish_frame(bool warped, int marker) {
     intake_slot_[frame_index_] = false;
+    // With split queues the unwarped frame is the shown one, copied (the warp never changes the state of
+    // the textures the intake queue may read at the same time).
+    if (split_ && !warped && private_[kPOutput].texture) { copy_shown_to_output(); warped = true; }
     ComPtr<ID3D12Resource> back;
     const UINT index = swapchain_->GetCurrentBackBufferIndex();
     swapchain_->GetBuffer(index, IID_PPV_ARGS(&back));
@@ -1928,10 +2075,7 @@ void Renderer::finish_frame(bool warped, int marker) {
         list_->EndQuery(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * 2 + 1);
         list_->ResolveQueryData(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * 2, 2, readback_.Get(), frame_index_ * 16);
     }
-    list_->Close();
-    if (pending_game_wait_ && fence_game_) { queue_->Wait(fence_game_.Get(), pending_game_wait_); pending_game_wait_ = 0; }
-    ID3D12CommandList* lists[] = {list_.Get()};
-    queue_->ExecuteCommandLists(1, lists);
+    execute();
     {
         LARGE_INTEGER q; QueryPerformanceCounter(&q);
         submit_qpc_[frame_index_] = q.QuadPart;
@@ -1946,16 +2090,16 @@ void Renderer::finish_frame(bool warped, int marker) {
         static int recalibrate = 0;
         if (++recalibrate % 240 == 0) queue_->GetClockCalibration(&calib_gpu_, &calib_cpu_);
     }
-    queue_->Signal(fence_.Get(), ++fence_value_);
-    frame_values_[frame_index_] = fence_value_;
+    signal();
 }
 
 bool Renderer::read_back(int which, std::vector<std::uint16_t>& pixels, std::uint32_t& w, std::uint32_t& h) {
     static const PrivateId kWhich[] = {kPBackbuffer, kPOutput, kPScene, kPDepth, kPMotion, kPObject, kPMask, kPHudScore, kPWorld, kPFill};
     if (which < 0 || which >= int(std::size(kWhich))) return false;
-    auto& p = private_[kWhich[which]];
+    auto& p = split_ && shown_id(kWhich[which]) ? front_[kWhich[which]] : private_[kWhich[which]];
     if (!p.texture) return false;
     wait_idle();
+    context_ = 0; list_ = lists_[0]; frame_index_ = static_cast<std::uint32_t>(ring_pos_[0]);
     const auto desc = p.texture->GetDesc();
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
     UINT64 total = 0;
@@ -2032,10 +2176,17 @@ bool Renderer::read_back(int which, std::vector<std::uint16_t>& pixels, std::uin
 }
 
 void Renderer::wait_idle() {
-    if (!queue_ || !fence_) return;
-    queue_->Signal(fence_.Get(), ++fence_value_);
-    if (fence_->GetCompletedValue() < fence_value_) {
-        fence_->SetEventOnCompletion(fence_value_, fence_event_);
+    if (!queue_ || !fences_[0]) return;
+    if (iqueue_ && fences_[1]) {
+        iqueue_->Signal(fences_[1].Get(), ++fence_values_[1]);
+        if (fences_[1]->GetCompletedValue() < fence_values_[1]) {
+            fences_[1]->SetEventOnCompletion(fence_values_[1], fence_event_);
+            WaitForSingleObject(fence_event_, 2000);
+        }
+    }
+    queue_->Signal(fences_[0].Get(), ++fence_values_[0]);
+    if (fences_[0]->GetCompletedValue() < fence_values_[0]) {
+        fences_[0]->SetEventOnCompletion(fence_values_[0], fence_event_);
         WaitForSingleObject(fence_event_, 2000);
     }
 }

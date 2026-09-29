@@ -61,8 +61,28 @@ public:
     // presenter never queues behind the game's in-flight GPU work.
     std::uint64_t game_fence_completed() const { return fence_game_ ? fence_game_->GetCompletedValue() : 0; }
 
-    // Frame recording.
+    // Frame recording. begin_frame starts a refresh (warp + present) on the realtime queue.
     ID3D12GraphicsCommandList* begin_frame();
+    // Split queues (XPAR's own engine, paced): a new game frame is taken in on its own compute queue
+    // (normal priority) into one set of the textures the warp reads, while the warp keeps reading the
+    // other, shown set; the warp never waits behind the several ms of HUD/mask work of a new frame.
+    // Without split queues everything is recorded on the realtime queue as before.
+    // set_split switches the mode (waits for the GPU; call with no frame being taken in): true if changed.
+    bool set_split(bool on);
+    bool split() const { return split_; }
+    // Starts recording the taking in of a game frame (the intake queue when split, else as begin_frame);
+    // submit_work submits it. mark_intake_complete: the frame's work is all submitted - show_intake then
+    // makes it the shown set once the GPU has finished it (true when it did: switch the source then).
+    ID3D12GraphicsCommandList* begin_intake();
+    void mark_intake_complete() { if (split_) pending_show_ = fence_values_[1]; }
+    bool intake_pending() const { return split_ && pending_show_ != 0; }
+    bool show_intake();
+    // Fence values of the intake work (the realtime queue's fence without split queues).
+    std::uint64_t intake_submitted() const { return fence_values_[split_ ? 1 : 0]; }
+    bool intake_completed(std::uint64_t value) const { return fences_[split_ ? 1 : 0]->GetCompletedValue() >= value; }
+    void wait_for_intake(std::uint64_t value);
+    // Development (FW_D3D_DEBUG=1): prints the debug layer's errors since the last call; returns their number.
+    int print_debug_messages();
     // Records conversion of slot `slot` into private textures; the queue waits for the game's fence.
     // after_depth (optional) runs once depth and motion vectors are recorded, before the colour work.
     IngestedSource ingest(const Shared& shared, int slot, const std::function<void(const IngestedSource&)>& after_depth = {});
@@ -89,9 +109,9 @@ public:
     // FrameWarp's own warp engine (experimental): writes the warped output like Latewarp would.
     // source_to_target maps the rendered frame's clip space (with depth) to the displayed camera's (row vectors).
     bool own_warp(const IngestedSource& src, bool use_ui_tags, bool use_mask, const float source_to_target[16], bool depth_inverted);
-    // Signalled value that completes all work recorded so far.
-    std::uint64_t submitted_value() const { return fence_value_; }
-    bool completed(std::uint64_t value) const { return fence_->GetCompletedValue() >= value; }
+    // Signalled value that completes all realtime-queue work recorded so far.
+    std::uint64_t submitted_value() const { return fence_values_[0]; }
+    bool completed(std::uint64_t value) const { return fences_[0]->GetCompletedValue() >= value; }
     HRESULT device_removed_reason() const { return device_ ? device_->GetDeviceRemovedReason() : S_OK; }
     // Notes about shared buffers opened during ingest (size/format changes), drained for logging.
     std::vector<std::string> take_notes() { std::vector<std::string> n; n.swap(notes_); return n; }
@@ -138,8 +158,11 @@ public:
     bool record_motion_samples(const IngestedSource& src, std::uint32_t grid_w, std::uint32_t grid_h);
     bool read_motion_samples(std::vector<float>& out);
     float last_flush_ms() const { return last_flush_ms_; }  // how long sample_motion waited for the GPU
-    ID3D12Resource* no_warp_mask() const { return mask_ready_ ? private_[kPMask].texture.Get() : nullptr; }
-    void reset_hud_detection() { reset_hud_ = true; mask_ready_ = false; }
+    ID3D12Resource* no_warp_mask() const {
+        if (split_) return shown_mask_ ? front_[kPMask].texture.Get() : nullptr;
+        return mask_ready_ ? private_[kPMask].texture.Get() : nullptr;
+    }
+    void reset_hud_detection() { reset_hud_ = true; mask_ready_ = false; shown_mask_ = false; }
 
     // Test/diagnostic helper: synchronously reads back the warped output (RGBA16F) or private backbuffer.
     // which: 0 the game's frame, 1 the warped output, 2 the upscaler's output (scene before HUD).
@@ -160,6 +183,16 @@ private:
     // cannot load/store that format in shaders. Half the memory traffic of half-float at the same values.
     DXGI_FORMAT colour_format(DXGI_FORMAT source);
     bool ensure_private(PrivateId id, std::uint32_t w, std::uint32_t h, DXGI_FORMAT format);
+    // The textures the warp reads, kept twice with split queues (front_: the shown set).
+    static bool shown_id(PrivateId id) {
+        return id == kPBackbuffer || id == kPHudless || id == kPUi || id == kPDepth || id == kPMask || id == kPFill;
+    }
+    const Private& shown(PrivateId id) const { return split_ && shown_id(id) ? front_[id] : private_[id]; }
+    void swap_shown();  // exchanges the two sets (and the per-texture descriptors)
+    void copy_shown_to_output();  // unwarped refresh with split queues (the shown frame as it is)
+    ID3D12GraphicsCommandList* begin(int context);
+    void execute();  // closes and submits list_ on its context's queue (with the waits it needs)
+    void signal();   // signals its context's fence for the frame slot
     void transition(Private& p, D3D12_RESOURCE_STATES to);
     ID3D12Resource* shared_texture(int slot, int kind, std::uint32_t generation);
     D3D12_CPU_DESCRIPTOR_HANDLE cpu(UINT index) const;
@@ -168,17 +201,27 @@ private:
     void create_swapchain_views();
     // HUD in this frame from the upscaler's output (into the HUD score texture, 1 = HUD).
     void detect_hud_from_scene(const struct XConstants& base, bool fill);
-    void set_x_srv(UINT index, PrivateId id);
+    void set_x_srv(UINT index, PrivateId id, bool from_shown = false);
     void set_x_uav(UINT index, PrivateId id);
     void x_dispatch(ID3D12PipelineState* pso, const void* constants, UINT srv_table, UINT uav_table, UINT groups_x, UINT groups_y);
 
+    // Two recording contexts: 0 the realtime (direct) queue, 1 the intake (compute) queue with split
+    // queues. Frame slots 0-2 belong to context 0 and 3-5 to context 1 (allocators, readbacks, timing).
+    static constexpr int kRing = 6;
     ComPtr<ID3D12Device> device_;
-    ComPtr<ID3D12CommandQueue> queue_;
-    ComPtr<ID3D12CommandAllocator> allocators_[3];
-    ComPtr<ID3D12GraphicsCommandList> list_;
-    ComPtr<ID3D12Fence> fence_;
+    ComPtr<ID3D12CommandQueue> queue_, iqueue_;
+    ComPtr<ID3D12CommandAllocator> allocators_[kRing];
+    ComPtr<ID3D12GraphicsCommandList> list_, lists_[2];
+    ComPtr<ID3D12Fence> fences_[2];
     HANDLE fence_event_ = nullptr;
-    std::uint64_t fence_value_ = 0, frame_values_[3] = {};
+    std::uint64_t fence_values_[2] = {}, frame_values_[kRing] = {};
+    int context_ = 0, ring_pos_[2] = {0, 0};
+    std::uint64_t timestamp_frequencies_[2] = {1, 1};
+    bool split_ = false;
+    std::uint64_t pending_show_ = 0;   // intake fence value after which the written set can be shown
+    std::uint64_t release_wait_ = 0;   // realtime fence value the intake waits for before rewriting (swap)
+    bool built_mask_ = false, shown_mask_ = false, shown_fill_ = false;
+    ID3D12CommandQueue* context_queue() const { return context_ ? iqueue_.Get() : queue_.Get(); }
     ComPtr<IDXGIFactory4> factory_;
     ComPtr<IDXGISwapChain3> swapchain_;
     ComPtr<IDCompositionDevice> dcomp_;
@@ -196,14 +239,14 @@ private:
     float last_flush_ms_ = 0;
     ComPtr<ID3D12Resource> hud_counts_, hud_readback_, scene_fit_, scene_stamps_readback_;
     ComPtr<ID3D12QueryHeap> scene_stamps_;
-    bool hud_pending_[3] = {}, hud_scene_pending_[3] = {}, hud_from_scene_ = false;
+    bool hud_pending_[kRing] = {}, hud_scene_pending_[kRing] = {}, hud_from_scene_ = false;
     double hud_scene_pixels_ = 1;
     HudStats hud_stats_;
     bool mask_ready_ = false, reset_hud_ = false;
     bool fill_ready_ = false;  // the scene behind the HUD was predicted for the current source (own warp)
     ComPtr<ID3D12Resource> partials_, sums_, fit_readback_;
     UINT partial_groups_ = 0;
-    bool fit_pending_[3] = {};
+    bool fit_pending_[kRing] = {};
     bool fit_ready_ = false;
     bool keep_previous_ = false, previous_valid_ = false, previous_from_hudless_ = false, ingested_ = false, last_had_hudless_ = false;
     MotionFit fit_latest_;
@@ -214,31 +257,32 @@ private:
     ComPtr<ID3D12Resource> readback_;
     std::uint64_t timestamp_frequency_ = 1;
     std::uint64_t calib_gpu_ = 0, calib_cpu_ = 0;  // GetClockCalibration pair
-    std::int64_t submit_qpc_[3] = {};
+    std::int64_t submit_qpc_[kRing] = {};
     FrameTiming timing_;
     std::uint64_t present_counter_ = 0;
     std::vector<std::string> notes_;
     UINT frame_latency_ = 1;
     PresentStats present_stats_;
     float gpu_ms_ = 0, intake_gpu_ms_ = 0;
-    bool intake_slot_[3] = {}, continuation_slot_[3] = {};
+    bool intake_slot_[kRing] = {}, continuation_slot_[kRing] = {};
     // Three stamps inside an intake (shared textures made readable, after depth/motion, after the colour
     // copies), one set per frame in flight.
     UINT samples_pending_bytes_ = 0;  // motion samples recorded, not read yet
     ComPtr<ID3D12QueryHeap> stage_stamps_;
     ComPtr<ID3D12Resource> stage_readback_;
     int stages_marked_ = 0;
-    bool stage_valid_[3] = {};
+    bool stage_valid_[kRing] = {};
     GpuUsage usage_;
     void mark_stage() {
         if (stage_stamps_ && stages_marked_ < 3) list_->EndQuery(stage_stamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * 3 + stages_marked_++);
     }
 
     Private private_[kPCount];
+    Private front_[kPCount];  // the shown set (split queues; shown_id textures only)
     DWORD pid_ = 0;
     std::uint64_t session_ = 0;
     ComPtr<ID3D12Fence> fence_game_;
-    std::uint64_t pending_game_wait_ = 0;
+    std::uint64_t pending_game_waits_[2] = {};  // game fence value the next submission of each context waits for
     struct SharedTex { ComPtr<ID3D12Resource> resource; std::uint32_t generation = 0; };
     SharedTex shared_[kSlots][kTexCount];
     std::vector<ID3D12Resource*> reading_;  // shared textures transitioned for this frame

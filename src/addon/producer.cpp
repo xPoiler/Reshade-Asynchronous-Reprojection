@@ -49,6 +49,7 @@ Producer::Producer() {
     s.no_warp_mask = 1;   // HUD detection in games without HUD layers
     s.keep_attached = 1;  // character / first-person weapon detection, every game
     s.near_camera_rule = 1;
+    s.hud_fill = 1;  // fill behind the HUD from the upscaler's output (XPAR engine)
     s.hud_from_scene = 2;  // HUD from the upscaler's output + camera-motion check (learned HUD without an upscaler output)
     s.auto_prediction = 3;     // default: 1/2 game frame, 1/4 in games without HUD layers (shorter warps hide mask misses); 1: full, 2: half, 4: quarter
     s.manual_gain_x = s.manual_gain_y = 0.0f; s.manual_delay_ms = 0.0f;

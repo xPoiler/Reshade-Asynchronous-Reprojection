@@ -53,6 +53,23 @@ function Test-ReShade([string]$path) {
     return ($info.ProductName -match "ReShade") -or ($info.FileDescription -match "ReShade")
 }
 
+# ReShade for Vulkan games is a system-wide Vulkan layer, not a DLL in the game folder: the game folder
+# only gets ReShade.ini next to the game's executable, and ReShade loads add-ons from there.
+function Test-VulkanReShadeLayer {
+    foreach ($key in @("HKLM:\SOFTWARE\Khronos\Vulkan\ImplicitLayers", "HKCU:\SOFTWARE\Khronos\Vulkan\ImplicitLayers")) {
+        $layers = Get-ItemProperty -ErrorAction SilentlyContinue $key
+        if ($layers -and @($layers.PSObject.Properties | Where-Object { $_.Name -match "ReShade[^\\]*\.json$" }).Count -gt 0) { return $true }
+    }
+    return $false
+}
+$vulkanLayer = Test-VulkanReShadeLayer
+# Folders with a ReShade.ini next to an executable (the Vulkan layer's per-game settings).
+function Get-VulkanReShadeDirs([object[]]$files) {
+    if (-not $vulkanLayer) { return @() }
+    return @($files | Where-Object { $_.Name -eq "ReShade.ini" } | Select-Object -ExpandProperty DirectoryName -Unique |
+             Where-Object { Get-ChildItem -File -Filter "*.exe" $_ -ErrorAction SilentlyContinue })
+}
+
 # Resolve the game folder.
 if ($GameDir) {
     if (Test-Path -PathType Leaf $GameDir) { $GameDir = Split-Path -Parent $GameDir }
@@ -69,8 +86,9 @@ if ($GameDir) {
     Write-Host "Scanning Steam libraries..."
     $choices = @()
     foreach ($dir in @(Get-SteamGameDirs | Sort-Object FullName -Unique)) {
-        $found = @(Get-ChildItem -Recurse -Depth 8 -File -ErrorAction SilentlyContinue $dir.FullName -Include ($reshadeNames + $upscalerNames + "FrameWarp.addon64"))
-        $hasReShade = [bool]($found | Where-Object { $reshadeNames -contains $_.Name } | Where-Object { Test-ReShade $_.FullName })
+        $found = @(Get-ChildItem -Recurse -Depth 8 -File -ErrorAction SilentlyContinue $dir.FullName -Include ($reshadeNames + $upscalerNames + "FrameWarp.addon64" + "ReShade.ini"))
+        $hasReShade = [bool]($found | Where-Object { $reshadeNames -contains $_.Name } | Where-Object { Test-ReShade $_.FullName }) -or
+                      ((Get-VulkanReShadeDirs $found).Count -gt 0)
         # The installed add-on (not a staged copy): the one closest to the game folder.
         $installedAddon = $found | Where-Object { $_.Name -eq "FrameWarp.addon64" } | Sort-Object { $_.FullName.Split('\').Count } | Select-Object -First 1
         $hasFrameWarp = [bool]$installedAddon
@@ -117,9 +135,21 @@ if ($GameDir) {
 
 # ReShade's folder is where the add-on must go (it loads add-ons from its own directory).
 $reshade = @(Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue $GameDir -Include $reshadeNames | Where-Object { Test-ReShade $_.FullName })
+$reshadeKind = if ($reshade.Count -gt 0) { $reshade[0].Name } else { $null }
+if ($reshade.Count -eq 0 -and -not $Uninstall) {
+    # Vulkan games: ReShade's layer, with the game's ReShade.ini next to its executable.
+    $vkDirs = @(Get-VulkanReShadeDirs @(Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue $GameDir -Filter "ReShade.ini"))
+    if ($vkDirs.Count -gt 1) { throw "ReShade.ini found next to several executables: $($vkDirs -join ', '). Pass the right folder with -GameDir." }
+    if ($vkDirs.Count -eq 1) {
+        $reshade = @(Get-Item (Join-Path $vkDirs[0] "ReShade.ini"))
+        $reshadeKind = "Vulkan layer"
+    }
+}
 if ($reshade.Count -eq 0) {
     if ($Uninstall) { $installed = @(Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue $GameDir -Filter "FrameWarp.addon64") }
-    if (-not $installed) { throw "ReShade not found under $GameDir (looked for $($reshadeNames -join ', ') made by ReShade)." }
+    if (-not $installed) {
+        throw "ReShade not found under $GameDir (looked for $($reshadeNames -join ', ') made by ReShade, or, for Vulkan games, ReShade's Vulkan layer with a ReShade.ini next to the game's executable)."
+    }
     $binDir = $installed[0].DirectoryName
 } else {
     $dirs = @($reshade | Select-Object -ExpandProperty DirectoryName -Unique)
@@ -256,7 +286,7 @@ if (Test-Path $old) {
     New-Item -ItemType Directory -Force (Join-Path $target "disabled") | Out-Null
     Move-Item -Force $old (Join-Path $target "disabled")
 }
-Write-Host "Installed to $binDir (ReShade: $($reshade[0].Name))"
+Write-Host "Installed to $binDir (ReShade: $reshadeKind)"
 if ($latewarpDll) { Write-Host "NVIDIA Latewarp: installed (optional warp engine, NVIDIA GPUs)" }
 else { Write-Host "NVIDIA Latewarp: not included (optional) - FrameWarp's own warp engine is used" }
 

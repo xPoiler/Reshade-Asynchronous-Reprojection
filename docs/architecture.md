@@ -74,6 +74,16 @@
   RGBA16F otherwise; R32F depth; RG16F motion). A new
   game frame is taken in between refreshes, as its own GPU submission, so a refresh only warps and
   presents; one arriving too close to a refresh waits until just after it.
+* **Split queues** (XPAR engine, paced): a game frame is taken in on a second, compute queue at normal
+  priority, into one of two sets of the textures the warp reads (colour, HUD-less and UI layers, depth,
+  no-warp mask, fill); the warp keeps reading the other, shown set. Once the intake queue's fence shows
+  the frame complete, the sets are exchanged on the CPU together with the frame's camera, before a
+  refresh is recorded, and the next intake waits on the GPU for the warps that still read the old set.
+  The shown set stays in the shader-read state on both queues (an unwarped refresh copies it with the
+  warp shader instead of transitioning it); state kept across frames (learned HUD score, world evidence,
+  motion analysis) stays on the intake side, and the previous frame the HUD checks compare against is
+  the shown set itself. The several ms of HUD/mask work of a new frame at 4K therefore never delay a
+  refresh. Latewarp and the unpaced path keep a single queue.
 * **No-warp mask** (R8, used by the warp), built once per game frame:
   * *character/weapon* (every game): pixels whose motion vectors the camera motion does not explain,
     close to the camera, or stuck to the screen while the camera moves further out;

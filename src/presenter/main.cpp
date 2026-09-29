@@ -411,6 +411,9 @@ void render_thread() {
     double source_time = 0;
     std::uint64_t source_frame = 0;
     bool first_eval = false;
+    // With split queues a frame taken in becomes the source the warp uses only once the GPU has finished
+    // it (Renderer::show_intake): until then the warp keeps the previous one, textures and camera together.
+    struct Incoming { IngestedSource s; Camera cam{}; CameraBasis basis{}; bool masked = false; } incoming;
     std::uint32_t last_reset = sh.settings.reset_calibration;
     double stat_start = now_seconds(), last_source_present = 0, last_profile_save = stat_start;
     std::uint32_t stat_frames = 0, stat_sources = 0;
@@ -498,13 +501,20 @@ void render_thread() {
             intake.s = renderer.ingest(sh, newest, [&](const IngestedSource& early) {
                 if (wants_samples && early.has_depth && early.has_motion) intake.sampled = renderer.record_motion_samples(early, 80, 45);
             });
-            held.push_back({newest, renderer.submitted_value() + 1});
+            held.push_back({newest, renderer.intake_submitted() + 1});
             return true;
         };
-        auto take_in_finish = [&]() {
+        auto commit_incoming = [&]() {
+            source = incoming.s;
+            source_camera = incoming.cam;
+            source_basis = incoming.basis;
+            source_masked = incoming.masked;
+            first_eval = true;
+        };
+        auto take_in_finish = [&]() {  // true: a valid frame was taken in
             const int newest = intake.slot;
             intake.slot = -1;
-            if (newest < 0) return;
+            if (newest < 0) return false;
             const SlotMeta& m = sh.slots[newest];
             const IngestedSource s = intake.s;
             const bool sampled = intake.sampled && renderer.read_motion_samples(raw_samples);
@@ -577,12 +587,12 @@ void render_thread() {
                         }
                     }
                 }
-                source = s;
-                source_camera = cam;
-                source_basis = to_basis(cam);
+                incoming.s = s;
+                incoming.cam = cam;
+                incoming.basis = to_basis(cam);
                 source_time = seconds(m.qpc_sim_start ? m.qpc_sim_start : m.qpc_constants);
                 source_frame = m.frame_id;
-                g_app.model.add_source(m.frame_id, source_time, seconds(qpc_now()), source_basis, cam.reset != 0, now_seconds(),
+                g_app.model.add_source(m.frame_id, source_time, seconds(qpc_now()), incoming.basis, cam.reset != 0, now_seconds(),
                                        cam.position_epoch);
                 if (rec(g_app.csv_sources)) {
                     const auto& c = cam;
@@ -603,7 +613,7 @@ void render_thread() {
                 const bool hud_mask = settings.no_warp_mask && !game_has_hud_layers && s.has_depth;
                 const bool attached_mask = settings.keep_attached && s.has_depth && s.has_motion;
                 const bool mask = hud_mask || attached_mask;
-                source_masked = mask;
+                incoming.masked = mask;
                 if ((settings.extrapolate_objects || mask) && s.has_motion)
                     analyzed_frames.push_back(m.frame_id);
                     if (analyzed_frames.size() > 16) analyzed_frames.pop_front();
@@ -634,12 +644,13 @@ void render_thread() {
                     }
                     if (!mask_logged) { logf("no-warp mask: %s%s", hud_mask ? "HUD (the game has no HUD layers)" : "", attached_mask ? (hud_mask ? " + character/weapon" : "character/weapon") : ""); mask_logged = true; }
                 }
-                first_eval = true;
                 const double present_t = seconds(m.qpc_present);
                 if (last_source_present > 0) source_interval = present_t - last_source_present;
                 last_source_present = present_t;
                 ++stat_sources;
+                if (!renderer.split()) commit_incoming();
             }
+            return s.valid;
         };
         // Both steps on the current command list (the refresh itself, without pacing): the samples, if
         // any, are waited for in between.
@@ -662,6 +673,20 @@ void render_thread() {
         // lead we allow one queued frame and wake `lead` ms before each composition instead, one frame
         // per refresh (a new target is always a later vblank than the previous one).
         const bool paced = settings.present_lead_ms > 0 && vblank.valid();
+        // Split queues with XPAR's own engine when paced (Latewarp and the unpaced path record everything on
+        // the realtime queue). Switched only while no frame is being taken in.
+        {
+            const bool want_split = paced && (settings.warp_engine == 1 || !latewarp.ready());
+            if (want_split != renderer.split() && intake.slot < 0) {
+                if (renderer.intake_pending() && renderer.show_intake()) commit_incoming();
+                if (!renderer.intake_pending() && renderer.set_split(want_split)) {
+                    // (the GPU is idle now: every slot still held can go back to the game)
+                    for (const auto& entry : held) InterlockedCompareExchange(&sh.slots[entry.slot].state, kFree, kReading);
+                    held.clear();
+                    logf("split queues %s", renderer.split() ? "on: game frames are taken in on their own GPU queue" : "off");
+                }
+            }
+        }
         renderer.set_frame_latency(paced ? 2 : 1);
         if (paced) {
             const double f = double(g_qpc_frequency);
@@ -681,42 +706,52 @@ void render_thread() {
                                      sh.backbuffer_width == renderer.width() && sh.backbuffer_height == renderer.height();
             for (;;) {
                 const std::int64_t t = qpc_now();
+                // A frame taken in on the intake queue whose GPU work has finished: shown from now on.
+                if (renderer.intake_pending() && renderer.show_intake()) commit_incoming();
                 // A frame whose motion samples are on their way: finished as soon as the GPU has them, and
-                // before the refresh at the latest.
+                // before the refresh at the latest (with split queues after it, if not back by then: its
+                // work cannot delay the warp there).
                 if (intake.slot >= 0) {
-                    if (renderer.completed(intake_fence) || t >= tick) {
+                    if (renderer.intake_completed(intake_fence) || (t >= tick && !renderer.split())) {
                         const double w0 = now_seconds();
-                        renderer.wait_for(intake_fence);
+                        renderer.wait_for_intake(intake_fence);
                         const double w1 = now_seconds();
                         intake_wait_ms += (w1 - w0) * 1000.0;
-                        renderer.begin_frame();
-                        take_in_finish();
+                        renderer.begin_intake();
+                        const bool valid = take_in_finish();
                         renderer.submit_work(true);
+                        if (valid) renderer.mark_intake_complete();
                         const double sample_ms = intake_cpu_ms + (w1 - w0) * 1000.0 + (now_seconds() - w1) * 1000.0;
                         intake_ms = std::clamp(0.8 * intake_ms + 0.2 * std::max<double>(renderer.last_intake_gpu_ms(), sample_ms), 2.0, 12.0);
                         if (++intakes % 600 == 0) logf("game frames taken in between refreshes: %.1f ms each (smoothed)", intake_ms);
                         continue;
                     }
+                    if (t >= tick) break;
                     sleep_until(std::min(tick, t + static_cast<std::int64_t>(2.5e-4 * double(g_qpc_frequency))));
                     continue;
                 }
                 if (t >= tick) break;
-                const int newest = can_take_in ? find_newest() : -1;
+                // With split queues a new frame starts only once the previous one is shown (the intake
+                // writes the other set), and needs only CPU time before the refresh (its GPU work runs on
+                // its own queue).
+                const int newest = can_take_in && !renderer.intake_pending() ? find_newest() : -1;
                 if (newest >= 0 && sh.slots[newest].frame_id != waiting_frame) { waiting_frame = sh.slots[newest].frame_id; waiting_since = t; }
                 // ...unless it has already waited a whole refresh (taking in would never fit otherwise).
                 const bool overdue = newest >= 0 && t - waiting_since > static_cast<std::int64_t>(vblank.period);
-                if (newest >= 0 && (t + budget < tick || overdue)) {
-                    renderer.begin_frame();
+                const std::int64_t room = renderer.split() ? static_cast<std::int64_t>(2e-3 * f) : budget;
+                if (newest >= 0 && (t + room < tick || overdue)) {
+                    renderer.begin_intake();
                     const double t0 = now_seconds();
                     const bool taken = take_in_start(newest);
                     if (taken && intake.sampled) {  // the rest once the samples are back (above)
                         renderer.submit_work();
-                        intake_fence = renderer.submitted_value();
+                        intake_fence = renderer.intake_submitted();
                         intake_cpu_ms = (now_seconds() - t0) * 1000.0;
                         continue;
                     }
-                    if (taken) take_in_finish();
+                    const bool valid = taken && take_in_finish();
                     renderer.submit_work();
+                    if (valid) renderer.mark_intake_complete();
                     if (taken) {
                         intake_ms = std::clamp(0.8 * intake_ms + 0.2 * std::max<double>(renderer.last_intake_gpu_ms(), (now_seconds() - t0) * 1000.0), 2.0, 12.0);
                         if (++intakes % 600 == 0)
@@ -730,9 +765,10 @@ void render_thread() {
             last_target_vblank = 0;
         }
         wake_qpc = qpc_now();
+        if (renderer.intake_pending() && renderer.show_intake()) commit_incoming();
 
         if (!renderer.session_open(sh.session)) {
-            held.clear(); source = {}; source_frame = 0; intake.slot = -1;
+            held.clear(); source = {}; source_frame = 0; intake.slot = -1; incoming = {};
             if (!renderer.open_session(sh.producer_pid, sh.session, error)) {
                 set_status("Waiting for game: %s", error.c_str());
                 Sleep(100); continue;
@@ -779,7 +815,7 @@ void render_thread() {
 
         // Return slots whose conversion has finished on the GPU.
         for (auto it = held.begin(); it != held.end();) {
-            if (renderer.completed(it->release_value)) {
+            if (renderer.intake_completed(it->release_value)) {
                 InterlockedCompareExchange(&sh.slots[it->slot].state, kFree, kReading);
                 it = held.erase(it);
             } else ++it;
@@ -826,7 +862,7 @@ void render_thread() {
         // Without pacing, the frame is taken in right here, in the refresh (paced loops take frames in
         // between refreshes, above).
         auto* list = renderer.begin_frame();
-        if (!paced) {
+        if (!paced && !renderer.split()) {
             const int newest = find_newest();
             if (newest >= 0) take_in(newest);
         }

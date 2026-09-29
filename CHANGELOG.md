@@ -1,13 +1,18 @@
 # Changelog
 
-## Unreleased
+## 1.5.0
 
+* **Steady refresh rate in demanding games:** with the XPAR engine, new game frames are taken in on their
+  own GPU queue while the warp keeps showing the previous frame, so the several milliseconds of HUD and
+  mask work per game frame no longer make refreshes late (DOOM Eternal, Resident Evil Requiem now hold
+  120 Hz). Uses about 50-100 MB more video memory at 4K. Latewarp and *Present lead* 0 keep the single
+  queue.
 * **Find the HUD** (replaces the *Find the HUD from the upscaler output* checkbox, remembered per game):
   the new default, **Upscaler output + camera motion check**, finds the HUD from the upscaler's output
   and leaves out what is seen moving with the world when the camera turns, so bright lights, neon and
   effects drawn after upscaling keep warping. *From the upscaler output* and *Learned from camera
   motion* remain; without an upscaler output the learned detection is used.
-* **Fill behind the HUD from the upscaler output** (new option, off by default, remembered per game, XPAR
+* **Fill behind the HUD from the upscaler output** (new option, on by default, remembered per game, XPAR
   engine): the scenery the HUD covered is shown from the upscaler's output when the camera turns, instead
   of a smeared trail.
 * **Keep near-camera motion still** (new option, on by default, remembered per game): turn it off if
@@ -20,7 +25,8 @@
 * Vulkan: frames are copied only after the game has finished drawing them (the lower part of the picture
   could come from another frame, and the ReShade menu could flicker).
 * **Vulkan support** (tested with DOOM Eternal, DLSS): depth, motion vectors and the frame are passed
-  from Vulkan games to the presenter.
+  from Vulkan games to the presenter. The installer recognises games that use ReShade's Vulkan layer
+  (a ReShade.ini next to the game's executable, no ReShade DLL).
 * The camera model keeps what it learned while the mouse barely moves (menus, standing still, the
   ReShade menu open) instead of dropping the mouse input until it is learned again.
 * See-through HUD panels stay held with the camera motion check: the scenery moving behind them could

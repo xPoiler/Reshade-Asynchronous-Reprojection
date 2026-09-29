@@ -97,7 +97,7 @@ void on_init_swapchain(swapchain* sc, bool) {
         fw::install_ffx_hooks(g_producer.get());
     }
     // The settings remembered per game (ReShade.ini, [FrameWarp]).
-    int from_scene = 2, record = 0, near_rule = 1, fill = 0;
+    int from_scene = 2, record = 0, near_rule = 1, fill = 1;
     if (g_producer->shared() && reshade::get_config_value(nullptr, "FrameWarp", "HudFromDlssOutput", from_scene))
         g_producer->shared()->settings.hud_from_scene = from_scene == 2 ? 2 : (from_scene != 0 ? 1 : 0);
     if (g_producer->shared() && reshade::get_config_value(nullptr, "FrameWarp", "FillBehindHud", fill))

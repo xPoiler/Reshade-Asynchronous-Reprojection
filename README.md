@@ -9,7 +9,7 @@ On every display refresh, FrameWarp takes the game's newest frame and re-project
 camera is *now*. It runs as a ReShade add-on and reads what it needs from the game's upscaler:
 
 * **DLSS**: camera, depth and HUD data from the game's NVIDIA Streamline integration, or depth and
-  motion vectors from DLSS called directly, without Streamline.
+  motion vectors from DLSS called directly, without Streamline (DirectX 12 and Vulkan games).
 * **AMD FSR 3** (3.0 and 3.1): depth and motion vectors from FSR. FSR 4 uses the same interface as
   FSR 3.1 and should work too. **FSR 2** should work in games that ship it as a DLL (untested).
 
@@ -24,6 +24,7 @@ vectors. It then draws the result in a click-through overlay above the game, wit
 | *Clair Obscur: Expedition 33* (Steam, DLSS) | Add the launch options `-slforcetagging -slviewextension` (see Install). The game provides HUD layers, so the HUD stays still; FrameWarp also holds the character while the camera turns around it. |
 | *Resident Evil Requiem* (Steam, DLSS or FSR) | **Requires [REFramework](https://github.com/praydog/REFramework)**: without it the game's DRM crashes with ReShade. The game doesn't provide HUD layers, so FrameWarp detects the HUD itself. With FSR, turn the camera for a second or two after loading while FrameWarp checks the field of view. |
 | *Cyberpunk 2077* (Steam, DLSS or FSR 3) | No launch options needed. The game doesn't provide HUD layers: FrameWarp detects the HUD and V's weapon itself. Semi-transparent HUD panels may still move slightly. The game's FSR 2.1 option is built into the game itself and can't be used. |
+| *DOOM Eternal* (Steam, Vulkan, DLSS) | Install ReShade for Vulkan (see Install). The game calls DLSS without Streamline, so FrameWarp works out the camera from DLSS's motion vectors; turn the camera for a few seconds after loading. FrameWarp finds the HUD and holds the weapon itself. If the ReShade menu hides behind the game, turn off *Present From Compute* in the game's advanced video settings. |
 | *Returnal* (Steam, DLSS) | No launch options needed. The game calls DLSS without Streamline, so FrameWarp works out the camera from DLSS's motion vectors; turn the camera for a few seconds after loading while it calibrates. |
 
 Other DLSS and FSR games may work but are untested.
@@ -31,6 +32,7 @@ Other DLSS and FSR games may work but are untested.
 ## Requirements
 
 * A DirectX 12 game with **DLSS or FSR** (see above) turned on, or a Vulkan game with **DLSS** (tested with DOOM Eternal).
+* About 1 GB of free video memory at 4K for the presenter.
 * A GPU for DirectX 12. FrameWarp is tested on NVIDIA GPUs; its own warp engine uses plain DirectX 12,
   so AMD and Intel GPUs should work too, but they are untested (reports welcome).
 * Windows 11 (tested; Windows 10 may work) with **Hardware-accelerated GPU scheduling** turned on (Settings > System >
@@ -59,6 +61,9 @@ To check the version, right-click the file and open Properties > Details.
    the number of the game and press Enter. For a non-Steam game, choose **P** and type its folder.
    The installer copies FrameWarp next to the game's ReShade. For Unreal Engine games, it also
    enables Streamline resource tagging in the game's `Engine.ini`, keeping a backup of the file.
+   **Vulkan games** (DOOM Eternal): install ReShade for the game choosing **Vulkan** as the rendering
+   API. ReShade then runs as a system-wide Vulkan layer and puts only a `ReShade.ini` in the game's
+   folder; the installer finds the game by that file.
 4. **Unreal Engine games with DLSS** (including Expedition 33): add these launch options (Steam >
    game > Properties > Launch Options):
    ```
@@ -83,13 +88,13 @@ Advanced: both files also accept a game name or folder directly (`install.bat "E
 | **Enable reprojection (N Hz)** | Turns reprojection on or off. N is your display's measured refresh rate. |
 | **Show original (A/B)** | Shows the game's own frames, for comparison. |
 | **Auto latency** | How far behind the newest game frame the displayed camera sits. **Auto** (default) uses 1/2 frame, or 1/4 frame in games without HUD layers, where a shorter warp keeps any undetected HUD steadier. You can also pick **1 frame** (smoothest), **1/2** or **1/4** (less latency, cleaner screen edges), or turn it **Off** to set the latency by hand. |
-| **Present lead (ms)** | How early each frame is rendered before the display refresh (default 6). Raise it if the output drops below your refresh rate. |
+| **Present lead (ms)** | How early each frame is rendered before the display refresh (default 6). Raise it if the output drops below your refresh rate. With the XPAR engine and a lead above 0, new game frames are taken in on their own GPU queue, so their processing never delays a refresh (about 50–100 MB more video memory at 4K). |
 | **Keep HUD still** | Warps the scene but not the HUD, using the HUD layers the game provides (Expedition 33). |
 | **Keep still** | What is not warped. **HUD + character/weapon** (default), **HUD only**, **Character/weapon only** or **Off**. *HUD*: in games without HUD layers, FrameWarp finds the HUD itself (see *Find the HUD*). *Character/weapon*: what moves with the camera, such as a first-person weapon or a third-person character, found from the game's motion vectors in every game; it starts after a few seconds of turning the camera. |
 | **Keep near-camera motion still** | On by default, remembered per game. Part of *Character/weapon*: things close to the camera that move against it (a weapon mid-animation, hands) are kept still. Turn it off if the floor near the camera is kept still while strafing; a weapon that stays put on screen is still kept still. |
 | **Find the HUD** | Remembered per game. **Upscaler output + camera motion check** (default): compares the final picture with the upscaler's (DLSS or FSR) own output, which has no HUD, and leaves out what is seen moving with the world when the camera turns (bright lights, neon or effects drawn after upscaling). **From the upscaler output**: the comparison alone. **Learned from camera motion**: finds the HUD from what stays put on screen while the camera moves; it needs a few seconds of camera movement, and is used whenever there is no upscaler output. |
-| **Fill behind the HUD from the upscaler output** | Off by default, remembered per game; XPAR engine, with the HUD found from the upscaler output. When the camera turns, the scenery the HUD covered is taken from the upscaler's output (colour-matched to the game's picture) instead of being smeared from the surroundings, so the HUD leaves no trail. Effects the game adds after upscaling, such as bloom or film grain, may be missing in those spots. |
-| **Show the mask** | Tints what is kept still (magenta), and with *Learned from camera motion* the HUD still being learned (green), to check the options above. |
+| **Fill behind the HUD from the upscaler output** | On by default, remembered per game; XPAR engine, with the HUD found from the upscaler output. When the camera turns, the scenery the HUD covered is taken from the upscaler's output (colour-matched to the game's picture) instead of being smeared from the surroundings, so the HUD leaves no trail. Effects the game adds after upscaling, such as bloom or film grain, may be missing in those spots. |
+| **Show the mask** | Tints what is kept still (magenta), to check the options above. With *Learned from camera motion* and NVIDIA Latewarp (or *Present lead* 0), the HUD still being learned shows green too. |
 | **Warp engine** | **XPAR** (default): FrameWarp's own engine, any GPU. **NVIDIA Latewarp**: selectable when `nvngx_latewarp.dll` is installed and the GPU is NVIDIA's. |
 | **Presenter GPU priority** | Keep **Realtime**. Lower priorities cannot hold the refresh rate while the game loads the GPU. |
 | **Record detailed diagnostics** | Off by default, remembered per game. Writes frame-by-frame recordings to the logs folder, for troubleshooting. |

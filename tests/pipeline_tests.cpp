@@ -7,6 +7,7 @@
 #include "presenter/renderer.hpp"
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <vector>
 
@@ -950,6 +951,59 @@ int main(int argc, char** argv) {
                 for (int i = 0; i < 18; ++i) std::printf(" %.3f", hs.scene_pass_ms[i] / hs.scene_frames);
                 std::printf("\n");
             }
+        }
+        // (Q) Split queues: frames taken in on the intake (compute) queue into one set of textures while
+        // the warp reads the shown set; the warp switches only once the new set is complete and shown.
+        {
+            own_engine = true;
+            const bool split_ok = renderer.set_split(true);
+            EXPECT(split_ok && renderer.split(), "split queues available");
+            auto intake_split = [&](int s_slot) {
+                EXPECT(s_slot >= 0, "frame published");
+                renderer.set_keep_previous_colour(true);
+                renderer.begin_intake();
+                IngestedSource s = renderer.ingest(sh, s_slot);
+                renderer.analyze_motion(s, moving_cam.clip_to_prev_clip, 1.0f, 1.0f, true);
+                renderer.build_no_warp_mask(s, moving_cam.clip_to_prev_clip, true, true, true, true, true, true);
+                renderer.submit_work();
+                renderer.mark_intake_complete();
+                return s;
+            };
+            IngestedSource first = intake_split(publish(960, 0.1f, 0, false, true));
+            renderer.wait_for_intake(renderer.intake_submitted());
+            const bool shown_a = renderer.show_intake();
+            show(first, 0);
+            const double a_x = peak(px, w, h, true, 1);
+            // A second frame (bar 40 px to the right) is being taken in: until it is shown, the warp keeps
+            // showing the first one, in full.
+            IngestedSource second = intake_split(publish(961, 0.1f, 40, false, true));
+            show(first, 0);
+            const double during_x = peak(px, w, h, true, 1);
+            renderer.wait_for_intake(renderer.intake_submitted());
+            const bool shown_b = renderer.show_intake();
+            show(second, 0);
+            const double b_x = peak(px, w, h, true, 1);
+            show(second, yaw);
+            const double b_turned = peak(px, w, h, true, 1);
+            // An unwarped refresh shows the shown frame too.
+            renderer.begin_frame();
+            renderer.finish_frame(false, 0);
+            renderer.read_back(1, px, w, h);
+            const double plain_x = peak(px, w, h, true, 1);
+            // Back to the single queue: the shown frame stays.
+            const bool back = renderer.set_split(false);
+            show(second, 0);
+            const double after_x = peak(px, w, h, true, 1);
+            own_engine = false;
+            std::printf("split queues: first frame bar x %.0f; while the second is taken in %.0f; second %.0f (turned %.0f), unwarped %.0f, "
+                        "back on one queue %.0f\n", a_x, during_x, b_x, b_turned, plain_x, after_x);
+            EXPECT(shown_a && shown_b, "each completed frame is shown");
+            EXPECT(std::fabs(during_x - a_x) < 1.0, "while a frame is taken in, the warp shows the previous one (%.0f vs %.0f)", during_x, a_x);
+            EXPECT(std::fabs(b_x - a_x - 40.0) < 2.0, "the new frame is shown once complete (%.0f vs %.0f)", b_x, a_x);
+            EXPECT(std::fabs(b_turned - b_x) > 20.0, "the shown frame warps (%.0f -> %.0f)", b_x, b_turned);
+            EXPECT(std::fabs(plain_x - b_x) < 1.0, "an unwarped refresh shows the shown frame (%.0f)", plain_x);
+            EXPECT(back && std::fabs(after_x - b_x) < 1.0, "back on one queue the shown frame stays (%.0f)", after_x);
+            if (std::getenv("FW_D3D_DEBUG")) EXPECT(renderer.print_debug_messages() == 0, "no D3D12 debug-layer errors");
         }
         with_scene = false;
         scene_offset = -1;
