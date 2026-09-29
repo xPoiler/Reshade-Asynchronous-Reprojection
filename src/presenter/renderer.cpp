@@ -95,9 +95,22 @@ groupshared float4 gs_a[64], gs_b[64];
                 // people) do not do that, and they must keep warping. The near rule can be switched off (flag
                 // 64): with an estimated camera the nearby floor can miss the camera model while strafing.
                 const float2 screen_px = g * mv_scale * float2(rect.zw);
+                // Still compared with the turn alone (flag 128, on by default): a camera orbiting a third-person
+                // character keeps it nearly still on screen. The camera model includes the orbit, so the
+                // character follows it and the rule above does not hold it - but the warp turns the view
+                // around the camera and would swing it away until the next frame snaps it back. Hold what
+                // moves under 20% of what the turn alone (the camera motion at infinite distance) moves.
+                bool turn_still = false;
+                if (flags & 128) {
+                    const float4 far = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, 0, 1), clip_to_prev);
+                    const float2 turn_px = far.w > 0 ? (float2(far.x / far.w * 0.5 + 0.5, 0.5 - far.y / far.w * 0.5) - uv) * float2(rect.zw)
+                                                     : float2(0, 0);
+                    turn_still = d > 1.0 / 4096.0 && length(turn_px) >= 2.0 && length(screen_px) < 0.2 * length(turn_px);
+                }
                 const bool attached = (flags & 1) && (flags & 16) &&
                                       ((!(flags & 64) && d > 1.0 / 64.0 && moving) ||
-                                       (d > 1.0 / 4096.0 && length(cam_px) >= 2.0 && length(screen_px) < 0.2 * length(cam_px)));
+                                       (d > 1.0 / 4096.0 && length(cam_px) >= 2.0 && length(screen_px) < 0.2 * length(cam_px)) ||
+                                       turn_still);
                 o = float4(own, d, attached ? 2 : (moving ? 1 : 0));
                 // The scale fit only uses pixels whose motion vector points along the camera motion (either
                 // sign per axis); attached or independently moving pixels would bias it.
@@ -1145,7 +1158,7 @@ struct XConstants {
 static_assert(sizeof(XConstants) == 32 * 4, "root constants");
 
 void Renderer::analyze_motion(const IngestedSource& src, const float clip_to_prev_clip[16], float scale_x, float scale_y, bool scale_valid,
-                              bool depth_inverted, bool near_rule) {
+                              bool depth_inverted, bool near_rule, bool turn_rule) {
     if (!src.has_depth || !src.has_motion) return;
     const auto& depth = private_[kPDepth];
     const UINT w = depth.width, h = depth.height, gx = (w + 7) / 8, gy = (h + 7) / 8;
@@ -1184,7 +1197,7 @@ void Renderer::analyze_motion(const IngestedSource& src, const float clip_to_pre
     c.mv_scale[0] = scale_x; c.mv_scale[1] = scale_y;
     c.threshold = 1.0f;
     c.groups_x = gx;
-    c.flags = (scale_valid ? 1u : 0u) | (depth_inverted ? 16u : 0u) | (near_rule ? 0u : 64u);
+    c.flags = (scale_valid ? 1u : 0u) | (depth_inverted ? 16u : 0u) | (near_rule ? 0u : 64u) | (turn_rule ? 128u : 0u);
     transition(private_[kPObject], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     x_dispatch(cs_analyze_.Get(), &c, kXAnalyzeSrv, kXAnalyzeUav, gx, gy);
     D3D12_RESOURCE_BARRIER uav{}; uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; uav.UAV.pResource = partials_.Get();

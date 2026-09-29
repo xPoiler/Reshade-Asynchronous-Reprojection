@@ -463,6 +463,8 @@ int main(int argc, char** argv) {
         LONG neon_x = -1;
         const LONG neon_y0 = LONG(H * 3 / 8), neon_y1 = LONG(H / 2);
         bool combined_hud = false;  // HUD from the upscaler's output + camera-motion check
+        bool turn_rule = false;     // attached: what stays nearly still on screen while the camera turns
+        const Camera* analyze_cam = &moving_cam;  // the camera motion the analysis gets
         bool hud_fill = false;      // own warp: fill behind the HUD from the upscaler's output
         bool near_rule = true;      // attached: near-camera pixels moving against the camera model count
         const D3D12_RECT washed_rect{LONG(W * 3 / 4), LONG(H * 5 / 8), LONG(W * 3 / 4) + 64, LONG(H * 5 / 8) + 64};
@@ -618,7 +620,7 @@ int main(int argc, char** argv) {
             renderer.set_keep_previous_colour(true);
             renderer.begin_frame();
             IngestedSource s = renderer.ingest(sh, s_slot);
-            renderer.analyze_motion(s, moving_cam.clip_to_prev_clip, 1.0f, 1.0f, true, true, near_rule);
+            renderer.analyze_motion(s, analyze_cam->clip_to_prev_clip, 1.0f, 1.0f, true, true, near_rule, turn_rule);
             renderer.build_no_warp_mask(s, moving_cam.clip_to_prev_clip, hud, weapon, weapon, true, combined_hud, hud_fill);
             renderer.finish_frame(false, 0);
             renderer.wait_idle();
@@ -651,6 +653,42 @@ int main(int argc, char** argv) {
         const double nr_x1 = peak(px, w, h, true, 1);
         std::printf("near-camera rule off: weapon stuck to the screen x %.0f -> %.0f\n", nr_x0, nr_x1);
         EXPECT(std::fabs(nr_x1 - nr_x0) < 2.0, "near-camera rule off: a weapon stuck to the screen is still held (%.0f -> %.0f)", nr_x0, nr_x1);
+        // (A1c) A camera orbiting a third-person character: it turns, but moves sideways too, so the character
+        // at the pivot (10x the near plane) stays still on screen and follows the camera model. The rules
+        // above do not hold it; the turn rule does. Scenery still warps.
+        {
+            Camera orbit = moving_cam;
+            orbit.clip_to_prev_clip[8] = -2.0f * shift / 0.1f;  // prev.x = x + 2*shift*(1 - d / 0.1): no motion at the pivot's depth
+            const float old_depth = strip_depth;
+            strip_depth = 0.1f;
+            weapon_mv = 0.0f;
+            analyze_cam = &orbit;
+            IngestedSource plain = ingest_frame(publish(212, 0.1f, 0, true, false), false, true);
+            show(plain, 0);
+            const double p0 = peak(px, w, h, true, 1);
+            show(plain, yaw);
+            const double p1 = peak(px, w, h, true, 1);
+            turn_rule = true;
+            IngestedSource held_src = ingest_frame(publish(213, 0.1f, 0, true, false), false, true);
+            show(held_src, 0);
+            const double h0 = peak(px, w, h, true, 1);
+            show(held_src, yaw);
+            const double h1 = peak(px, w, h, true, 1);
+            // A camera that only turns: the same rule holds nothing of the scenery (the bar warps).
+            analyze_cam = &moving_cam;
+            IngestedSource turn_src = ingest_frame(publish(214, 0.1f, 0, false, false), false, true);
+            turn_rule = false;
+            strip_depth = old_depth;
+            show(turn_src, 0);
+            const double t0 = peak(px, w, h, true, 1);
+            show(turn_src, yaw);
+            const double t1 = peak(px, w, h, true, 1);
+            std::printf("orbited character: without the turn rule x %.0f -> %.0f, with it %.0f -> %.0f; scenery with a plain turn %.0f -> %.0f\n",
+                        p0, p1, h0, h1, t0, t1);
+            EXPECT(std::fabs(p1 - p0) > 20.0, "the orbited character follows the camera model: not held by the other rules (%.0f -> %.0f)", p0, p1);
+            EXPECT(std::fabs(h1 - h0) < 2.0, "the turn rule holds the orbited character (%.0f -> %.0f)", h0, h1);
+            EXPECT(std::fabs(t1 - t0) > 20.0, "with a plain turn the turn rule holds no scenery (%.0f -> %.0f)", t0, t1);
+        }
         // (A1b) a third-person character: attached to the camera too, but a few metres away (300x the near
         // plane). Held as well.
         strip_depth = 1.0f / 300.0f;

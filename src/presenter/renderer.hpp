@@ -128,9 +128,10 @@ public:
     // Moving-object extrapolation (experimental). Once per new game frame: per-pixel object motion
     // (scaled game motion vectors minus the camera-only motion from depth + clipToPrevClip), plus the
     // motion-vector scale fit (read back a few frames later, see take_motion_fit).
-    // near_rule: pixels near the camera that move against the camera model count as attached (see cs_analyze).
+    // near_rule: pixels near the camera that move against the camera model count as attached; turn_rule:
+    // so do pixels nearly still on screen while the camera turns (third-person orbit cameras). See cs_analyze.
     void analyze_motion(const IngestedSource& src, const float clip_to_prev_clip[16], float scale_x, float scale_y, bool scale_valid,
-                        bool depth_inverted = true, bool near_rule = true);
+                        bool depth_inverted = true, bool near_rule = true, bool turn_rule = false);
     // Per output frame: moves object pixels `alpha` game frames forward (negative: back) into a copy of
     // the hud-less colour (or the backbuffer). Returns the result, or nullptr when unavailable.
     ID3D12Resource* extrapolate_objects(const IngestedSource& src, bool from_hudless, float alpha, const float clip_to_prev_clip[16]);

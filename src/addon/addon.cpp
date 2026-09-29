@@ -97,11 +97,13 @@ void on_init_swapchain(swapchain* sc, bool) {
         fw::install_ffx_hooks(g_producer.get());
     }
     // The settings remembered per game (ReShade.ini, [FrameWarp]).
-    int from_scene = 2, record = 0, near_rule = 1, fill = 1;
+    int from_scene = 2, record = 0, near_rule = 1, fill = 1, turn_rule = 1;
     if (g_producer->shared() && reshade::get_config_value(nullptr, "FrameWarp", "HudFromDlssOutput", from_scene))
         g_producer->shared()->settings.hud_from_scene = from_scene == 2 ? 2 : (from_scene != 0 ? 1 : 0);
     if (g_producer->shared() && reshade::get_config_value(nullptr, "FrameWarp", "FillBehindHud", fill))
         g_producer->shared()->settings.hud_fill = fill != 0;
+    if (g_producer->shared() && reshade::get_config_value(nullptr, "FrameWarp", "HoldOrbitedCharacter", turn_rule))
+        g_producer->shared()->settings.turn_rule = turn_rule != 0;
     if (g_producer->shared() && reshade::get_config_value(nullptr, "FrameWarp", "NearCameraRule", near_rule))
         g_producer->shared()->settings.near_camera_rule = near_rule != 0;
     if (g_producer->shared() && reshade::get_config_value(nullptr, "FrameWarp", "RecordDiagnostics", record))
@@ -320,6 +322,12 @@ void draw_overlay(effect_runtime*) {
                 reshade::set_config_value(nullptr, "FrameWarp", "NearCameraRule", near_rule ? "1" : "0");
             }
             ImGui::TextDisabled("  turn off if the floor near the camera is kept still while strafing");
+            bool orbited = s.turn_rule != 0;
+            if (ImGui::Checkbox("Keep still what the camera turns around (third-person)", &orbited)) {
+                s.turn_rule = orbited;
+                reshade::set_config_value(nullptr, "FrameWarp", "HoldOrbitedCharacter", orbited ? "1" : "0");
+            }
+            ImGui::TextDisabled("  for over-the-shoulder cameras that circle the character: what barely moves on screen while turning is held");
         }
         if (mask) {
             static const char* const kHudFind[] = {"Learned from camera motion", "From the upscaler output (DLSS or FSR)",

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+* **Keep still what the camera turns around (third-person)** (new option, on by default, remembered per
+  game): over-the-shoulder cameras circle the character, so it barely moves on screen while the room
+  swings around it, and the warp broke it up (Resident Evil Requiem, Expedition 33). What moves less than
+  a fifth of what the camera's turn alone would move it is now kept still while turning.
+
 ## 1.5.0
 
 * **Steady refresh rate in demanding games:** with the XPAR engine, new game frames are taken in on their

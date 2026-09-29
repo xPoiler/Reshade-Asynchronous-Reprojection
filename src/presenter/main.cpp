@@ -619,7 +619,7 @@ void render_thread() {
                     if (analyzed_frames.size() > 16) analyzed_frames.pop_front();
                     renderer.analyze_motion(s, cam.clip_to_prev_clip, float(mv_scale.scale(0, s.depth_rect.w)),
                                             float(mv_scale.scale(1, s.depth_rect.h)), mv_scale.valid, cam.depth_inverted != 0,
-                                            settings.near_camera_rule != 0);
+                                            settings.near_camera_rule != 0, settings.turn_rule != 0);
                 if (mask) {
                     // HUD from the upscaler's output only when chosen (opt-in: its colour model cannot be
                     // proven for every game); otherwise the learned HUD map, which works everywhere.
