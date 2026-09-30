@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 39;
+constexpr std::uint32_t kVersion = 40;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -155,7 +155,8 @@ struct NgxStats {
     float jitter[2], mv_scale[2];
     std::uint32_t dlss_feature;  // 1 Super Resolution, 13 Ray Reconstruction (0: none seen)
     std::uint32_t identified_by_inputs;  // DLSS handles recognised from their inputs (created before our hooks)
-    std::uint32_t frames_published, pad2;  // frames published from DLSS calls (camera estimated by the presenter)
+    std::uint32_t frames_published;  // frames published from DLSS calls (camera estimated by the presenter)
+    std::uint32_t frames_joined;     // depth and motion vectors taken at the DLSS call for the game's own (Streamline) camera
 };
 
 // AMD FidelityFX (FSR 3.1 / FSR 4) upscaler calls, for diagnostics and games without Streamline.
@@ -186,7 +187,11 @@ struct Shared {
     FsrStats fsr;
     volatile LONG presents_without_frame;  // consecutive game presents with no captured frame (menus, loading)
     volatile LONG overlay_open;            // the ReShade menu is open (the game gets no mouse; its frame is shown as it is)
-    std::uint32_t pad_presents;
+    // The game's own camera checked against its motion vectors (camera_check.hpp), written by the presenter
+    // and remembered per game by the add-on: 0 used (nothing against it so far), 1 unusable - the add-on
+    // publishes frames from the upscaler's call with a camera the presenter estimates, 2 the estimate was no
+    // better - the game's camera stays.
+    volatile LONG game_camera_check;
     // Totals since start: images the game presented and frames it rendered (distinct frames with camera
     // data). Frame generation presents two or more images per rendered frame.
     volatile LONG presents_total, frames_total;

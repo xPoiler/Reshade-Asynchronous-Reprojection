@@ -23,6 +23,8 @@ public:
     Producer& operator=(const Producer&) = delete;
 
     Shared* shared() { return shared_; }
+    // The game's camera was found not to match its motion vectors: it is left out (see Shared::game_camera_check).
+    bool game_camera_unusable() const { return shared_ && shared_->game_camera_check == 1; }
     bool ready() const { return shared_ != nullptr && device_ != nullptr; }
 
     // First D3D12 device seen (the game's). Creates the shared fence.

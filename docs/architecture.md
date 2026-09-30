@@ -91,6 +91,16 @@
     the camera moves the scene under them; or, with the option on, predicted per frame from the DLSS
     output (tone curve per channel, highlight wash-out, smooth per-tile correction) - what the
     prediction misses is HUD.
+* **Camera check.** The game's frame-to-frame reprojection (with depth) and its motion vectors describe
+  the same motion of the static scene. Per game frame with real camera motion, the presenter measures
+  how much of the first the second explains at its best scale (`shared/camera_check.hpp`). Games whose
+  camera data is right lock the motion vector scale within a few such frames, which ends the check;
+  150 frames with fewer than one in ten consistent, without ever locking, mark the game's camera
+  unusable (`Shared::game_camera_check`). The add-on then ignores the Streamline camera and tags and
+  publishes frames from the upscaler's call with a camera the presenter estimates, remembers the
+  verdict per game until the next update, and takes it back if the estimate explains the motion
+  vectors no better. A game that sends its Streamline camera but no depth gets depth and motion
+  vectors from the DLSS call, for the frame being rendered.
 * **Frame generation.** When the game presents 1.6 or more images per rendered frame for a second, the
   presenter steps aside (overlay hidden, no GPU work) until the ratio is back near 1.
 * **Warp engines.** The own engine (default, any D3D12 GPU): for each output pixel a short fixed-point

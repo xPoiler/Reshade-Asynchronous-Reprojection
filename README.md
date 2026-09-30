@@ -14,7 +14,8 @@ camera is *now*. It runs as a ReShade add-on and reads what it needs from the ga
   FSR 3.1 and should work too. **FSR 2** should work in games that ship it as a DLL (untested).
 
 Without the game's own camera data, FrameWarp works out the camera's movement from the motion
-vectors. It then draws the result in a click-through overlay above the game, with its own warp engine
+vectors. It does the same when a game's camera data turns out not to match its motion vectors, which
+it checks by itself while the camera moves. It then draws the result in a click-through overlay above the game, with its own warp engine
 (or, optionally, NVIDIA's Latewarp).
 
 ## Tested games
@@ -25,6 +26,7 @@ vectors. It then draws the result in a click-through overlay above the game, wit
 | *Resident Evil Requiem* (Steam, DLSS or FSR) | **Requires [REFramework](https://github.com/praydog/REFramework)**: without it the game's DRM crashes with ReShade. The game doesn't provide HUD layers, so FrameWarp detects the HUD itself. With FSR, turn the camera for a second or two after loading while FrameWarp checks the field of view. |
 | *Cyberpunk 2077* (Steam, DLSS or FSR 3) | No launch options needed. The game doesn't provide HUD layers: FrameWarp detects the HUD and V's weapon itself. Semi-transparent HUD panels may still move slightly. The game's FSR 2.1 option is built into the game itself and can't be used. |
 | *DOOM Eternal* (Steam, Vulkan, DLSS) | Install ReShade for Vulkan (see Install). The game calls DLSS without Streamline, so FrameWarp works out the camera from DLSS's motion vectors; turn the camera for a few seconds after loading. FrameWarp finds the HUD and holds the weapon itself. If the ReShade menu hides behind the game, turn off *Present From Compute* in the game's advanced video settings. |
+| *Assassin's Creed Black Flag Resynced* (DLSS or FSR) | No launch options needed. The game's camera data doesn't match its picture: FrameWarp notices within the first seconds of camera movement on the first launch (the picture may warp wrongly until then), switches to working out the camera from the motion vectors, and remembers that for the game. Turn the camera for a few seconds after loading while it calibrates. |
 | *Returnal* (Steam, DLSS) | No launch options needed. The game calls DLSS without Streamline, so FrameWarp works out the camera from DLSS's motion vectors; turn the camera for a few seconds after loading while it calibrates. |
 
 Other DLSS and FSR games may work but are untested.
@@ -115,8 +117,9 @@ diagnostics) are for fine-tuning and troubleshooting.
 * Frame rates that swing a lot degrade the result, because the camera model assumes a steady frame
   cadence.
 * During fast turns, the screen edges show fill for areas the game never rendered.
-* Without the game's own camera data (DLSS called directly, most FSR games), the camera is estimated
-  from motion vectors, which is a little less exact than the camera data Streamline games provide.
+* Without the game's own camera data (DLSS called directly, most FSR games, games whose camera data
+  doesn't match their motion vectors), the camera is estimated from motion vectors, which is a little
+  less exact than the camera data Streamline games provide.
 * Upscalers built into a game's executable instead of a DLL (Cyberpunk 2077's FSR 2.1) can't be used.
 * Very fast motion goes beyond what re-projecting a single frame can hide. In Expedition 33's
   overworld, very fast camera turns can make the picture shake slightly.

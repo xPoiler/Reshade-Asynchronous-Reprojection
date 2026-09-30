@@ -105,7 +105,7 @@ void on_init_swapchain(swapchain* sc, bool) {
     struct Saved { const char* key; int default_value; };
     static constexpr Saved kSaved[] = {{"HudFromDlssOutput", 2}, {"FillBehindHud", 1}, {"HoldOrbitedCharacter", 1},
                                        {"NearCameraRule", 1}, {"RecordDiagnostics", 0}, {"BackgroundMemory", 1},
-                                       {"StretchWidth", 1}};
+                                       {"StretchWidth", 1}, {"GameCameraCheck", 0}};
     char saved_version[32] = "";
     size_t size = sizeof(saved_version);
     if (!reshade::get_config_value(nullptr, "FrameWarp", "SettingsVersion", saved_version, &size) ||
@@ -137,6 +137,8 @@ void on_init_swapchain(swapchain* sc, bool) {
         shared->settings.record_diagnostics = saved("RecordDiagnostics") != 0;
         shared->settings.background_memory = saved("BackgroundMemory") != 0;
         shared->settings.stretch_width = static_cast<std::uint32_t>(std::clamp(saved("StretchWidth"), 0, 32));
+        // What the presenter found out about the game's own camera in an earlier run (Shared::game_camera_check).
+        InterlockedExchange(&shared->game_camera_check, std::clamp(saved("GameCameraCheck"), 0, 2));
     }
 }
 
@@ -222,6 +224,14 @@ void on_reshade_present(effect_runtime* runtime) {
     fw::install_ffx_hooks(g_producer.get());
     static unsigned probe_counter = 0;
     if ((probe_counter++ % 120) == 0) fw::probe_streamline_features();
+    // The presenter's verdict on the game's own camera is remembered per game (until the next update).
+    static LONG remembered_check = -1;
+    const LONG check = g_producer->shared()->game_camera_check;
+    if (remembered_check >= 0 && check != remembered_check) {
+        const char value[2] = {static_cast<char>('0' + std::clamp<LONG>(check, 0, 2)), 0};
+        reshade::set_config_value(nullptr, "FrameWarp", "GameCameraCheck", static_cast<const char*>(value));
+    }
+    remembered_check = check;
     auto* bb = reinterpret_cast<ID3D12Resource*>(runtime->get_current_back_buffer().handle);
     command_list* cl = queue->get_immediate_command_list();
     const auto token = g_producer->begin_present(bb, reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native()));
@@ -280,6 +290,8 @@ void draw_overlay(effect_runtime*) {
         ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
                            "Frame generation is on in the game. XPAR is paused: turn frame generation off -\n"
                            "XPAR already fills your display's refresh rate, and the two cannot be combined.");
+    if (sh.game_camera_check == 1)
+        ImGui::TextDisabled("Camera: estimated from the motion vectors (the game's own camera data does not match them)");
     if (!alive && ImGui::Button("Start presenter")) { g_presenter_launched = false; launch_presenter(); }
     if (alive) {
         ImGui::Text("Output %.1f fps | game %.1f fps | warp GPU %.2f ms | source age %.1f ms",
@@ -441,6 +453,7 @@ void draw_overlay(effect_runtime*) {
             if (n.feature_calls[i]) ImGui::Text("  feature %2d: %u evaluations", i, n.feature_calls[i]);
         if (n.identified_by_inputs) ImGui::TextDisabled("  DLSS recognised from its inputs (it was created before the hooks)");
         if (n.frames_published) ImGui::Text("  frames published from DLSS (camera estimated): %u", n.frames_published);
+        if (n.frames_joined) ImGui::Text("  depth and motion vectors taken at the DLSS call (the game's camera): %u", n.frames_joined);
         ImGui::Text("DLSS (%s) create: render %ux%u -> output %ux%u, flags 0x%X (%s%s%s%s)",
                     n.dlss_feature == 13 ? "Ray Reconstruction" : n.dlss_feature == 1 ? "Super Resolution" : "none yet", n.render_w, n.render_h, n.out_w, n.out_h,
                     n.create_flags, (n.create_flags & 1) ? "HDR " : "", (n.create_flags & 2) ? "MV-low-res " : "",

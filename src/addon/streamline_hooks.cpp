@@ -125,7 +125,8 @@ int hk_set_constants(const void* values, const void* frame, const void* viewport
                     break;
                 }
         }
-        if (ok) g_producer->on_constants(id, cam);
+        // (a camera found unusable is left out: the upscaler's hooks publish the frames, camera estimated)
+        if (ok && !g_producer->game_camera_unusable()) g_producer->on_constants(id, cam);
         if (!g_marker_hook.installed() && g_pcl_attempts < 200 && (g_pcl_attempts++ % 20) == 0) try_hook_pcl();
     }
     return reinterpret_cast<SetConstantsFn>(g_constants_hook.original())(values, frame, viewport);
@@ -190,7 +191,7 @@ std::size_t tag_stride(const std::uint8_t* tags, std::uint32_t count, int b) {
 }
 
 void handle_tags(std::uint64_t frame, const void* tags_ptr, std::uint32_t count, void* command_buffer) {
-    if (!g_producer || !tags_ptr || !count || !command_buffer) return;
+    if (!g_producer || !tags_ptr || !count || !command_buffer || g_producer->game_camera_unusable()) return;
     auto* tags = static_cast<const std::uint8_t*>(tags_ptr);
     // Base size follows sl::Constants (both derive from BaseStructure); default to Streamline 2.x.
     const int b = g_constants_base >= 0 ? static_cast<int>(g_constants_base) : 32;

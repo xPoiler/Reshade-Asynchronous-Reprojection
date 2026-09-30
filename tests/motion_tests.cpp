@@ -1,4 +1,5 @@
 #include "shared/camera_motion.hpp"
+#include "shared/camera_check.hpp"
 #include <cstdio>
 
 using namespace fw;
@@ -57,7 +58,61 @@ static void zoom_is_not_motion(double zoom, V3 t, double near_change = 1.0) {
     EXPECT(with_prev.valid && err < 0.05, "zoom does not read as motion (error %g)", err);
 }
 
+// The check of the game's own camera against its motion vectors (camera_check.hpp). One game frame's sums
+// for motion vectors g = c / scale + noise over `n` pixels with camera motion of `motion` uv rms.
+static void sums(double motion, double scale, double noise, double n, double gc[2], double gg[2], double cc[2]) {
+    for (int k = 0; k < 2; ++k) {
+        const double c2 = motion * motion * n * (k ? 0.25 : 1.0);  // (mostly a turn: less vertical motion)
+        cc[k] = c2;
+        gc[k] = c2 / scale;
+        gg[k] = c2 / (scale * scale) + noise * noise * n / (scale * scale);
+    }
+}
+static void camera_check_tests() {
+    double gc[2], gg[2], cc[2];
+    // A game whose camera is right: the motion vectors follow it (a moving character adds a little noise).
+    {
+        CameraCheck check;
+        sums(0.01, 1.0 / 1920, 0.002, 2e6, gc, gg, cc);
+        for (int i = 0; i < 400; ++i) check.add(gc, gg, cc, 2e6, false);
+        EXPECT(check.verdict == CameraCheck::kUndecided, "a consistent camera is never found unusable (%d)", int(check.verdict));
+        EXPECT(check.add(gc, gg, cc, 2e6, true) == CameraCheck::kTrusted, "trusted once the motion vector scale locks");
+        sums(0.01, 1.0, 1.0, 2e6, gc, gg, cc);
+        for (int i = 0; i < 400; ++i) check.add(gc, gg, cc, 2e6, false);
+        EXPECT(check.verdict == CameraCheck::kTrusted, "a trusted camera stays trusted");
+    }
+    // A camera that stands still, and frames with too few pixels, say nothing - however long.
+    {
+        CameraCheck check;
+        sums(0.0002, 1.0, 1.0, 2e6, gc, gg, cc);
+        for (int i = 0; i < 2000; ++i) check.add(gc, gg, cc, 2e6, false);
+        sums(0.01, 1.0, 1.0, 500, gc, gg, cc);
+        for (int i = 0; i < 2000; ++i) check.add(gc, gg, cc, 500, false);
+        EXPECT(check.verdict == CameraCheck::kUndecided && check.frames == 0, "a still camera decides nothing (%d frames)", check.frames);
+    }
+    // A game whose reprojection matrix is not the camera's motion: the motion vectors have nothing to do with it.
+    {
+        CameraCheck check;
+        sums(0.3, 1.0, 1.0, 2e6, gc, gg, cc);
+        gc[0] *= 0.05; gc[1] *= -0.05;
+        int frames = 0;
+        while (check.add(gc, gg, cc, 2e6, false) == CameraCheck::kUndecided && frames < 1000) ++frames;
+        EXPECT(check.verdict == CameraCheck::kUnusable && frames == CameraCheck::kWindow - 1, "an inconsistent camera is found unusable after one window (%d frames)", frames);
+    }
+    // A messy stretch (a cutscene with large moving things) in a game whose camera is right: one frame in
+    // five still fits, so the window starts over instead of deciding.
+    {
+        CameraCheck check;
+        for (int i = 0; i < 600; ++i) {
+            sums(0.01, 1.0, i % 5 == 0 ? 0.002 : 0.05, 2e6, gc, gg, cc);
+            check.add(gc, gg, cc, 2e6, false);
+        }
+        EXPECT(check.verdict == CameraCheck::kUndecided, "a messy stretch does not condemn a camera that fits now and then (%d)", int(check.verdict));
+    }
+}
+
 int main() {
+    camera_check_tests();
     zoom_is_not_motion(1.06, {0, 0, 0});
     zoom_is_not_motion(0.94, {0, 0, -30});
     zoom_is_not_motion(1.10, {5, 0, 20});

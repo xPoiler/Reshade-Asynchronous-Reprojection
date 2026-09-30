@@ -3,6 +3,7 @@
 #include "presenter/pose.hpp"
 #include "presenter/camera_estimator.hpp"
 #include "presenter/renderer.hpp"
+#include "shared/camera_check.hpp"
 #include <shellapi.h>
 #include <winternl.h>  // NTSTATUS for d3dkmthk.h
 #include <d3dkmthk.h>
@@ -146,7 +147,7 @@ void open_recordings() {
         };
         g_app.csv_events = open_csv(L"events.csv", "qpc,kind,tid,frame,extra");
         g_app.csv_mouse = open_csv(L"mouse.csv", "qpc,dx,dy");
-        g_app.csv_motion = open_csv(L"motion.csv", "qpc,frame,samples,moving_fraction,agree_x,agree_y,render_w,render_h");
+        g_app.csv_motion = open_csv(L"motion.csv", "qpc,frame,samples,moving_fraction,agree_x,agree_y,render_w,render_h,camera_fit");
         g_app.csv_sources = open_csv(L"sources.csv",
             "frame,qpc_sim,qpc_constants,qpc_present,qpc_ingest,px,py,pz,fx,fy,fz,ux,uy,uz,rx,ry,rz,fov,aspect,reset,mouse_gate,has_depth,has_hudless,"
             "p00,p01,p02,p03,p10,p11,p12,p13,p20,p21,p22,p23,p30,p31,p32,p33,"
@@ -425,6 +426,8 @@ void render_thread() {
     bool pacing_paused = false;
     bool device_loss_logged = false;
     MotionVectorScale mv_scale;
+    CameraCheck camera_check;        // the game's own camera against its motion vectors
+    int poor_estimate_windows = 0;   // ...and, once it was found unusable, whether the estimate does any better
     std::deque<std::uint64_t> analyzed_frames;  // game frames whose motion fit is on its way back
     bool have_source_kind = false, source_was_estimated = false;
     double last_mv_log = 0, last_usage_log = 0;
@@ -529,6 +532,7 @@ void render_thread() {
                     g_app.model.reset_history();
                     estimator.reset();
                     mv_scale = MotionVectorScale{};
+                    camera_check = CameraCheck{};
                     renderer.reset_hud_detection();
                     logf("camera source switched to %s", cam.estimated ? "the upscaler's motion vectors (estimated)" : "the game's own camera data");
                 }
@@ -556,12 +560,24 @@ void render_thread() {
                         flush_ms_sum += renderer.last_flush_ms() + intake_wait_ms;
                         intake_wait_ms = 0;
                         if (estimator_runs >= 300) {
+                            const double unexplained = estimator.take_rejected_fraction();
                             logf("camera estimation: %.2f ms CPU + %.2f ms waiting for the samples per game frame, residual %.2f px, field of view %.1f deg%s, "
                                  "%.0f%% of frames unexplained, depth %s",
                                  estimator_ms_sum / estimator_runs, flush_ms_sum / estimator_runs, estimator.last_residual(),
                                  estimator.vertical_fov() * 180.0 / 3.14159265358979, estimator.fov_locked() ? "" : " (learning)",
-                                 estimator.take_rejected_fraction() * 100.0, m.camera.depth_inverted ? "reversed" : "standard");
+                                 unexplained * 100.0, m.camera.depth_inverted ? "reversed" : "standard");
                             estimator_ms_sum = 0; flush_ms_sum = 0; estimator_runs = 0;
+                            // The game's camera was found unusable: the estimate has to do better. When it explains
+                            // less than half of the frames for two such stretches in a row, the game's camera stays
+                            // (and is not checked again).
+                            if (sh.game_camera_check == 1) {
+                                poor_estimate_windows = unexplained > 0.6 ? poor_estimate_windows + 1 : 0;
+                                if (poor_estimate_windows >= 2) {
+                                    InterlockedExchange(&sh.game_camera_check, 2);
+                                    logf("the estimated camera explains the motion vectors no better (%.0f%% of frames unexplained): back to the game's own camera",
+                                         unexplained * 100.0);
+                                }
+                            }
                         }
                         if (!estimator_logged) { logf("no camera from the game: estimating it from the upscaler's motion vectors"); estimator_logged = true; }
                         // The upscaler's motion vector settings, once (FSR games).
@@ -1003,8 +1019,13 @@ void render_thread() {
                     const double sc = mv_scale.scale(k, k ? source.depth_rect.h : source.depth_rect.w);
                     if (fit.cc[k] > 0) agree[k] = 1.0 - (sc * sc * fit.gg[k] - 2 * sc * fit.gc[k] + fit.cc[k]) / fit.cc[k];
                 }
-                wr(g_app.csv_motion, "%lld,%llu,%.0f,%.4f,%.4f,%.4f,%u,%u\n", qpc_now(), static_cast<unsigned long long>(f), fit.samples,
-                             fit.samples > 0 ? fit.moving / fit.samples : 0.0, agree[0], agree[1], source.depth_rect.w, source.depth_rect.h);
+                // camera_fit: how much of the camera's motion the motion vectors explain at their best scale
+                // (needs no locked scale; -1: the camera stood still), see camera_check.hpp.
+                double camera_fit = -1;
+                if (!CameraCheck::quality(fit.gc, fit.gg, fit.cc, fit.samples, camera_fit)) camera_fit = -1;
+                wr(g_app.csv_motion, "%lld,%llu,%.0f,%.4f,%.4f,%.4f,%u,%u,%.4f\n", qpc_now(), static_cast<unsigned long long>(f), fit.samples,
+                             fit.samples > 0 ? fit.moving / fit.samples : 0.0, agree[0], agree[1], source.depth_rect.w, source.depth_rect.h,
+                             camera_fit);
             }
             if (have_fit && mv_scale.add(fit, source.depth_rect.w, source.depth_rect.h))
                 logf("motion vectors locked: %s, scale %.4g x %.4g (sign %+.0f %+.0f), fit quality %.3f",
@@ -1012,6 +1033,20 @@ void render_thread() {
                      std::fabs(std::fabs(mv_scale.locked[0]) - 0.5) < 1e-9 ? "ndc" : "custom units", mv_scale.scale(0, source.depth_rect.w),
                      mv_scale.scale(1, source.depth_rect.h), mv_scale.locked[0] < 0 ? -1.0 : 1.0, mv_scale.locked[1] < 0 ? -1.0 : 1.0,
                      mv_scale.quality);
+            // The game's own camera against its motion vectors (camera_check.hpp): when they never agree
+            // while the camera moves, the camera is estimated from the motion vectors from here on.
+            if (have_fit && have_source_kind && !source_was_estimated && g_app.shared->game_camera_check == 0 &&
+                camera_check.verdict == CameraCheck::kUndecided) {
+                const auto verdict = camera_check.add(fit.gc, fit.gg, fit.cc, fit.samples, mv_scale.valid);
+                if (verdict == CameraCheck::kTrusted)
+                    logf("the game's camera matches its motion vectors");
+                else if (verdict == CameraCheck::kUnusable) {
+                    InterlockedExchange(&g_app.shared->game_camera_check, 1);
+                    poor_estimate_windows = 0;
+                    logf("the game's camera does not match its motion vectors (%d of %d frames with camera motion): "
+                         "estimating the camera from the motion vectors instead", camera_check.consistent, camera_check.frames);
+                }
+            }
             vram.poll(now, notes.empty() ? nullptr : "texture change");
         }
         if (now - stat_start >= 0.5) {

@@ -1,4 +1,5 @@
 #include "addon/ngx_hooks.hpp"
+#include "addon/streamline_hooks.hpp"
 #include "common/inline_hook.hpp"
 #include <d3d11.h>
 #include <d3d12.h>
@@ -147,14 +148,34 @@ NVSDK_NGX_Result NVSDK_CONV hk_evaluate(ID3D12GraphicsCommandList* list, const N
             if (params->Get(NVSDK_NGX_Parameter_Reset, &reset) == NVSDK_NGX_Result_Success && reset) ++s->resets;
             // Games without a Streamline camera: publish this frame's depth and motion vectors with a camera
             // the presenter estimates from the motion vectors. (Streamline games publish through their own
-            // hooks; once slSetConstants has been seen, this stays off.)
+            // hooks; once slSetConstants has been seen, this stays off - unless that camera was found
+            // unusable, see Shared::game_camera_check.)
             auto* shared = g_producer->shared();
             ID3D12Resource *depth = nullptr, *motion = nullptr;
+            const bool inputs = shared && s->dlss_calls > 60 &&
+                                params->Get(NVSDK_NGX_Parameter_Depth, &depth) == NVSDK_NGX_Result_Success && depth &&
+                                params->Get(NVSDK_NGX_Parameter_MotionVectors, &motion) == NVSDK_NGX_Result_Success && motion;
+            const bool no_camera = shared && (shared->hooks.constants_calls == 0 || g_producer->game_camera_unusable());
+            // A game that sends its Streamline camera but whose depth and motion vectors do not reach the
+            // Streamline hooks (none for a second while DLSS runs): they are taken here, for the frame being
+            // rendered, with the game's own camera - as the FSR hook does.
+            if (inputs && !no_camera && streamline_camera_recent() && !streamline_depth_recent()) {
+                const std::uint64_t frame = g_producer->rendering_frame() ? g_producer->rendering_frame() : streamline_current_frame();
+                if (frame) {
+                    g_last_dlss_publish = qpc_now();
+                    const std::uint32_t w = s->subrect_w ? s->subrect_w : s->depth_w, h = s->subrect_h ? s->subrect_h : s->depth_h;
+                    const auto state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                    g_producer->on_tag(frame, kDepth, depth, state, 0, 0, w, h, list);
+                    g_producer->on_tag(frame, kMotion, motion, state, 0, 0, w, h, list);
+                    ++s->frames_joined;
+                    if (shared->settings.hud_from_scene && params->Get(NVSDK_NGX_Parameter_Output, &output) == NVSDK_NGX_Result_Success && output) {
+                        published = frame; output_w = s->out_w; output_h = s->out_h;
+                    }
+                }
+            }
             // Only after 60 DLSS evaluations without any Streamline camera: a Streamline game sets its camera
             // before its first DLSS call, so it can never reach this (and frame numbers cannot mix).
-            if (shared && shared->hooks.constants_calls == 0 && s->dlss_calls > 60 &&
-                params->Get(NVSDK_NGX_Parameter_Depth, &depth) == NVSDK_NGX_Result_Success && depth &&
-                params->Get(NVSDK_NGX_Parameter_MotionVectors, &motion) == NVSDK_NGX_Result_Success && motion) {
+            if (inputs && no_camera) {
                 const std::uint64_t frame = next_estimated_frame();
                 g_last_dlss_publish = qpc_now();
                 Camera cam{};

@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.6.1
+
+* **The game's camera is checked against its motion vectors.** Some games send camera data through
+  Streamline that does not describe how the picture moves (Assassin's Creed Black Flag Resynced): the
+  image warped wildly, or not at all. While the camera moves, XPAR now compares the game's camera with
+  the game's own motion vectors; when they never agree, the camera is estimated from the motion vectors
+  instead, as in games that send no camera. The verdict is remembered per game until the next update,
+  and taken back if the estimate does no better. Nothing to set; the XPAR panel says when the camera is
+  estimated.
+* Games that send a Streamline camera but whose depth and motion vectors do not reach the Streamline
+  hooks: they are taken at the DLSS call instead.
+
 ## 1.6.0
 
 * After an update, the settings remembered per game are reset to the defaults on the first launch (the

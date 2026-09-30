@@ -190,10 +190,13 @@ std::uint64_t before_upscale(const Upscale& u) {
     const bool known = u.context && flags_of(u.context, flags);
     if (known) s->create_flags = flags;
     auto* shared = g_producer->shared();
-    if (!shared || dlss_publishing() || streamline_depth_recent() || s->upscale_dispatches <= 60 || !u.list || !u.depth || !u.motion)
+    // (a Streamline camera found unusable counts as none: the camera is estimated)
+    const bool own_camera = !g_producer->game_camera_unusable();
+    if (!shared || dlss_publishing() || (own_camera && streamline_depth_recent()) || s->upscale_dispatches <= 60 || !u.list || !u.depth ||
+        !u.motion)
         return 0;
     const std::uint32_t w = u.render.width, h = u.render.height;
-    if (streamline_camera_recent()) {
+    if (own_camera && streamline_camera_recent()) {
         // The frame whose render work is being submitted (render-submit marker), else the newest camera's.
         const std::uint64_t frame = g_producer->rendering_frame() ? g_producer->rendering_frame() : streamline_current_frame();
         if (!frame) return 0;
