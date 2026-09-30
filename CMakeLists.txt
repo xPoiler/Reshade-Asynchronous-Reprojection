@@ -30,7 +30,7 @@ target_include_directories(fw_options INTERFACE src)
 
 # In-game ReShade add-on (static CRT so it has no runtime dependency inside the game).
 add_library(FrameWarpAddon SHARED src/addon/addon.cpp src/addon/producer.cpp src/addon/vk_transport.cpp src/addon/streamline_hooks.cpp
-            src/addon/ngx_hooks.cpp src/addon/ffx_hooks.cpp src/addon/game_probe.cpp src/common/inline_hook.cpp)
+            src/addon/ngx_hooks.cpp src/addon/ffx_hooks.cpp src/addon/reshade_feed.cpp src/addon/depth_choice.cpp src/addon/game_probe.cpp src/common/inline_hook.cpp)
 target_link_libraries(FrameWarpAddon PRIVATE fw_options d3d12 dxgi)
 # NGX headers only (no library); Khronos Vulkan headers for Vulkan games.
 target_include_directories(FrameWarpAddon SYSTEM PRIVATE third_party/reshade/include third_party/imgui third_party/vulkan/include "${FW_NGX_INCLUDE}")

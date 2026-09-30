@@ -8,6 +8,8 @@
 #include "addon/streamline_hooks.hpp"
 #include "addon/ngx_hooks.hpp"
 #include "addon/ffx_hooks.hpp"
+#include "addon/depth_choice.hpp"
+#include "addon/reshade_feed.hpp"
 #include <d3d12.h>
 #include <algorithm>
 #include <cstdio>
@@ -95,9 +97,10 @@ void on_init_swapchain(swapchain* sc, bool) {
     g_producer->set_swapchain(static_cast<HWND>(sc->get_hwnd()), desc.texture.width, desc.texture.height,
                               static_cast<DXGI_FORMAT>(desc.texture.format), to_dxgi_color_space(sc->get_color_space()));
     fw::install_ngx_hooks(g_producer.get());
-    if (dev->get_api() == device_api::d3d12) {  // (Streamline and FSR: D3D12 only for now)
+    if (dev->get_api() == device_api::d3d12) {  // (Streamline, FSR and the ReShade feed: D3D12 only for now)
         fw::install_streamline_hooks(g_producer.get());
         fw::install_ffx_hooks(g_producer.get());
+        fw::install_reshade_feed(g_producer.get());
     }
     // The settings remembered per game (ReShade.ini, [FrameWarp]). They belong to the version that saved
     // them: after an update (any version change) they go back to the defaults, so the improved defaults of
@@ -290,6 +293,7 @@ void draw_overlay(effect_runtime*) {
         ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
                            "Frame generation is on in the game. XPAR is paused: turn frame generation off -\n"
                            "XPAR already fills your display's refresh rate, and the two cannot be combined.");
+    if (fw::reshade_feed_status()[0]) ImGui::TextWrapped("%s", fw::reshade_feed_status());
     if (sh.game_camera_check == 1)
         ImGui::TextDisabled("Camera: estimated from the motion vectors (the game's own camera data does not match them)");
     if (!alive && ImGui::Button("Start presenter")) { g_presenter_launched = false; launch_presenter(); }
@@ -502,6 +506,9 @@ void draw_overlay(effect_runtime*) {
 void register_callbacks() {
     reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
     reshade::register_event<reshade::addon_event::reshade_present>(on_reshade_present);
+    reshade::register_event<reshade::addon_event::reshade_finish_effects>(fw::on_reshade_finish_effects);
+    reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(fw::on_reshade_reloaded_effects);
+    fw::register_depth_choice_events();
     reshade::register_event<reshade::addon_event::finish_present>(on_finish_present);
     reshade::register_event<reshade::addon_event::create_resource>(on_create_resource);
     reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
@@ -514,6 +521,9 @@ void unregister_callbacks() {
     reshade::unregister_event<reshade::addon_event::destroy_device>(on_destroy_device);
     reshade::unregister_event<reshade::addon_event::create_resource>(on_create_resource);
     reshade::unregister_event<reshade::addon_event::finish_present>(on_finish_present);
+    fw::unregister_depth_choice_events();
+    reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(fw::on_reshade_reloaded_effects);
+    reshade::unregister_event<reshade::addon_event::reshade_finish_effects>(fw::on_reshade_finish_effects);
     reshade::unregister_event<reshade::addon_event::reshade_present>(on_reshade_present);
     reshade::unregister_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
 }

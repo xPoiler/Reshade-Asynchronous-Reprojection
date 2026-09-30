@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+* **Games without DLSS or FSR, or with both switched off (experimental, DirectX 12):** XPAR now works
+  from ReShade's depth buffer alone. The motion between two game frames is estimated from the pictures themselves (in the presenter,
+  on its own GPU queue: no motion vector shader is needed), and the camera from that and the depth. Against
+  a game's real motion vectors the estimate is typically within a quarter of a pixel where the picture
+  has detail; rain, water and flat areas are recognised as unreliable and left out of the camera
+  estimate. The installer adds `XPAR.fx` to the game's `reshade-shaders\Shaders`; the add-on enables it
+  itself. ReShade's depth buffer has to be set up for the game, as for any depth effect. With DLSS
+  or FSR switched on the game's own depth and motion vectors are used, exactly as before, and none of
+  this runs.
+* The game's depth buffer is found automatically for the ReShade path: each depth buffer of the
+  picture's shape, whatever its size, is selected in turn and the one whose depth belongs to the picture
+  is kept (ReShade's own pick skips a scene rendered well below the picture's size and can settle on the
+  wrong buffer; ticking the right one in its list did not last beyond the session). A buffer ticked by
+  hand is respected. Every step is written to ReShade.log.
+* Games whose camera XPAR estimates (no camera data from the game): the nearby scenery could start
+  jumping between refreshes while the distance stayed smooth, after a frame with next to no depth in it
+  had thrown the estimated position millions of units away (its steps were then coarser than a frame's
+  move). Such moves are refused, and the position starts again from zero before it gets far.
+* The field of view XPAR learns (games that give no camera) is judged by the camera's turn and move
+  together. Judged by the turn alone it came out far too wide under a high third-person camera (the ground
+  a few metres away moves with the camera's orbit), and never settled: the nearby ground shook, and the
+  motion vector scale kept being learned again.
+* The capture key (Ctrl+Shift+D) saves two consecutive game frames.
+
 ## 1.6.1
 
 * **The game's camera is checked against its motion vectors.** Some games send camera data through

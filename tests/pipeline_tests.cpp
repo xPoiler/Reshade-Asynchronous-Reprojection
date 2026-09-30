@@ -1195,6 +1195,149 @@ int main(int argc, char** argv) {
         EXPECT(std::fabs(bar_x1 - bar_x0) > 20.0, "the scene under the HUD mask is still warped");
     }
 
+    // XPAR's own motion estimation: a frame with depth but without motion vectors, and a camera to estimate
+    // (ReShade's depth, no DLSS or FSR). A textured picture displaced between two frames: the motion
+    // texture must say where every pixel came from, and say so with confidence.
+    {
+        ComPtr<ID3D12Fence> gf; game->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gf));
+        UINT64 fence_value = 0;
+        auto publish = [&](std::uint64_t fid, LONG ox, LONG oy) -> int {
+            alloc->Reset();
+            list->Reset(alloc.Get(), nullptr);
+            list->ResourceBarrier(1, &b);  // backbuffer PRESENT -> RENDER_TARGET
+            const float back[4] = {0.2f, 0.2f, 0.2f, 1};
+            list->ClearRenderTargetView(rtv, back, 0, nullptr);
+            // The same rectangles every frame, displaced by (ox, oy): large shapes first, then smaller and
+            // smaller ones on top (detail at every scale, like a real picture), sized with the picture.
+            std::uint32_t seed = 12345;
+            auto next = [&]() { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+            const LONG margin = LONG(W / 4);
+            for (int i = 0; i < 2000; ++i) {
+                const LONG unit = i < 60 ? LONG(W / 8) : i < 400 ? LONG(W / 32) : LONG(W / 128);
+                const LONG x = LONG(next() % (W + 2 * margin)) - margin + ox, y = LONG(next() % (H + 2 * margin)) - margin + oy;
+                const LONG rw = unit / 2 + LONG(next() % unit), rh = unit / 2 + LONG(next() % unit);
+                const float g = 0.1f + float(next() % 100) / 125.0f;
+                const float grey[4] = {g, g, g, 1};
+                const D3D12_RECT r{std::clamp<LONG>(x, 0, LONG(W)), std::clamp<LONG>(y, 0, LONG(H)), std::clamp<LONG>(x + rw, 0, LONG(W)),
+                                   std::clamp<LONG>(y + rh, 0, LONG(H))};
+                if (r.right > r.left && r.bottom > r.top) list->ClearRenderTargetView(rtv, grey, 1, &r);
+            }
+            list->ClearDepthStencilView(dsv_heap->GetCPUDescriptorHandleForHeapStart(), D3D12_CLEAR_FLAG_DEPTH, 0.01f, 0, 0, nullptr);
+            std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+            list->ResourceBarrier(1, &b);
+            std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+            Camera to_estimate{};
+            to_estimate.valid = 1; to_estimate.estimated = 1; to_estimate.depth_inverted = 1;
+            to_estimate.mvec_scale[0] = float(DW); to_estimate.mvec_scale[1] = float(DH);
+            producer.on_constants(fid, to_estimate);
+            producer.on_tag(fid, kDepth, depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 0, 0, DW, DH, list.Get());
+            const auto t = producer.begin_present(backbuffer.Get(), list.Get());
+            list->Close();
+            queue->ExecuteCommandLists(1, lists);
+            producer.finish_present(queue.Get(), t);
+            queue->Signal(gf.Get(), ++fence_value);
+            while (gf->GetCompletedValue() < fence_value) Sleep(1);
+            int found = -1;
+            for (int i = 0; i < kSlots; ++i) if (sh.slots[i].state == kReady && sh.slots[i].frame_id == fid) found = i;
+            return found;
+        };
+        auto take_in = [&](int s) {
+            renderer.begin_frame();
+            const IngestedSource src = renderer.ingest(sh, s);
+            renderer.submit_work();
+            renderer.wait_idle();
+            return src;
+        };
+        auto median = [](std::vector<float> v) { if (v.empty()) return 0.0f; std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end()); return v[v.size() / 2]; };
+        renderer.reset_hud_detection();  // (no previous frame)
+        std::uint64_t fid = 2000;
+        const int first = publish(fid, 0, 0);
+        EXPECT(first >= 0, "frame without motion vectors published");
+        const IngestedSource before = first >= 0 ? take_in(first) : IngestedSource{};
+        EXPECT(before.has_motion && before.motion_estimated, "a frame with depth and no motion vectors gets estimated ones");
+        // A slow turn, a fast one (past what the refinements alone can follow: the coarse search), and none.
+        LONG at_x = 0, at_y = 0;
+        for (const auto& [dx, dy] : {std::pair<LONG, LONG>{24, 6}, std::pair<LONG, LONG>{-150, 20}, std::pair<LONG, LONG>{0, 0}}) {
+            at_x += dx; at_y += dy;
+            const int s = publish(++fid, at_x, at_y);
+            if (s < 0) { EXPECT(false, "frame published"); continue; }
+            take_in(s);
+            std::vector<std::uint16_t> mv, flow;
+            std::uint32_t mw = 0, mh = 0, fw2 = 0, fh2 = 0;
+            EXPECT(renderer.read_back(4, mv, mw, mh) && renderer.read_back(13, flow, fw2, fh2), "estimated motion read back");
+            // (the displacements' texture holds a pyramid; level 0, half the depth grid, is at its origin)
+            const std::uint32_t stride = fw2;
+            fw2 = std::max(1u, DW / 2); fh2 = std::max(1u, DH / 2);
+            // The picture moved by (dx, dy): every pixel was at (-dx, -dy) from where it is, in px of the picture.
+            std::vector<float> ex, ey, all_x;
+            std::size_t confident = 0;
+            for (std::uint32_t y = fh2 / 8; y < fh2 * 7 / 8; ++y)
+                for (std::uint32_t x = fw2 / 8; x < fw2 * 7 / 8; ++x) {
+                    const std::size_t i = (std::size_t(y) * stride + x) * 4;
+                    const float mx = half_to_float(flow[i]) * float(W) / float(fw2), my = half_to_float(flow[i + 1]) * float(H) / float(fh2);
+                    all_x.push_back(std::fabs(mx + float(dx)));
+                    if (half_to_float(flow[i + 2]) < 0.5f) continue;
+                    ++confident;
+                    ex.push_back(std::fabs(mx + float(dx))); ey.push_back(std::fabs(my + float(dy)));
+                }
+            const float tex_x = half_to_float(mv[(std::size_t(mh / 2) * mw + mw / 2) * 4]) * float(W), tex_y = half_to_float(mv[(std::size_t(mh / 2) * mw + mw / 2) * 4 + 1]) * float(H);
+            const double share = double(confident) / double(std::max<std::size_t>(all_x.size(), 1));
+            std::printf("own motion, picture moved by (%ld, %ld) px: confident %.0f%%, their median error %.2f, %.2f px (all pixels %.2f); motion texture at the centre (%.1f, %.1f)\n",
+                        dx, dy, share * 100.0, median(ex), median(ey), median(all_x), tex_x, tex_y);
+            // (flat rectangle interiors tell nothing: how much counts depends on the picture's size)
+            EXPECT(share > 0.03, "the estimated motion is confident where the picture has detail (%.0f%%)", share * 100.0);
+            EXPECT(median(ex) < 0.5f && median(ey) < 0.5f, "the confident motion is right (%.2f, %.2f px off)", median(ex), median(ey));
+            EXPECT(std::fabs(tex_x + float(dx)) < 2.0f && std::fabs(tex_y + float(dy)) < 2.0f, "the motion texture holds it, in uv (%.1f, %.1f)", tex_x, tex_y);
+            // Where nothing is known (the flat insides of the rectangles) the motion texture takes what is
+            // known around it: nearly every pixel of it is right, not only the confident ones.
+            std::vector<float> off;
+            for (std::uint32_t y = mh / 8; y < mh * 7 / 8; y += 2)
+                for (std::uint32_t x = mw / 8; x < mw * 7 / 8; x += 2) {
+                    const std::size_t i = (std::size_t(y) * mw + x) * 4;
+                    off.push_back(std::hypot(half_to_float(mv[i]) * float(W) + float(dx), half_to_float(mv[i + 1]) * float(H) + float(dy)));
+                }
+            std::sort(off.begin(), off.end());
+            const float p95 = off.empty() ? 0.0f : off[off.size() * 95 / 100];
+            if (std::getenv("FW_DUMP")) {  // (where the motion texture is off: share of pixels beyond 2 px per cell of an 8 x 4 grid)
+                for (std::uint32_t cy = 0; cy < 4; ++cy) {
+                    std::printf("   ");
+                    for (std::uint32_t cx = 0; cx < 8; ++cx) {
+                        int bad = 0, n = 0;
+                        for (std::uint32_t y = cy * mh / 4; y < (cy + 1) * mh / 4; y += 2)
+                            for (std::uint32_t x = cx * mw / 8; x < (cx + 1) * mw / 8; x += 2) {
+                                const std::size_t i = (std::size_t(y) * mw + x) * 4;
+                                ++n;
+                                if (std::hypot(half_to_float(mv[i]) * float(W) + float(dx), half_to_float(mv[i + 1]) * float(H) + float(dy)) > 2.0f) ++bad;
+                            }
+                        std::printf("%4d%%", n ? 100 * bad / n : 0);
+                    }
+                    std::printf("\n");
+                }
+                // one cell in detail: the displacements found there (level 0) and the motion texture
+                const std::uint32_t x0 = fw2 * 2 / 8, x1 = fw2 * 3 / 8, y0 = 0, y1 = fh2 / 4;
+                int known = 0, known_bad = 0, all = 0, all_bad = 0;
+                for (std::uint32_t y = y0; y < y1; ++y)
+                    for (std::uint32_t x = x0; x < x1; ++x) {
+                        const std::size_t i = (std::size_t(y) * stride + x) * 4;
+                        const float e = std::hypot(half_to_float(flow[i]) * float(W) / float(fw2) + float(dx), half_to_float(flow[i + 1]) * float(H) / float(fh2) + float(dy));
+                        ++all; if (e > 2.0f) ++all_bad;
+                        if (half_to_float(flow[i + 2]) > 0.5f) { ++known; if (e > 2.0f) ++known_bad; }
+                    }
+                const std::size_t mi = (std::size_t(mh / 8) * mw + mw * 5 / 16) * 4;
+                std::printf("   cell (row 0, column 2): %d of %d displacements known, %d of those wrong; %d of all wrong; motion texture in it (%.1f, %.1f) px\n",
+                            known, all, known_bad, all_bad, half_to_float(mv[mi]) * float(W), half_to_float(mv[mi + 1]) * float(H));
+            }
+            std::vector<float> conf_err;
+            for (std::size_t i = 0; i < ex.size(); ++i) conf_err.push_back(std::hypot(ex[i], ey[i]));
+            std::sort(conf_err.begin(), conf_err.end());
+            std::printf("   motion texture, every pixel: 95%% within %.2f px; the confident displacements: 95%% within %.2f px, 99%% within %.2f px\n", p95,
+                        conf_err.empty() ? 0.0f : conf_err[conf_err.size() * 95 / 100], conf_err.empty() ? 0.0f : conf_err[conf_err.size() * 99 / 100]);
+            // (not checked for the fast turn: where this picture has little detail - the large rectangles -
+            // the coarse search finds nothing to hold on to, and a whole area is wrong and unknown alike)
+            if (std::abs(dx) < 100) EXPECT(p95 < 2.0f, "the motion texture is right where nothing was known too (95%% within %.2f px)", p95);
+        }
+    }
+
     // Timing: GPU time of a whole presenter frame (Latewarp + blit), steady state.
     // Every 4th frame takes in a new game frame (ingest + rendered-frame Latewarp), like 30 fps -> 120 Hz.
     double total = 0; int samples = 0;

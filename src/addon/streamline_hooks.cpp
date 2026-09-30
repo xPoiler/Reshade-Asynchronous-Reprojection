@@ -126,7 +126,7 @@ int hk_set_constants(const void* values, const void* frame, const void* viewport
                 }
         }
         // (a camera found unusable is left out: the upscaler's hooks publish the frames, camera estimated)
-        if (ok && !g_producer->game_camera_unusable()) g_producer->on_constants(id, cam);
+        if (ok && !g_producer->game_camera_unusable() && !g_producer->feed_publishing()) g_producer->on_constants(id, cam);
         if (!g_marker_hook.installed() && g_pcl_attempts < 200 && (g_pcl_attempts++ % 20) == 0) try_hook_pcl();
     }
     return reinterpret_cast<SetConstantsFn>(g_constants_hook.original())(values, frame, viewport);
@@ -226,7 +226,7 @@ void handle_tags(std::uint64_t frame, const void* tags_ptr, std::uint32_t count,
         }
         // Only the buffer types whose numbers are certain; UI colour is identified from the logged list first.
         Tex kind = kTexCount;
-        if (type == kSlDepth && is_depth_format(desc.Format)) { kind = kDepth; g_last_depth_qpc = qpc_now(); }
+        if (type == kSlDepth && is_depth_format(desc.Format)) { kind = kDepth; g_last_depth_qpc = qpc_now(); g_producer->note_game_depth(); }
         else if (type == kSlMotionVectors) kind = kMotion;
         else if (type == kSlHudless && is_rgba8(desc.Format)) kind = kHudless;
         // E33 (UE StreamlineCore): UI colour + alpha from the UI hint extraction pass, full-res BGRA8.

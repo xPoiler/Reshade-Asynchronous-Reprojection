@@ -178,6 +178,7 @@ std::uint64_t before_upscale(const Upscale& u) {
     auto* s = stats();
     if (!s) return 0;
     ++s->upscale_dispatches;
+    g_producer->note_game_depth();
     s->render_w = u.render.width; s->render_h = u.render.height;
     s->out_w = u.upscale.width; s->out_h = u.upscale.height;
     s->depth_format = u.depth_format; s->mv_format = u.motion_format;

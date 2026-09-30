@@ -155,8 +155,56 @@ public:
         return V3{v[0] * k, v[1] * k, v[2] * k};
     }
 
-    // One game frame. Updates the orientation and returns the synthesized camera.
-    Camera update(const std::vector<MotionSample>& all, double w, double h, const Camera& game) {
+    // Motion vectors estimated from the picture (no game vectors) are right where the picture has detail and
+    // the camera explains the motion, and wrong elsewhere: rain, water, things moving on their own, false
+    // matches. A least-squares fit over all of them is pulled away by the wrong ones, so the turn is the one
+    // most samples agree with: candidates from three samples at a time, the best by the number of samples
+    // within kAgree px of it, then least squares over those alone, repeated.
+    static constexpr double kAgree = 2.0;
+    static bool consensus_rotation(const std::vector<MotionSample>& s, double w, double h, double f, double fp, V3& omega, double& share) {
+        share = 0;
+        if (s.size() < 32) return false;
+        // (agreeing: within kAgree px, or 4% of the typical motion on fast turns, where both the vectors and
+        // the model - a field of view still being learned - are less exact)
+        std::vector<double> motion;
+        for (const auto& p : s) motion.push_back(std::hypot(p.mx, p.my));
+        std::nth_element(motion.begin(), motion.begin() + motion.size() / 2, motion.end());
+        const double agree = std::max(kAgree, 0.04 * motion[motion.size() / 2]);
+        auto agreeing = [&](const V3& o) {
+            const M3 R = rotation(o);
+            int n = 0;
+            for (const auto& p : s) if (sample_error(p, R, w, h, f, fp) <= agree) ++n;
+            return n;
+        };
+        V3 best = linear_rotation(s, w, h, f, fp);
+        int best_n = agreeing(best);
+        if (const int still = agreeing(V3{}); still > best_n) { best = V3{}; best_n = still; }
+        std::uint32_t seed = 0x9E3779B9u;  // (the same candidates every frame: the result does not flicker by chance)
+        std::vector<MotionSample> three(3);
+        for (int trial = 0; trial < 96; ++trial) {
+            for (auto& p : three) { seed = seed * 1664525u + 1013904223u; p = s[(seed >> 8) % s.size()]; }
+            const V3 o = linear_rotation(three, w, h, f, fp);
+            if (!std::isfinite(o[0] + o[1] + o[2])) continue;
+            const int n = agreeing(o);
+            if (n > best_n) { best = o; best_n = n; }
+        }
+        omega = best;
+        for (int it = 0; it < 3; ++it) {
+            const M3 R = rotation(omega);
+            std::vector<MotionSample> in;
+            for (const auto& p : s) if (sample_error(p, R, w, h, f, fp) <= agree) in.push_back(p);
+            if (in.size() < 24) break;
+            V3 o = linear_rotation(in, w, h, f, fp);
+            if (agreeing(o) >= agreeing(omega)) omega = o;
+        }
+        const int n = agreeing(omega);
+        share = double(n) / double(s.size());
+        return n >= 24 && share >= 0.25;
+    }
+
+    // One game frame. Updates the orientation and returns the synthesized camera. noisy: the motion vectors
+    // are estimated from the picture; when the plain fit fails, see consensus_rotation.
+    Camera update(const std::vector<MotionSample>& all, double w, double h, const Camera& game, bool noisy = false) {
         // The game may tell the field of view (FSR asks for the vertical one). It is checked against the one
         // learned from the motion: some games hand over the horizontal one, and some values are simply off.
         // (only plausible values: some games hand FSR nonsense while loading)
@@ -177,11 +225,11 @@ public:
             for (const auto& p : all) if (p.valid > 0.5f && p.depth <= median) distant.push_back(p);
         }
         V3 omega{};
-        bool ok = false;
+        bool ok = false, consensus = false;
         // The previous frame's focal length (differs only while the game zooms and tells us its field of view).
         const double fprev_fov = prev_fov_ > 0 ? prev_fov_ : fov_;
         if (distant.size() >= 16) {
-            if (!learned_locked_) learn_fov(distant, w, h);
+            if (!learned_locked_) learn_fov(distant, all, w, h, noisy);
             const double f = focal(h), fp = (h * 0.5) / std::tan((follow_zoom ? fprev_fov : fov_) * 0.5);
             omega = linear_rotation(distant, w, h, f, fp);
             V3 no_move{};
@@ -198,11 +246,47 @@ public:
             if (inliers.size() >= 16) { V3 t0{}; e = fit_motion(inliers, w, h, f, omega, t0, fp); }
             ok = std::isfinite(e) && std::sqrt(e) < acceptable(distant);
             last_residual_ = std::sqrt(e);
+            // Estimated motion vectors that the plain fit cannot explain (a storm, water): the turn most of
+            // them agree with.
+            if (!ok && noisy) {
+                double share = 0;
+                ok = consensus = consensus_rotation(distant, w, h, f, fp, omega, share);
+            }
         }
         // Rotation and translation from all samples (near ones carry the translation), starting from the
         // distant-sample rotation; samples the motion does not explain (moving objects) are dropped.
         V3 T{};
-        if (ok) {
+        if (ok && consensus) {
+            // The move, from all samples: starting from the turn, the samples within a limit of the model are
+            // fitted (turn and move together) while the limit comes down to kAgree; kept when enough agree.
+            std::vector<MotionSample> valid;
+            for (const auto& p : all) if (p.valid > 0.5f) valid.push_back(p);
+            valid = without_carried(valid);
+            const double f = focal(h), fp = (h * 0.5) / std::tan((follow_zoom ? fprev_fov : fov_) * 0.5);
+            V3 o = omega, t{};
+            auto error = [&](const MotionSample& p) {
+                const M3 R0 = rotation(o);
+                const double X = (p.x - w * 0.5) / f, Y = -(p.y - h * 0.5) / f;
+                const V3 c = mul(R0, V3{X, Y, 1.0});
+                const double qz = std::max(c[2] + t[2] * p.depth, 1e-6);
+                const double ex = w * 0.5 + fp * (c[0] + t[0] * p.depth) / qz - (p.x + p.mx);
+                const double ey = h * 0.5 - fp * (c[1] + t[1] * p.depth) / qz - (p.y + p.my);
+                return std::sqrt(ex * ex + ey * ey);
+            };
+            std::size_t agree = 0;
+            for (const double limit : {16.0, 8.0, 4.0, kAgree, kAgree}) {
+                std::vector<MotionSample> in;
+                for (const auto& p : valid) if (error(p) <= limit) in.push_back(p);
+                if (in.size() < 32) break;
+                V3 o2 = o, t2 = t;
+                const double e = fit_motion(in, w, h, f, o2, t2, fp);
+                if (!std::isfinite(e)) break;
+                o = o2; t = t2;
+                agree = 0;
+                for (const auto& p : valid) if (error(p) <= kAgree) ++agree;
+            }
+            if (agree >= 32 && agree * 4 >= valid.size()) { omega = o; T = t; }
+        } else if (ok) {
             std::vector<MotionSample> valid;
             for (const auto& p : all) if (p.valid > 0.5f) valid.push_back(p);
             valid = without_carried(valid);
@@ -227,14 +311,35 @@ public:
             if (inliers.size() >= 32) e = fit_motion(inliers, w, h, f, o, t, fp);
             if (std::isfinite(e) && std::sqrt(e) < acceptable(valid)) { omega = o; T = t; last_residual_ = std::sqrt(e); }
         }
+        // A field of view learned from estimated vectors and then locked has to keep explaining the frames:
+        // when it fails a third of 300, it is learned again.
+        if (noisy && learned_locked_) {
+            ++locked_frames_;
+            if (!ok) ++locked_rejected_;
+            if (locked_frames_ >= 300) {
+                if (locked_rejected_ * 3 > locked_frames_) { learned_locked_ = false; fov_votes_.clear(); }
+                locked_frames_ = locked_rejected_ = 0;
+            }
+        }
         ++frames_;
+        if (consensus) ++consensus_;
+        for (const auto& p : all) { ++samples_; if (p.valid > 0.5f) ++samples_valid_; }
         if (!ok) ++rejected_;
         last_rejected_ = !ok;
         if (!ok || game.reset) { omega = V3{0, 0, 0}; T = V3{0, 0, 0}; }
+        // A move no camera makes in one frame (further than four times the distance of the typical scenery,
+        // or thousands of near planes): a fit on a frame with next to no depth in it. No move then.
+        if (!plausible_move(T, depths.empty() ? 0.0 : double(depths[depths.size() / 2]))) T = V3{0, 0, 0};
         last_omega_ = omega;
         last_translation_ = T;
         // The camera now sits at T in the previous camera's coordinates: world move = B_prev * T.
         for (int i = 0; i < 3; ++i) position_[i] += basis_[i][0] * T[0] + basis_[i][1] * T[1] + basis_[i][2] * T[2];
+        // The position is handed on in single precision, and only its changes matter: far from the origin its
+        // steps get coarser than a frame's move (at millions of units, whole units: the nearby scenery then
+        // jumps by tens of pixels between refreshes while the distance stays smooth). It starts again from
+        // zero before that, as a discontinuity (position_epoch), like a game's own camera after a cut.
+        if (std::fabs(position_[0]) > kFarFromOrigin || std::fabs(position_[1]) > kFarFromOrigin ||
+            std::fabs(position_[2]) > kFarFromOrigin) { position_ = V3{}; ++epoch_; }
         // world = B_prev * c_prev = B_prev * R * c_cur  ->  B_cur = B_prev * R  (B columns: right, up, fwd)
         const M3 R = rotation(omega);
         basis_ = mul(basis_, R);
@@ -284,7 +389,15 @@ public:
     double last_residual() const { return last_residual_; }
     // Frames whose motion no camera move explained (the camera then held still for that frame); read and cleared.
     bool last_rejected() const { return last_rejected_; }
-    double take_rejected_fraction() { const double r = frames_ ? double(rejected_) / double(frames_) : 0.0; frames_ = rejected_ = 0; return r; }
+    // Since the last call: the share of frames fitted by consensus (estimated motion vectors the plain fit
+    // could not explain) and of samples that counted (estimated vectors: the confident ones). Before take_rejected_fraction.
+    double consensus_fraction() const { return frames_ ? double(consensus_) / double(frames_) : 0.0; }
+    double valid_fraction() const { return samples_ ? double(samples_valid_) / double(samples_) : 0.0; }
+    double take_rejected_fraction() {
+        const double r = frames_ ? double(rejected_) / double(frames_) : 0.0;
+        frames_ = rejected_ = consensus_ = samples_ = samples_valid_ = 0;
+        return r;
+    }
     V3 last_omega() const { return last_omega_; }
     V3 last_translation() const { return last_translation_; }
     // How the game's field of view is used: 0 not checked yet (taken as vertical meanwhile), 1 as the vertical
@@ -292,11 +405,17 @@ public:
     int game_fov_mode() const { return game_fov_mode_; }
     double learned_fov() const { return learned_fov_; }
     void reset() {
-        basis_ = identity_basis(); position_ = V3{}; fov_votes_.clear(); fov_locked_ = false; fov_ = kDefaultFov; prev_fov_ = 0;
+        basis_ = identity_basis(); position_ = V3{}; ++epoch_; fov_votes_.clear(); fov_locked_ = false; fov_ = kDefaultFov; prev_fov_ = 0;
         learned_fov_ = kDefaultFov; learned_locked_ = false; game_fov_mode_ = 0; game_votes_v_.clear(); game_votes_h_.clear();
     }
 
     static constexpr double kDefaultFov = 1.2217;  // 70 degrees vertical until learned
+    // Where the position starts again from zero: single precision still has steps of 1/1000 of a near plane there.
+    static constexpr double kFarFromOrigin = 8192.0;
+    static bool plausible_move(const V3& T, double typical_depth) {
+        const double m = std::sqrt(T[0] * T[0] + T[1] * T[1] + T[2] * T[2]);
+        return std::isfinite(m) && m <= 4096.0 && m * typical_depth <= 4.0;
+    }
 
     // Rotation matrix for a rotation vector (axis * angle).
     static M3 rotation(const V3& o) {
@@ -379,14 +498,97 @@ private:
     // The focal length only shows in how the flow bends towards the screen edges, so it is learned from
     // frames with clear rotation: each such frame votes for the field of view that fits it best
     // (coarse-to-fine search), and the median of the votes locks once enough agree.
-    void learn_fov(const std::vector<MotionSample>& s, double w, double h) {
+    // noisy (motion vectors estimated from the picture): wrong vectors among them pull a plain fit's error
+    // towards whichever field of view happens to suit them (it ended at the narrowest one tried); a field of
+    // view is then scored by the samples that agree with its turn - fitted, the samples beyond twice the
+    // median error dropped, fitted again - and by how many do.
+    // A field of view is judged by the turn and the move together, over near and distant samples alike: the
+    // distant half is not always distant enough to show the turn alone. Under a high third-person camera it is
+    // ground a few metres away, which moves with the camera's orbit - in step with the turn, so every frame
+    // erred the same way and a turn-only judgement settled 15 to 30 degrees too wide (Assassin's Creed Black
+    // Flag: 55 to 70 degrees for a real 39). (A move alone says nothing about the field of view, a turn does:
+    // frames are still chosen by their turn.)
+    void learn_fov(const std::vector<MotionSample>& s, const std::vector<MotionSample>& all, double w, double h, bool noisy = false) {
         const double pi = 3.14159265358979;
-        auto score = [&](double fov) { V3 o; return fit_rotation(s, w, h, (h * 0.5) / std::tan(fov * 0.5), o); };
+        double best_fov = fov_, best = 1e30;
+        // (some nine hundred samples are plenty to tell one field of view from another)
+        std::vector<MotionSample> some;
+        {
+            std::vector<MotionSample> valid;
+            for (const auto& p : all) if (p.valid > 0.5f) valid.push_back(p);
+            valid = without_carried(valid);
+            const std::size_t step = std::max<std::size_t>(1, valid.size() / 900);
+            for (std::size_t i = 0; i < valid.size(); i += step) some.push_back(valid[i]);
+        }
+        auto move_error = [&](const MotionSample& p, const M3& R, const V3& t, double f) {
+            const double X = (p.x - w * 0.5) / f, Y = -(p.y - h * 0.5) / f;
+            const V3 c = mul(R, V3{X, Y, 1.0});
+            const double qz = std::max(c[2] + t[2] * p.depth, 1e-6);
+            const double ex = w * 0.5 + f * (c[0] + t[0] * p.depth) / qz - (p.x + p.mx);
+            const double ey = h * 0.5 - f * (c[1] + t[1] * p.depth) / qz - (p.y + p.my);
+            return std::sqrt(ex * ex + ey * ey);
+        };
+        if (noisy) {
+            // A vote only from a frame that can tell: the picture as a whole moved (half the samples by 8 px
+            // or more - estimated vectors of a still camera are noise, and noise has no bend), most samples
+            // agree with the best field of view's turn, and that one is clearly better than those 15 degrees
+            // to either side and is not simply the end of the range.
+            std::vector<double> motion;
+            for (const auto& p : s) motion.push_back(std::hypot(p.mx, p.my));
+            if (motion.size() < 48 || some.size() < 48) return;
+            std::nth_element(motion.begin(), motion.begin() + motion.size() / 2, motion.end());
+            if (motion[motion.size() / 2] < 8.0) return;
+            const std::vector<MotionSample>& half = some;
+            double share = 0;
+            auto among_agreeing = [&](double fov) {
+                const double f = (h * 0.5) / std::tan(fov * 0.5);
+                std::vector<MotionSample> in = half;
+                std::vector<double> errs;
+                V3 o = linear_rotation(s, w, h, f), t{};
+                for (int it = 0; it < 3; ++it) {
+                    if (in.size() < 24) return 1e30;
+                    if (!std::isfinite(fit_motion(in, w, h, f, o, t))) return 1e30;
+                    const M3 R = rotation(o);
+                    errs.clear();
+                    for (const auto& p : half) errs.push_back(move_error(p, R, t, f));
+                    std::vector<double> sorted = errs;
+                    std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
+                    const double limit = std::max(1.0, 2.0 * sorted[sorted.size() / 2]);
+                    in.clear();
+                    for (std::size_t i = 0; i < half.size(); ++i) if (errs[i] <= limit) in.push_back(half[i]);
+                }
+                double sum = 0;  // (every sample counts, the disagreeing ones as 3 px off at most)
+                int close = 0;
+                for (const double e : errs) { sum += std::min(e, 3.0) * std::min(e, 3.0); if (e <= 1.5) ++close; }
+                share = double(close) / double(errs.size());
+                return sum / double(errs.size());
+            };
+            double coarse[19];
+            int at = 0;
+            for (int i = 0; i < 19; ++i) { coarse[i] = among_agreeing((30 + 5 * i) * pi / 180); if (coarse[i] < coarse[at]) at = i; }
+            if (at == 0 || at == 18) return;
+            if (coarse[at] > 0.8 * std::min(coarse[std::max(at - 3, 0)], coarse[std::min(at + 3, 18)])) return;
+            best = coarse[at]; best_fov = (30 + 5 * at) * pi / 180;
+            const double centre = best_fov;
+            for (double d = -4; d <= 4; d += 1) {
+                if (d == 0) continue;
+                const double e = among_agreeing(centre + d * pi / 180);
+                if (e < best) { best = e; best_fov = centre + d * pi / 180; }
+            }
+            among_agreeing(best_fov);
+            if (share < 0.4) return;
+        } else {
+        if (some.size() < 32) return;
+        auto score = [&](double fov) {
+            const double f = (h * 0.5) / std::tan(fov * 0.5);
+            V3 turn = linear_rotation(s, w, h, f), move{};
+            const double e = fit_motion(some, w, h, f, turn, move);
+            return std::isfinite(e) ? e : 1e30;
+        };
         V3 o;
         fit_rotation(s, w, h, focal(h), o);
         const double angle = std::sqrt(o[0] * o[0] + o[1] * o[1] + o[2] * o[2]);
         if (angle < 0.004) return;  // under ~0.25 degrees this frame: the bend is too small to measure
-        double best_fov = fov_, best = 1e30;
         for (double deg = 30; deg <= 120; deg += 5) { const double e = score(deg * pi / 180); if (e < best) { best = e; best_fov = deg * pi / 180; } }
         const double centre = best_fov;
         for (double d = -4; d <= 4; d += 1) {
@@ -394,6 +596,7 @@ private:
             if (fov <= 0.3) continue;
             const double e = score(fov);
             if (e < best) { best = e; best_fov = fov; }
+        }
         }
         fov_votes_.push_back(best_fov);
         // How far the game's value is from this frame's measurement, read either way (focal length ratio).
@@ -405,9 +608,10 @@ private:
         std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
         learned_fov_ = v[v.size() / 2];
         if (fov_votes_.size() >= 30) {
+            // (estimated vectors: the votes spread more - half of them within 5 degrees settle it)
             int close = 0;
-            for (double x : fov_votes_) if (std::fabs(x - learned_fov_) < 3 * pi / 180) ++close;
-            if (close * 3 >= int(fov_votes_.size()) * 2) learned_locked_ = true;
+            for (double x : fov_votes_) if (std::fabs(x - learned_fov_) < (noisy ? 5 : 3) * pi / 180) ++close;
+            if (noisy ? close * 2 >= int(fov_votes_.size()) : close * 3 >= int(fov_votes_.size()) * 2) learned_locked_ = true;
         }
     }
 
@@ -483,6 +687,7 @@ private:
             c.right[i] = float(basis_[i][0]); c.up[i] = float(basis_[i][1]); c.fwd[i] = float(basis_[i][2]);
             c.pos[i] = float(position_[i]);
         }
+        c.position_epoch = game.position_epoch + epoch_;
         c.near_plane = near_plane; c.far_plane = 0;
         c.fov = float(fov_); c.aspect = float(w / h);
         c.depth_inverted = reversed ? 1u : 0u;
@@ -499,7 +704,9 @@ private:
     int game_fov_mode_ = 0;
     std::vector<double> game_votes_v_, game_votes_h_;
     V3 last_omega_{}, last_translation_{}, position_{};
-    std::uint64_t frames_ = 0, rejected_ = 0;
+    std::uint32_t epoch_ = 0;  // times the position started again from zero
+    std::uint64_t frames_ = 0, rejected_ = 0, consensus_ = 0, samples_ = 0, samples_valid_ = 0;
+    std::uint64_t locked_frames_ = 0, locked_rejected_ = 0;
     bool last_rejected_ = false;
 };
 

@@ -21,6 +21,7 @@ struct IngestedSource {
     std::uint32_t color_w = 0, color_h = 0;
     Rect2 color_rect, depth_rect;
     bool has_motion = false;  // game motion vectors converted into the private motion texture
+    bool motion_estimated = false;  // ...or none from the game: XPAR's own, estimated from the picture
 };
 
 // HUD detection frames: learned from, skipped for too few telling pixels, or held back by the
@@ -172,11 +173,16 @@ public:
         if (split_) return shown_mask_ ? front_[kPMask].texture.Get() : nullptr;
         return mask_ready_ ? private_[kPMask].texture.Get() : nullptr;
     }
-    void reset_hud_detection() { reset_hud_ = true; mask_ready_ = false; shown_mask_ = false; mem_last_ = -1; }
+    void reset_hud_detection() { reset_hud_ = true; mask_ready_ = false; shown_mask_ = false; mem_last_ = -1; flow_previous_ = false; }
 
     // Test/diagnostic helper: synchronously reads back the warped output (RGBA16F) or private backbuffer.
     // which: 0 the game's frame, 1 the warped output, 2 the upscaler's output (scene before HUD).
+    // (10-12: the picture, depth and motion vectors kept by stash_source; 13: own motion estimation's displacements)
     bool read_back(int which, std::vector<std::uint16_t>& pixels, std::uint32_t& w, std::uint32_t& h);
+    // Diagnostics: keeps a copy of the current game frame's picture, depth and motion vectors on the GPU (a
+    // few milliseconds, nothing is read back), so a capture taken on the next game frame holds two
+    // consecutive ones.
+    void stash_source();
 
 private:
     struct Private {
@@ -185,7 +191,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     };
-    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPDest, kPExtrap, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPCount };
+    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPDest, kPExtrap, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPStashColor, kPStashDepth, kPStashMotion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPCount };
 
     bool create_pipelines(std::string& error);
     // The format a private copy of a game colour image is kept in: the game's own 4-byte format when it
@@ -231,6 +237,13 @@ private:
     std::uint64_t pending_show_ = 0;   // intake fence value after which the written set can be shown
     std::uint64_t release_wait_ = 0;   // realtime fence value the intake waits for before rewriting (swap)
     bool built_mask_ = false, shown_mask_ = false, shown_fill_ = false, stretch_built_ = false, shown_stretch_ = false;
+    // Own motion estimation (games that give depth but no motion vectors): fills the motion texture from
+    // the picture of this game frame and the previous one. Called by ingest, between the depth and the
+    // motion samples.
+    void estimate_motion(DXGI_FORMAT colour);
+    int flow_luma_ = 0;            // which brightness pyramid holds the previous frame
+    bool flow_previous_ = false;   // ...and whether it does (false: no motion this frame)
+    bool own_motion_ = false;      // the current frame's motion vectors are XPAR's own (samples: confident ones only)
     int mem_last_ = -1, mem_shown_ = -1, mem_pending_ = -1;  // background memory buffer written last / read by the warp / of the frame to show
     ID3D12CommandQueue* context_queue() const { return context_ ? iqueue_.Get() : queue_.Get(); }
     ComPtr<IDXGIFactory4> factory_;
@@ -244,7 +257,7 @@ private:
     const char* priority_name_ = "normal";
 
     ComPtr<ID3D12RootSignature> root_, root_x_;
-    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_clear_, cs_splat_, cs_gather_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_memory_, cs_ramp_rows_, cs_ramp_;
+    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_clear_, cs_splat_, cs_gather_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_memory_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_;
     ComPtr<ID3D12Resource> samples_, samples_readback_;
     UINT samples_count_ = 0;
     float last_flush_ms_ = 0;

@@ -1,5 +1,8 @@
 #include "shared/camera_motion.hpp"
 #include "shared/camera_check.hpp"
+#include "addon/depth_probe_score.hpp"
+#include <random>
+#include <vector>
 #include <cstdio>
 
 using namespace fw;
@@ -111,7 +114,40 @@ static void camera_check_tests() {
     }
 }
 
+// Which depth buffer belongs to the picture: a probe of a scene (ground receding into the distance, two
+// nearer boxes that are also drawn differently in the picture) against the same picture with the right
+// depth, the depth turned round, another view's depth, only part of the scene and an empty buffer.
+static void depth_probe_tests() {
+    const std::uint32_t w = 256, h = 144;
+    std::mt19937 rng(3);
+    std::uniform_real_distribution<float> noise(-0.03f, 0.03f);
+    auto in_box = [](int x, int y, int k) { return k == 0 ? (x > 40 && x < 90 && y > 50 && y < 120) : (x > 150 && x < 200 && y > 30 && y < 80); };
+    std::vector<float> right(w * h * 2), turned(w * h * 2), other(w * h * 2), partial(w * h * 2), empty(w * h * 2);
+    for (std::uint32_t y = 0; y < h; ++y)
+        for (std::uint32_t x = 0; x < w; ++x) {
+            const std::size_t i = (std::size_t(y) * w + x) * 2;
+            const bool box = in_box(int(x), int(y), 0) || in_box(int(x), int(y), 1);
+            const float ground = y < 40 ? 0.0f : 0.002f + 0.02f * float(y - 40) / float(h - 40);  // sky above
+            const float depth = box ? 0.08f : ground;
+            const float luma = (box ? 0.25f : y < 40 ? 0.8f : 0.55f) + noise(rng);
+            right[i] = depth; right[i + 1] = luma;
+            turned[i] = 1.0f - depth; turned[i + 1] = luma;
+            // (another view: the same scene mirrored left to right)
+            const bool mbox = in_box(int(w - 1 - x), int(y), 0) || in_box(int(w - 1 - x), int(y), 1);
+            other[i] = mbox ? 0.08f : ground; other[i + 1] = luma;
+            partial[i] = in_box(int(x), int(y), 0) ? 0.08f : 0.0f; partial[i + 1] = luma;
+            empty[i] = 0.0f; empty[i + 1] = luma;
+        }
+    const auto r = fw::score_depth_probe(right.data(), w, h), t = fw::score_depth_probe(turned.data(), w, h), o = fw::score_depth_probe(other.data(), w, h),
+               p = fw::score_depth_probe(partial.data(), w, h), e = fw::score_depth_probe(empty.data(), w, h);
+    std::printf("depth probe: right %.2f, turned round %.2f, another view %.2f, part of the scene %.2f, empty %.2f\n", r.score, t.score, o.score, p.score, e.score);
+    EXPECT(r.score > 2.0, "the right depth stands out (%.2f)", r.score);
+    EXPECT(t.score > 0.8 * r.score, "whichever way round it is stored (%.2f against %.2f)", t.score, r.score);
+    EXPECT(o.score < 0.5 * r.score && p.score < 0.5 * r.score && e.score == 0.0, "another view's, a partial and an empty one do not (%.2f, %.2f, %.2f)", o.score, p.score, e.score);
+}
+
 int main() {
+    depth_probe_tests();
     camera_check_tests();
     zoom_is_not_motion(1.06, {0, 0, 0});
     zoom_is_not_motion(0.94, {0, 0, -30});

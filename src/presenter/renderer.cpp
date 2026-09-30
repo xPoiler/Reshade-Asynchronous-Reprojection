@@ -364,11 +364,16 @@ bool hud_follows_world(uint2 id) {
 }
 
 // Motion/depth samples on a grid (mv_size = grid size) over the render rect, for camera estimation.
+// flags bit 1: the motion vectors are XPAR's own (see cs_flow_lk) - a sample counts only where they are
+// confident (t2: the displacements, out_size: their size).
+Texture2D<float4> sample_flow_t : register(t2);
 RWStructuredBuffer<float4> sample_u : register(u0);
 [numthreads(8, 8, 1)] void cs_sample(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= mv_size)) return;
     const uint2 p = rect.xy + uint2((float2(id.xy) + 0.5) * float2(rect.zw) / float2(mv_size));
-    sample_u[id.y * mv_size.x + id.x] = float4(motion_t.Load(int3(p, 0)), depth_t.Load(int3(p, 0)), 1);
+    float valid = 1;
+    if (flags & 2) valid = sample_flow_t.Load(int3(min(uint2((float2(id.xy) + 0.5) * float2(out_size) / float2(mv_size)), out_size - 1), 0)).z;
+    sample_u[id.y * mv_size.x + id.x] = float4(motion_t.Load(int3(p, 0)), depth_t.Load(int3(p, 0)), valid);
 }
 
 [numthreads(8, 8, 1)] void cs_clear_score(uint3 id : SV_DispatchThreadID) { if (all(id.xy < out_size)) hud_score_u[id.xy] = 0; }
@@ -938,6 +943,225 @@ RWTexture2D<float> memz_u : register(u1);
     memz_u[id.xy] = z;
 }
 
+// XPAR's own motion estimation, for games that give depth but no motion vectors (no DLSS or FSR: depth
+// from ReShade). From the picture of this game frame and of the one before: for every pixel of a grid
+// half the render grid's size, where that pixel was in the previous frame.
+//  - Both pictures as brightness, in a pyramid of 5 levels (each half the one before; all in one texture,
+//    level 0 at the origin and the others stacked to its right).
+//  - Coarse to fine. At the coarsest level every pixel first tries whole-pixel displacements of its 5x5
+//    window (fast turns: up to 12 px there, 384 px of the render grid). Then, level by level, the
+//    displacement is refined (Lucas-Kanade, inverse-compositional: the brightness gradients of this frame,
+//    one bilinear sample of the previous frame per window pixel, the window sharing one displacement),
+//    with a 3x3 median after every level.
+//  - A pixel's displacement counts as known (confident) where its window has detail in both directions
+//    and the two frames agree there once matched; rain, water, flat sky and moving things do not.
+// Motion vectors in uv to the previous frame (as a game's) go to the motion texture; the camera is
+// estimated from the confident ones.
+// grid: level 0 size; rect.x: level; rect.y: 1 = take the displacement from the coarser level (x2).
+static const uint kFlowLevels = 5;
+static const int kFlowWindow = 2;        // 5x5
+static const float kFlowNoise = 1e-5;    // brightness gradient energy below which a window has no detail
+static const float kFlowRatio = 0.8;     // left-over difference allowed per unit of detail
+uint2 fl_size(uint k) { return max(grid >> k, uint2(1, 1)); }
+uint2 fl_origin(uint k) {
+    if (k == 0) return uint2(0, 0);
+    uint y = 0;
+    for (uint j = 1; j < k; ++j) y += fl_size(j).y;
+    return uint2(grid.x, y);
+}
+float2 fl_atlas() { return float2(grid.x + fl_size(1).x, grid.y); }
+// (flags bit 0: the picture is linear HDR - compressed so that dark and bright detail weigh alike)
+float fl_tone(float3 c) {
+    const float l = dot(max(c, 0), float3(0.299, 0.587, 0.114));
+    return (flags & 1) ? sqrt(l / (1.0 + l)) : l;
+}
+Texture2D<float4> fl_color_t : register(t0);
+RWTexture2D<float> fl_luma_u : register(u0);
+[numthreads(8, 8, 1)] void cs_flow_luma(uint3 id : SV_DispatchThreadID) {
+    uint k = 0;
+    uint2 p = id.xy;
+    if (id.x >= grid.x) {
+        bool found = false;
+        for (uint j = 1; j < kFlowLevels && !found; ++j) {
+            const uint2 o = fl_origin(j), s = fl_size(j);
+            if (all(id.xy >= o) && all(id.xy < o + s)) { k = j; p = id.xy - o; found = true; }
+        }
+        if (!found) return;
+    } else if (id.y >= grid.y) return;
+    // The part of the picture this pixel stands for, averaged (bilinear taps two source pixels apart).
+    const float2 span = float2(out_size) / float2(grid) * float(1u << k);
+    const int n = clamp(int(ceil(max(span.x, span.y) * 0.5)), 1, 32);
+    float sum = 0;
+    [loop] for (int j = 0; j < n; ++j)
+        [loop] for (int i = 0; i < n; ++i)
+            sum += fl_tone(fl_color_t.SampleLevel(ow_linear, (float2(p) + (float2(i, j) + 0.5) / float(n)) * span / float2(out_size), 0).rgb);
+    fl_luma_u[id.xy] = sum / float(n * n);
+}
+// Brightness and its gradients (x: brightness, y/z: central differences, 0 on a level's border).
+Texture2D<float> fl_luma_t : register(t0);
+RWTexture2D<float4> fl_feat_u : register(u0);
+[numthreads(8, 8, 1)] void cs_flow_feat(uint3 id : SV_DispatchThreadID) {
+    uint k = 0;
+    int2 p = int2(id.xy);
+    if (id.x >= grid.x) {
+        bool found = false;
+        for (uint j = 1; j < kFlowLevels && !found; ++j) {
+            const uint2 o = fl_origin(j), s = fl_size(j);
+            if (all(id.xy >= o) && all(id.xy < o + s)) { k = j; p = int2(id.xy - o); found = true; }
+        }
+        if (!found) return;
+    } else if (id.y >= grid.y) return;
+    const int2 o = int2(fl_origin(k)), last = int2(fl_size(k)) - 1;
+    const float gx = (p.x > 0 && p.x < last.x) ? 0.5 * (fl_luma_t.Load(int3(o + p + int2(1, 0), 0)) - fl_luma_t.Load(int3(o + p - int2(1, 0), 0))) : 0.0;
+    const float gy = (p.y > 0 && p.y < last.y) ? 0.5 * (fl_luma_t.Load(int3(o + p + int2(0, 1), 0)) - fl_luma_t.Load(int3(o + p - int2(0, 1), 0))) : 0.0;
+    fl_feat_u[id.xy] = float4(fl_luma_t.Load(int3(o + p, 0)), gx, gy, 0);
+}
+Texture2D<float4> fl_feat_t : register(t0);   // this frame: brightness and gradients
+Texture2D<float> fl_prev_t : register(t1);    // the previous frame's brightness
+Texture2D<float4> fl_flow_t : register(t2);   // displacement so far (px of its level), z: confident
+RWTexture2D<float4> fl_flow_u : register(u0);
+// The previous frame's brightness at a position of level k (pixel centres at +0.5), clamped to the level.
+float fl_prev(uint k, float2 pos) {
+    const float2 s = float2(fl_size(k));
+    return fl_prev_t.SampleLevel(ow_linear, (float2(fl_origin(k)) + clamp(pos, 0.5, s - 0.5)) / fl_atlas(), 0);
+}
+[numthreads(8, 8, 1)] void cs_flow_search(uint3 id : SV_DispatchThreadID) {
+    const uint k = rect.x;
+    const int2 size = int2(fl_size(k)), o = int2(fl_origin(k));
+    if (any(int2(id.xy) >= size)) return;
+    float c[25];
+    [unroll] for (int j = 0; j < 25; ++j)
+        c[j] = fl_feat_t.Load(int3(o + clamp(int2(id.xy) + int2(j % 5 - 2, j / 5 - 2), int2(0, 0), size - 1), 0)).x;
+    const int reach = int(rect.z);
+    float best = 1e9;
+    int2 shift = int2(0, 0);
+    [loop] for (int sy = -reach; sy <= reach; ++sy)
+        [loop] for (int sx = -reach; sx <= reach; ++sx) {
+            float e = 1e-4 * float(abs(sx) + abs(sy)) * 25.0;  // (equal matches: the smaller displacement)
+            [unroll] for (int j = 0; j < 25; ++j) {
+                const int2 q = clamp(clamp(int2(id.xy) + int2(j % 5 - 2, j / 5 - 2), int2(0, 0), size - 1) + int2(sx, sy), int2(0, 0), size - 1);
+                e += abs(c[j] - fl_prev_t.Load(int3(o + q, 0)));
+            }
+            if (e < best) { best = e; shift = int2(sx, sy); }
+        }
+    fl_flow_u[id.xy] = float4(shift, 0, 0);
+}
+// One refinement of a pixel's displacement; z of the result: confident (written by the last pass, flags bit 1).
+[numthreads(8, 8, 1)] void cs_flow_lk(uint3 id : SV_DispatchThreadID) {
+    const uint k = rect.x;
+    const int2 size = int2(fl_size(k)), o = int2(fl_origin(k));
+    if (any(int2(id.xy) >= size)) return;
+    float2 u;
+    if (rect.y) {
+        uint tw, th;
+        fl_flow_t.GetDimensions(tw, th);
+        const float2 coarse = float2(fl_size(k + 1));
+        u = 2.0 * fl_flow_t.SampleLevel(ow_linear, clamp((float2(id.xy) + 0.5) / float2(size) * coarse, 0.5, coarse - 0.5) / float2(tw, th), 0).xy;
+    } else {
+        u = fl_flow_t.Load(int3(id.xy, 0)).xy;
+    }
+    float sxx = 0, sxy = 0, syy = 0, bx = 0, by = 0, rr = 0;
+    [loop] for (int dy = -kFlowWindow; dy <= kFlowWindow; ++dy)
+        [loop] for (int dx = -kFlowWindow; dx <= kFlowWindow; ++dx) {
+            const int2 q = clamp(int2(id.xy) + int2(dx, dy), int2(0, 0), size - 1);
+            const float3 f = fl_feat_t.Load(int3(o + q, 0)).xyz;
+            const float d = f.x - fl_prev(k, float2(q) + 0.5 + u);
+            sxx += f.y * f.y; sxy += f.y * f.z; syy += f.z * f.z;
+            bx += f.y * d; by += f.z * d; rr += d * d;
+        }
+    const float n = float((2 * kFlowWindow + 1) * (2 * kFlowWindow + 1));
+    sxx /= n; sxy /= n; syy /= n; bx /= n; by /= n; rr /= n;
+    if (flags & 2) {
+        // Confident: detail in both directions (the smaller eigenvalue of the window's gradient matrix) and
+        // little left between the two frames once matched.
+        const float tr = sxx + syy;
+        const float lmin = 0.5 * (tr - sqrt(max(tr * tr - 4.0 * (sxx * syy - sxy * sxy), 0.0)));
+        fl_flow_u[id.xy] = float4(u, (lmin > kFlowNoise && rr < kFlowRatio * lmin + kFlowNoise) ? 1.0 : 0.0, 0);
+        return;
+    }
+    const float lam = 1e-7;
+    const float det = (sxx + lam) * (syy + lam) - sxy * sxy;
+    float2 du = float2((syy + lam) * bx - sxy * by, (sxx + lam) * by - sxy * bx) / det;
+    du *= min(1.0, threshold / max(length(du), 1e-9));  // (at most `threshold` px per refinement)
+    fl_flow_u[id.xy] = float4(u + du, 0, 0);
+}
+[numthreads(8, 8, 1)] void cs_flow_median(uint3 id : SV_DispatchThreadID) {
+    const int2 size = int2(fl_size(rect.x));
+    if (any(int2(id.xy) >= size)) return;
+    float2 v[9];
+    [unroll] for (int j = 0; j < 9; ++j) v[j] = fl_flow_t.Load(int3(clamp(int2(id.xy) + int2(j % 3 - 1, j / 3 - 1), int2(0, 0), size - 1), 0)).xy;
+    // (a sorting network for the median of 9, per component)
+#define FL_SORT(a, b) { const float2 lo = min(v[a], v[b]); v[b] = max(v[a], v[b]); v[a] = lo; }
+    FL_SORT(1, 2) FL_SORT(4, 5) FL_SORT(7, 8) FL_SORT(0, 1) FL_SORT(3, 4) FL_SORT(6, 7) FL_SORT(1, 2) FL_SORT(4, 5) FL_SORT(7, 8)
+    FL_SORT(0, 3) FL_SORT(5, 8) FL_SORT(4, 7) FL_SORT(3, 6) FL_SORT(1, 4) FL_SORT(2, 5) FL_SORT(4, 7) FL_SORT(4, 2) FL_SORT(6, 4) FL_SORT(4, 2)
+#undef FL_SORT
+    fl_flow_u[id.xy] = float4(v[4], 0, 0);
+}
+// Where nothing is known (flat sand, sky, a plain wall) the displacement found is a guess, and the masks
+// would take it at its word: ground that seems to stand still while the camera turns counts as attached
+// to the camera. Those pixels take the displacement of the known ones around them instead: the known
+// displacements are averaged down a pyramid (levels laid out like the brightness pyramid, in the
+// displacement textures; z: how much of a pixel is known), and on the way back up every pixel that knows
+// nothing takes the coarser level's. Displacements stay in level-0 px at every level.
+// During a turn the side of the picture that has just come into view has no previous position at all,
+// yet something there always matches something: once the pyramid's top says how the picture moved as a
+// whole, a pixel that would have come from outside the previous picture is not known after all (mode 3),
+// and the pyramid is built again without those.
+// rect.x: the level written; rect.y: 0 average the level above it, 1 copy, 2 own where known, else from
+// the coarser level, 3 level 0 without what came from outside (rect.z: the top level).
+[numthreads(8, 8, 1)] void cs_flow_fill(uint3 id : SV_DispatchThreadID) {
+    const uint k = rect.x;
+    const int2 size = int2(fl_size(k)), o = int2(fl_origin(k));
+    if (any(int2(id.xy) >= size)) return;
+    float4 r = 0;
+    if (rect.y == 0) {
+        const int2 fs = int2(fl_size(k - 1)), fo = int2(fl_origin(k - 1));
+        float3 sum = 0;
+        [unroll] for (int j = 0; j < 4; ++j) {
+            const float4 v = fl_flow_t.Load(int3(fo + min(int2(id.xy) * 2 + int2(j & 1, j >> 1), fs - 1), 0));
+            sum += float3(v.xy * v.z, v.z);
+        }
+        if (sum.z > 0) r = float4(sum.xy / sum.z, sum.z * 0.25, 0);
+    } else if (rect.y == 1) {
+        r = fl_flow_t.Load(int3(o + int2(id.xy), 0));
+    } else if (rect.y == 3) {
+        r = fl_flow_t.Load(int3(id.xy, 0));
+        const int2 ts = int2(fl_size(rect.z)), to = int2(fl_origin(rect.z));
+        float3 whole = 0;
+        [loop] for (int y = 0; y < ts.y; ++y)
+            [loop] for (int x = 0; x < ts.x; ++x) {
+                const float4 v = fl_flow_t.Load(int3(to + int2(x, y), 0));
+                whole += float3(v.xy * v.z, v.z);
+            }
+        if (whole.z > 0) {
+            const float2 from = float2(id.xy) + 0.5 + whole.xy / whole.z;
+            if (any(from < 0.0) || any(from > float2(size))) r.z = 0;
+        }
+    } else {
+        r = fl_flow_t.Load(int3(o + int2(id.xy), 0));
+        if (r.z <= 0) {
+            uint tw, th;
+            fl_flow_t.GetDimensions(tw, th);
+            const float2 cs = float2(fl_size(k + 1));
+            const float2 at = float2(fl_origin(k + 1)) + clamp((float2(id.xy) + 0.5) / float2(size) * cs, 0.5, cs - 0.5);
+            r = float4(fl_flow_t.SampleLevel(ow_linear, at / float2(tw, th), 0).xy, 0, 0);
+        }
+    }
+    fl_flow_u[o + int2(id.xy)] = r;
+}
+// The motion texture (mv_size: its size, the render grid): uv to the previous frame. flags bit 2: no
+// previous frame yet - no motion.
+RWTexture2D<float2> fl_motion_u : register(u0);
+[numthreads(8, 8, 1)] void cs_flow_motion(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= mv_size)) return;
+    if (flags & 4) { fl_motion_u[id.xy] = float2(0, 0); return; }
+    uint tw, th;
+    fl_flow_t.GetDimensions(tw, th);
+    const float2 g = float2(grid);
+    const float2 u = fl_flow_t.SampleLevel(ow_linear, clamp((float2(id.xy) + 0.5) / float2(mv_size) * g, 0.5, g - 0.5) / float2(tw, th), 0).xy;
+    fl_motion_u[id.xy] = u / g;
+}
+
 // Debug view on the warped output: masked pixels magenta, HUD score still below the threshold green
 // (learned HUD only, flag 1: with the upscaler's output there is nothing being learned).
 Texture2D<unorm float> tint_mask_t : register(t0);
@@ -954,11 +1178,12 @@ RWTexture2D<float4> tint_u : register(u0);
 
 // Descriptor layout in the shader-visible heap.
 constexpr UINT kSrcSrv = 0;         // + slot * kTexCount + kind: shared textures
+constexpr UINT kPrivMax = 48;       // private textures at most
 constexpr UINT kPrivUav = 32;       // + private id
-constexpr UINT kPrivSrv = 64;       // + private id
+constexpr UINT kPrivSrv = kPrivUav + kPrivMax;  // + private id
 // Extrapolation tables (6 SRVs t0-t5, 2 UAVs u0-u1 each).
 constexpr UINT kXSrvCount = 6;
-constexpr UINT kX = 96;  // first table
+constexpr UINT kX = kPrivSrv + kPrivMax;  // first table
 constexpr UINT kXAnalyzeSrv = kX + 0, kXAnalyzeUav = kX + 6, kXReduceUav = kX + 8, kXSplatSrv = kX + 10, kXSplatUav = kX + 16;
 constexpr UINT kXGatherSrvHudless = kX + 18, kXGatherSrvBackbuffer = kX + 24, kXGatherUav = kX + 30;
 constexpr UINT kXHudSrv = kX + 32, kXHudUav = kX + 38, kXMaskSrv = kX + 40, kXMaskUav = kX + 46, kXSampleSrv = kX + 48, kXSampleUav = kX + 54;
@@ -966,7 +1191,10 @@ constexpr UINT kXTintSrv = kX + 56, kXTintUav = kX + 62, kXSceneSrv = kX + 64, k
 constexpr UINT kXAttSrv = kX + 80, kXAttUav = kX + 86, kXWorldUav = kX + 88, kXFillSrv = kX + 90, kXFillUav = kX + 96;
 constexpr UINT kXMemSrv = kX + 98, kXMemUav = kX + 104, kXRowsSrv = kX + 106, kXRowsUav = kX + 112;
 constexpr UINT kXRampSrv = kX + 114, kXRampUav = kX + 120;
-constexpr UINT kHeapSize = kX + 122;
+// Own motion estimation: one table of 6 SRVs + 2 UAVs per pass and direction (see estimate_motion).
+constexpr UINT kXFlow = kX + 122;
+enum FlowTable : UINT { kFlowLuma, kFlowFeat, kFlowSearch, kFlowMedianAB, kFlowMedianBA, kFlowLkAB, kFlowLkBA, kFlowMotion, kFlowFillAB, kFlowFillBA, kFlowTables };
+constexpr UINT kHeapSize = kXFlow + kFlowTables * 8;
 constexpr float kMemMargin = 0.125f;  // as in the shaders
 // Scene HUD fit buffer (see cs_scene_*): curve accumulators and curves, wash-out accumulators and
 // values, 2 tile sets, HUD pixel count (same layout as the shader's constants).
@@ -1210,7 +1438,9 @@ bool Renderer::create_pipelines(std::string& error) {
         {"cs_scene_clear", &cs_scene_clear_}, {"cs_scene_accum", &cs_scene_accum_}, {"cs_scene_finish", &cs_scene_finish_},
         {"cs_scene_tiles", &cs_scene_tiles_}, {"cs_scene_hud", &cs_scene_hud_}, {"cs_scene_fill", &cs_scene_fill_}, {"cs_scene_grey", &cs_scene_grey_},
         {"cs_scene_grey_finish", &cs_scene_grey_finish_}, {"cs_scene_wash", &cs_scene_wash_}, {"cs_scene_wash_finish", &cs_scene_wash_finish_},
-        {"cs_own_warp", &cs_own_warp_}, {"cs_attached", &cs_attached_}, {"cs_memory", &cs_memory_}, {"cs_ramp_rows", &cs_ramp_rows_}, {"cs_ramp", &cs_ramp_}};
+        {"cs_own_warp", &cs_own_warp_}, {"cs_attached", &cs_attached_}, {"cs_memory", &cs_memory_}, {"cs_ramp_rows", &cs_ramp_rows_}, {"cs_ramp", &cs_ramp_},
+        {"cs_flow_luma", &cs_flow_luma_}, {"cs_flow_feat", &cs_flow_feat_}, {"cs_flow_search", &cs_flow_search_}, {"cs_flow_lk", &cs_flow_lk_},
+        {"cs_flow_median", &cs_flow_median_}, {"cs_flow_motion", &cs_flow_motion_}, {"cs_flow_fill", &cs_flow_fill_}};
     for (auto& x : xs) {
         auto code = compile(x.entry, "cs_5_0", error, kShadersX);
         if (!code) return false;
@@ -1704,7 +1934,8 @@ bool Renderer::record_motion_samples(const IngestedSource& src, std::uint32_t gr
     }
     set_x_srv(kXSampleSrv + 0, kPDepth);
     set_x_srv(kXSampleSrv + 1, kPMotion);
-    for (UINT i = 2; i < kXSrvCount; ++i) set_x_srv(kXSampleSrv + i, kPDepth);
+    set_x_srv(kXSampleSrv + 2, own_motion_ ? kPFlowB : kPDepth);  // (the displacements found, with their confidence)
+    for (UINT i = 3; i < kXSrvCount; ++i) set_x_srv(kXSampleSrv + i, kPDepth);
     D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
     d.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; d.Format = DXGI_FORMAT_UNKNOWN;
     d.Buffer.NumElements = count; d.Buffer.StructureByteStride = 16;
@@ -1716,6 +1947,7 @@ bool Renderer::record_motion_samples(const IngestedSource& src, std::uint32_t gr
     c.rect[0] = r.x; c.rect[1] = r.y; c.rect[2] = std::min(r.w, w - r.x); c.rect[3] = std::min(r.h, h - r.y);
     c.grid[0] = w; c.grid[1] = h;
     c.mv_size[0] = grid_w; c.mv_size[1] = grid_h;
+    if (own_motion_) { c.flags = 2; c.out_size[0] = std::max(1u, w / 2); c.out_size[1] = std::max(1u, h / 2); }  // (level 0 of the displacements)
     x_dispatch(cs_sample_.Get(), &c, kXSampleSrv, kXSampleUav, (grid_w + 7) / 8, (grid_h + 7) / 8);
     auto to_copy = transition_barrier(samples_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     list_->ResourceBarrier(1, &to_copy);
@@ -2120,6 +2352,101 @@ void Renderer::convert(ID3D12Resource* source, DXGI_FORMAT source_format, int sl
     transition(p, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 }
 
+void Renderer::estimate_motion(DXGI_FORMAT colour) {
+    const UINT W = private_[kPDepth].width, H = private_[kPDepth].height;
+    const UINT w0 = std::max(1u, W / 2), h0 = std::max(1u, H / 2);  // level 0: half the render grid
+    constexpr UINT kLevels = 5;
+    auto level_w = [&](UINT k) { return std::max(1u, w0 >> k); };
+    auto level_h = [&](UINT k) { return std::max(1u, h0 >> k); };
+    const UINT aw = w0 + level_w(1), ah = h0;  // the pyramid in one texture (see cs_flow_luma)
+    const bool same = private_[kPLumaA].texture && private_[kPLumaA].width == aw && private_[kPLumaA].height == ah;
+    if (!ensure_private(kPLumaA, aw, ah, DXGI_FORMAT_R16_FLOAT) || !ensure_private(kPLumaB, aw, ah, DXGI_FORMAT_R16_FLOAT) ||
+        !ensure_private(kPFeat, aw, ah, DXGI_FORMAT_R16G16B16A16_FLOAT) || !ensure_private(kPFlowA, aw, ah + 8, DXGI_FORMAT_R16G16B16A16_FLOAT) ||
+        !ensure_private(kPFlowB, aw, ah + 8, DXGI_FORMAT_R16G16B16A16_FLOAT)) return;  // (+8: room for the fill's smallest levels)
+    if (!same) flow_previous_ = false;
+    const PrivateId now = flow_luma_ ? kPLumaA : kPLumaB, before = flow_luma_ ? kPLumaB : kPLumaA;  // (flow_luma_: which one holds the previous frame)
+    XConstants c{};
+    c.grid[0] = w0; c.grid[1] = h0;
+    c.out_size[0] = private_[kPBackbuffer].width; c.out_size[1] = private_[kPBackbuffer].height;
+    c.mv_size[0] = W; c.mv_size[1] = H;
+    c.threshold = 1.5f;
+    const std::uint32_t tone = colour == DXGI_FORMAT_R16G16B16A16_FLOAT ? 1u : 0u;
+    auto table = [&](FlowTable t, PrivateId s0, PrivateId s1, PrivateId s2, PrivateId out) {
+        const UINT base = kXFlow + t * 8;
+        set_x_srv(base + 0, s0); set_x_srv(base + 1, s1); set_x_srv(base + 2, s2);
+        for (UINT i = 3; i < kXSrvCount; ++i) set_x_srv(base + i, s0);
+        set_x_uav(base + 6, out); set_x_uav(base + 7, out);
+        return base;
+    };
+    auto run = [&](ID3D12PipelineState* pso, UINT base, PrivateId out, UINT w, UINT h) {
+        transition(private_[out], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        x_dispatch(pso, &c, base, base + 6, (w + 7) / 8, (h + 7) / 8);
+        transition(private_[out], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    };
+    // This frame's brightness pyramid and gradients.
+    c.flags = tone;
+    run(cs_flow_luma_.Get(), table(kFlowLuma, kPBackbuffer, kPBackbuffer, kPBackbuffer, now), now, aw, ah);
+    c.flags = 0;
+    run(cs_flow_feat_.Get(), table(kFlowFeat, now, now, now, kPFeat), kPFeat, aw, ah);
+    const UINT motion = table(kFlowMotion, kPFeat, before, kPFlowA, kPMotion);  // (the filled displacements end in A)
+    if (flow_previous_) {
+        const UINT lk_ab = table(kFlowLkAB, kPFeat, before, kPFlowA, kPFlowB), lk_ba = table(kFlowLkBA, kPFeat, before, kPFlowB, kPFlowA);
+        const UINT med_ab = table(kFlowMedianAB, kPFeat, before, kPFlowA, kPFlowB), med_ba = table(kFlowMedianBA, kPFeat, before, kPFlowB, kPFlowA);
+        bool in_a = true;  // which texture holds the displacements so far
+        auto step = [&](ID3D12PipelineState* pso, UINT k) {
+            run(pso, pso == cs_flow_median_.Get() ? (in_a ? med_ab : med_ba) : (in_a ? lk_ab : lk_ba), in_a ? kPFlowB : kPFlowA, level_w(k), level_h(k));
+            in_a = !in_a;
+        };
+        // Coarsest level: whole-pixel search, then the refinements; every level ends with a median.
+        c.rect[0] = kLevels - 1; c.rect[1] = 0; c.rect[2] = 12;
+        run(cs_flow_search_.Get(), table(kFlowSearch, kPFeat, before, kPFeat, kPFlowA), kPFlowA, level_w(kLevels - 1), level_h(kLevels - 1));
+        step(cs_flow_median_.Get(), kLevels - 1);
+        static constexpr int kRefinements[kLevels] = {1, 2, 3, 3, 4};
+        for (int k = kLevels - 1; k >= 0; --k) {
+            c.rect[0] = static_cast<std::uint32_t>(k);
+            for (int i = 0; i < kRefinements[k]; ++i) {
+                c.rect[1] = (i == 0 && k != int(kLevels) - 1) ? 1u : 0u;  // from the coarser level
+                step(cs_flow_lk_.Get(), static_cast<UINT>(k));
+            }
+            c.rect[1] = 0;
+            step(cs_flow_median_.Get(), static_cast<UINT>(k));
+        }
+        // Which displacements are known (always ends in A: 1 + 13 refinements + 5 medians + this = 20 passes).
+        c.rect[0] = 0; c.rect[1] = 0; c.flags = 2;
+        step(cs_flow_lk_.Get(), 0);
+        c.flags = 0;
+        // Filling in what is not known (see cs_flow_fill). A level's own displacements are in one texture
+        // for even levels and in the other for odd ones; the filled level j is written into the texture
+        // level j is not in, where the filled level j + 1 it needs also went. So every pass reads one
+        // texture and writes the other, and level 0 ends own and confident in B, for the camera estimate,
+        // and filled in A, for the motion texture.
+        const UINT fill_ab = table(kFlowFillAB, kPFeat, before, kPFlowA, kPFlowB), fill_ba = table(kFlowFillBA, kPFeat, before, kPFlowB, kPFlowA);
+        auto fill = [&](UINT level, UINT mode, bool from_a) {
+            c.rect[0] = level; c.rect[1] = mode;
+            run(cs_flow_fill_.Get(), from_a ? fill_ab : fill_ba, from_a ? kPFlowB : kPFlowA, level_w(level), level_h(level));
+        };
+        constexpr UINT kTop = 8;  // (an even level, a few pixels large: it ends in the texture level 0 is in)
+        for (UINT j = 1; j <= kTop; ++j) fill(j, 0, (j - 1) % 2 == 0);
+        // Level 0 again, in B, without what would have come from outside the previous picture; from here on
+        // B holds the even levels and the confident displacements the camera is estimated from.
+        c.rect[2] = kTop;
+        fill(0, 3, true);
+        for (UINT j = 1; j <= kTop; ++j) fill(j, 0, (j - 1) % 2 == 1);
+        fill(kTop, 1, false);
+        for (int j = int(kTop) - 1; j >= 0; --j) fill(static_cast<UINT>(j), 2, j % 2 == 1);
+        c.rect[0] = 0; c.rect[1] = 0;
+    } else {
+        // No previous frame: no motion, nothing known (a search that reaches nowhere writes zeros).
+        c.rect[0] = 0; c.rect[1] = 0; c.rect[2] = 0;
+        run(cs_flow_search_.Get(), table(kFlowSearch, kPFeat, before, kPFeat, kPFlowA), kPFlowA, w0, h0);
+        run(cs_flow_search_.Get(), table(kFlowFillAB, kPFeat, before, kPFeat, kPFlowB), kPFlowB, w0, h0);
+        c.flags = 4;
+    }
+    run(cs_flow_motion_.Get(), motion, kPMotion, W, H);
+    flow_luma_ ^= 1;
+    flow_previous_ = true;
+}
+
 IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::function<void(const IngestedSource&)>& after_depth) {
     IngestedSource out;
     const auto& m = shared.slots[slot];
@@ -2138,28 +2465,9 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
     list_->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
     mark_stage();  // shared textures made readable
 
-    const auto& dp = m.tex[kDepth];
-    if (sources[kDepth]) {
-        ensure_private(kPDepth, dp.width, dp.height, DXGI_FORMAT_R32_FLOAT);
-        ensure_private(kPMotion, dp.width, dp.height, DXGI_FORMAT_R16G16_FLOAT);
-        convert(sources[kDepth], static_cast<DXGI_FORMAT>(dp.format), slot, kDepth, kPDepth, dp.width, dp.height);
-        const auto& mv = m.tex[kMotion];
-        if (sources[kMotion]) {
-            convert(sources[kMotion], static_cast<DXGI_FORMAT>(mv.format), slot, kMotion, kPMotion,
-                    std::min(mv.width, dp.width), std::min(mv.height, dp.height));
-            out.has_motion = true;
-        }
-        out.depth_rect = {dp.ext_x, dp.ext_y, dp.ext_w, dp.ext_h};
-        out.has_depth = true;
-    }
-    // Depth and motion vectors are recorded first: a caller that needs them on the CPU (camera
-    // estimation) can flush here and wait for this small amount of work, before the 4K colour work.
-    if (after_depth) after_depth(out);
-    mark_stage();
-
-    out.color_w = bb.width; out.color_h = bb.height;
-    out.color_rect = {0, 0, bb.width, bb.height};
     const DXGI_FORMAT colour = colour_format(static_cast<DXGI_FORMAT>(bb.format));
+    // The game's picture (and the copy of the previous one the HUD detection compares it with).
+    auto take_colour = [&]() {
     ensure_private(kPBackbuffer, bb.width, bb.height, colour);
     ensure_private(kPOutput, bb.width, bb.height, colour);  // the warped frame: the same values as the game's
     if (keep_previous_ && ingested_ && split_) {
@@ -2183,6 +2491,40 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
         }
     }
     convert(sources[kBackbuffer], static_cast<DXGI_FORMAT>(bb.format), slot, kBackbuffer, kPBackbuffer, bb.width, bb.height);
+    };
+
+    const auto& dp = m.tex[kDepth];
+    // Depth without motion vectors, and no camera from the game (ReShade's depth, no DLSS or FSR): the
+    // motion is estimated from the picture, which is then taken first.
+    const bool estimate = sources[kDepth] && !sources[kMotion] && m.camera.estimated != 0;
+    own_motion_ = false;
+    if (sources[kDepth]) {
+        ensure_private(kPDepth, dp.width, dp.height, DXGI_FORMAT_R32_FLOAT);
+        ensure_private(kPMotion, dp.width, dp.height, DXGI_FORMAT_R16G16_FLOAT);
+        convert(sources[kDepth], static_cast<DXGI_FORMAT>(dp.format), slot, kDepth, kPDepth, dp.width, dp.height);
+        const auto& mv = m.tex[kMotion];
+        if (sources[kMotion]) {
+            convert(sources[kMotion], static_cast<DXGI_FORMAT>(mv.format), slot, kMotion, kPMotion,
+                    std::min(mv.width, dp.width), std::min(mv.height, dp.height));
+            out.has_motion = true;
+        } else if (estimate) {
+            take_colour();
+            estimate_motion(colour);
+            out.has_motion = true;
+            out.motion_estimated = true;
+            own_motion_ = true;
+        }
+        out.depth_rect = {dp.ext_x, dp.ext_y, dp.ext_w, dp.ext_h};
+        out.has_depth = true;
+    }
+    // Depth and motion vectors are recorded first: a caller that needs them on the CPU (camera
+    // estimation) can flush here and wait for this small amount of work, before the 4K colour work.
+    if (after_depth) after_depth(out);
+    mark_stage();
+
+    out.color_w = bb.width; out.color_h = bb.height;
+    out.color_rect = {0, 0, bb.width, bb.height};
+    if (!own_motion_) take_colour();
 
     const auto& hl = m.tex[kHudless];
     // HUD layers (games that send them) in half-float: the UI's alpha needs more than 2 bits.
@@ -2303,8 +2645,37 @@ void Renderer::finish_frame(bool warped, int marker) {
     signal();
 }
 
+void Renderer::stash_source() {
+    static const PrivateId kFrom[] = {kPBackbuffer, kPDepth, kPMotion}, kTo[] = {kPStashColor, kPStashDepth, kPStashMotion};
+    wait_idle();
+    context_ = 0; list_ = lists_[0]; frame_index_ = static_cast<std::uint32_t>(ring_pos_[0]);
+    for (int i = 0; i < 3; ++i) {
+        const auto& from = split_ && shown_id(kFrom[i]) ? front_[kFrom[i]] : private_[kFrom[i]];
+        if (from.texture) ensure_private(kTo[i], from.width, from.height, from.format);
+        else private_[kTo[i]] = Private{};
+    }
+    allocators_[frame_index_]->Reset();
+    list_->Reset(allocators_[frame_index_].Get(), nullptr);
+    for (int i = 0; i < 3; ++i) {
+        auto& from = split_ && shown_id(kFrom[i]) ? front_[kFrom[i]] : private_[kFrom[i]];
+        auto& to = private_[kTo[i]];
+        if (!from.texture || !to.texture) continue;
+        const auto before = from.state;
+        transition(from, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        transition(to, D3D12_RESOURCE_STATE_COPY_DEST);
+        list_->CopyResource(to.texture.Get(), from.texture.Get());
+        transition(from, before);
+        transition(to, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    list_->Close();
+    ID3D12CommandList* lists[] = {list_.Get()};
+    queue_->ExecuteCommandLists(1, lists);
+    wait_idle();
+}
+
 bool Renderer::read_back(int which, std::vector<std::uint16_t>& pixels, std::uint32_t& w, std::uint32_t& h) {
-    static const PrivateId kWhich[] = {kPBackbuffer, kPOutput, kPScene, kPDepth, kPMotion, kPObject, kPMask, kPHudScore, kPWorld, kPFill};
+    static const PrivateId kWhich[] = {kPBackbuffer, kPOutput, kPScene, kPDepth, kPMotion, kPObject, kPMask, kPHudScore, kPWorld, kPFill,
+                                       kPStashColor, kPStashDepth, kPStashMotion, kPFlowB};
     if (which < 0 || which >= int(std::size(kWhich))) return false;
     auto& p = split_ && shown_id(kWhich[which]) ? front_[kWhich[which]] : private_[kWhich[which]];
     if (!p.texture) return false;
@@ -2342,7 +2713,8 @@ bool Renderer::read_back(int which, std::vector<std::uint16_t>& pixels, std::uin
         const std::uint32_t sign = (x >> 16) & 0x8000u;
         const int e = int((x >> 23) & 0xFF) - 127 + 15;
         const std::uint32_t mant = x & 0x7FFFFFu;
-        if (e <= 0) return std::uint16_t(sign);
+        // (small values - distant reversed depth - as subnormal halves instead of zero)
+        if (e <= 0) return e < -10 ? std::uint16_t(sign) : std::uint16_t(sign | (((mant | 0x800000u) >> (1 - e)) + 0x1000u) >> 13);
         if (e >= 31) return std::uint16_t(sign | 0x7C00u);
         return std::uint16_t(sign | (std::uint32_t(e) << 10) | ((mant + 0x1000u) >> 13));
     };

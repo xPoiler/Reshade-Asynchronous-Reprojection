@@ -235,6 +235,7 @@ function Set-Cvar([string]$ini, [bool]$enable) {
 if ($Uninstall) {
     $info = if (Test-Path $record) { Get-Content -Raw $record | ConvertFrom-Json } else { $null }
     Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $binDir "FrameWarp.addon64")
+    Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $binDir "reshade-shaders\Shaders\XPAR.fx")
     # Some games copy their DLLs into a staging folder at launch (RE9: _storage_); remove those copies too.
     Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue $GameDir -Filter "FrameWarp.addon64" | Remove-Item -Force -ErrorAction SilentlyContinue
     $old = Join-Path $target "disabled\ReprojectionDiagnostics.addon64"
@@ -278,6 +279,12 @@ Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue $GameDir -Filter "Fra
     Where-Object { $_.DirectoryName -ne $binDir } |
     ForEach-Object { Copy-Item -Force (Join-Path $build "FrameWarp.addon64") $_.FullName; Write-Host "Updated staged copy: $($_.FullName)" }
 Copy-Item -Force (Join-Path $build "FrameWarp\FrameWarpPresenter.exe") $target
+# XPAR.fx (depth from ReShade, for games without DLSS or FSR) goes where ReShade keeps
+# its effects; without that folder ReShade has no ReShade.fxh for it either, so it is left out.
+$feed = @((Join-Path $build "XPAR.fx"), (Join-Path $root "shaders\XPAR.fx")) | Where-Object { Test-Path -PathType Leaf $_ } | Select-Object -First 1
+$shaderDir = Join-Path $binDir "reshade-shaders\Shaders"
+$feedInstalled = $false
+if ($feed -and (Test-Path -PathType Container $shaderDir)) { Copy-Item -Force $feed $shaderDir; $feedInstalled = $true }
 $latewarpTarget = Join-Path $target "nvngx_latewarp.dll"
 if ($latewarpDll -and (Resolve-Path $latewarpDll).Path -ne $latewarpTarget) { Copy-Item -Force $latewarpDll $latewarpTarget }
 # The previous prototype's add-on captures every frame through an effect; park it (reversible).
@@ -287,6 +294,7 @@ if (Test-Path $old) {
     Move-Item -Force $old (Join-Path $target "disabled")
 }
 Write-Host "Installed to $binDir (ReShade: $reshadeKind)"
+if ($feedInstalled) { Write-Host "XPAR.fx: installed in $shaderDir (games without DLSS or FSR: set up ReShade's depth buffer)" }
 if ($latewarpDll) { Write-Host "NVIDIA Latewarp: installed (optional warp engine, NVIDIA GPUs)" }
 else { Write-Host "NVIDIA Latewarp: not included (optional) - FrameWarp's own warp engine is used" }
 

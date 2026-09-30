@@ -426,10 +426,13 @@ void render_thread() {
     bool pacing_paused = false;
     bool device_loss_logged = false;
     MotionVectorScale mv_scale;
+    bool dump_pending = false;       // Ctrl+Shift+D: the capture is written on the game frame after dump_after
+    std::uint64_t dump_after = 0;
+    std::uint64_t shown_frame = 0;   // the game frame the warp shows (with split queues: after the one taken in last)
     CameraCheck camera_check;        // the game's own camera against its motion vectors
     int poor_estimate_windows = 0;   // ...and, once it was found unusable, whether the estimate does any better
     std::deque<std::uint64_t> analyzed_frames;  // game frames whose motion fit is on its way back
-    bool have_source_kind = false, source_was_estimated = false;
+    bool have_source_kind = false, source_was_estimated = false, source_motion_estimated = false;
     double last_mv_log = 0, last_usage_log = 0;
     bool game_has_hud_layers = false, mask_logged = false, source_masked = false;
     CameraEstimator estimator;
@@ -514,6 +517,7 @@ void render_thread() {
             source_basis = incoming.basis;
             source_masked = incoming.masked;
             first_eval = true;
+            shown_frame = source_frame;
         };
         auto take_in_finish = [&]() {  // true: a valid frame was taken in
             const int newest = intake.slot;
@@ -528,15 +532,19 @@ void render_thread() {
                 // A switch between the game's own camera and one estimated from motion vectors (e.g. the
                 // player changed DLSS <-> FSR in a game that sends Streamline data only with DLSS): nothing
                 // learned from one carries over to the other except the input calibration.
-                if (have_source_kind && (cam.estimated != 0) != source_was_estimated) {
+                // The same between an upscaler's motion vectors and XPAR's own, estimated from the picture (a
+                // game whose upscaler starts after its intro): a field of view, a motion vector scale or a HUD
+                // learned from the one must not be kept for the other.
+                if (have_source_kind && ((cam.estimated != 0) != source_was_estimated || s.motion_estimated != source_motion_estimated)) {
                     g_app.model.reset_history();
                     estimator.reset();
                     mv_scale = MotionVectorScale{};
                     camera_check = CameraCheck{};
                     renderer.reset_hud_detection();
-                    logf("camera source switched to %s", cam.estimated ? "the upscaler's motion vectors (estimated)" : "the game's own camera data");
+                    logf("camera source switched to %s", !cam.estimated ? "the game's own camera data" :
+                         s.motion_estimated ? "XPAR's own motion vectors (estimated from the picture)" : "the upscaler's motion vectors (estimated)");
                 }
-                have_source_kind = true; source_was_estimated = cam.estimated != 0;
+                have_source_kind = true; source_was_estimated = cam.estimated != 0; source_motion_estimated = s.motion_estimated;
                 if (cam.estimated && s.has_depth && s.has_motion && s.depth_rect.w && s.depth_rect.h) {
                     constexpr std::uint32_t kGridW = 80, kGridH = 45;
                     if (sampled) {
@@ -555,22 +563,29 @@ void render_thread() {
                                 motion_samples.push_back(p);
                             }
                         const double t0 = now_seconds();
-                        cam = estimator.update(motion_samples, rw, rh, m.camera);
+                        cam = estimator.update(motion_samples, rw, rh, m.camera, s.motion_estimated);
                         estimator_ms_sum += (now_seconds() - t0) * 1000.0; ++estimator_runs;
                         flush_ms_sum += renderer.last_flush_ms() + intake_wait_ms;
                         intake_wait_ms = 0;
                         if (estimator_runs >= 300) {
+                            const double by_consensus = estimator.consensus_fraction(), counted = estimator.valid_fraction();
                             const double unexplained = estimator.take_rejected_fraction();
+                            char own[96] = "";
+                            if (s.motion_estimated)
+                                std::snprintf(own, sizeof(own), "; own motion vectors: %.0f%% of samples confident, %.0f%% of frames fitted by consensus",
+                                              counted * 100.0, by_consensus * 100.0);
                             logf("camera estimation: %.2f ms CPU + %.2f ms waiting for the samples per game frame, residual %.2f px, field of view %.1f deg%s, "
-                                 "%.0f%% of frames unexplained, depth %s",
+                                 "%.0f%% of frames unexplained, depth %s%s",
                                  estimator_ms_sum / estimator_runs, flush_ms_sum / estimator_runs, estimator.last_residual(),
                                  estimator.vertical_fov() * 180.0 / 3.14159265358979, estimator.fov_locked() ? "" : " (learning)",
-                                 unexplained * 100.0, m.camera.depth_inverted ? "reversed" : "standard");
+                                 unexplained * 100.0, m.camera.depth_inverted ? "reversed" : "standard", own);
                             estimator_ms_sum = 0; flush_ms_sum = 0; estimator_runs = 0;
                             // The game's camera was found unusable: the estimate has to do better. When it explains
                             // less than half of the frames for two such stretches in a row, the game's camera stays
                             // (and is not checked again).
-                            if (sh.game_camera_check == 1) {
+                            // (judged on an upscaler's motion vectors only: XPAR's own, estimated from the picture,
+                            // are harder to explain and say nothing about the game's camera)
+                            if (sh.game_camera_check == 1 && !s.motion_estimated) {
                                 poor_estimate_windows = unexplained > 0.6 ? poor_estimate_windows + 1 : 0;
                                 if (poor_estimate_windows >= 2) {
                                     InterlockedExchange(&sh.game_camera_check, 2);
@@ -603,6 +618,14 @@ void render_thread() {
                             fov_logged = true;
                         }
                     }
+                }
+                // XPAR's own motion vectors (estimated from the picture) are in uv by construction: nothing to
+                // learn, and their noise must not teach a scale.
+                if (s.motion_estimated && !(mv_scale.valid && !mv_scale.pixel_units && mv_scale.locked[0] == 1.0 && mv_scale.locked[1] == 1.0)) {
+                    mv_scale = MotionVectorScale{};
+                    mv_scale.valid = true;
+                    mv_scale.locked[0] = mv_scale.locked[1] = 1.0;
+                    logf("no motion vectors from the game: estimating them from the picture");
                 }
                 incoming.s = s;
                 incoming.cam = cam;
@@ -951,7 +974,16 @@ void render_thread() {
         // depth, motion vectors, the motion analysis and the masks (half-float RGBA, 8-byte header: width,
         // height) to captures\.
         const bool dump_down = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000) && (GetAsyncKeyState('D') & 0x8000);
-        if (dump_down && !g_app.dump_was_down && source.valid) {
+        // The key keeps the current game frame's picture, depth and motion vectors on the GPU (quick); the
+        // capture itself is written on the next game frame, together with that kept one ("prev_"): two
+        // consecutive game frames. (Reading everything back and writing it stalls the presenter for about a
+        // second, so the frame after a capture would be dozens of frames later.)
+        if (dump_down && !g_app.dump_was_down && source.valid && !dump_pending) {
+            renderer.stash_source();
+            dump_pending = true; dump_after = shown_frame;
+        }
+        if (dump_pending && source.valid && shown_frame != dump_after) {
+            dump_pending = false;
             static int captures = 0;
             const auto dir = g_app.data_dir / L"captures";
             std::error_code ec;
@@ -959,7 +991,8 @@ void render_thread() {
             const int n = ++captures;
             for (const auto& [which, name] : {std::pair{0, L"frame"}, std::pair{1, L"output"}, std::pair{2, L"scene"}, std::pair{3, L"depth"},
                                               std::pair{4, L"motion"}, std::pair{5, L"object"}, std::pair{6, L"mask"}, std::pair{7, L"hudscore"},
-                                              std::pair{8, L"world"}, std::pair{9, L"fill"}}) {
+                                              std::pair{8, L"world"}, std::pair{9, L"fill"}, std::pair{10, L"prev_frame"},
+                                              std::pair{11, L"prev_depth"}, std::pair{12, L"prev_motion"}}) {
                 std::vector<std::uint16_t> px;
                 std::uint32_t cw = 0, ch = 0;
                 if (which == 2 && !source.has_scene) { logf("capture %d: no upscaler output this frame", n); continue; }
@@ -973,7 +1006,8 @@ void render_thread() {
                     std::fclose(f);
                 }
             }
-            logf("capture %d saved", n);
+            logf("capture %d saved: game frame %llu, and %llu before it (prev_)", n, static_cast<unsigned long long>(shown_frame),
+                 static_cast<unsigned long long>(dump_after));
         }
         g_app.dump_was_down = dump_down;
         if (rec(g_app.csv_outputs)) {
@@ -1027,7 +1061,7 @@ void render_thread() {
                              fit.samples > 0 ? fit.moving / fit.samples : 0.0, agree[0], agree[1], source.depth_rect.w, source.depth_rect.h,
                              camera_fit);
             }
-            if (have_fit && mv_scale.add(fit, source.depth_rect.w, source.depth_rect.h))
+            if (have_fit && !source.motion_estimated && mv_scale.add(fit, source.depth_rect.w, source.depth_rect.h))
                 logf("motion vectors locked: %s, scale %.4g x %.4g (sign %+.0f %+.0f), fit quality %.3f",
                      mv_scale.pixel_units ? "render pixels" : std::fabs(std::fabs(mv_scale.locked[0]) - 1) < 1e-9 ? "uv" :
                      std::fabs(std::fabs(mv_scale.locked[0]) - 0.5) < 1e-9 ? "ndc" : "custom units", mv_scale.scale(0, source.depth_rect.w),

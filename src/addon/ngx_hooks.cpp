@@ -134,6 +134,7 @@ NVSDK_NGX_Result NVSDK_CONV hk_evaluate(ID3D12GraphicsCommandList* list, const N
         else ++s->unknown_handle_calls;
         if (is_dlss(feature) && params) {
             ++s->dlss_calls;
+            g_producer->note_game_depth();
             describe(params, NVSDK_NGX_Parameter_Depth, s->depth_w, s->depth_h, s->depth_format);
             describe(params, NVSDK_NGX_Parameter_MotionVectors, s->mv_w, s->mv_h, s->mv_format);
             describe(params, NVSDK_NGX_Parameter_Color, s->color_w, s->color_h, s->color_format);
@@ -248,6 +249,7 @@ NVSDK_NGX_Result NVSDK_CONV hk_vk_evaluate(VkCommandBuffer cb, const NVSDK_NGX_H
         else ++s->unknown_handle_calls;
         if (is_dlss(feature) && params) {
             ++s->dlss_calls;
+            g_producer->note_game_depth();
             describe_vk(params, NVSDK_NGX_Parameter_Depth, s->depth_w, s->depth_h, s->depth_format);
             describe_vk(params, NVSDK_NGX_Parameter_MotionVectors, s->mv_w, s->mv_h, s->mv_format);
             describe_vk(params, NVSDK_NGX_Parameter_Color, s->color_w, s->color_h, s->color_format);

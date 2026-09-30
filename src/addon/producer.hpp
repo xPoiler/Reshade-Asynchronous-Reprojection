@@ -26,6 +26,22 @@ public:
     // The game's camera was found not to match its motion vectors: it is left out (see Shared::game_camera_check).
     bool game_camera_unusable() const { return shared_ && shared_->game_camera_check == 1; }
     bool ready() const { return shared_ != nullptr && device_ != nullptr; }
+    // The game itself gave a frame depth and motion vectors (an upscaler call, Streamline tags) within the
+    // last two seconds: the ReShade feed (reshade_feed.hpp) stays out. Not for the session: DLSS or FSR
+    // switched off in the game's settings leaves the feed as the only source, from then on.
+    void note_game_depth() { game_depth_qpc_ = qpc_now(); }
+    bool game_depth_seen() const {
+        const std::int64_t last = game_depth_qpc_.load();
+        return last && shared_ && qpc_now() - last < shared_->qpc_frequency * 2;
+    }
+    // The ReShade feed published a frame within the last quarter of a second: a Streamline camera that
+    // arrives without depth is left out meanwhile (the feed's frames carry an estimated camera). Never while
+    // the game gives depth itself: the feed is over then, and its camera counts from that very frame.
+    void note_feed() { feed_qpc_ = qpc_now(); }
+    bool feed_publishing() const {
+        const std::int64_t last = feed_qpc_.load();
+        return last && !game_depth_seen() && shared_ && qpc_now() - last < shared_->qpc_frequency / 4;
+    }
 
     // First D3D12 device seen (the game's). Creates the shared fence.
     bool attach(ID3D12Device* device);
@@ -64,6 +80,8 @@ public:
 
 private:
     std::atomic<std::uint64_t> highest_frame_{0}, rendering_frame_{0};
+    std::atomic<std::int64_t> game_depth_qpc_{0};
+    std::atomic<std::int64_t> feed_qpc_{0};
     void note_frame(std::uint64_t f) { std::uint64_t h = highest_frame_.load(); while (f > h && !highest_frame_.compare_exchange_weak(h, f)) {} }
     std::uint64_t last_counted_frame_ = 0;  // frames_total counts each rendered frame once
     struct Texture {

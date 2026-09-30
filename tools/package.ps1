@@ -19,6 +19,7 @@ Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $out, "$out.zip"
 New-Item -ItemType Directory -Force (Join-Path $out "FrameWarp") | Out-Null
 Copy-Item (Join-Path $build "FrameWarp.addon64") $out
 Copy-Item (Join-Path $build "FrameWarp\FrameWarpPresenter.exe") (Join-Path $out "FrameWarp")
+Copy-Item (Join-Path $root "shaders\XPAR.fx") $out
 Copy-Item (Join-Path $root "tools\install.ps1") $out
 Copy-Item (Join-Path $root "tools\release\install.bat") $out
 Copy-Item (Join-Path $root "tools\release\uninstall.bat") $out

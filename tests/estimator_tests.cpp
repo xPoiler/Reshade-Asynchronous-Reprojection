@@ -67,6 +67,36 @@ int main() {
                     case_.second[0], case_.second[1], case_.second[2], t[0], t[1], t[2], eo, et);
         EXPECT(eo < 3e-4 && et < 3e-3, "rotation and translation recovered (%g, %g)", eo, et);
     }
+    // Motion vectors estimated from the picture: more than half of them wrong (rain, water, false matches).
+    // The plain fit gives up (the camera would stand still); told that the vectors are estimated, the
+    // estimator finds the turn and the move the rest agree on. With the game's own vectors (not told), a
+    // frame like that is still rejected, as before.
+    {
+        const CameraEstimator::V3 omega{0.004, 0.03, -0.002}, T{0.04, 0, 0.02};
+        Camera g{};
+        g.fov = float(fov);
+        g.depth_inverted = 1;
+        const auto s = make(omega, fov, 0.55, rng, T);
+        CameraEstimator strict, tolerant;
+        strict.update(s, kW, kH, g);
+        tolerant.update(s, kW, kH, g, true);
+        const auto o = tolerant.last_omega();
+        const auto t = tolerant.last_translation();
+        double eo = 0, et = 0;
+        for (int k = 0; k < 3; ++k) { eo = std::max(eo, std::fabs(o[k] - omega[k])); et = std::max(et, std::fabs(t[k] - T[k])); }
+        std::printf("55%% wrong vectors: plain fit %s; as estimated vectors %s, rotation error %.1e rad, translation error %.1e\n",
+                    strict.last_rejected() ? "rejected" : "accepted", tolerant.last_rejected() ? "rejected" : "accepted", eo, et);
+        EXPECT(strict.last_rejected(), "the plain fit rejects a frame with 55%% wrong vectors");
+        EXPECT(!tolerant.last_rejected() && eo < 5e-4 && et < 5e-3, "the turn and move most estimated vectors agree on are found (%g, %g)", eo, et);
+        // Clean estimated vectors go through the plain fit, exactly as a game's.
+        const auto clean = make(omega, fov, 0.0, rng, T);
+        CameraEstimator a, b;
+        a.update(clean, kW, kH, g);
+        b.update(clean, kW, kH, g, true);
+        double same = 0;
+        for (int k = 0; k < 3; ++k) same = std::max(same, std::fabs(a.last_omega()[k] - b.last_omega()[k]));
+        EXPECT(same == 0, "clean estimated vectors are fitted like a game's (%g)", same);
+    }
     // First-person weapon: a fifth of the screen right in front of the camera (0.3 = 3.3x the near plane),
     // carried with the camera (no motion on screen), with the world no nearer than 30x the near plane.
     // It must not count as scenery in the translation fit (it would invent a camera move).
@@ -232,6 +262,38 @@ int main() {
         const double ms = double(b.QuadPart - a.QuadPart) * 1000.0 / double(f0.QuadPart) / frames.size();
         std::printf("estimator CPU: %.3f ms per game frame\n", ms);
         EXPECT(ms < 1.5, "estimator is cheap enough per game frame (%.3f ms)", ms);
+    }
+    // A long way in one direction (scenery ten near planes away and further, 1 near plane per
+    // frame): the position handed on stays near the origin (single precision keeps a frame's move exact
+    // there), starting again from zero as a discontinuity; the frame's own move is never lost.
+    {
+        CameraEstimator trek;
+        Camera g{}; g.fov = float(fov); g.depth_inverted = 1;
+        const CameraEstimator::V3 move{1.0, 0, 0};
+        for (int i = 0; i < 80; ++i) trek.update(make({turn(rng) * 0.5, turn(rng), 0}, fov, 0.0, rng), kW, kH, g);  // (the field of view first)
+        double worst_pos = 0, worst_step = 0, worst_move = 0;
+        int restarts = 0, moved = 0;
+        Camera before{};
+        for (int i = 0; i < 9000; ++i) {
+            const auto s = make({0, 0, 0}, fov, 0.0, rng, move, 0, 32, 18, 0.1);
+            const Camera c = trek.update(s, kW, kH, g);
+            const auto t = trek.last_translation();
+            if (i >= 3) worst_move = std::max(worst_move, std::hypot(t[0] - move[0], t[1] - move[1], t[2] - move[2]));
+            for (int k = 0; k < 3; ++k) worst_pos = std::max(worst_pos, double(std::fabs(c.pos[k])));
+            if (i > 0 && c.position_epoch != before.position_epoch) ++restarts;
+            else if (i > 3) {
+                const double d = std::hypot(double(c.pos[0]) - before.pos[0], double(c.pos[1]) - before.pos[1], double(c.pos[2]) - before.pos[2]);
+                worst_step = std::max(worst_step, std::fabs(d - 1.0)); ++moved;
+            }
+            before = c;
+        }
+        std::printf("long way: position within %.0f, %d restarts, a frame's step off by at most %.4f, its move by %.3f\n", worst_pos, restarts, worst_step, worst_move);
+        EXPECT(worst_pos <= CameraEstimator::kFarFromOrigin + 2.0, "the position stays near the origin (%.0f)", worst_pos);
+        EXPECT(restarts >= 1 && restarts <= 3, "it starts again from zero, rarely (%d times)", restarts);
+        EXPECT(moved > 8900 && worst_step < 0.1 && worst_move < 0.1, "every frame's move is kept (step off by %.3f, move by %.3f)", worst_step, worst_move);
+        EXPECT(!CameraEstimator::plausible_move({5000, 0, 0}, 0.0) && !CameraEstimator::plausible_move({300, 0, 0}, 0.02) &&
+               CameraEstimator::plausible_move({12, 0, 0}, 0.02) && CameraEstimator::plausible_move({0, 0, 0}, 1.0),
+               "only moves no camera makes in a frame are refused");
     }
     if (failures) { std::printf("%d failure(s)\n", failures); return 1; }
     std::printf("estimator tests passed\n");
