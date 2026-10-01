@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(FrameWarp VERSION 1.6.1 LANGUAGES CXX)
+project(FrameWarp VERSION 1.7.0 LANGUAGES CXX)
 
 if(NOT WIN32 OR NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "FrameWarp requires Windows, MSVC and x64.")

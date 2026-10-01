@@ -976,15 +976,17 @@ void render_thread() {
         // presents in a row bring no frame, step aside and let the game's own picture show.
         g_app.has_frames = source.valid && sh.presents_without_frame < 3;
         renderer.finish_frame(warped && !unmoved, settings.overlay_debug ? (warped ? 1 : 2) : 0);
-        // Ctrl+Shift+M marks "it looks bad now" in the log.
-        const bool mark_down = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000) && (GetAsyncKeyState('M') & 0x8000);
+        // Ctrl+Shift+M marks "it looks bad now" in the log. Both keys (this and Ctrl+Shift+D below) only with
+        // "Record detailed diagnostics" ticked: pressed by accident, a capture freezes the game for a second.
+        const bool keys_on = settings.record_diagnostics != 0;
+        const bool mark_down = keys_on && (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000) && (GetAsyncKeyState('M') & 0x8000);
         const int mark = mark_down && !g_app.mark_was_down ? 1 : 0;
         g_app.mark_was_down = mark_down;
         if (mark) logf("MARK (user flagged a bad moment)");
         // Ctrl+Shift+D (development): saves the newest game frame, the warped output, the upscaler's output,
         // depth, motion vectors, the motion analysis and the masks (half-float RGBA, 8-byte header: width,
         // height) to captures\.
-        const bool dump_down = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000) && (GetAsyncKeyState('D') & 0x8000);
+        const bool dump_down = keys_on && (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000) && (GetAsyncKeyState('D') & 0x8000);
         // The key keeps the current game frame's picture, depth and motion vectors on the GPU (quick); the
         // capture itself is written on the next game frame, together with that kept one ("prev_"): two
         // consecutive game frames. (Reading everything back and writing it stalls the presenter for about a

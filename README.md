@@ -6,12 +6,17 @@ moves at 120 Hz on a 120 Hz display. In ReShade it appears as **XPAR** (xPoiler'
 Reprojection).
 
 On every display refresh, FrameWarp takes the game's newest frame and re-projects it to where the
-camera is *now*. It runs as a ReShade add-on and reads what it needs from the game's upscaler:
+camera is *now*. It runs as a ReShade add-on and reads what it needs from the game's upscaler, or,
+in games without one, from ReShade and the picture itself:
 
 * **DLSS**: camera, depth and HUD data from the game's NVIDIA Streamline integration, or depth and
   motion vectors from DLSS called directly, without Streamline (DirectX 12 and Vulkan games).
 * **AMD FSR 3** (3.0 and 3.1): depth and motion vectors from FSR. FSR 4 uses the same interface as
   FSR 3.1 and should work too. **FSR 2** should work in games that ship it as a DLL (untested).
+* **No DLSS or FSR** (DirectX 12 and DirectX 11, experimental): the depth from ReShade's depth buffer,
+  which FrameWarp picks and sets up by itself, and the motion worked out from the picture itself. This
+  is also used when a game's DLSS and FSR are switched off, and FrameWarp switches back by itself when
+  they are switched on again.
 
 Without the game's own camera data, FrameWarp works out the camera's movement from the motion
 vectors. It does the same when a game's camera data turns out not to match its motion vectors, which
@@ -28,12 +33,17 @@ it checks by itself while the camera moves. It then draws the result in a click-
 | *DOOM Eternal* (Steam, Vulkan, DLSS) | Install ReShade for Vulkan (see Install). The game calls DLSS without Streamline, so FrameWarp works out the camera from DLSS's motion vectors; turn the camera for a few seconds after loading. FrameWarp finds the HUD and holds the weapon itself. If the ReShade menu hides behind the game, turn off *Present From Compute* in the game's advanced video settings. |
 | *Assassin's Creed Black Flag Resynced* (DLSS or FSR) | No launch options needed. The game's camera data doesn't match its picture: FrameWarp notices within the first seconds of camera movement on the first launch (the picture may warp wrongly until then), switches to working out the camera from the motion vectors, and remembers that for the game. Turn the camera for a few seconds after loading while it calibrates. |
 | *Returnal* (Steam, DLSS) | No launch options needed. The game calls DLSS without Streamline, so FrameWarp works out the camera from DLSS's motion vectors; turn the camera for a few seconds after loading while it calibrates. |
+| *Resident Evil 2* (Steam, DirectX 11, no DLSS or FSR) | Choose DirectX 11 in the game's settings. FrameWarp finds the depth buffer and works out the motion and the camera from the picture; turn the camera for a few seconds after loading while it calibrates. Very fast turns and dark scenes are the hardest. |
+| *Assassin's Creed Black Flag Resynced* (upscaler off) | The same as above, in DirectX 12. |
 
-Other DLSS and FSR games may work but are untested.
+Other games may work but are untested.
 
 ## Requirements
 
-* A DirectX 12 game with **DLSS or FSR** (see above) turned on, or a Vulkan game with **DLSS** (tested with DOOM Eternal).
+* A DirectX 12 game with **DLSS or FSR** (see above) turned on, a Vulkan game with **DLSS** (tested with
+  DOOM Eternal), or a DirectX 12 or 11 game **without** them (experimental). Without DLSS or FSR,
+  ReShade has to be able to see the game's depth buffer, as for any depth effect (online games
+  often block it). DirectX 11 games need Windows 10 version 1703 or later.
 * About 1 GB of free video memory at 4K for the presenter.
 * A GPU for DirectX 12. FrameWarp is tested on NVIDIA GPUs; its own warp engine uses plain DirectX 12,
   so AMD and Intel GPUs should work too, but they are untested (reports welcome).
@@ -61,7 +71,8 @@ To check the version, right-click the file and open Properties > Details.
 2. Optional: put `nvngx_latewarp.dll` next to `install.bat` to have NVIDIA Latewarp available.
 3. Close the game and double-click `install.bat`. It lists your Steam games that have ReShade; type
    the number of the game and press Enter. For a non-Steam game, choose **P** and type its folder.
-   The installer copies FrameWarp next to the game's ReShade. For Unreal Engine games, it also
+   The installer copies FrameWarp next to the game's ReShade, and `XPAR.fx` (for games without DLSS
+   or FSR) into the game's ReShade shader folder. For Unreal Engine games, it also
    enables Streamline resource tagging in the game's `Engine.ini`, keeping a backup of the file.
    **Vulkan games** (DOOM Eternal): install ReShade for the game choosing **Vulkan** as the rendering
    API. ReShade then runs as a system-wide Vulkan layer and puts only a `ReShade.ini` in the game's
@@ -84,7 +95,8 @@ Advanced: both files also accept a game name or folder directly (`install.bat "E
 
 ## Use
 
-1. Run the game in **borderless** mode, with DLSS or FSR on and frame generation off.
+1. Run the game in **borderless** mode, with DLSS or FSR on if the game has them, and frame
+   generation off.
 2. Open the ReShade overlay (Home key) and go to **Add-ons > XPAR**. The presenter starts
    automatically with the game.
 
@@ -92,7 +104,7 @@ Advanced: both files also accept a game name or folder directly (`install.bat "E
 |---|---|
 | **Enable reprojection (N Hz)** | Turns reprojection on or off. N is your display's measured refresh rate. |
 | **Show original (A/B)** | Shows the game's own frames, for comparison. |
-| **Auto latency** | How far behind the newest game frame the displayed camera sits. **Auto** (default) uses 1/2 frame, or 1/4 frame in games without HUD layers, where a shorter warp keeps any undetected HUD steadier. You can also pick **1 frame** (smoothest), **1/2** or **1/4** (less latency, cleaner screen edges), or turn it **Off** to set the latency by hand. |
+| **Auto latency** | How far behind the newest game frame the displayed camera sits. **Auto** (default) uses 1/2 frame, or 1/4 frame in games without HUD layers, where a shorter warp keeps any undetected HUD steadier, and a whole frame in games without DLSS or FSR, where the camera worked out from the picture can't be carried ahead as well. You can also pick **1 frame** (smoothest), **1/2** or **1/4** (less latency, cleaner screen edges), or turn it **Off** to set the latency by hand. |
 | **Present lead (ms)** | How early each frame is rendered before the display refresh (default 6). Raise it if the output drops below your refresh rate. With the XPAR engine and a lead above 0, new game frames are taken in on their own GPU queue, so their processing never delays a refresh (about 50–100 MB more video memory at 4K). |
 | **Keep HUD still** | Warps the scene but not the HUD, using the HUD layers the game provides (Expedition 33). |
 | **Keep still** | What is not warped. **HUD + character/weapon** (default), **HUD only**, **Character/weapon only** or **Off**. *HUD*: in games without HUD layers, FrameWarp finds the HUD itself (see *Find the HUD*). *Character/weapon*: what moves with the camera, such as a first-person weapon or a third-person character, found from the game's motion vectors in every game; it starts after a few seconds of turning the camera. |
@@ -105,7 +117,7 @@ Advanced: both files also accept a game name or folder directly (`install.bat "E
 | **Show the mask** | Tints what is kept still (magenta), to check the options above. With *Learned from camera motion* and NVIDIA Latewarp (or *Present lead* 0), the HUD still being learned shows green too. |
 | **Warp engine** | **XPAR** (default): FrameWarp's own engine, any GPU. **NVIDIA Latewarp**: selectable when `nvngx_latewarp.dll` is installed and the GPU is NVIDIA's. |
 | **Presenter GPU priority** | Keep **Realtime**. Lower priorities cannot hold the refresh rate while the game loads the GPU. |
-| **Record detailed diagnostics** | Off by default, remembered per game. Writes frame-by-frame recordings to the logs folder, for troubleshooting. |
+| **Record detailed diagnostics** | Off by default, remembered per game. Writes frame-by-frame recordings to the logs folder, for troubleshooting, and turns on the **Ctrl+Shift+M** (mark a moment in the log) and **Ctrl+Shift+D** (capture the current frames; the game pauses for about a second) keys. |
 | **Reset camera model** | Re-learns how the game's camera responds to your mouse. This also happens automatically within seconds of play. |
 | **Start presenter** | Restarts the presenter if it was closed. |
 
@@ -121,6 +133,11 @@ diagnostics) are for fine-tuning and troubleshooting.
   doesn't match their motion vectors), the camera is estimated from motion vectors, which is a little
   less exact than the camera data Streamline games provide.
 * Upscalers built into a game's executable instead of a DLL (Cyberpunk 2077's FSR 2.1) can't be used.
+* Without DLSS or FSR, the motion is worked out from the picture: very fast turns, dark or blurry
+  scenes and flat surfaces are where it is least sure, and the result is less exact than with an
+  upscaler's motion vectors. A game whose depth buffer ReShade can't see doesn't work this way. When
+  the depth reads empty, FrameWarp switches on ReShade's depth copy and asks for one restart of the
+  game. DirectX 9, DirectX 10 and OpenGL games aren't supported, and Vulkan games only with DLSS.
 * Very fast motion goes beyond what re-projecting a single frame can hide. In Expedition 33's
   overworld, very fast camera turns can make the picture shake slightly.
 * The Expedition 33 support targets the current Steam build. It switches itself off safely if a game
@@ -132,9 +149,10 @@ If the XPAR panel says frame generation is on, turn frame generation off in the 
 settings; FrameWarp resumes by itself.
 
 Logs are written to `FrameWarp\logs\`, next to the game's ReShade. The previous run is kept in
-`logs\previous\`. When something looks wrong in game, press **Ctrl+Shift+M** to mark that moment in
-the logs. For a problem report, tick **Record detailed diagnostics** in the XPAR panel, reproduce the
-problem, and include both log folders.
+`logs\previous\`. For a problem report, tick **Record detailed diagnostics** in the XPAR panel,
+reproduce the problem (pressing **Ctrl+Shift+M** marks the moment it looks wrong in the logs), and
+include both log folders. Without DLSS or FSR, `ReShade.log` also shows which depth buffer FrameWarp
+picked and why.
 
 ## Building from source
 

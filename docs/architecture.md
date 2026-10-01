@@ -34,6 +34,11 @@
 | `src/presenter/latewarp12.cpp` | NGX Latewarp on D3D12 (parameter names from `nvngx_latewarp.dll`); optional. |
 | `src/presenter/pose.hpp` | Camera model: fitting, prediction/interpolation, handoff blending, cursor gate. |
 | `src/presenter/camera_estimator.hpp` | Games without camera data: rotation, translation and field of view fitted to the motion vectors. |
+| `src/presenter/frame_clock.hpp` | Frame times at the game's steady pace for frames that come without a simulation time. |
+| `src/addon/reshade_feed.cpp` | Games without DLSS or FSR: ReShade's depth (through `shaders/XPAR.fx`) published as the frame's depth. |
+| `src/addon/depth_choice.cpp` | Which of the game's depth buffers is the scene's, which way round its depth is stored, and whether ReShade has to copy it before the game clears it. |
+| `src/addon/depth_probe_score.hpp` | Does a depth buffer belong to the picture: brightness changes across its depth edges. |
+| `shaders/XPAR.fx` | ReShade effect the add-on enables itself: ReShade's depth, oriented near = 1, and a small probe of depth and brightness. |
 
 ## Game side (add-on)
 
@@ -57,6 +62,19 @@
   an 80x45 grid of motion vectors; the field of view learned by votes, or the one the game gives FSR
   once checked against the picture). A game that keeps sending its Streamline camera but no Streamline
   depth (Cyberpunk 2077 with FSR) gets FSR's depth and motion vectors attached to its own frames.
+* **Games without DLSS or FSR (ReShade path).** When no upscaler has given depth for 600 frames, the
+  add-on enables `XPAR.fx` in ReShade's effect chain and publishes its depth (ReShade's depth buffer,
+  un-linearised to near / distance) as the frame's depth, with no motion vectors and a camera to
+  estimate. It drives ReShade's Generic Depth by itself: each picture-shaped depth buffer the game
+  binds is selected in turn (Generic Depth's own override) and scored on a 256x144 probe (brightness
+  changes across depth edges against elsewhere, times coverage); the best one is kept, re-checked when
+  another buffer comes into use. The probe also tells which way round the depth is stored (XPAR.fx
+  turns it), and an empty depth in a running 3D scene switches Generic Depth's copy before clears on.
+  The first upscaler frame ends the feed; it comes back 600 frames after the last one.
+* **DirectX 11.** A D3D12 device of the add-on's own on the game's adapter creates the shared textures
+  (as render-target-capable, which D3D11 needs to open them) and the fence; the game's D3D11.4 device
+  opens both. Copies go through its immediate context, and the fence is signalled from it after the
+  backbuffer copy.
 * **Upscaler output.** Unless *Find the HUD* is set to *Learned from camera motion*: copied right after the
   upscaler writes it (after `slEvaluateFeature` for Streamline games, after the NGX evaluation or the
   FSR dispatch otherwise).
@@ -101,6 +119,16 @@
   verdict per game until the next update, and takes it back if the estimate explains the motion
   vectors no better. A game that sends its Streamline camera but no depth gets depth and motion
   vectors from the DLSS call, for the frame being rendered.
+* **Own motion estimation** (frames with depth but no motion vectors): brightness pyramid of the new and
+  the previous picture, a whole-pixel search at the coarsest level, then inverse-compositional
+  Lucas-Kanade per level with a 3x3 median; a pixel is trusted where its window has texture in both
+  directions and little is left after matching. Untrusted pixels take the motion around them
+  (push-pull fill) and never count as moving on their own. The estimator samples trusted pixels only;
+  with such noisy vectors it falls back to a consensus turn when a plain fit fails, keeps the move
+  close to the previous frame's where a turn and a move look alike, keeps the camera level and eases
+  its up-down angle back towards level, and carries the last frame's motion over up to two frames it
+  cannot explain. These frames are timed by `FrameClock`, and *Auto* latency shows them a whole game
+  frame back.
 * **Frame generation.** When the game presents 1.6 or more images per rendered frame for a second, the
   presenter steps aside (overlay hidden, no GPU work) until the ratio is back near 1.
 * **Warp engines.** The own engine (default, any D3D12 GPU): for each output pixel a short fixed-point

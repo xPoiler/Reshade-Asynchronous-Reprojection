@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.7.0
 
 * **Games without DLSS or FSR, or with both switched off (experimental, DirectX 12 and 11):** XPAR now works
   from ReShade's depth buffer alone. The motion between two game frames is estimated from the pictures themselves (in the presenter,
@@ -8,9 +8,9 @@
   a game's real motion vectors the estimate is typically within a quarter of a pixel where the picture
   has detail; rain, water and flat areas are recognised as unreliable and left out of the camera
   estimate. The installer adds `XPAR.fx` to the game's `reshade-shaders\Shaders`; the add-on enables it
-  itself. ReShade's depth buffer has to be set up for the game, as for any depth effect. With DLSS
-  or FSR switched on the game's own depth and motion vectors are used, exactly as before, and none of
-  this runs.
+  itself, and sets up ReShade's depth by itself (below). ReShade has to be able to see the game's
+  depth buffer, as for any depth effect. With DLSS or FSR switched on the game's own depth and motion
+  vectors are used, exactly as before; switching them on or off mid-game hands over by itself.
 * The game's depth buffer is found automatically for the ReShade path: each depth buffer of the
   picture's shape, whatever its size, is selected in turn and the one whose depth belongs to the picture
   is kept (ReShade's own pick skips a scene rendered well below the picture's size and can settle on the
@@ -41,7 +41,9 @@
   calibration ran away), a frame whose motion cannot be worked out keeps the motion of the one before
   instead of stopping the camera dead, and "Auto" latency shows the view a whole game frame behind
   (the camera estimated from the picture cannot be carried ahead as well; RE2 went from shaking to steady).
-* The capture key (Ctrl+Shift+D) saves two consecutive game frames.
+* The capture key (Ctrl+Shift+D) saves two consecutive game frames. It and the marker key (Ctrl+Shift+M)
+  now only work with **Record detailed diagnostics** ticked: pressed by accident, a capture froze the
+  game for a second.
 
 ## 1.6.1
 
