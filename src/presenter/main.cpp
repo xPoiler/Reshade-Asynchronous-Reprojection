@@ -2,6 +2,7 @@
 // Latewarp to the camera predicted from raw mouse input and the game's own camera history.
 #include "presenter/pose.hpp"
 #include "presenter/camera_estimator.hpp"
+#include "presenter/frame_clock.hpp"
 #include "presenter/renderer.hpp"
 #include "shared/camera_check.hpp"
 #include <shellapi.h>
@@ -410,6 +411,7 @@ void render_thread() {
     Camera source_camera{};
     CameraBasis source_basis{};
     double source_time = 0;
+    FrameClock frame_clock;
     std::uint64_t source_frame = 0;
     std::uint64_t memory_frame = 0;  // game frame the background memory was last updated with
     bool first_eval = false;
@@ -630,7 +632,11 @@ void render_thread() {
                 incoming.s = s;
                 incoming.cam = cam;
                 incoming.basis = to_basis(cam);
-                source_time = seconds(m.qpc_sim_start ? m.qpc_sim_start : m.qpc_constants);
+                // Frames that come without a simulation time from XPAR's own motion path (the ReShade path):
+                // timed at the game's steady pace instead of when they were presented (see FrameClock).
+                const double presented = seconds(m.qpc_sim_start ? m.qpc_sim_start : m.qpc_constants);
+                if (!m.qpc_sim_start && s.motion_estimated) source_time = frame_clock.next(m.frame_id, presented);
+                else { source_time = presented; frame_clock.reset(); }
                 source_frame = m.frame_id;
                 g_app.model.add_source(m.frame_id, source_time, seconds(qpc_now()), incoming.basis, cam.reset != 0, now_seconds(),
                                        cam.position_epoch);
@@ -841,8 +847,13 @@ void render_thread() {
         ps.rotation_extrapolation = settings.rotation_extrapolation;
         ps.prediction = settings.prediction_ms / 1000.0;
         // Auto: half a game frame, or a quarter when the game sends no HUD layers - the HUD/weapon mask
-        // misses some pixels (semi-transparent HUD), and a shorter warp moves them less.
-        const std::uint32_t fraction = settings.auto_prediction == 3 ? (game_has_hud_layers ? 2u : 4u) : settings.auto_prediction;
+        // misses some pixels (semi-transparent HUD), and a shorter warp moves them less. A whole game frame
+        // when XPAR estimates the motion from the picture itself (no DLSS or FSR): its camera cannot be
+        // carried ahead of the newest frame as well (RE2: raw mouse input, ~100 mouse events a second to go
+        // by), and showing the moment between the last two frames instead held the view on the camera
+        // (slow wander in a replay: 11 px with a quarter, 3 px with a whole frame).
+        const std::uint32_t fraction = settings.auto_prediction == 3 ? (source_motion_estimated ? 1u : game_has_hud_layers ? 2u : 4u)
+                                                                     : settings.auto_prediction;
         ps.auto_fraction = (fraction == 1 || fraction == 2 || fraction == 4) ? 1.0 / fraction : 0.0;
         ps.orbit_distance = settings.orbit_distance;
         ps.max_horizon = settings.max_horizon_ms / 1000.0;

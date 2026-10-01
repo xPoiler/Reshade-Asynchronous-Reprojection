@@ -294,7 +294,7 @@ if (Test-Path $old) {
     Move-Item -Force $old (Join-Path $target "disabled")
 }
 Write-Host "Installed to $binDir (ReShade: $reshadeKind)"
-if ($feedInstalled) { Write-Host "XPAR.fx: installed in $shaderDir (games without DLSS or FSR: set up ReShade's depth buffer)" }
+if ($feedInstalled) { Write-Host "XPAR.fx: installed in $shaderDir (games without DLSS or FSR: the add-on picks ReShade's depth buffer itself)" }
 if ($latewarpDll) { Write-Host "NVIDIA Latewarp: installed (optional warp engine, NVIDIA GPUs)" }
 else { Write-Host "NVIDIA Latewarp: not included (optional) - FrameWarp's own warp engine is used" }
 
@@ -307,7 +307,7 @@ if ($streamline) { Write-Host "Streamline: $($streamline.FullName)" }
 elseif ($dlss) { Write-Host "DLSS without Streamline: $($dlss.FullName) (the camera is worked out from DLSS's motion vectors)" }
 if ($fsr) { Write-Host "FSR: $($fsr.FullName)" }
 if (-not $streamline -and -not $dlss -and -not $fsr) {
-    Write-Warning "No DLSS or FSR found: FrameWarp needs a game with DLSS, or with FSR 2 / 3 / 4 shipped as a DLL."
+    Write-Host "No DLSS or FSR found: XPAR takes the depth from ReShade and works out the motion itself (DirectX 11 and 12)."
 }
 
 $ini = $null

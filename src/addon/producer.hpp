@@ -4,6 +4,7 @@
 // barriers + copies into the game's own command lists, then signals a shared fence at present.
 #include "shared/protocol.hpp"
 #include "addon/vk_image.hpp"
+#include <d3d11_4.h>
 #include <d3d12.h>
 #include <wrl/client.h>
 #include <memory>
@@ -50,6 +51,15 @@ public:
     bool attach_vulkan(reshade::api::device* device);
     void detach_vulkan();
     bool vulkan() const { return vk_ != nullptr; }
+    // Direct3D 11 games: the same, the shared textures and fence opened in the game's D3D11 device (11.4:
+    // Windows 10 1703 or later); copies and the fence signal go through its immediate context.
+    bool attach_d3d11(reshade::api::device* device);
+    void detach_d3d11();
+    bool d3d11() const { return d11_ != nullptr; }
+    void on_tag_d3d11(std::uint64_t frame, Tex kind, ID3D11Resource* source, std::uint32_t ext_x, std::uint32_t ext_y,
+                      std::uint32_t ext_w, std::uint32_t ext_h, ID3D11DeviceContext* context);
+    std::uint64_t begin_present_d3d11(ID3D11Resource* backbuffer, ID3D11DeviceContext* context);
+    void finish_present_d3d11(ID3D11DeviceContext* context, std::uint64_t token);
     void set_swapchain(HWND hwnd, std::uint32_t width, std::uint32_t height, DXGI_FORMAT format, std::uint32_t color_space);
 
     void on_constants(std::uint64_t frame, const Camera& camera);
@@ -90,8 +100,14 @@ private:
         std::uint32_t generation = 0;
         D3D12_RESOURCE_DESC desc{};
         VkSharedImage vk;  // Vulkan games: the same texture imported into the game's device
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> d11;  // D3D11 games: the same texture opened in the game's device
     };
-    struct Retired { Microsoft::WRL::ComPtr<ID3D12Resource> resource; HANDLE handle; std::uint64_t after_fence; VkSharedImage vk; };
+    struct Retired {
+        Microsoft::WRL::ComPtr<ID3D12Resource> resource; HANDLE handle; std::uint64_t after_fence; VkSharedImage vk;
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> d11;
+    };
+    bool own_device_for(reshade::api::device* device, const char* api, Microsoft::WRL::ComPtr<ID3D12Device>& own);
+    void copy_d3d11(ID3D11DeviceContext* context, ID3D11Resource* source, ID3D11Texture2D* target);
 
     int slot_for_frame(std::uint64_t frame, bool create);
     bool ensure_texture(int slot, Tex kind, const D3D12_RESOURCE_DESC& source_desc, std::uint32_t vk_depth_bytes = 0);
@@ -106,6 +122,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Device> device_;
     Microsoft::WRL::ComPtr<ID3D12Device> own_device_;  // Vulkan games
     std::unique_ptr<VkTransport> vk_;
+    Microsoft::WRL::ComPtr<ID3D11Device5> d11_;
+    Microsoft::WRL::ComPtr<ID3D11Fence> d11_fence_;
     Microsoft::WRL::ComPtr<ID3D12Fence> fence_;
     HANDLE fence_handle_ = nullptr;
     std::uint64_t fence_value_ = 0;

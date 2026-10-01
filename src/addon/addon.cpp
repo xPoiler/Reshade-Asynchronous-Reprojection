@@ -90,6 +90,8 @@ void on_init_swapchain(swapchain* sc, bool) {
         if (!g_producer->attach(reinterpret_cast<ID3D12Device*>(dev->get_native()))) return;
     } else if (dev->get_api() == device_api::vulkan) {
         if (!g_producer->attach_vulkan(dev)) return;
+    } else if (dev->get_api() == device_api::d3d11) {
+        if (!g_producer->attach_d3d11(dev)) return;
     } else {
         return;
     }
@@ -97,11 +99,11 @@ void on_init_swapchain(swapchain* sc, bool) {
     g_producer->set_swapchain(static_cast<HWND>(sc->get_hwnd()), desc.texture.width, desc.texture.height,
                               static_cast<DXGI_FORMAT>(desc.texture.format), to_dxgi_color_space(sc->get_color_space()));
     fw::install_ngx_hooks(g_producer.get());
-    if (dev->get_api() == device_api::d3d12) {  // (Streamline, FSR and the ReShade feed: D3D12 only for now)
+    if (dev->get_api() == device_api::d3d12) {  // (Streamline and FSR: D3D12 only for now)
         fw::install_streamline_hooks(g_producer.get());
         fw::install_ffx_hooks(g_producer.get());
-        fw::install_reshade_feed(g_producer.get());
     }
+    if (dev->get_api() == device_api::d3d12 || dev->get_api() == device_api::d3d11) fw::install_reshade_feed(g_producer.get());
     // The settings remembered per game (ReShade.ini, [FrameWarp]). They belong to the version that saved
     // them: after an update (any version change) they go back to the defaults, so the improved defaults of
     // a new version apply right after installing it.
@@ -176,6 +178,7 @@ void on_destroy_device(device* dev) {
         g_pending_vk = {};
         g_producer->detach_vulkan();
     }
+    if (g_producer && dev->get_api() == device_api::d3d11) g_producer->detach_d3d11();
 }
 
 // Vulkan games: the copy goes into the ReShade queue's immediate command buffer, which ReShade submits
@@ -219,6 +222,15 @@ void on_reshade_present(effect_runtime* runtime) {
     if (!g_producer || !g_producer->ready() || !queue) return;
     if (queue->get_device()->get_api() == device_api::vulkan) {
         if (g_producer->vulkan()) present_vulkan(runtime, queue);
+        return;
+    }
+    if (queue->get_device()->get_api() == device_api::d3d11) {
+        // The immediate context: the copy, then the fence signal after it (the presenter waits for that).
+        if (!g_producer->d3d11()) return;
+        auto* context = reinterpret_cast<ID3D11DeviceContext*>(queue->get_native());
+        const auto token = g_producer->begin_present_d3d11(reinterpret_cast<ID3D11Resource*>(runtime->get_current_back_buffer().handle), context);
+        g_producer->finish_present_d3d11(context, token);
+        if (token && g_producer->shared()->settings.enabled && !presenter_running()) launch_presenter();
         return;
     }
     if (queue->get_device()->get_api() != device_api::d3d12) return;
@@ -307,7 +319,7 @@ void draw_overlay(effect_runtime*) {
         bool mouse = s.use_mouse != 0;
         if (ImGui::Checkbox("Raw mouse drives rotation", &mouse)) s.use_mouse = mouse;
         ImGui::SliderFloat("Rotation extrapolation", &s.rotation_extrapolation, 0.0f, 1.0f);
-        static const char* const kAutoModes[] = {"Off (manual slider)", "Auto (1/2, or 1/4 without HUD layers)", "1 game frame", "1/2 game frame",
+        static const char* const kAutoModes[] = {"Off (manual slider)", "Auto (1/2, 1/4 without HUD layers, 1 without DLSS/FSR)", "1 game frame", "1/2 game frame",
                                                  "1/4 game frame"};
         static const std::uint32_t kAutoValues[] = {0, 3, 1, 2, 4};
         int auto_index = 0;

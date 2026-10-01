@@ -54,7 +54,7 @@ Producer::Producer() {
     s.stretch_width = 1;
     s.background_memory = 1;  // what the warp uncovers comes from the scenery last seen there (XPAR engine)  // hold what stays nearly still on screen while the camera turns (orbit cameras)
     s.hud_from_scene = 2;  // HUD from the upscaler's output + camera-motion check (learned HUD without an upscaler output)
-    s.auto_prediction = 3;     // default: 1/2 game frame, 1/4 in games without HUD layers (shorter warps hide mask misses); 1: full, 2: half, 4: quarter
+    s.auto_prediction = 3;     // default: 1/2 game frame, 1/4 in games without HUD layers (shorter warps hide mask misses), 1 without DLSS/FSR (XPAR's own motion); 1: full, 2: half, 4: quarter
     s.manual_gain_x = s.manual_gain_y = 0.0f; s.manual_delay_ms = 0.0f;
 }
 
@@ -166,8 +166,8 @@ bool Producer::ensure_texture(int slot, Tex kind, const D3D12_RESOURCE_DESC& sou
     auto& t = textures_[slot][kind];
     const DXGI_FORMAT format = copy_format(source.Format);
     if (t.resource && t.desc.Width == source.Width && t.desc.Height == source.Height && t.desc.Format == format &&
-        (!vk_ || (t.vk.image && t.vk.depth_bytes == vk_depth_bytes))) return true;
-    if (t.resource) retired_.push_back({t.resource, t.handle, fence_value_ + 1, t.vk});
+        (!vk_ || (t.vk.image && t.vk.depth_bytes == vk_depth_bytes)) && (!d11_ || t.d11)) return true;
+    if (t.resource) retired_.push_back({t.resource, t.handle, fence_value_ + 1, t.vk, t.d11});
     const std::uint32_t generation = t.generation + 1;
     t = Texture{};
     t.generation = generation;
@@ -176,6 +176,9 @@ bool Producer::ensure_texture(int slot, Tex kind, const D3D12_RESOURCE_DESC& sou
     desc.Width = source.Width; desc.Height = source.Height; desc.DepthOrArraySize = 1; desc.MipLevels = 1;
     desc.Format = format; desc.SampleDesc.Count = 1; desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+    // D3D11 opens a texture shared by D3D12 only if it could be a render target (both vendors' drivers
+    // refuse the rest; R32F needs simultaneous access as well): what D3D11 games copy is colour or R32F.
+    if (d11_) desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     HRESULT hr = device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&t.resource));
     if (FAILED(hr)) {  // depth families may refuse simultaneous access; retry as a plain shared texture
@@ -199,6 +202,13 @@ bool Producer::ensure_texture(int slot, Tex kind, const D3D12_RESOURCE_DESC& sou
             CloseHandle(t.handle); t.handle = nullptr; t.resource.Reset();
             return false;
         }
+    }
+    if (d11_ && FAILED(d11_->OpenSharedResource1(t.handle, IID_PPV_ARGS(&t.d11)))) {
+        char text[160]; std::snprintf(text, sizeof(text), "D3D11: opening %s %ux%u fmt %d failed", tex_name(kind),
+                                      static_cast<unsigned>(desc.Width), desc.Height, format);
+        set_message(text);
+        CloseHandle(t.handle); t.handle = nullptr; t.resource.Reset();
+        return false;
     }
     return true;
 }
@@ -473,6 +483,147 @@ std::uint64_t Producer::begin_present_vk(std::uint64_t image, DXGI_FORMAT format
     }
     m.qpc_present = qpc_now();
     return m.frame_id + 1;  // 0 means "nothing to finish"
+}
+
+bool Producer::own_device_for(reshade::api::device* device, const char* api, ComPtr<ID3D12Device>& own) {
+    LUID luid{};
+    char text[96];
+    if (!device->get_property(reshade::api::device_properties::adapter_luid, &luid)) {
+        std::snprintf(text, sizeof(text), "%s: adapter LUID unknown", api); set_message(text); return false;
+    }
+    ComPtr<IDXGIFactory4> factory;
+    ComPtr<IDXGIAdapter1> adapter;
+    if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory))) || FAILED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter))) ||
+        FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&own)))) {
+        std::snprintf(text, sizeof(text), "%s: no D3D12 device on the game's GPU", api); set_message(text); return false;
+    }
+    return true;
+}
+
+bool Producer::attach_d3d11(reshade::api::device* device) {
+    if (!shared_ || !device) return false;
+    ComPtr<ID3D11Device5> game;
+    if (FAILED(reinterpret_cast<ID3D11Device*>(device->get_native())->QueryInterface(IID_PPV_ARGS(&game)))) {
+        set_message("D3D11: the game's device has no shared fences (Direct3D 11.4, Windows 10 1703 or later)");
+        return false;
+    }
+    if (d11_ && d11_.Get() == game.Get()) return true;
+    detach_d3d11();
+    // A D3D12 device of our own on the game's GPU creates what the presenter opens; the game's D3D11 device
+    // opens the same textures and fence.
+    ComPtr<ID3D12Device> own;
+    if (!own_device_for(device, "D3D11", own) || !attach(own.Get())) return false;
+    std::lock_guard lock(mutex_);
+    ComPtr<ID3D11Fence> fence;
+    if (FAILED(game->OpenSharedFence(fence_handle_, IID_PPV_ARGS(&fence)))) { set_message("D3D11: opening the shared fence failed"); return false; }
+    own_device_ = own;
+    d11_ = game;
+    d11_fence_ = fence;
+    return true;
+}
+
+void Producer::detach_d3d11() {
+    std::lock_guard lock(mutex_);
+    if (!d11_) return;
+    release_textures();  // (their D3D11 views belong to the device going away)
+    for (auto& m : shared_->slots) { m.state = kFree; m.frame_id = 0; }
+    d11_fence_.Reset();
+    d11_.Reset();
+}
+
+void Producer::copy_d3d11(ID3D11DeviceContext* context, ID3D11Resource* source, ID3D11Texture2D* target) {
+    ComPtr<ID3D11Texture2D> texture;
+    D3D11_TEXTURE2D_DESC desc{};
+    if (SUCCEEDED(source->QueryInterface(IID_PPV_ARGS(&texture)))) texture->GetDesc(&desc);
+    if (desc.SampleDesc.Count > 1) {
+        // (a multisampled swapchain, as older games have: resolved, which needs a typed format)
+        DXGI_FORMAT typed = desc.Format;
+        switch (typed) {
+            case DXGI_FORMAT_R8G8B8A8_TYPELESS: typed = DXGI_FORMAT_R8G8B8A8_UNORM; break;
+            case DXGI_FORMAT_B8G8R8A8_TYPELESS: typed = DXGI_FORMAT_B8G8R8A8_UNORM; break;
+            case DXGI_FORMAT_R10G10B10A2_TYPELESS: typed = DXGI_FORMAT_R10G10B10A2_UNORM; break;
+            case DXGI_FORMAT_R16G16B16A16_TYPELESS: typed = DXGI_FORMAT_R16G16B16A16_FLOAT; break;
+            default: break;
+        }
+        context->ResolveSubresource(target, 0, source, 0, typed);
+    } else {
+        context->CopySubresourceRegion(target, 0, 0, 0, 0, source, 0, nullptr);
+    }
+}
+
+void Producer::on_tag_d3d11(std::uint64_t frame, Tex kind, ID3D11Resource* source, std::uint32_t ext_x, std::uint32_t ext_y,
+                            std::uint32_t ext_w, std::uint32_t ext_h, ID3D11DeviceContext* context) {
+    std::lock_guard lock(mutex_);
+    if (!ready() || !d11_ || !source || !context) return;
+    ComPtr<ID3D11Texture2D> texture;
+    if (FAILED(source->QueryInterface(IID_PPV_ARGS(&texture)))) return;
+    D3D11_TEXTURE2D_DESC sd{};
+    texture->GetDesc(&sd);
+    if (sd.SampleDesc.Count != 1) return;
+    const int slot = slot_for_frame(frame, true);
+    if (slot < 0) return;
+    collect_retired();
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = sd.Width; desc.Height = sd.Height; desc.Format = sd.Format;
+    if (!ensure_texture(slot, kind, desc)) { ++shared_->hooks.copies_failed; return; }
+    auto& t = textures_[slot][kind];
+    copy_d3d11(context, source, t.d11.Get());
+    auto& info = shared_->slots[slot].tex[kind];
+    info.width = sd.Width; info.height = sd.Height;
+    info.format = t.desc.Format; info.generation = t.generation;
+    if (!ext_w || !ext_h) { ext_x = ext_y = 0; ext_w = info.width; ext_h = info.height; }
+    info.ext_x = ext_x; info.ext_y = ext_y; info.ext_w = ext_w; info.ext_h = ext_h;
+    info.valid = 1;
+    push_event(shared_, kEvTag, frame, static_cast<std::uint64_t>(kind) | (static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(source)) << 8));
+}
+
+std::uint64_t Producer::begin_present_d3d11(ID3D11Resource* backbuffer, ID3D11DeviceContext* context) {
+    std::lock_guard lock(mutex_);
+    if (!ready() || !d11_ || !backbuffer || !context) return 0;
+    const int slot = present_slot();
+    if (slot < 0) return 0;
+    auto& m = shared_->slots[slot];
+    ComPtr<ID3D11Texture2D> texture;
+    D3D11_TEXTURE2D_DESC sd{};
+    if (SUCCEEDED(backbuffer->QueryInterface(IID_PPV_ARGS(&texture)))) texture->GetDesc(&sd);
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = sd.Width; desc.Height = sd.Height; desc.Format = sd.Format;
+    // (swapchains made format-mutable are typeless: share the plain format)
+    switch (desc.Format) {
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS: desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; break;
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS: desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; break;
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS: desc.Format = DXGI_FORMAT_R10G10B10A2_UNORM; break;
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS: desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; break;
+        default: break;
+    }
+    if (sd.Width && sd.Height && ensure_texture(slot, kBackbuffer, desc)) {
+        auto& t = textures_[slot][kBackbuffer];
+        copy_d3d11(context, backbuffer, t.d11.Get());
+        auto& info = m.tex[kBackbuffer];
+        info.width = sd.Width; info.height = sd.Height; info.format = t.desc.Format;
+        info.generation = t.generation; info.ext_x = info.ext_y = 0; info.ext_w = sd.Width; info.ext_h = sd.Height;
+        info.valid = 1;
+    }
+    m.qpc_present = qpc_now();
+    return m.frame_id + 1;  // 0 means "nothing to finish"
+}
+
+void Producer::finish_present_d3d11(ID3D11DeviceContext* context, std::uint64_t token) {
+    std::lock_guard lock(mutex_);
+    if (!token || !context || !d11_fence_) return;
+    const std::uint64_t frame = token - 1;
+    const int slot = slot_for_frame(frame, false);
+    if (slot < 0) return;
+    ComPtr<ID3D11DeviceContext4> context4;
+    if (FAILED(context->QueryInterface(IID_PPV_ARGS(&context4))) || FAILED(context4->Signal(d11_fence_.Get(), ++fence_value_))) return;
+    auto& m = shared_->slots[slot];
+    m.fence_value = fence_value_;
+    InterlockedExchange(&m.state, kReady);
+    InterlockedExchange64(&shared_->latest_ready_frame, static_cast<LONG64>(frame));
+    ++shared_->hooks.frames_published;
+    push_event(shared_, kEvPublished, frame, fence_value_);
 }
 
 void Producer::finish_present_vk(reshade::api::command_queue* queue, std::uint64_t token) {

@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-* **Games without DLSS or FSR, or with both switched off (experimental, DirectX 12):** XPAR now works
+* **Games without DLSS or FSR, or with both switched off (experimental, DirectX 12 and 11):** XPAR now works
   from ReShade's depth buffer alone. The motion between two game frames is estimated from the pictures themselves (in the presenter,
   on its own GPU queue: no motion vector shader is needed), and the camera from that and the depth. Against
   a game's real motion vectors the estimate is typically within a quarter of a pixel where the picture
@@ -16,6 +16,11 @@
   is kept (ReShade's own pick skips a scene rendered well below the picture's size and can settle on the
   wrong buffer; ticking the right one in its list did not last beyond the session). A buffer ticked by
   hand is respected. Every step is written to ReShade.log.
+* A game whose depth buffers read empty by the end of the frame (it clears them first) is recognised -
+  only while a 3D scene is being drawn and the picture moves, so never in a menu or a loading screen -
+  and ReShade's "Copy depth buffer before clear operations" is switched on; the panel asks for one restart.
+* Which way round the game stores its depth is found out too: ReShade's "reversed" depth setting no
+  longer has to match the game for XPAR.
 * Games whose camera XPAR estimates (no camera data from the game): the nearby scenery could start
   jumping between refreshes while the distance stayed smooth, after a frame with next to no depth in it
   had thrown the estimated position millions of units away (its steps were then coarser than a frame's
@@ -24,6 +29,18 @@
   together. Judged by the turn alone it came out far too wide under a high third-person camera (the ground
   a few metres away moves with the camera's orbit), and never settled: the nearby ground shook, and the
   motion vector scale kept being learned again.
+* **DirectX 11 games** (experimental): the game's frames reach the presenter through textures and a
+  fence shared with the game's DirectX 11 device (Windows 10 1703 or later). Without DLSS or FSR data,
+  as in DirectX 12 games: ReShade's depth and XPAR's own motion estimation.
+* The ReShade path (no DLSS or FSR): frames are timed at the game's steady pace instead of when they
+  were presented (an uneven presentation made the warp's camera speed jump: shaking, e.g. RE2), and only
+  the parts of the picture whose motion XPAR is sure of can count as moving on their own (under TAA or in
+  dark areas, the guessed motion of the rest was mistaken for movement and warped along: wobble).
+* The ReShade path (no DLSS or FSR): the camera put together from the picture's motion is kept level
+  and eases back from drifting up or down (it tipped over within minutes: the view swung and the mouse
+  calibration ran away), a frame whose motion cannot be worked out keeps the motion of the one before
+  instead of stopping the camera dead, and "Auto" latency shows the view a whole game frame behind
+  (the camera estimated from the picture cannot be carried ahead as well; RE2 went from shaking to steady).
 * The capture key (Ctrl+Shift+D) saves two consecutive game frames.
 
 ## 1.6.1

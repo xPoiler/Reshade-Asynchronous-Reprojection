@@ -90,11 +90,15 @@ public:
     // constrains the rotation. Starts from `omega`; returns the mean squared residual (px^2).
     // f: this frame's focal length (px), fp: the previous frame's (0: the same). A zoom between the two
     // (the game told us both fields of view) is then part of the model instead of looking like movement.
-    static double fit_motion(const std::vector<MotionSample>& s, double w, double h, double f, V3& omega, V3& T, double fp = 0) {
+    // prior, prior_weight: a move to stay close to where the picture cannot tell (see update: estimated
+    // motion vectors), weighted at prior_weight of the average weight the samples give the move.
+    static double fit_motion(const std::vector<MotionSample>& s, double w, double h, double f, V3& omega, V3& T, double fp = 0,
+                             const V3* prior = nullptr, double prior_weight = 0) {
         if (fp <= 0) fp = f;
         // Gauss-Newton with the exact Jacobian (one projection per sample and iteration). The rotation is
         // updated multiplicatively: R <- exp(delta) R, for which d(R c)/d(delta) = -[R c]x.
         M3 R = rotation(omega);
+        int used = 0;
         auto evaluate = [&](const M3& Rm, const V3& t, double A[6][6], double g[6]) {
             double sum = 0; int n = 0;
             for (const auto& p : s) {
@@ -122,27 +126,40 @@ public:
                         for (int j = i; j < 6; ++j) A[i][j] += J[a][i] * J[a][j];
                     }
             }
+            used = n;
             return n ? sum / n : 1e30;
         };
-        double best = 1e30;
+        double lambda = 0;
+        auto prior_cost = [&](const V3& t) {
+            if (lambda <= 0 || used <= 0) return 0.0;
+            double c = 0;
+            for (int i = 0; i < 3; ++i) c += (t[i] - (*prior)[i]) * (t[i] - (*prior)[i]);
+            return lambda * c / used;
+        };
+        double best = 1e30, best_data = 1e30;
         for (int it = 0; it < 5; ++it) {
             double A[6][6] = {}, g[6] = {};
             const double e = evaluate(R, T, A, g);
-            if (it == 0) best = e;
+            if (it == 0) {
+                if (prior && prior_weight > 0) lambda = prior_weight * (A[3][3] + A[4][4] + A[5][5]) / 3.0;
+                best = e + prior_cost(T); best_data = e;
+            }
             for (int i = 0; i < 6; ++i) for (int j = 0; j < i; ++j) A[i][j] = A[j][i];
+            if (lambda > 0)
+                for (int i = 0; i < 3; ++i) { A[3 + i][3 + i] += lambda; g[3 + i] += lambda * (T[i] - (*prior)[i]); }
             for (int i = 0; i < 6; ++i) A[i][i] += 1e-9 + 1e-6 * A[i][i];  // damping: translation is weak without near samples
             double step[6];
             if (!solve6(A, g, step)) break;
             const M3 Rn = mul(rotation(V3{-step[0], -step[1], -step[2]}), R);
             const V3 Tn{T[0] - step[3], T[1] - step[4], T[2] - step[5]};
-            const double en = evaluate(Rn, Tn, nullptr, nullptr);
+            const double en_data = evaluate(Rn, Tn, nullptr, nullptr), en = en_data + prior_cost(Tn);
             if (!(en < best)) break;
             const double gain = best - en;
-            R = Rn; T = Tn; best = en;
+            R = Rn; T = Tn; best = en; best_data = en_data;
             if (gain < 1e-6 * (best + 1e-9)) break;
         }
         omega = log_rotation(R);
-        return best;
+        return best_data;
     }
 
     // Rotation vector (axis * angle) of a rotation matrix.
@@ -255,6 +272,13 @@ public:
         }
         // Rotation and translation from all samples (near ones carry the translation), starting from the
         // distant-sample rotation; samples the motion does not explain (moving objects) are dropped.
+        // Estimated motion vectors (noisy): where most of the picture lies at a similar distance (a corridor),
+        // a turn and a sideways move shift it almost alike, and the fit split the same motion between them
+        // differently from frame to frame (RE2: their frame-to-frame changes ran opposite, correlation -0.57) -
+        // right on screen for the frame, but the warp carries a turn and a move forward differently: the near
+        // scenery shook. There, the move stays close to the previous frame's (move_prior): where the picture
+        // can tell, the samples outweigh it.
+        const V3* prior = noisy && have_prev_move_ ? &prev_move_ : nullptr;
         V3 T{};
         if (ok && consensus) {
             // The move, from all samples: starting from the turn, the samples within a limit of the model are
@@ -279,7 +303,7 @@ public:
                 for (const auto& p : valid) if (error(p) <= limit) in.push_back(p);
                 if (in.size() < 32) break;
                 V3 o2 = o, t2 = t;
-                const double e = fit_motion(in, w, h, f, o2, t2, fp);
+                const double e = fit_motion(in, w, h, f, o2, t2, fp, prior, move_prior);
                 if (!std::isfinite(e)) break;
                 o = o2; t = t2;
                 agree = 0;
@@ -292,7 +316,7 @@ public:
             valid = without_carried(valid);
             const double f = focal(h), fp = (h * 0.5) / std::tan((follow_zoom ? fprev_fov : fov_) * 0.5);
             V3 o = omega, t{};
-            double e = fit_motion(valid, w, h, f, o, t, fp);
+            double e = fit_motion(valid, w, h, f, o, t, fp, prior, move_prior);
             std::vector<double> errs;
             const M3 R0 = rotation(o);
             for (const auto& p : valid) {
@@ -308,7 +332,7 @@ public:
             const double limit = std::max(1.0, 3.0 * sorted[sorted.size() / 2]);
             std::vector<MotionSample> inliers;
             for (std::size_t i = 0; i < valid.size(); ++i) if (errs[i] <= limit) inliers.push_back(valid[i]);
-            if (inliers.size() >= 32) e = fit_motion(inliers, w, h, f, o, t, fp);
+            if (inliers.size() >= 32) e = fit_motion(inliers, w, h, f, o, t, fp, prior, move_prior);
             if (std::isfinite(e) && std::sqrt(e) < acceptable(valid)) { omega = o; T = t; last_residual_ = std::sqrt(e); }
         }
         // A field of view learned from estimated vectors and then locked has to keep explaining the frames:
@@ -326,12 +350,23 @@ public:
         for (const auto& p : all) { ++samples_; if (p.valid > 0.5f) ++samples_valid_; }
         if (!ok) ++rejected_;
         last_rejected_ = !ok;
-        if (!ok || game.reset) { omega = V3{0, 0, 0}; T = V3{0, 0, 0}; }
+        // A frame whose motion nothing explains holds the camera still - unless the motion vectors are
+        // estimated from the picture: there such a frame (2% of the turning ones in RE2: a fast turn, a
+        // blurred or dark picture) comes in the middle of a turn, and stopping the camera dead for a frame
+        // made the view swing like a pendulum. It keeps the motion of the frame before instead, for two
+        // frames at most.
+        bool carried = false;
+        if (!ok && noisy && !game.reset && have_good_ && carried_frames_ < 2) {
+            omega = good_omega_; T = good_move_; carried = true; ++carried_frames_;
+        }
+        if (ok) { good_omega_ = omega; good_move_ = T; have_good_ = !game.reset; carried_frames_ = 0; }
+        if ((!ok && !carried) || game.reset) { omega = V3{0, 0, 0}; T = V3{0, 0, 0}; if (!ok) have_good_ = false; }
         // A move no camera makes in one frame (further than four times the distance of the typical scenery,
         // or thousands of near planes): a fit on a frame with next to no depth in it. No move then.
         if (!plausible_move(T, depths.empty() ? 0.0 : double(depths[depths.size() / 2]))) T = V3{0, 0, 0};
         last_omega_ = omega;
         last_translation_ = T;
+        prev_move_ = T; have_prev_move_ = ok && !game.reset;
         // The camera now sits at T in the previous camera's coordinates: world move = B_prev * T.
         for (int i = 0; i < 3; ++i) position_[i] += basis_[i][0] * T[0] + basis_[i][1] * T[1] + basis_[i][2] * T[2];
         // The position is handed on in single precision, and only its changes matter: far from the origin its
@@ -344,6 +379,8 @@ public:
         const M3 R = rotation(omega);
         basis_ = mul(basis_, R);
         orthonormalize(basis_);
+        level(basis_);
+        if (noisy) settle_pitch(basis_);
         const Camera out = synthesize(w, h, R, T, game, (h * 0.5) / std::tan((follow_zoom ? prev_fov_ : fov_) * 0.5));
         prev_fov_ = fov_;
         if (learned_locked_ && game_v_ > 0 && game_fov_mode_ == 0) decide_game_fov();
@@ -407,9 +444,13 @@ public:
     void reset() {
         basis_ = identity_basis(); position_ = V3{}; ++epoch_; fov_votes_.clear(); fov_locked_ = false; fov_ = kDefaultFov; prev_fov_ = 0;
         learned_fov_ = kDefaultFov; learned_locked_ = false; game_fov_mode_ = 0; game_votes_v_.clear(); game_votes_h_.clear();
+        have_prev_move_ = false; have_good_ = false; carried_frames_ = 0;
     }
 
     static constexpr double kDefaultFov = 1.2217;  // 70 degrees vertical until learned
+    // How much the previous frame's move counts in the fit, against the average weight of the samples
+    // (estimated motion vectors only: see update).
+    static inline double move_prior = 0.05;
     // Where the position starts again from zero: single precision still has steps of 1/1000 of a near plane there.
     static constexpr double kFarFromOrigin = 8192.0;
     static bool plausible_move(const V3& T, double typical_depth) {
@@ -648,6 +689,44 @@ private:
         // Unreal-like world axes: forward +X, right +Y, up +Z. Columns: right, up, forward.
         return M3{{{0, 0, 1}, {1, 0, 0}, {0, 1, 0}}};
     }
+    // Game cameras do not roll: the camera is kept level (its right vector perpendicular to the world's up,
+    // +Z). Frame by frame the turn is right, but its small errors add up, and the camera put together from
+    // them tipped over within minutes (RE2: its right vector 35-45 degrees off level). The world's up worked
+    // out from that drifted with it, so mouse turns were applied about a tilted axis - up-down motion mixed
+    // into left-right, the view swinging diagonally (violent shaking across the whole screen after some
+    // minutes, until the camera model was reset) - and the mouse calibration learned from the mixture
+    // (sensitivity running away). Only the camera's orientation is levelled; each frame's own turn, which
+    // the reprojection matrices are made of, is left as measured. (Looking straight up or down there is no
+    // level to keep: left as it is.)
+    static void level(M3& B) {
+        const V3 f{B[0][2], B[1][2], B[2][2]};
+        if (std::fabs(f[2]) > 0.99) return;
+        const double n = std::sqrt(f[0] * f[0] + f[1] * f[1]);
+        const V3 r{-f[1] / n, f[0] / n, 0.0};  // Z x f
+        const V3 u{f[1] * r[2] - f[2] * r[1], f[2] * r[0] - f[0] * r[2], f[0] * r[1] - f[1] * r[0]};  // f x r
+        for (int i = 0; i < 3; ++i) { B[i][0] = r[i]; B[i][1] = u[i]; }
+    }
+    // Estimated motion vectors: the up-down angle eases back towards level, by 0.4% per frame (some 5
+    // seconds at 50 frames per second). Each frame's measured pitch carries a small bias (half a pixel), and
+    // added up it drifted the camera put together from them far up or down (RE2: from +8 to +70 degrees in a
+    // minute and a half). At such an angle a turn about the world's up axis reads as a heading change
+    // 1/cos(angle) too large, so the warp and the mouse calibration went increasingly wrong the longer one
+    // played. Real cameras spend most of their time near level; a real look up or down still shows at once
+    // (each frame's own turn is untouched) and only its absolute angle fades.
+    static void settle_pitch(M3& B) {
+        const V3 f{B[0][2], B[1][2], B[2][2]}, u{B[0][1], B[1][1], B[2][1]};
+        const double el = std::asin(std::clamp(f[2], -1.0, 1.0));
+        // (the heading: from the forward vector, or near straight up or down from the up vector)
+        double hx = f[0], hy = f[1];
+        if (std::fabs(f[2]) > 0.9) { const double s = f[2] < 0 ? 1.0 : -1.0; hx = u[0] * s; hy = u[1] * s; }
+        const double hn = std::sqrt(hx * hx + hy * hy);
+        if (hn < 1e-9) return;
+        const double target = el * (1.0 - 0.004);
+        const V3 g{hx / hn * std::cos(target), hy / hn * std::cos(target), std::sin(target)};
+        const V3 r{-hy / hn, hx / hn, 0.0};  // level: Z x heading
+        const V3 up{g[1] * r[2] - g[2] * r[1], g[2] * r[0] - g[0] * r[2], g[0] * r[1] - g[1] * r[0]};  // f x r
+        for (int i = 0; i < 3; ++i) { B[i][0] = r[i]; B[i][1] = up[i]; B[i][2] = g[i]; }
+    }
     static void orthonormalize(M3& B) {
         V3 f{B[0][2], B[1][2], B[2][2]}, u{B[0][1], B[1][1], B[2][1]};
         auto norm = [](V3& v) { const double l = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); for (auto& x : v) x /= l; };
@@ -704,6 +783,11 @@ private:
     int game_fov_mode_ = 0;
     std::vector<double> game_votes_v_, game_votes_h_;
     V3 last_omega_{}, last_translation_{}, position_{};
+    V3 prev_move_{};
+    bool have_prev_move_ = false;
+    V3 good_omega_{}, good_move_{};  // the last frame whose motion was explained (estimated motion vectors)
+    bool have_good_ = false;
+    int carried_frames_ = 0;
     std::uint32_t epoch_ = 0;  // times the position started again from zero
     std::uint64_t frames_ = 0, rejected_ = 0, consensus_ = 0, samples_ = 0, samples_valid_ = 0;
     std::uint64_t locked_frames_ = 0, locked_rejected_ = 0;

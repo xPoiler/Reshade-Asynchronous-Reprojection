@@ -27,6 +27,13 @@ enum class DepthChoice { kUnavailable, kChoosing, kSettled };
 // not to be used.
 DepthChoice choose_depth_buffer(reshade::api::effect_runtime* runtime, reshade::api::command_list* cmd_list,
                                 reshade::api::resource_view probe, reshade::api::resource_view bound_depth);
+// Which way round the depth is stored (ReShade's RESHADE_DEPTH_INPUT_IS_REVERSED does not have to match the
+// game): checked on XPAR.fx's probe and corrected through its XPAR_Flip uniform. False until known; the
+// depth of such frames is not to be used.
+bool depth_orientation_ready(reshade::api::effect_runtime* runtime, reshade::api::command_list* cmd_list,
+                             reshade::api::resource_view probe, reshade::api::effect_uniform_variable flip_variable);
+// ReShade's depth copy setting was switched on (the depth read empty): the game has to be restarted once.
+bool depth_restart_needed();
 // The feed stopped (an upscaler gives depth again, XPAR disabled): Generic Depth's own choice again.
 void release_depth_choice(reshade::api::effect_runtime* runtime);
 }

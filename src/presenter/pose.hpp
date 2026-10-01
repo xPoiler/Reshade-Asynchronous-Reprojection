@@ -280,6 +280,7 @@ struct PoseSettings {
     double auto_fraction = 1.0;           // > 0: prediction = -auto_fraction * (measured game frame interval)
     bool manual_gain = false;
     double manual_gain_x = 0, manual_gain_y = 0, manual_delay = 0;
+    bool freeze_fit = false;  // (testing: the mouse parameters stay as seeded)
 };
 
 struct Prediction {
@@ -507,6 +508,7 @@ public:
 
     // Refit tau / delay (grid) and gain (least squares) per axis on the frame history.
     void fit() {
+        if (settings_.freeze_fit) return;
         static constexpr double kTaus[] = {0.0, 0.03, 0.05, 0.07, 0.09, 0.12, 0.15, 0.2, 0.3};
         static constexpr double kDelays[] = {-0.01, 0.0, 0.01, 0.02, 0.03};
         for (int k = 0; k < 2; ++k) {

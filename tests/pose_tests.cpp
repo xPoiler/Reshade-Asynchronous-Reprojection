@@ -1,4 +1,6 @@
 #include "presenter/pose.hpp"
+#include "presenter/frame_clock.hpp"
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 
@@ -264,7 +266,27 @@ static void world_up_detection() {
     EXPECT(err < 0.5, "a drifted up axis is followed (error %.2f deg)", err);
 }
 
+// FrameClock: a game simulating at a steady 60 Hz whose presents come late now and then (one in five 6 ms
+// late) is timed at its steady pace, never after a frame was presented; a skipped frame starts it again.
+static void frame_clock_tests() {
+    fw::FrameClock clock;
+    double worst = 0, later = 0;
+    std::uint64_t frame = 100;
+    for (int i = 0; i < 300; ++i, ++frame) {
+        const double sim = i / 60.0, presented = sim + 0.002 + (i % 5 == 4 ? 0.006 : 0.0);
+        const double t = clock.next(frame, presented);
+        if (i > 20) worst = std::max(worst, std::fabs((t - sim) - 0.002 - 0.0012));  // (a steady offset is fine: about the mean delay)
+        later = std::max(later, t - presented);
+    }
+    std::printf("frame clock: off the steady pace by at most %.2f ms, after the present by %.2f ms\n", worst * 1000, later * 1000);
+    EXPECT(worst < 0.0015, "late presents do not move the frame times (%.2f ms)", worst * 1000);
+    EXPECT(later <= 0.0, "never after the present");
+    const double gap = clock.next(frame + 5, 10.0);
+    EXPECT(gap == 10.0, "a skipped frame starts again from the presented time");
+}
+
 int main() {
+    frame_clock_tests();
     rotation_conventions();
     right_handed_projection();
     fit_recovers_smoothed_camera();

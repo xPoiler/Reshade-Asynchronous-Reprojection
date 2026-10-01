@@ -18,6 +18,7 @@ struct State {
     unsigned waited = 0;
     effect_technique feed{0};
     effect_texture_variable depth{0}, probe{0}, bound{0};
+    effect_uniform_variable flip{0};
     char status[200] = "";
 } g;
 
@@ -33,6 +34,7 @@ void scan(effect_runtime* runtime) {
     g.scanned = true;
     g.feed = runtime->find_technique("XPAR.fx", "XPAR_Feed");
     g.depth = {0}; g.probe = {0}; g.bound = {0};
+    g.flip = runtime->find_uniform_variable("XPAR.fx", "XPAR_Flip");
     runtime->enumerate_texture_variables("XPAR.fx", [&](effect_runtime* r, effect_texture_variable v) {
         char name[160] = "";
         r->get_texture_variable_name(v, name);
@@ -55,7 +57,7 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
     Producer* p = g_producer;
     if (!p || !p->ready() || p->vulkan() || !runtime || !cmd_list) return;
     device* dev = runtime->get_device();
-    if (!dev || dev->get_api() != device_api::d3d12) return;
+    if (!dev || (dev->get_api() != device_api::d3d12 && !(dev->get_api() == device_api::d3d11 && p->d3d11()))) return;
     // The game's own depth and motion vectors (an upscaler's, Streamline's) always come first: the feed is
     // what there is when nothing else gives them (a game without DLSS or FSR, or with both switched off, at
     // the start or in the middle of a session), and it is out from the first frame an upscaler gives. It
@@ -82,11 +84,10 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
     resource_view depth_view{0}, unused{0};
     runtime->get_texture_binding(g.depth, &depth_view, &unused);
     if (!depth_view.handle) return;  // (not created yet: from the next frame on)
-    auto* depth = reinterpret_cast<ID3D12Resource*>(dev->get_resource_from_view(depth_view).handle);
-    auto* list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
-    if (!depth || !list) return;
-    const D3D12_RESOURCE_DESC desc = depth->GetDesc();
-    const std::uint32_t w = static_cast<std::uint32_t>(desc.Width), h = desc.Height;
+    const resource depth = dev->get_resource_from_view(depth_view);
+    if (!depth.handle || !cmd_list->get_native()) return;
+    const resource_desc desc = dev->get_resource_desc(depth);
+    const std::uint32_t w = desc.texture.width, h = desc.texture.height;
     // Which of the game's depth buffers ReShade hands over (depth_choice.hpp): while that is being found out,
     // this frame's depth is a candidate's and is not published.
     resource_view probe_view{0}, bound_view{0};
@@ -94,6 +95,10 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
     if (g.bound.handle) runtime->get_texture_binding(g.bound, &bound_view, &unused);
     if (choose_depth_buffer(runtime, cmd_list, probe_view, bound_view) == DepthChoice::kChoosing) {
         set_status("No DLSS or FSR data from this game: finding the game's depth buffer...");
+        return;
+    }
+    if (!depth_orientation_ready(runtime, cmd_list, probe_view, g.flip)) {
+        set_status("No DLSS or FSR data from this game: checking which way round its depth is stored...");
         return;
     }
 
@@ -107,11 +112,21 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
     cam.mvec_scale[0] = static_cast<float>(w);
     cam.mvec_scale[1] = static_cast<float>(h);
     p->on_constants(frame, cam);
-    // ReShade leaves an effect's render targets readable by shaders between passes.
-    const auto state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    p->on_tag(frame, kDepth, depth, state, 0, 0, w, h, list);
+    if (dev->get_api() == device_api::d3d11) {
+        // (the immediate context: ReShade renders its effects there)
+        p->on_tag_d3d11(frame, kDepth, reinterpret_cast<ID3D11Resource*>(depth.handle), 0, 0, w, h,
+                        reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native()));
+    } else {
+        // ReShade leaves an effect's render targets readable by shaders between passes.
+        const auto state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        p->on_tag(frame, kDepth, reinterpret_cast<ID3D12Resource*>(depth.handle), state, 0, 0, w, h,
+                  reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()));
+    }
     char text[200];
-    std::snprintf(text, sizeof(text), "No DLSS or FSR data from this game: depth from ReShade (%ux%u), motion and camera estimated by XPAR.", w, h);
+    if (depth_restart_needed())
+        std::snprintf(text, sizeof(text), "No DLSS or FSR data from this game. Its depth reads empty: XPAR switched on ReShade's depth copy - restart the game once.");
+    else
+        std::snprintf(text, sizeof(text), "No DLSS or FSR data from this game: depth from ReShade (%ux%u), motion and camera estimated by XPAR.", w, h);
     set_status(text);
 }
 

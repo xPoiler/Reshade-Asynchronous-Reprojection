@@ -11,10 +11,22 @@ namespace fw {
 // other way round, which is tried as well) and brightness per probe pixel.
 struct DepthProbeScore {
     double coverage = 0, edges = 0, lift = 0, score = 0;
+    bool flat = false;    // one depth value everywhere: an empty (cleared) buffer
+    double detail = 0;    // how much the picture's brightness varies (standard deviation, 0..1)
 };
 inline DepthProbeScore score_depth_probe(const float* px, std::uint32_t w, std::uint32_t h) {
     DepthProbeScore best;
     if (!px || w < 8 || h < 8) return best;
+    float dmin = 1e30f, dmax = -1e30f;
+    double lsum = 0, lsq = 0;
+    for (std::size_t i = 0; i < std::size_t(w) * h; ++i) {
+        const float d = px[i * 2], l = px[i * 2 + 1];
+        if (std::isfinite(d)) { dmin = std::min(dmin, d); dmax = std::max(dmax, d); }
+        if (std::isfinite(l)) { lsum += l; lsq += double(l) * l; }
+    }
+    const double n = double(w) * h, mean = lsum / n;
+    const bool flat = !(dmax - dmin > 1e-4f);
+    const double detail = std::sqrt(std::max(lsq / n - mean * mean, 0.0));
     // (the depth as handed over, and turned round: ReShade's "reversed" setting may be the wrong way for the game)
     for (int turned = 0; turned < 2; ++turned) {
         auto depth = [&](std::uint32_t x, std::uint32_t y) {
@@ -49,6 +61,7 @@ inline DepthProbeScore score_depth_probe(const float* px, std::uint32_t w, std::
         s.score = std::max(s.lift - 1.0, 0.0) * std::min(1.0, s.coverage / 0.5);
         if (s.score > best.score || turned == 0) best = s;
     }
+    best.flat = flat; best.detail = detail;
     return best;
 }
 }  // namespace fw

@@ -263,6 +263,53 @@ int main() {
         std::printf("estimator CPU: %.3f ms per game frame\n", ms);
         EXPECT(ms < 1.5, "estimator is cheap enough per game frame (%.3f ms)", ms);
     }
+    // Estimated motion vectors: a frame nothing explains (all its vectors wrong) in the middle of a steady turn
+    // keeps the turn of the frame before; three in a row: the third holds still.
+    {
+        CameraEstimator carry;
+        Camera g{}; g.fov = float(fov); g.depth_inverted = 1;
+        for (int i = 0; i < 80; ++i) carry.update(make({turn(rng) * 0.5, turn(rng), 0}, fov, 0.0, rng), kW, kH, g, true);  // (the field of view first)
+        const CameraEstimator::V3 steady{0, 0.02, 0};
+        for (int i = 0; i < 10; ++i) carry.update(make(steady, fov, 0.0, rng), kW, kH, g, true);
+        double kept[3];
+        for (int i = 0; i < 3; ++i) { carry.update(make(steady, fov, 1.0, rng), kW, kH, g, true); kept[i] = carry.last_omega()[1]; }
+        std::printf("carry: turns through three unexplained frames %.4f %.4f %.4f (steady 0.0200)\n", kept[0], kept[1], kept[2]);
+        EXPECT(std::fabs(kept[0] - 0.02) < 0.002 && std::fabs(kept[1] - 0.02) < 0.002 && kept[2] == 0.0,
+               "an unexplained frame keeps the turn before it, twice at most");
+    }
+    // Estimated motion vectors with a small bias in every frame's pitch (half a pixel): the camera put together
+    // from them stays near level instead of drifting up (it would reach the vertical within the run), and
+    // stays a proper camera (unit, perpendicular axes).
+    {
+        CameraEstimator drift;
+        Camera g{}; g.fov = float(fov); g.depth_inverted = 1;
+        for (int i = 0; i < 80; ++i) drift.update(make({turn(rng) * 0.5, turn(rng), 0}, fov, 0.0, rng), kW, kH, g, true);  // (the field of view first)
+        double worst = 0, axes = 0;
+        for (int i = 0; i < 3000; ++i) {
+            const Camera c = drift.update(make({0.0006, 0.02 * std::sin(i * 0.02), 0}, fov, 0.0, rng, {0, 0, 0}, 0, 32, 18), kW, kH, g, true);
+            worst = std::max(worst, std::fabs(std::asin(std::clamp(double(c.fwd[2]), -1.0, 1.0))) * 180 / kPi);
+            const double dot = double(c.fwd[0]) * c.right[0] + double(c.fwd[1]) * c.right[1] + double(c.fwd[2]) * c.right[2];
+            axes = std::max(axes, std::fabs(dot));
+        }
+        std::printf("pitch drift: up-down angle at most %.1f deg over 3000 frames of a biased pitch (unchecked: %.0f deg), axes off by %.1e\n",
+                    worst, 0.0006 * 3000 * 180 / kPi, axes);
+        EXPECT(worst < 12.0 && axes < 1e-6, "the picture-estimated camera stays near level (%.1f deg)", worst);
+    }
+    // Minutes of turning with a little roll in every frame's measured turn (errors of estimated motion): the
+    // camera put together from the turns stays level - its right vector perpendicular to the world's up.
+    {
+        CameraEstimator level;
+        Camera g{}; g.fov = float(fov); g.depth_inverted = 1;
+        std::uniform_real_distribution<double> roll(-0.004, 0.006);  // (biased: errors that would add up)
+        double worst = 0;
+        Camera out{};
+        for (int i = 0; i < 600; ++i) {
+            out = level.update(make({0.004 * std::sin(i * 0.05), 0.02, roll(rng)}, fov, 0.0, rng, {0, 0, 0}, 0, 32, 18), kW, kH, g);
+            worst = std::max(worst, double(std::fabs(out.right[2])));
+        }
+        std::printf("level: right vector off level by at most %.2e after %d frames of turning\n", worst, 600);
+        EXPECT(worst < 1e-6, "the estimated camera stays level (%.2e)", worst);
+    }
     // A long way in one direction (scenery ten near planes away and further, 1 near plane per
     // frame): the position handed on stays near the origin (single precision keeps a frame's move exact
     // there), starting again from zero as a discontinuity; the frame's own move is never lost.

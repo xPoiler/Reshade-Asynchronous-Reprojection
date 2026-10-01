@@ -64,6 +64,7 @@ float depth_key(float d) { return 1.0 + saturate((log2(max(d, 1e-30)) + 24.0) / 
 
 Texture2D<float> depth_t : register(t0);
 Texture2D<float2> motion_t : register(t1);
+Texture2D<float4> analyze_flow_t : register(t2);  // (flag 2: XPAR's own motion, z = trusted)
 RWTexture2D<float4> object_u : register(u0);        // xy: own motion (render px, to previous frame), z: depth, w: 1 moving, 2 attached to camera
 RWStructuredBuffer<float4> partial_u : register(u1);
 groupshared float4 gs_a[64], gs_b[64];
@@ -81,7 +82,13 @@ groupshared float4 gs_a[64], gs_b[64];
                 const float2 own = (g * mv_scale - cam) * float2(rect.zw);
                 const float2 cam_px = cam * float2(rect.zw);
                 const float limit = max(threshold, 0.15 * length(cam_px));  // camera-model error grows with camera speed
-                const bool moving = (flags & 1) && dot(own, own) > limit * limit;
+                // XPAR's own motion (flag 2), estimated from the picture: only where it is trusted can a pixel be
+                // seen moving on its own. Elsewhere (flat or dark areas, a soft TAA picture) the motion is filled
+                // in from around it and its error would pass for movement: up to a quarter of the picture, warped
+                // along with that error, shook (RE2 with TAA).
+                bool trusted = true;
+                if (flags & 2) trusted = analyze_flow_t.Load(int3(min(uint2((float2(id.xy) + 0.5) * float2(out_size) / float2(grid)), out_size - 1), 0)).z > 0.5;
+                const bool moving = (flags & 1) && trusted && dot(own, own) > limit * limit;
                 // Attached to the camera (first-person weapon, hands): close to the camera and moving in a way the
                 // camera motion does not explain - stuck to the screen while the world moves under it, or mid
                 // animation (aiming in/out while walking). Nearby walls move exactly as the camera predicts.
@@ -1532,7 +1539,8 @@ void Renderer::analyze_motion(const IngestedSource& src, const float clip_to_pre
     // Descriptors are rewritten each time; the resources behind them only change after wait_idle.
     set_x_srv(kXAnalyzeSrv + 0, kPDepth);
     set_x_srv(kXAnalyzeSrv + 1, kPMotion);
-    for (UINT i = 2; i < kXSrvCount; ++i) set_x_srv(kXAnalyzeSrv + i, kPDepth);
+    set_x_srv(kXAnalyzeSrv + 2, own_motion_ ? kPFlowB : kPDepth);  // (XPAR's own motion: which of it is trusted)
+    for (UINT i = 3; i < kXSrvCount; ++i) set_x_srv(kXAnalyzeSrv + i, kPDepth);
     set_x_uav(kXAnalyzeUav + 0, kPObject);
     auto buffer_uav = [&](UINT index, ID3D12Resource* r, UINT elements) {
         D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
@@ -1554,6 +1562,7 @@ void Renderer::analyze_motion(const IngestedSource& src, const float clip_to_pre
     c.threshold = 1.0f;
     c.groups_x = gx;
     c.flags = (scale_valid ? 1u : 0u) | (depth_inverted ? 16u : 0u) | (near_rule ? 0u : 64u) | (turn_rule ? 128u : 0u);
+    if (own_motion_) { c.flags |= 2u; c.out_size[0] = std::max(1u, w / 2); c.out_size[1] = std::max(1u, h / 2); }  // (level 0 of the displacements)
     transition(private_[kPObject], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     x_dispatch(cs_analyze_.Get(), &c, kXAnalyzeSrv, kXAnalyzeUav, gx, gy);
     D3D12_RESOURCE_BARRIER uav{}; uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; uav.UAV.pResource = partials_.Get();

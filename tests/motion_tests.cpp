@@ -144,6 +144,7 @@ static void depth_probe_tests() {
     EXPECT(r.score > 2.0, "the right depth stands out (%.2f)", r.score);
     EXPECT(t.score > 0.8 * r.score, "whichever way round it is stored (%.2f against %.2f)", t.score, r.score);
     EXPECT(o.score < 0.5 * r.score && p.score < 0.5 * r.score && e.score == 0.0, "another view's, a partial and an empty one do not (%.2f, %.2f, %.2f)", o.score, p.score, e.score);
+    EXPECT(e.flat && !r.flat && !p.flat && e.detail > 0.1, "an empty buffer is told apart (one value everywhere) in a picture with detail (%.2f)", e.detail);
 }
 
 int main() {

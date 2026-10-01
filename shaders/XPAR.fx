@@ -16,6 +16,10 @@
     #define XPAR_FEED_DIV 1
 #endif
 
+// Set by the add-on when the depth comes the other way round (ReShade's RESHADE_DEPTH_INPUT_IS_REVERSED
+// not matching the game): it checks that itself, so the setting does not have to be right.
+uniform bool XPAR_Flip < hidden = true; > = false;
+
 texture XPAR_Depth { Width = BUFFER_WIDTH / XPAR_FEED_DIV; Height = BUFFER_HEIGHT / XPAR_FEED_DIV; Format = R32F; };
 
 float XPAR_FeedPS(in float4 position : SV_Position, in float2 texcoord : TEXCOORD) : SV_Target
@@ -25,7 +29,8 @@ float XPAR_FeedPS(in float4 position : SV_Position, in float2 texcoord : TEXCOOR
     // near = 1 and far = 0 (then it is proportional to 1 / distance): undo the last step and turn it round.
     const float far_plane = RESHADE_DEPTH_LINEARIZATION_FAR_PLANE;
     const float lin = ReShade::GetLinearizedDepth(texcoord);
-    return 1.0 - lin * far_plane / (1.0 + lin * (far_plane - 1.0));
+    const float depth = 1.0 - lin * far_plane / (1.0 + lin * (far_plane - 1.0));
+    return XPAR_Flip ? 1.0 - depth : depth;
 }
 
 // A small probe of the depth and of the picture's brightness: the add-on reads it to tell which of the

@@ -1,5 +1,6 @@
 #include "addon/depth_choice.hpp"
 #include <reshade.hpp>
+#include <d3d11.h>
 #include <d3d12.h>
 #include <wrl/client.h>
 #include <algorithm>
@@ -45,7 +46,7 @@ std::unordered_map<std::uint64_t, Candidate> g_seen;  // by resource handle
 void note(command_list* cmd_list, resource_view dsv) {
     if (!g_track.load(std::memory_order_relaxed) || !dsv.handle || !cmd_list) return;
     device* dev = cmd_list->get_device();
-    if (!dev || dev->get_api() != device_api::d3d12) return;
+    if (!dev || (dev->get_api() != device_api::d3d12 && dev->get_api() != device_api::d3d11)) return;
     const resource res = dev->get_resource_from_view(dsv);
     if (!res.handle) return;
     const std::uint64_t frame = g_frame.load(std::memory_order_relaxed);
@@ -82,6 +83,15 @@ constexpr int kReadbackFrames = 5;  // after the probe's copy: the GPU has done 
 constexpr int kRounds = 2;
 constexpr double kMinScore = 0.5;   // brightness changes 1.5x stronger across the depth edges than elsewhere, at least
 
+// Reads XPAR.fx's probe back to the CPU (a few frames after the copy).
+struct ProbeReader {
+    ComPtr<ID3D12Resource> readback;
+    ComPtr<ID3D11Texture2D> staging;  // (Direct3D 11)
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    std::uint64_t readback_bytes = 0;
+    void reset() { readback.Reset(); staging.Reset(); }
+};
+
 struct Chooser {
     enum Phase { kIdle, kProbe, kSettled } phase = kIdle;
     std::vector<Candidate> cand;
@@ -96,9 +106,15 @@ struct Chooser {
     // Checking that the chosen buffer still fits the picture (another one came into use), while it is used.
     bool verifying = false, verify_copied = false;
     int verify_wait = 0, verify_fails = 0;
-    ComPtr<ID3D12Resource> readback;
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
-    std::uint64_t readback_bytes = 0;
+    ProbeReader reader;
+    // Empty depth in a running game (see empty_depth_verdict): this choice's evidence, and the verdicts so far.
+    bool all_flat = true;
+    double detail = 0;
+    std::vector<float> luma;          // the picture's brightness at the last probe of this choice
+    std::vector<float> empty_luma;    // ... at the last verdict of empty depth
+    int empty_verdicts = 0;
+    std::uint64_t first_empty_frame = 0;
+    bool restart_needed = false;
 } c;
 
 void say(const char* text) { reshade::log::message(reshade::log::level::info, text); }
@@ -113,7 +129,28 @@ bool fits_picture(const Candidate& k, std::uint32_t fw_, std::uint32_t fh) {
     return std::fabs(float(fw_) / float(fh) - float(k.w) / float(k.h)) <= 0.1f;
 }
 
-bool copy_probe(device* dev, command_list* cmd_list, resource_view probe) {
+bool copy_probe(ProbeReader& r, device* dev, command_list* cmd_list, resource_view probe) {
+    if (dev->get_api() == device_api::d3d11) {
+        auto* tex = reinterpret_cast<ID3D11Texture2D*>(dev->get_resource_from_view(probe).handle);
+        auto* context = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
+        if (!tex || !context) return false;
+        D3D11_TEXTURE2D_DESC desc{};
+        tex->GetDesc(&desc);
+        if (desc.Format != DXGI_FORMAT_R32G32_FLOAT) return false;
+        D3D11_TEXTURE2D_DESC have{};
+        if (r.staging) r.staging->GetDesc(&have);
+        if (!r.staging || have.Width != desc.Width || have.Height != desc.Height) {
+            r.staging.Reset();
+            ComPtr<ID3D11Device> d3d;
+            tex->GetDevice(&d3d);
+            D3D11_TEXTURE2D_DESC sd = desc;
+            sd.MipLevels = 1; sd.ArraySize = 1; sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0;
+            sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; sd.MiscFlags = 0;
+            if (!d3d || FAILED(d3d->CreateTexture2D(&sd, nullptr, &r.staging))) return false;
+        }
+        context->CopySubresourceRegion(r.staging.Get(), 0, 0, 0, 0, tex, 0, nullptr);
+        return true;
+    }
     auto* tex = reinterpret_cast<ID3D12Resource*>(dev->get_resource_from_view(probe).handle);
     auto* d3d = reinterpret_cast<ID3D12Device*>(dev->get_native());
     auto* list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
@@ -123,16 +160,16 @@ bool copy_probe(device* dev, command_list* cmd_list, resource_view probe) {
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
     UINT64 total = 0;
     d3d->GetCopyableFootprints(&desc, 0, 1, 0, &fp, nullptr, nullptr, &total);
-    if (!c.readback || c.readback_bytes != total) {
-        c.readback.Reset();
+    if (!r.readback || r.readback_bytes != total) {
+        r.readback.Reset();
         D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_READBACK;
         D3D12_RESOURCE_DESC bd{}; bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = total; bd.Height = 1;
         bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        if (FAILED(d3d->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&c.readback))))
+        if (FAILED(d3d->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&r.readback))))
             return false;
-        c.readback_bytes = total;
+        r.readback_bytes = total;
     }
-    c.footprint = fp;
+    r.footprint = fp;
     // ReShade leaves an effect's render targets readable by shaders between passes.
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -140,7 +177,7 @@ bool copy_probe(device* dev, command_list* cmd_list, resource_view probe) {
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     list->ResourceBarrier(1, &b);
-    D3D12_TEXTURE_COPY_LOCATION dst{c.readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+    D3D12_TEXTURE_COPY_LOCATION dst{r.readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
     dst.PlacedFootprint = fp;
     D3D12_TEXTURE_COPY_LOCATION src{tex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
     list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
@@ -149,21 +186,89 @@ bool copy_probe(device* dev, command_list* cmd_list, resource_view probe) {
     return true;
 }
 
-bool read_probe(std::vector<float>& px, std::uint32_t& w, std::uint32_t& h) {
-    if (!c.readback) return false;
-    w = c.footprint.Footprint.Width; h = c.footprint.Footprint.Height;
-    const D3D12_RANGE range{0, static_cast<SIZE_T>(c.readback_bytes)};
+bool read_probe(ProbeReader& r, std::vector<float>& px, std::uint32_t& w, std::uint32_t& h) {
+    if (r.staging) {
+        ComPtr<ID3D11Device> d3d;
+        ComPtr<ID3D11DeviceContext> context;
+        r.staging->GetDevice(&d3d);
+        if (d3d) d3d->GetImmediateContext(&context);
+        D3D11_TEXTURE2D_DESC desc{};
+        r.staging->GetDesc(&desc);
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (!context || FAILED(context->Map(r.staging.Get(), 0, D3D11_MAP_READ, 0, &mapped)) || !mapped.pData) return false;
+        w = desc.Width; h = desc.Height;
+        px.resize(std::size_t(w) * h * 2);
+        for (std::uint32_t y = 0; y < h; ++y)
+            std::memcpy(&px[std::size_t(y) * w * 2], static_cast<const std::uint8_t*>(mapped.pData) + std::size_t(y) * mapped.RowPitch, std::size_t(w) * 8);
+        context->Unmap(r.staging.Get(), 0);
+        return true;
+    }
+    if (!r.readback) return false;
+    w = r.footprint.Footprint.Width; h = r.footprint.Footprint.Height;
+    const D3D12_RANGE range{0, static_cast<SIZE_T>(r.readback_bytes)};
     std::uint8_t* mapped = nullptr;
-    if (FAILED(c.readback->Map(0, &range, reinterpret_cast<void**>(&mapped))) || !mapped) return false;
+    if (FAILED(r.readback->Map(0, &range, reinterpret_cast<void**>(&mapped))) || !mapped) return false;
     px.resize(std::size_t(w) * h * 2);
     for (std::uint32_t y = 0; y < h; ++y)
-        std::memcpy(&px[std::size_t(y) * w * 2], mapped + c.footprint.Offset + std::size_t(y) * c.footprint.Footprint.RowPitch, std::size_t(w) * 8);
+        std::memcpy(&px[std::size_t(y) * w * 2], mapped + r.footprint.Offset + std::size_t(y) * r.footprint.Footprint.RowPitch, std::size_t(w) * 8);
     const D3D12_RANGE none{0, 0};
-    c.readback->Unmap(0, &none);
+    r.readback->Unmap(0, &none);
     return true;
 }
 
+// Which way round the game stores its depth (depth_orientation_ready). The depth XPAR.fx hands over is
+// near = 1 and proportional to 1 / distance, so nearly everything in a picture - and the sky, 0 - lies
+// close to zero; the wrong way round, it all bunches up near 1. Three readings in a row decide.
+struct Orientation {
+    ProbeReader reader;
+    bool decided = false, flip = false, copied = false;
+    int wait = 1, wrong = 0, right = 0;
+    std::uint64_t checks = 0;
+} g_orient;
+
+// The game draws a 3D scene into its depth buffers, yet by the end of the frame (when ReShade's effects and
+// XPAR read it) every one of them is empty: the game clears or reuses them before that. ReShade's Generic
+// Depth can keep a copy from before the clear ("Copy depth buffer before clear operations"), a setting it
+// reads when the game starts. Only on firm evidence, so that a menu, a loading screen or an intro never
+// sets it: every candidate flat, a 3D scene being drawn (the buffers bound 20 times a frame or more - a menu
+// or a video hardly binds them), a picture with detail that keeps changing between the checks, three
+// times over 15 seconds at least. Then the setting goes one step up (off -> before clears -> also before
+// full-screen draws) and the game has to be restarted once.
+void empty_depth_verdict(std::uint64_t frame) {
+    bool busy = false;
+    for (const auto& k : c.cand)
+        if (frame > k.first_frame && double(k.binds) / double(frame - k.first_frame) >= 20.0) busy = true;
+    const bool empty = !c.cand.empty() && c.all_flat && busy && c.detail >= 0.03 && !c.luma.empty();
+    if (!empty) { c.empty_verdicts = 0; c.empty_luma.clear(); return; }
+    bool changing = true;
+    if (!c.empty_luma.empty() && c.empty_luma.size() == c.luma.size()) {
+        double diff = 0;
+        for (std::size_t i = 0; i < c.luma.size(); ++i) diff += std::fabs(double(c.luma[i]) - c.empty_luma[i]);
+        changing = diff / double(c.luma.size()) >= 0.02;
+    }
+    if (c.empty_verdicts > 0 && !changing) return;  // (a still picture: no evidence either way)
+    if (c.empty_verdicts == 0) c.first_empty_frame = frame;
+    ++c.empty_verdicts;
+    c.empty_luma = c.luma;
+    if (c.empty_verdicts < 3 || frame < c.first_empty_frame + 900 || c.restart_needed) return;
+    int copy = 0;
+    reshade::get_config_value(nullptr, "DEPTH", "DepthCopyBeforeClears", copy);
+    char text[260];
+    if (copy >= 2) {
+        say("XPAR: the game's depth buffers still read empty with ReShade copying them before clears and full-screen draws: "
+            "the depth has to be set up by hand for this game (ReShade's Add-ons tab, Generic Depth)");
+        c.empty_verdicts = -1000000;  // (said once)
+        return;
+    }
+    reshade::set_config_value(nullptr, "DEPTH", "DepthCopyBeforeClears", copy + 1);
+    std::snprintf(text, sizeof(text), "XPAR: the game draws into its depth buffers but they read empty by the end of the frame: ReShade's "
+                  "'Copy depth buffer before %s' switched on - restart the game once", copy == 0 ? "clear operations" : "full-screen draw calls");
+    say(text);
+    c.restart_needed = true;
+}
+
 void settle(generic_depth_data* gd, std::uint64_t frame) {
+    empty_depth_verdict(frame);
     const Candidate* best = nullptr;
     for (const auto& k : c.cand)
         if (k.probes && (!best || k.sum / k.probes > best->sum / best->probes)) best = &k;
@@ -205,7 +310,8 @@ void unregister_depth_choice_events() {
     reshade::unregister_event<reshade::addon_event::destroy_resource>(on_destroy);
     reshade::unregister_event<reshade::addon_event::begin_render_pass>(on_begin_pass);
     reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(on_bind);
-    c.readback.Reset();
+    c.reader.reset();
+    g_orient.reader.reset();
 }
 
 DepthChoice choose_depth_buffer(effect_runtime* runtime, command_list* cmd_list, resource_view probe, resource_view bound_depth) {
@@ -258,12 +364,12 @@ DepthChoice choose_depth_buffer(effect_runtime* runtime, command_list* cmd_list,
         }
         if (c.verifying && !c.users && c.chosen.handle && --c.verify_wait <= 0) {
             if (!c.verify_copied) {
-                if (probe.handle && copy_probe(dev, cmd_list, probe)) { c.verify_copied = true; c.verify_wait = kReadbackFrames; }
+                if (probe.handle && copy_probe(c.reader, dev, cmd_list, probe)) { c.verify_copied = true; c.verify_wait = kReadbackFrames; }
                 else c.verifying = false;
             } else {
                 std::vector<float> px;
                 std::uint32_t w = 0, h = 0;
-                const DepthProbeScore s = read_probe(px, w, h) ? score_depth_probe(px.data(), w, h) : DepthProbeScore{};
+                const DepthProbeScore s = read_probe(c.reader, px, w, h) ? score_depth_probe(px.data(), w, h) : DepthProbeScore{};
                 char text[200];
                 if (s.score >= kMinScore) {
                     std::snprintf(text, sizeof(text), "XPAR: another depth buffer came into use; the chosen one still fits the picture (score %.2f)", s.score);
@@ -314,9 +420,9 @@ DepthChoice choose_depth_buffer(effect_runtime* runtime, command_list* cmd_list,
         std::sort(c.cand.begin(), c.cand.end(), [](const Candidate& a, const Candidate& b) { return a.binds > b.binds; });
         if (c.cand.size() > 16) c.cand.resize(16);
         for (auto& k : c.cand) { k.sum = 0; k.probes = 0; }
-        if (c.cand.size() < 2 || !probe.handle) {
-            // A single one or none (nothing to choose), or an XPAR.fx without the probe: ReShade's own choice
-            // until another comes into use.
+        if (c.cand.empty() || !probe.handle) {
+            // None (nothing to choose), or an XPAR.fx without the probe: ReShade's own choice until another
+            // comes into use. (A single one is still probed: whether it holds any depth at all.)
             if (c.said_candidates != c.cand.size()) {
                 char text[200];
                 std::snprintf(text, sizeof(text), "XPAR: %zu depth buffer(s) of the picture's shape in use (of %zu the game binds)%s: ReShade's own choice",
@@ -345,6 +451,7 @@ DepthChoice choose_depth_buffer(effect_runtime* runtime, command_list* cmd_list,
         }
         c.said_candidates = ~std::size_t(0);
         c.at = 0; c.round = 0; c.copied = false; c.wait = kSettleFrames; c.tried.clear();
+        c.all_flat = true; c.detail = 0; c.luma.clear();
         gd->override_depth_stencil = c.cand[0].res;
         c.phase = Chooser::kProbe;
         return DepthChoice::kChoosing;
@@ -352,7 +459,7 @@ DepthChoice choose_depth_buffer(effect_runtime* runtime, command_list* cmd_list,
     case Chooser::kProbe: {
         if (--c.wait > 0) return DepthChoice::kChoosing;
         if (!c.copied) {
-            if (!probe.handle || !copy_probe(dev, cmd_list, probe)) {
+            if (!probe.handle || !copy_probe(c.reader, dev, cmd_list, probe)) {
                 gd->override_depth_stencil = {0};
                 c.chosen = {0}; c.retry_at = frame + 600; c.phase = Chooser::kSettled;
                 return DepthChoice::kChoosing;
@@ -363,9 +470,13 @@ DepthChoice choose_depth_buffer(effect_runtime* runtime, command_list* cmd_list,
         std::vector<float> px;
         std::uint32_t w = 0, h = 0;
         Candidate& k = c.cand[c.at];
-        if (read_probe(px, w, h)) {
+        if (read_probe(c.reader, px, w, h)) {
             const DepthProbeScore s = score_depth_probe(px.data(), w, h);
             k.sum += s.score; ++k.probes;
+            c.all_flat = c.all_flat && s.flat;
+            c.detail = std::max(c.detail, s.detail);
+            c.luma.resize(std::size_t(w) * h);
+            for (std::size_t i = 0; i < c.luma.size(); ++i) c.luma[i] = px[i * 2 + 1];
             char text[240];
             std::snprintf(text, sizeof(text), "XPAR: depth buffer %zu/%zu: %ux%u format %u, bound %llu times: covers %.0f%% of the picture, edges %.1f%%, "
                           "brightness changes %.2fx across them (score %.2f)", c.at + 1, c.cand.size(), k.w, k.h, unsigned(k.fmt),
@@ -392,6 +503,54 @@ DepthChoice choose_depth_buffer(effect_runtime* runtime, command_list* cmd_list,
     }
     return DepthChoice::kSettled;
 }
+
+bool depth_orientation_ready(effect_runtime* runtime, command_list* cmd_list, resource_view probe, effect_uniform_variable flip_variable) {
+    Orientation& o = g_orient;
+    if (!probe.handle || !flip_variable.handle) return true;  // (an older XPAR.fx: ReShade's setting as it is)
+    runtime->set_uniform_value_bool(flip_variable, o.flip);
+    if (--o.wait > 0) return o.decided;
+    device* dev = runtime->get_device();
+    if (!o.copied) {
+        if (!copy_probe(o.reader, dev, cmd_list, probe)) { o.wait = 600; return true; }
+        o.copied = true; o.wait = kReadbackFrames;
+        return o.decided;
+    }
+    o.copied = false;
+    // (first quickly, then once in a while: a game can change it between its menu and the game)
+    o.wait = o.decided ? 120 : 2;
+    std::vector<float> px;
+    std::uint32_t w = 0, h = 0;
+    if (!read_probe(o.reader, px, w, h) || !w || !h) return o.decided;
+    std::vector<float> depth;
+    depth.reserve(std::size_t(w) * h);
+    for (std::size_t i = 0; i < std::size_t(w) * h; ++i)
+        if (std::isfinite(px[i * 2])) depth.push_back(std::clamp(px[i * 2], 0.0f, 1.0f));
+    if (depth.size() < 64) return o.decided;
+    const auto [lo, hi] = std::minmax_element(depth.begin(), depth.end());
+    if (*hi - *lo < 1e-4f) return o.decided;  // (one value everywhere - a menu, a cleared buffer - says nothing)
+    std::nth_element(depth.begin(), depth.begin() + depth.size() / 2, depth.end());
+    const float median = depth[depth.size() / 2];
+    ++o.checks;
+    if (median > 0.5f) { ++o.wrong; o.right = 0; } else { ++o.right; o.wrong = 0; }
+    if (o.wrong >= 3) {
+        o.flip = !o.flip;
+        o.wrong = o.right = 0;
+        o.decided = false; o.wait = 3;  // (the next readings see it turned)
+        runtime->set_uniform_value_bool(flip_variable, o.flip);
+        char text[200];
+        std::snprintf(text, sizeof(text), "XPAR: the depth comes the other way round (half of it above %.2f): turned%s", median,
+                      o.flip ? " (ReShade's 'reversed' setting does not match the game)" : "");
+        say(text);
+    } else if (o.right >= 3 && !o.decided) {
+        o.decided = true;
+        char text[160];
+        std::snprintf(text, sizeof(text), "XPAR: the depth is the right way round%s (half of it below %.2f)", o.flip ? " once turned" : "", median);
+        say(text);
+    }
+    return o.decided;
+}
+
+bool depth_restart_needed() { return c.restart_needed; }
 
 void track_depth_buffers() {
     g_track = true;

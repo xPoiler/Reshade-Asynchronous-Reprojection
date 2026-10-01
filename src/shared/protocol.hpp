@@ -75,7 +75,7 @@ struct Settings {
     std::uint32_t overlay_debug;   // presenter draws a debug indicator
     std::uint32_t invert_warp;     // debug: flip the applied rotation
     float prediction_ms;           // show the camera this far ahead of the game's own latency
-    std::uint32_t auto_prediction; // 0: manual slider; 1, 2, 4: -(1/n of the measured game frame); 3: 1/2 with HUD layers, 1/4 without
+    std::uint32_t auto_prediction; // 0: manual slider; 1, 2, 4: -(1/n of the measured game frame); 3: 1/2 with HUD layers, 1/4 without, 1 with XPAR's own motion vectors
     float present_lead_ms;         // render this long before the next vblank (0: right after the previous one)
     std::uint32_t gpu_priority;    // presenter GPU scheduling class: 0 realtime (default), 1 high, 2 normal
     std::uint32_t extrapolate_objects;  // shelved experiment (no UI): interpolate moving objects with the game's motion vectors
