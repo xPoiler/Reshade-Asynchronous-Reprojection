@@ -115,7 +115,8 @@ void on_init_swapchain(swapchain* sc, bool) {
     struct Saved { const char* key; int default_value; };
     static constexpr Saved kSaved[] = {{"HudFromDlssOutput", 2}, {"FillBehindHud", 1}, {"HoldOrbitedCharacter", 1},
                                        {"NearCameraRule", 1}, {"RecordDiagnostics", 0}, {"BackgroundMemory", 1},
-                                       {"StretchWidth", 1}, {"GameCameraCheck", 0}, {"MovingObjects", 0}};
+                                       {"StretchWidth", 1}, {"GameCameraCheck", 0}, {"MovingObjects", 0},
+                                       {"GpuPriority", 0}};
     char saved_version[32] = "";
     size_t size = sizeof(saved_version);
     if (!reshade::get_config_value(nullptr, "FrameWarp", "SettingsVersion", saved_version, &size) ||
@@ -148,6 +149,7 @@ void on_init_swapchain(swapchain* sc, bool) {
         shared->settings.background_memory = saved("BackgroundMemory") != 0;
         shared->settings.moving_objects = saved("MovingObjects") != 0;
         shared->settings.stretch_width = static_cast<std::uint32_t>(std::clamp(saved("StretchWidth"), 0, 32));
+        shared->settings.gpu_priority = static_cast<std::uint32_t>(std::clamp(saved("GpuPriority"), 0, 2));
         // What the presenter found out about the game's own camera in an earlier run (Shared::game_camera_check).
         InterlockedExchange(&shared->game_camera_check, std::clamp(saved("GameCameraCheck"), 0, 2));
     }
@@ -365,7 +367,10 @@ void draw_overlay(effect_runtime*) {
         ImGui::TextDisabled("  render this long before the next refresh; 0 = right after the previous one");
         static const char* const kPriorities[] = {"Realtime (default)", "High", "Normal"};
         int priority = s.gpu_priority <= 2 ? static_cast<int>(s.gpu_priority) : 0;
-        if (ImGui::Combo("Presenter GPU priority", &priority, kPriorities, 3)) s.gpu_priority = static_cast<std::uint32_t>(priority);
+        if (ImGui::Combo("Presenter GPU priority", &priority, kPriorities, 3)) {
+            s.gpu_priority = static_cast<std::uint32_t>(priority);
+            reshade::set_config_value(nullptr, "FrameWarp", "GpuPriority", priority);
+        }
         static const char* const kEngines[] = {"NVIDIA Latewarp", "XPAR (default)"};
         // NVIDIA Latewarp is optional: only selectable once the presenter reports it ready.
         const bool latewarp = sh.presenter.latewarp == 2;

@@ -93,10 +93,8 @@ if ($GameDir) {
         $installedAddon = $found | Where-Object { $_.Name -eq "FrameWarp.addon64" } | Sort-Object { $_.FullName.Split('\').Count } | Select-Object -First 1
         $hasFrameWarp = [bool]$installedAddon
         $installedVersion = if ($installedAddon) { Get-FrameWarpVersion $installedAddon.FullName } else { $null }
-        # DLSS (through Streamline or called directly) or FSR (its DLLs): FrameWarp works with any of them.
-        $hasUpscaler = [bool]($found | Where-Object { $upscalerNames -contains $_.Name })
         if (($Uninstall -and $hasFrameWarp) -or (-not $Uninstall -and $hasReShade)) {
-            $choices += [pscustomobject]@{ Name = $dir.Name; Path = $dir.FullName; FrameWarp = $hasFrameWarp; Version = $installedVersion; Upscaler = $hasUpscaler }
+            $choices += [pscustomobject]@{ Name = $dir.Name; Path = $dir.FullName; FrameWarp = $hasFrameWarp; Version = $installedVersion }
         }
     }
     Write-Host ""
@@ -109,7 +107,6 @@ if ($GameDir) {
             $notes = @()
             if (-not $Uninstall) {
                 if ($c.FrameWarp) { $notes += "FrameWarp $($c.Version) installed" }
-                if (-not $c.Upscaler) { $notes += "no DLSS or FSR found: will not work" }
             }
             if ($Uninstall -and $c.Version) { $notes += "FrameWarp $($c.Version)" }
             Write-Host ("  {0,2}) {1}{2}" -f ($i + 1), $c.Name, $(if ($notes) { "   [" + ($notes -join ", ") + "]" } else { "" }))
@@ -175,7 +172,7 @@ $record = Join-Path $target "install.json"
 if (-not $Uninstall -and -not $Force) {
     $existing = Get-FrameWarpVersion (Join-Path $binDir "FrameWarp.addon64")
     if ($existing) {
-        $question = "FrameWarp $existing is installed. Update it to $packageVersion?"
+        $question = "FrameWarp $existing is installed. Update it to ${packageVersion}?"
         try {
             if ($existing -ne "unknown" -and $packageVersion -and $packageVersion -ne "unknown") {
                 if ([version]$existing -eq [version]$packageVersion) { $question = "FrameWarp $existing is already installed. Reinstall it?" }
