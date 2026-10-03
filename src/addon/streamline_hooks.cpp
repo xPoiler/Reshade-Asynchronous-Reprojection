@@ -1,4 +1,5 @@
 #include "addon/streamline_hooks.hpp"
+#include "addon/ui_alpha.hpp"
 #include "common/inline_hook.hpp"
 #include <array>
 #include <atomic>
@@ -42,7 +43,10 @@ std::atomic<std::uint32_t> g_pcl_attempts{0};
 
 enum Marker : std::uint32_t { kSimulationStart = 0, kSimulationEnd = 1, kRenderSubmitStart = 2, kRenderSubmitEnd = 3,
                               kPresentStart = 4, kPresentEnd = 5 };
-enum BufferType : std::uint32_t { kSlDepth = 0, kSlMotionVectors = 1, kSlHudless = 2, kSlScalingOutputColor = 4, kSlUiColorAlpha = 23 };
+enum BufferType : std::uint32_t {
+    kSlDepth = 0, kSlMotionVectors = 1, kSlHudless = 2, kSlScalingOutputColor = 4, kSlUiColorAlpha = 23,
+    kSlUiAlpha = 69  // Streamline 2.12+; 68 is now the responsivity mask
+};
 
 HookStats* stats() { return g_producer && g_producer->shared() ? &g_producer->shared()->hooks : nullptr; }
 
@@ -232,6 +236,8 @@ void handle_tags(std::uint64_t frame, const void* tags_ptr, std::uint32_t count,
         // E33 (UE StreamlineCore): UI colour + alpha from the UI hint extraction pass, full-res BGRA8.
         else if (type == kSlUiColorAlpha && is_rgba8(desc.Format) && g_producer->shared() &&
                  desc.Width == g_producer->shared()->backbuffer_width) kind = kUi;
+        else if (type == kSlUiAlpha && is_ui_alpha_format(desc.Format) && g_producer->shared() &&
+                 desc.Width == g_producer->shared()->backbuffer_width) kind = kUiAlpha;
         // The upscaler's output (the scene before post-processing and HUD): only when the HUD is to be found
         // from it (opt-in) and the game has no HUD layers; kept until DLSS has written it.
         if (type == kSlScalingOutputColor && g_producer->shared() && g_producer->shared()->settings.hud_from_scene &&

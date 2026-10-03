@@ -1,4 +1,5 @@
 #include "presenter/renderer.hpp"
+#include "addon/ui_alpha.hpp"
 #include <cstdlib>
 #include <d3dcompiler.h>
 #include <cstdio>
@@ -1181,6 +1182,68 @@ RWTexture2D<float4> tint_u : register(u0);
     if (m > 0.5) tint_u[id.xy] = float4(lerp(c.rgb, float3(1, 0, 1), 0.5), c.a);
     else if ((flags & 1) && s > 0.05) tint_u[id.xy] = float4(lerp(c.rgb, float3(0, 1, 0), 0.5 * saturate(s / 0.6)), c.a);
 }
+
+Texture2D<float4> ui_frame_t : register(t0);
+Texture2D<float4> ui_hudless_t : register(t1);
+Texture2D<float4> ui_layer_t : register(t2);
+Texture2D<float4> ui_alpha_t : register(t3);
+RWTexture2D<float4> ui_rebuilt_u : register(u0);
+float ui_blend_error(float3 final_rgb, float3 hudless_rgb, float3 ui_rgb, float alpha) {
+    return max(abs(ui_rgb.r + (1.0 - alpha) * hudless_rgb.r - final_rgb.r),
+               max(abs(ui_rgb.g + (1.0 - alpha) * hudless_rgb.g - final_rgb.g),
+                   abs(ui_rgb.b + (1.0 - alpha) * hudless_rgb.b - final_rgb.b)));
+}
+[numthreads(8, 8, 1)] void cs_ui_alpha(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= out_size)) return;
+    const int3 p = int3(id.xy, 0);
+    const float4 frame = ui_frame_t.Load(p);
+    const float4 hudless = ui_hudless_t.Load(p);
+    const float4 ui = ui_layer_t.Load(p);
+    const float3 source_ui = ui.rgb;
+    float alpha = (flags & 2) ? ui_alpha_t.Load(p).r : ui.a;
+    if (!(flags & 2) && (flags & 4)) {
+        const float denominator = dot(hudless.rgb, hudless.rgb);
+        if (denominator > 1e-6) {
+            const float transmittance = dot(frame.rgb - ui.rgb, hudless.rgb) / denominator;
+            const float candidate = saturate(1.0 - transmittance);
+            const float3 reconstructed = ui.rgb + (1.0 - candidate) * hudless.rgb;
+            const float error = max(abs(reconstructed.r - frame.r), max(abs(reconstructed.g - frame.g), abs(reconstructed.b - frame.b)));
+            if (error <= 0.01) alpha = candidate;
+        }
+    }
+    float3 color = (flags & 1) ? source_ui : frame.rgb - (1.0 - alpha) * hudless.rgb;
+    if ((flags & 8) && (flags & 1)) {
+        float best_error = ui_blend_error(frame.rgb, hudless.rgb, color, alpha);
+        const float inverse_alpha = 1.0 - alpha;
+        const float3 straight = source_ui * alpha;
+        float error = ui_blend_error(frame.rgb, hudless.rgb, straight, alpha);
+        if (error <= 0.02 && error + 0.002 < best_error) { color = straight; best_error = error; }
+        error = ui_blend_error(frame.rgb, hudless.rgb, source_ui, inverse_alpha);
+        if (error <= 0.02 && error + 0.002 < best_error) { color = source_ui; alpha = inverse_alpha; best_error = error; }
+        const float3 inverted_straight = source_ui * inverse_alpha;
+        error = ui_blend_error(frame.rgb, hudless.rgb, inverted_straight, inverse_alpha);
+        if (error <= 0.02 && error + 0.002 < best_error) { color = inverted_straight; alpha = inverse_alpha; }
+        if (best_error > 0.02) {
+            // BGRA8 has no color-space tag. If its RGB does not fit a direct blend in the HDR frame's
+            // PQ space, recover the effective UI contribution from the observed frame/HUD-less pair.
+            const float3 normal_residual = frame.rgb - (1.0 - alpha) * hudless.rgb;
+            const float3 inverted_residual = frame.rgb - alpha * hudless.rgb;
+            const float normal_penalty = max(0.0, max(max(max(-normal_residual.r, normal_residual.r - 1.0),
+                                                          max(-normal_residual.g, normal_residual.g - 1.0)),
+                                                      max(-normal_residual.b, normal_residual.b - 1.0)));
+            const float inverted_penalty = max(0.0, max(max(max(-inverted_residual.r, inverted_residual.r - 1.0),
+                                                            max(-inverted_residual.g, inverted_residual.g - 1.0)),
+                                                        max(-inverted_residual.b, inverted_residual.b - 1.0)));
+            if (inverted_penalty + 0.002 < normal_penalty) {
+                color = inverted_residual;
+                alpha = inverse_alpha;
+            } else {
+                color = normal_residual;
+            }
+        }
+    }
+    ui_rebuilt_u[id.xy] = float4(color, alpha);
+}
 )";
 
 // Descriptor layout in the shader-visible heap.
@@ -1201,7 +1264,8 @@ constexpr UINT kXRampSrv = kX + 114, kXRampUav = kX + 120;
 // Own motion estimation: one table of 6 SRVs + 2 UAVs per pass and direction (see estimate_motion).
 constexpr UINT kXFlow = kX + 122;
 enum FlowTable : UINT { kFlowLuma, kFlowFeat, kFlowSearch, kFlowMedianAB, kFlowMedianBA, kFlowLkAB, kFlowLkBA, kFlowMotion, kFlowFillAB, kFlowFillBA, kFlowTables };
-constexpr UINT kHeapSize = kXFlow + kFlowTables * 8;
+constexpr UINT kXUi = kXFlow + kFlowTables * 8;
+constexpr UINT kHeapSize = kXUi + 8;
 constexpr float kMemMargin = 0.125f;  // as in the shaders
 // Scene HUD fit buffer (see cs_scene_*): curve accumulators and curves, wash-out accumulators and
 // values, 2 tile sets, HUD pixel count (same layout as the shader's constants).
@@ -1216,6 +1280,7 @@ DXGI_FORMAT srv_format(DXGI_FORMAT f) {
         case DXGI_FORMAT_R32G8X24_TYPELESS: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
         case DXGI_FORMAT_R24G8_TYPELESS: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
         case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_R32_FLOAT;
+        case DXGI_FORMAT_R8_TYPELESS: return DXGI_FORMAT_R8_UNORM;
         case DXGI_FORMAT_R16_TYPELESS: return DXGI_FORMAT_R16_UNORM;
         case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
         case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -1447,7 +1512,8 @@ bool Renderer::create_pipelines(std::string& error) {
         {"cs_scene_grey_finish", &cs_scene_grey_finish_}, {"cs_scene_wash", &cs_scene_wash_}, {"cs_scene_wash_finish", &cs_scene_wash_finish_},
         {"cs_own_warp", &cs_own_warp_}, {"cs_attached", &cs_attached_}, {"cs_memory", &cs_memory_}, {"cs_ramp_rows", &cs_ramp_rows_}, {"cs_ramp", &cs_ramp_},
         {"cs_flow_luma", &cs_flow_luma_}, {"cs_flow_feat", &cs_flow_feat_}, {"cs_flow_search", &cs_flow_search_}, {"cs_flow_lk", &cs_flow_lk_},
-        {"cs_flow_median", &cs_flow_median_}, {"cs_flow_motion", &cs_flow_motion_}, {"cs_flow_fill", &cs_flow_fill_}};
+        {"cs_flow_median", &cs_flow_median_}, {"cs_flow_motion", &cs_flow_motion_}, {"cs_flow_fill", &cs_flow_fill_},
+        {"cs_ui_alpha", &cs_ui_alpha_}};
     for (auto& x : xs) {
         auto code = compile(x.entry, "cs_5_0", error, kShadersX);
         if (!code) return false;
@@ -2351,7 +2417,7 @@ void Renderer::convert(ID3D12Resource* source, DXGI_FORMAT source_format, int sl
     }
     auto& p = private_[target];
     transition(p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    list_->SetPipelineState(target == kPDepth ? cs_depth_.Get() : cs_color_.Get());
+    list_->SetPipelineState(target == kPDepth || target == kPUiAlpha ? cs_depth_.Get() : cs_color_.Get());
     list_->SetComputeRootSignature(root_.Get());
     const std::uint32_t constants[4] = {w, h, 0, 0};
     list_->SetComputeRoot32BitConstants(0, 4, constants, 0);
@@ -2543,9 +2609,39 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
         out.has_hudless = true;
     }
     const auto& ui = m.tex[kUi];
-    if (sources[kUi] && ui.width == bb.width && ui.height == bb.height && ensure_private(kPUi, bb.width, bb.height, DXGI_FORMAT_R16G16B16A16_FLOAT)) {
+    const bool has_ui_color = sources[kUi] && ui.width == bb.width && ui.height == bb.height &&
+                              ensure_private(kPUi, bb.width, bb.height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    if (has_ui_color) {
         convert(sources[kUi], static_cast<DXGI_FORMAT>(ui.format), slot, kUi, kPUi, bb.width, bb.height);
+    }
+    const auto& ui_alpha = m.tex[kUiAlpha];
+    const bool has_ui_alpha = sources[kUiAlpha] && ui_alpha.width == bb.width && ui_alpha.height == bb.height &&
+                              ensure_private(kPUiAlpha, bb.width, bb.height, DXGI_FORMAT_R16_FLOAT);
+    if (has_ui_alpha) convert(sources[kUiAlpha], static_cast<DXGI_FORMAT>(ui_alpha.format), slot, kUiAlpha, kPUiAlpha, bb.width, bb.height);
+    const bool infer_alpha = has_ui_color && !has_ui_alpha && needs_ui_alpha_reconstruction(static_cast<DXGI_FORMAT>(ui.format));
+    const bool validate_ui_blend = has_ui_color &&
+                                   (has_ui_alpha || infer_alpha ||
+                                    needs_ui_blend_validation(static_cast<DXGI_FORMAT>(ui.format), static_cast<DXGI_FORMAT>(bb.format)));
+    if (out.has_hudless && (has_ui_alpha || infer_alpha || validate_ui_blend) &&
+        ensure_private(kPUiRebuilt, bb.width, bb.height, DXGI_FORMAT_R16G16B16A16_FLOAT)) {
+        XConstants c{};
+        c.out_size[0] = bb.width; c.out_size[1] = bb.height;
+        c.flags = (has_ui_color ? 1u : 0u) | (has_ui_alpha ? 2u : 0u) | (infer_alpha ? 4u : 0u) |
+                  (validate_ui_blend ? 8u : 0u);
+        set_x_srv(kXUi + 0, kPBackbuffer);
+        set_x_srv(kXUi + 1, kPHudless);
+        set_x_srv(kXUi + 2, has_ui_color ? kPUi : kPBackbuffer);
+        set_x_srv(kXUi + 3, has_ui_alpha ? kPUiAlpha : kPBackbuffer);
+        for (UINT i = 4; i < kXSrvCount; ++i) set_x_srv(kXUi + i, kPBackbuffer);
+        set_x_uav(kXUi + 6, kPUiRebuilt);
+        set_x_uav(kXUi + 7, kPUiRebuilt);
+        transition(private_[kPUiRebuilt], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        x_dispatch(cs_ui_alpha_.Get(), &c, kXUi, kXUi + 6, (bb.width + 7) / 8, (bb.height + 7) / 8);
+        transition(private_[kPUiRebuilt], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        std::swap(private_[kPUi], private_[kPUiRebuilt]);
         out.has_ui = true;
+    } else {
+        out.has_ui = has_ui_color;
     }
     const auto& sc = m.tex[kScene];
     if (sources[kScene] && sc.width == bb.width && sc.height == bb.height &&
@@ -2684,7 +2780,7 @@ void Renderer::stash_source() {
 
 bool Renderer::read_back(int which, std::vector<std::uint16_t>& pixels, std::uint32_t& w, std::uint32_t& h) {
     static const PrivateId kWhich[] = {kPBackbuffer, kPOutput, kPScene, kPDepth, kPMotion, kPObject, kPMask, kPHudScore, kPWorld, kPFill,
-                                       kPStashColor, kPStashDepth, kPStashMotion, kPFlowB};
+                                       kPStashColor, kPStashDepth, kPStashMotion, kPFlowB, kPHudless, kPUiRebuilt, kPUi, kPUiAlpha};
     if (which < 0 || which >= int(std::size(kWhich))) return false;
     auto& p = split_ && shown_id(kWhich[which]) ? front_[kWhich[which]] : private_[kWhich[which]];
     if (!p.texture) return false;

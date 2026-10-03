@@ -74,6 +74,10 @@ if(BUILD_TESTING)
   target_link_libraries(hook_tests PRIVATE fw_options)
   add_test(NAME inline_hook COMMAND hook_tests)
 
+  add_executable(ui_alpha_tests tests/ui_alpha_tests.cpp)
+  target_link_libraries(ui_alpha_tests PRIVATE fw_options)
+  add_test(NAME ui_alpha_format COMMAND ui_alpha_tests)
+
   # End-to-end on the real GPU: producer on one device, presenter renderer + Latewarp on another.
   add_executable(pipeline_tests tests/pipeline_tests.cpp src/addon/producer.cpp src/addon/vk_transport.cpp)
   target_link_libraries(pipeline_tests PRIVATE fw_presenter_core user32 dxgi)

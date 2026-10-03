@@ -12,8 +12,11 @@
 #include <pdh.h>
 #include <wrl/client.h>
 #include <atomic>
+#include <algorithm>
+#include <cmath>
 #include <condition_variable>
 #include <cstdarg>
+#include <cstdint>
 #include <mutex>
 #include <deque>
 #include <cstring>
@@ -33,6 +36,14 @@ std::int64_t g_qpc_frequency = 10000000;
 char g_gpu_priority[32] = "normal";
 double seconds(std::int64_t qpc) { return double(qpc) * g_qpc_to_seconds; }
 double now_seconds() { return seconds(qpc_now()); }
+float half_sample_value(std::uint16_t value) {
+    const float sign = (value & 0x8000u) ? -1.0f : 1.0f;
+    const unsigned exponent = (value >> 10) & 0x1Fu;
+    const unsigned mantissa = value & 0x3FFu;
+    if (exponent == 0) return sign * std::ldexp(float(mantissa), -24);
+    if (exponent == 31) return 0.0f;
+    return sign * std::ldexp(1.0f + float(mantissa) / 1024.0f, int(exponent) - 15);
+}
 
 struct App {
     DWORD pid = 0;
@@ -55,6 +66,7 @@ struct App {
     FILE* csv_motion = nullptr;   // per game frame: agreement of the motion vectors with depth + camera
     FILE* csv_sources = nullptr;  // ingested frames + camera
     FILE* csv_outputs = nullptr;  // presented frames + applied warp
+    FILE* csv_ui_samples = nullptr;  // sparse numeric samples of the raw/normalized UI and HDR composition
     std::int64_t events_read = 0;
     bool mark_was_down = false, dump_was_down = false;
 };
@@ -156,6 +168,9 @@ void open_recordings() {
         g_app.csv_outputs = open_csv(L"outputs.csv",
             "qpc,source_frame,warped,yaw,pitch,horizon_ms,gpu_ms,mark,t_submit,t_gpu_start,t_gpu_end,last_present,present_count,present_refresh,"
             "sync_refresh,sync_qpc,stats_hr,t_wake,cam_x,cam_y,cam_z,cam_fx,cam_fy,cam_fz");
+        g_app.csv_ui_samples = open_csv(L"ui_samples.csv",
+            "frame,x,y,raw_r,raw_g,raw_b,raw_a,normalized_r,normalized_g,normalized_b,normalized_a,frame_r,frame_g,frame_b,"
+            "hudless_r,hudless_g,hudless_b,error_premultiplied,error_straight,error_inverted_premultiplied,error_inverted_straight");
     }
     g_recording.store(true, std::memory_order_release);
 }
@@ -429,6 +444,7 @@ void render_thread() {
     bool device_loss_logged = false;
     MotionVectorScale mv_scale;
     bool dump_pending = false;       // Ctrl+Shift+D: the capture is written on the game frame after dump_after
+    bool ui_samples_written = false; // one sparse numeric sample set per detailed-diagnostics session
     std::uint64_t dump_after = 0;
     std::uint64_t shown_frame = 0;   // the game frame the warp shows (with split queues: after the one taken in last)
     CameraCheck camera_check;        // the game's own camera against its motion vectors
@@ -983,7 +999,7 @@ void render_thread() {
         const int mark = mark_down && !g_app.mark_was_down ? 1 : 0;
         g_app.mark_was_down = mark_down;
         if (mark) logf("MARK (user flagged a bad moment)");
-        // Ctrl+Shift+D (development): saves the newest game frame, the warped output, the upscaler's output,
+        // Ctrl+Shift+D (development): saves the newest game frame, warped output, the upscaler's output,
         // depth, motion vectors, the motion analysis and the masks (half-float RGBA, 8-byte header: width,
         // height) to captures\.
         const bool dump_down = keys_on && (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000) && (GetAsyncKeyState('D') & 0x8000);
@@ -1036,8 +1052,97 @@ void render_thread() {
         }
         // Dump the game-side timeline.
         if ((settings.record_diagnostics != 0) != g_recording.load()) {
-            if (settings.record_diagnostics) { open_recordings(); logf("detailed diagnostics: recording to the logs folder"); }
-            else { g_recording = false; logf("detailed diagnostics: off"); }
+            if (settings.record_diagnostics) {
+                open_recordings();
+                ui_samples_written = false;
+                logf("detailed diagnostics: recording to the logs folder; sparse UI samples will be written on the first tagged frame");
+            } else {
+                g_recording = false;
+                ui_samples_written = false;
+                logf("detailed diagnostics: off");
+            }
+        }
+        if (settings.record_diagnostics && !ui_samples_written && source.valid && source.has_ui && source.has_hudless &&
+            rec(g_app.csv_ui_samples)) {
+            ui_samples_written = true;
+            std::vector<std::uint16_t> frame_px, hudless_px, raw_ui_px, normalized_ui_px;
+            std::uint32_t frame_w = 0, frame_h = 0, hudless_w = 0, hudless_h = 0;
+            std::uint32_t raw_ui_w = 0, raw_ui_h = 0, normalized_ui_w = 0, normalized_ui_h = 0;
+            const bool read_ok = renderer.read_back(0, frame_px, frame_w, frame_h) &&
+                                 renderer.read_back(14, hudless_px, hudless_w, hudless_h) &&
+                                 renderer.read_back(15, raw_ui_px, raw_ui_w, raw_ui_h) &&
+                                 renderer.read_back(16, normalized_ui_px, normalized_ui_w, normalized_ui_h);
+            if (!read_ok || frame_w != hudless_w || frame_h != hudless_h || frame_w != raw_ui_w || frame_h != raw_ui_h ||
+                frame_w != normalized_ui_w || frame_h != normalized_ui_h) {
+                logf("UI sample CSV readback failed or dimensions differed");
+            } else {
+                constexpr std::uint32_t kGridX = 48, kGridY = 27, kSampleStep = 4;
+                unsigned rows = 0;
+                for (std::uint32_t gy = 0; gy < kGridY; ++gy) {
+                    const std::uint32_t y0 = gy * frame_h / kGridY, y1 = (gy + 1) * frame_h / kGridY;
+                    for (std::uint32_t gx = 0; gx < kGridX; ++gx) {
+                        const std::uint32_t x0 = gx * frame_w / kGridX, x1 = (gx + 1) * frame_w / kGridX;
+                        float best_score = 0.0f;
+                        std::size_t best = 0;
+                        std::uint32_t best_x = 0, best_y = 0;
+                        for (std::uint32_t y = y0; y < y1; y += kSampleStep) {
+                            for (std::uint32_t x = x0; x < x1; x += kSampleStep) {
+                                const std::size_t i = (std::size_t(y) * frame_w + x) * 4;
+                                const float alpha = half_sample_value(raw_ui_px[i + 3]);
+                                if (alpha <= 0.01f || alpha >= 0.99f) continue;
+                                const float raw_r = half_sample_value(raw_ui_px[i]);
+                                const float raw_g = half_sample_value(raw_ui_px[i + 1]);
+                                const float raw_b = half_sample_value(raw_ui_px[i + 2]);
+                                const float frame_r = half_sample_value(frame_px[i]);
+                                const float frame_g = half_sample_value(frame_px[i + 1]);
+                                const float frame_b = half_sample_value(frame_px[i + 2]);
+                                const float hud_r = half_sample_value(hudless_px[i]);
+                                const float hud_g = half_sample_value(hudless_px[i + 1]);
+                                const float hud_b = half_sample_value(hudless_px[i + 2]);
+                                const float ui_signal = std::max(std::max(std::fabs(raw_r), std::fabs(raw_g)), std::fabs(raw_b));
+                                const float scene_delta = std::max(std::max(std::fabs(frame_r - hud_r), std::fabs(frame_g - hud_g)),
+                                                                   std::fabs(frame_b - hud_b));
+                                const float score = std::min(alpha, 1.0f - alpha) * std::max(ui_signal, scene_delta);
+                                if (score > best_score) { best_score = score; best = i; best_x = x; best_y = y; }
+                            }
+                        }
+                        if (best_score <= 0.0005f) continue;
+                        const float raw_r = half_sample_value(raw_ui_px[best]);
+                        const float raw_g = half_sample_value(raw_ui_px[best + 1]);
+                        const float raw_b = half_sample_value(raw_ui_px[best + 2]);
+                        const float alpha = half_sample_value(raw_ui_px[best + 3]);
+                        const float transmittance = 1.0f - alpha;
+                        const float norm_r = half_sample_value(normalized_ui_px[best]);
+                        const float norm_g = half_sample_value(normalized_ui_px[best + 1]);
+                        const float norm_b = half_sample_value(normalized_ui_px[best + 2]);
+                        const float norm_a = half_sample_value(normalized_ui_px[best + 3]);
+                        const float frame_r = half_sample_value(frame_px[best]);
+                        const float frame_g = half_sample_value(frame_px[best + 1]);
+                        const float frame_b = half_sample_value(frame_px[best + 2]);
+                        const float hud_r = half_sample_value(hudless_px[best]);
+                        const float hud_g = half_sample_value(hudless_px[best + 1]);
+                        const float hud_b = half_sample_value(hudless_px[best + 2]);
+                        const auto error = [&](float r, float g, float b, float a) {
+                            return std::max(std::max(std::fabs(r + (1.0f - a) * hud_r - frame_r),
+                                                     std::fabs(g + (1.0f - a) * hud_g - frame_g)),
+                                            std::fabs(b + (1.0f - a) * hud_b - frame_b));
+                        };
+                        const float error_premultiplied = error(raw_r, raw_g, raw_b, alpha);
+                        const float error_straight = error(raw_r * alpha, raw_g * alpha, raw_b * alpha, alpha);
+                        const float error_inverted_premultiplied = error(raw_r, raw_g, raw_b, transmittance);
+                        const float error_inverted_straight =
+                            error(raw_r * transmittance, raw_g * transmittance, raw_b * transmittance, transmittance);
+                        wr(g_app.csv_ui_samples,
+                           "%llu,%u,%u,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+                           static_cast<unsigned long long>(source_frame), best_x, best_y, raw_r, raw_g, raw_b, alpha,
+                           norm_r, norm_g, norm_b, norm_a, frame_r, frame_g, frame_b, hud_r, hud_g, hud_b,
+                           error_premultiplied, error_straight, error_inverted_premultiplied, error_inverted_straight);
+                        ++rows;
+                    }
+                }
+                logf("UI sample CSV captured %u translucent pixels from frame %llu", rows,
+                     static_cast<unsigned long long>(source_frame));
+            }
         }
         if (rec(g_app.csv_events)) {
             const std::int64_t count = sh.timeline_count;
@@ -1334,7 +1439,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (g_app.shared) g_app.shared->presenter.pid = 0;
     logf("exit");
     g_files.stop();
-    for (FILE* csv : {g_app.csv_events, g_app.csv_mouse, g_app.csv_sources, g_app.csv_outputs, g_app.csv_motion}) if (csv) std::fclose(csv);
+    for (FILE* csv : {g_app.csv_events, g_app.csv_mouse, g_app.csv_sources, g_app.csv_outputs, g_app.csv_motion,
+                      g_app.csv_ui_samples}) if (csv) std::fclose(csv);
     if (g_app.log) std::fclose(g_app.log);
     if (single) CloseHandle(single);
     return 0;

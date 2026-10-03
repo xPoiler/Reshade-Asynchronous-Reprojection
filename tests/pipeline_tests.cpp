@@ -48,6 +48,8 @@ int main(int argc, char** argv) {
     const double depth_fraction = argc > 3 ? std::atof(argv[3]) : 0.75;
     // [colour bits]: 10 makes the game's frame R10G10B10A2 (like HDR10 / 10-bit games), otherwise RGBA8.
     const DXGI_FORMAT kColour = argc > 4 && std::atoi(argv[4]) == 10 ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+    const auto colour_space = kColour == DXGI_FORMAT_R10G10B10A2_UNORM ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+                                                                         : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
     const std::uint32_t DW = std::uint32_t(W * depth_fraction), DH = std::uint32_t(H * depth_fraction);
     ComPtr<IDXGIFactory6> factory;
     CreateDXGIFactory2(0, IID_PPV_ARGS(&factory));
@@ -72,7 +74,7 @@ int main(int argc, char** argv) {
 
     Producer producer;
     EXPECT(producer.attach(game.Get()), "producer attach");
-    producer.set_swapchain(window, W, H, kColour, 0);
+    producer.set_swapchain(window, W, H, kColour, static_cast<std::uint32_t>(colour_space));
 
     // Synthetic game frame: dark background, white vertical bar at the center column, red horizontal bar.
     D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -130,7 +132,9 @@ int main(int argc, char** argv) {
 
     Renderer renderer;
     std::string error;
-    if (!renderer.init(sh.adapter, window, W, H, kColour, 0, error)) { std::printf("FAIL renderer: %s\n", error.c_str()); return 1; }
+    if (!renderer.init(sh.adapter, window, W, H, kColour, static_cast<std::uint32_t>(colour_space), error)) {
+        std::printf("FAIL renderer: %s\n", error.c_str()); return 1;
+    }
     std::printf("presenter queue priority: %s\n", renderer.queue_priority());
     EXPECT(renderer.open_session(sh.producer_pid, sh.session, error), "open session: %s", error.c_str());
     Latewarp12 latewarp;
@@ -1375,6 +1379,365 @@ int main(int argc, char** argv) {
                 p50(cpu_present), pmax(cpu_present));
     std::printf("CPU ms per tick incl. waits (p50/max): new-frame tick %.3f/%.3f, other tick %.3f/%.3f\n", p50(cpu_ingest_tick), pmax(cpu_ingest_tick),
                 p50(cpu_plain_tick), pmax(cpu_plain_tick));
+    // A packed HDR UI target has only two alpha bits, but its premultiplied RGB and the final composite
+    // still contain enough information to recover the intended alpha.
+    {
+        if (renderer.split()) {
+            renderer.wait_idle();
+            EXPECT(renderer.set_split(false), "single queue for UI-alpha test");
+        }
+        renderer.wait_idle();
+
+        D3D12_RESOURCE_DESC layer_desc = cd;
+        layer_desc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+        const float hudless_colour[4] = {0.6f, 0.4f, 0.2f, 1.0f};
+        const float ui_colour[4] = {0.0f, 0.0f, 0.0f, 0.4f};
+        const float final_colour[4] = {0.36f, 0.24f, 0.12f, 1.0f};
+        const float bgra_ui_colour[4] = {0.0f, 0.0f, 0.0f, 0.3f};
+        const float inverted_alpha_final[4] = {0.18f, 0.12f, 0.06f, 1.0f};
+        auto make_layer = [&](DXGI_FORMAT format, D3D12_RESOURCE_STATES state, const float* clear,
+                              ComPtr<ID3D12Resource>& resource) {
+            D3D12_RESOURCE_DESC desc = cd;
+            desc.Format = format;
+            D3D12_CLEAR_VALUE cv{}; cv.Format = format;
+            std::memcpy(cv.Color, clear, sizeof(cv.Color));
+            const HRESULT hr = game->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, &cv, IID_PPV_ARGS(&resource));
+            EXPECT(SUCCEEDED(hr), "create UI-alpha test layer");
+            return SUCCEEDED(hr);
+        };
+        const float ui_alpha_colour[4] = {0.4f, 0.0f, 0.0f, 0.0f};
+        ComPtr<ID3D12Resource> alpha_backbuffer, hudless_layer, ui_layer, ui_alpha_layer, bgra_ui_layer;
+        const bool layers_created = make_layer(layer_desc.Format, D3D12_RESOURCE_STATE_RENDER_TARGET, final_colour, alpha_backbuffer) &&
+                                    make_layer(layer_desc.Format, D3D12_RESOURCE_STATE_RENDER_TARGET, hudless_colour, hudless_layer) &&
+                                    make_layer(layer_desc.Format, D3D12_RESOURCE_STATE_RENDER_TARGET, ui_colour, ui_layer) &&
+                                    make_layer(DXGI_FORMAT_R16_FLOAT, D3D12_RESOURCE_STATE_RENDER_TARGET, ui_alpha_colour, ui_alpha_layer) &&
+                                    make_layer(DXGI_FORMAT_B8G8R8A8_UNORM, D3D12_RESOURCE_STATE_RENDER_TARGET, bgra_ui_colour, bgra_ui_layer);
+        ComPtr<ID3D12DescriptorHeap> layer_rtvs;
+        D3D12_DESCRIPTOR_HEAP_DESC layer_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 5, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        const HRESULT rtv_hr = game->CreateDescriptorHeap(&layer_heap_desc, IID_PPV_ARGS(&layer_rtvs));
+        EXPECT(SUCCEEDED(rtv_hr), "create UI-alpha test RTVs");
+        ComPtr<ID3D12Fence> alpha_test_fence;
+        const HRESULT fence_hr = game->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&alpha_test_fence));
+        EXPECT(SUCCEEDED(fence_hr), "create UI-alpha test fence");
+        if (layers_created && SUCCEEDED(rtv_hr) && SUCCEEDED(fence_hr)) {
+            const D3D12_CPU_DESCRIPTOR_HANDLE layer_rtv0 = layer_rtvs->GetCPUDescriptorHandleForHeapStart();
+            D3D12_CPU_DESCRIPTOR_HANDLE layer_rtv1 = layer_rtv0, layer_rtv2 = layer_rtv0, layer_rtv3 = layer_rtv0, layer_rtv4 = layer_rtv0;
+            const SIZE_T layer_rtv_step = game->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+            layer_rtv1.ptr += layer_rtv_step; layer_rtv2.ptr += 2 * layer_rtv_step; layer_rtv3.ptr += 3 * layer_rtv_step;
+            layer_rtv4.ptr += 4 * layer_rtv_step;
+            game->CreateRenderTargetView(alpha_backbuffer.Get(), nullptr, layer_rtv0);
+            game->CreateRenderTargetView(hudless_layer.Get(), nullptr, layer_rtv1);
+            game->CreateRenderTargetView(ui_layer.Get(), nullptr, layer_rtv2);
+            game->CreateRenderTargetView(ui_alpha_layer.Get(), nullptr, layer_rtv3);
+            game->CreateRenderTargetView(bgra_ui_layer.Get(), nullptr, layer_rtv4);
+
+            HANDLE alpha_test_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            EXPECT(alpha_test_event != nullptr, "create UI-alpha test synchronization event");
+            if (!alpha_test_event) return 1;
+            if (alpha_test_event) {
+                const HRESULT event_hr = alpha_test_fence->SetEventOnCompletion(1, alpha_test_event);
+                const HRESULT signal_hr = queue->Signal(alpha_test_fence.Get(), 1);
+                EXPECT(SUCCEEDED(event_hr) && SUCCEEDED(signal_hr), "subscribe before waiting for prior game work");
+                const bool prior_work_complete = WaitForSingleObject(alpha_test_event, 10000) == WAIT_OBJECT_0;
+                EXPECT(prior_work_complete, "prior game work completes");
+                CloseHandle(alpha_test_event);
+                if (!prior_work_complete) return 1;
+            }
+            alloc->Reset();
+            list->Reset(alloc.Get(), nullptr);
+
+            list->ClearRenderTargetView(layer_rtv0, final_colour, 0, nullptr);
+            list->ClearRenderTargetView(layer_rtv1, hudless_colour, 0, nullptr);
+            list->ClearRenderTargetView(layer_rtv2, ui_colour, 0, nullptr);
+            list->ClearRenderTargetView(layer_rtv3, ui_alpha_colour, 0, nullptr);
+            D3D12_RESOURCE_BARRIER to_present{};
+            to_present.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            to_present.Transition = {alpha_backbuffer.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                     D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT};
+            list->ResourceBarrier(1, &to_present);
+            constexpr std::uint64_t alpha_test_frame = 10000;
+            producer.on_constants(alpha_test_frame, cam);
+            producer.on_tag(alpha_test_frame, kDepth, depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 0, 0, DW, DH, list.Get());
+            producer.on_tag(alpha_test_frame, kHudless, hudless_layer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 0, 0, W, H, list.Get());
+            producer.on_tag(alpha_test_frame, kUi, ui_layer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 0, 0, W, H, list.Get());
+            const auto alpha_token = producer.begin_present(alpha_backbuffer.Get(), list.Get());
+            EXPECT(alpha_token != 0, "begin present for low-precision UI layer");
+            list->Close();
+            ID3D12CommandList* alpha_lists[] = {list.Get()};
+            queue->ExecuteCommandLists(1, alpha_lists);
+            producer.finish_present(queue.Get(), alpha_token);
+
+            HANDLE alpha_test_event2 = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            EXPECT(alpha_test_event2 != nullptr, "create UI-alpha publish event");
+            if (!alpha_test_event2) return 1;
+            if (alpha_test_event2) {
+                const HRESULT event_hr = alpha_test_fence->SetEventOnCompletion(2, alpha_test_event2);
+                const HRESULT signal_hr = queue->Signal(alpha_test_fence.Get(), 2);
+                EXPECT(SUCCEEDED(event_hr) && SUCCEEDED(signal_hr), "subscribe before waiting for tagged frame copies");
+                const bool frame_copies_complete = WaitForSingleObject(alpha_test_event2, 10000) == WAIT_OBJECT_0;
+                EXPECT(frame_copies_complete, "tagged frame copies complete");
+                CloseHandle(alpha_test_event2);
+                if (!frame_copies_complete) return 1;
+            }
+
+            int alpha_slot = -1;
+            for (int i = 0; i < kSlots; ++i)
+                if (sh.slots[i].state == kReady && sh.slots[i].frame_id == alpha_test_frame) alpha_slot = i;
+            EXPECT(alpha_slot >= 0, "low-precision UI frame published");
+            if (alpha_slot >= 0) {
+                renderer.begin_frame();
+                const IngestedSource alpha_source = renderer.ingest(sh, alpha_slot);
+                EXPECT(alpha_source.has_hudless && alpha_source.has_ui, "low-precision UI tags remain enabled");
+                float identity[16]{};
+                for (int i = 0; i < 16; ++i) identity[i] = i % 5 == 0 ? 1.0f : 0.0f;
+                const bool own_ok = renderer.own_warp(alpha_source, true, false, identity, true);
+                EXPECT(own_ok, "own warp accepts the reconstructed UI layer");
+                renderer.finish_frame(own_ok, 0);
+                EXPECT(renderer.read_back(true, px, w, h), "read back reconstructed XPAR UI");
+                const std::size_t centre = (std::size_t(h / 2) * w + w / 2) * 4;
+                EXPECT(std::fabs(half_to_float(px[centre]) - final_colour[0]) < 0.015f &&
+                       std::fabs(half_to_float(px[centre + 1]) - final_colour[1]) < 0.015f &&
+                       std::fabs(half_to_float(px[centre + 2]) - final_colour[2]) < 0.015f,
+                       "XPAR's recovered alpha reproduces the black translucent overlay");
+
+                auto* alpha_late_list = renderer.begin_frame();
+                auto alpha_inputs = renderer.latewarp_inputs(alpha_source, true);
+                alpha_inputs.depth_inverted = true;
+                const bool late_ok = latewarp.evaluate(alpha_late_list, alpha_inputs, true, view_matrix(source, {}),
+                                                       view_matrix(source, {}), projection);
+                EXPECT(late_ok, "Latewarp accepts the same reconstructed UI layer");
+                renderer.finish_frame(late_ok, 0);
+                EXPECT(renderer.read_back(true, px, w, h), "read back reconstructed Latewarp UI");
+                EXPECT(std::fabs(half_to_float(px[centre]) - final_colour[0]) < 0.015f &&
+                       std::fabs(half_to_float(px[centre + 1]) - final_colour[1]) < 0.015f &&
+                       std::fabs(half_to_float(px[centre + 2]) - final_colour[2]) < 0.015f,
+                       "Latewarp preserves the black translucent overlay");
+            }
+
+            // Repeat with Streamline's separate, full-precision UI Alpha tag. It must repair the packed
+            // UI color layer as well, and the feature remains active in both warp engines.
+            constexpr std::uint64_t alpha_tag_frame = 10001;
+            HANDLE alpha_test_event3 = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            EXPECT(alpha_test_event3 != nullptr, "create separate UI-alpha synchronization event");
+            if (!alpha_test_event3) return 1;
+            if (alpha_test_event3) {
+                const HRESULT event_hr = alpha_test_fence->SetEventOnCompletion(3, alpha_test_event3);
+                EXPECT(SUCCEEDED(event_hr), "subscribe before submitting separate UI-alpha frame");
+                alloc->Reset();
+                list->Reset(alloc.Get(), nullptr);
+                D3D12_RESOURCE_BARRIER to_target{};
+                to_target.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                to_target.Transition = {alpha_backbuffer.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                        D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET};
+                list->ResourceBarrier(1, &to_target);
+                list->ClearRenderTargetView(layer_rtv0, final_colour, 0, nullptr);
+                list->ClearRenderTargetView(layer_rtv1, hudless_colour, 0, nullptr);
+                list->ClearRenderTargetView(layer_rtv2, ui_colour, 0, nullptr);
+                list->ClearRenderTargetView(layer_rtv3, ui_alpha_colour, 0, nullptr);
+                std::swap(to_target.Transition.StateBefore, to_target.Transition.StateAfter);
+                list->ResourceBarrier(1, &to_target);
+                producer.on_constants(alpha_tag_frame, cam);
+                producer.on_tag(alpha_tag_frame, kDepth, depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 0, 0, DW, DH, list.Get());
+                producer.on_tag(alpha_tag_frame, kHudless, hudless_layer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 0, 0, W, H, list.Get());
+                producer.on_tag(alpha_tag_frame, kUi, ui_layer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 0, 0, W, H, list.Get());
+                producer.on_tag(alpha_tag_frame, kUiAlpha, ui_alpha_layer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 0, 0, W, H, list.Get());
+                const auto alpha_tag_token = producer.begin_present(alpha_backbuffer.Get(), list.Get());
+                EXPECT(alpha_tag_token != 0, "begin present with separate UI Alpha tag");
+                list->Close();
+                ID3D12CommandList* alpha_tag_lists[] = {list.Get()};
+                queue->ExecuteCommandLists(1, alpha_tag_lists);
+                producer.finish_present(queue.Get(), alpha_tag_token);
+                const HRESULT signal_hr = queue->Signal(alpha_test_fence.Get(), 3);
+                EXPECT(SUCCEEDED(signal_hr), "signal completion for separate UI-alpha frame");
+                const bool alpha_tag_copies_complete = WaitForSingleObject(alpha_test_event3, 10000) == WAIT_OBJECT_0;
+                EXPECT(alpha_tag_copies_complete, "separate UI-alpha copies complete");
+                CloseHandle(alpha_test_event3);
+                if (!alpha_tag_copies_complete) return 1;
+
+                int alpha_tag_slot = -1;
+                for (int i = 0; i < kSlots; ++i)
+                    if (sh.slots[i].state == kReady && sh.slots[i].frame_id == alpha_tag_frame) alpha_tag_slot = i;
+                EXPECT(alpha_tag_slot >= 0, "frame with separate UI Alpha published");
+                if (alpha_tag_slot >= 0) {
+                    renderer.begin_frame();
+                    const IngestedSource alpha_tag_source = renderer.ingest(sh, alpha_tag_slot);
+                    EXPECT(alpha_tag_source.has_hudless && alpha_tag_source.has_ui, "separate UI Alpha reconstructs a HUD layer");
+                    float identity[16]{};
+                    for (int i = 0; i < 16; ++i) identity[i] = i % 5 == 0 ? 1.0f : 0.0f;
+                    const bool alpha_tag_own_ok = renderer.own_warp(alpha_tag_source, true, false, identity, true);
+                    EXPECT(alpha_tag_own_ok, "own warp uses separate UI Alpha");
+                    renderer.finish_frame(alpha_tag_own_ok, 0);
+                    EXPECT(renderer.read_back(true, px, w, h), "read back separate-alpha XPAR UI");
+                    const std::size_t tag_centre = (std::size_t(h / 2) * w + w / 2) * 4;
+                    EXPECT(std::fabs(half_to_float(px[tag_centre]) - final_colour[0]) < 0.015f &&
+                           std::fabs(half_to_float(px[tag_centre + 1]) - final_colour[1]) < 0.015f &&
+                           std::fabs(half_to_float(px[tag_centre + 2]) - final_colour[2]) < 0.015f,
+                           "XPAR recomposes packed UI color with full-precision alpha");
+
+                    auto* alpha_tag_late_list = renderer.begin_frame();
+                    auto alpha_tag_inputs = renderer.latewarp_inputs(alpha_tag_source, true);
+                    alpha_tag_inputs.depth_inverted = true;
+                    const bool alpha_tag_late_ok = latewarp.evaluate(alpha_tag_late_list, alpha_tag_inputs, true,
+                                                                      view_matrix(source, {}), view_matrix(source, {}), projection);
+                    EXPECT(alpha_tag_late_ok, "Latewarp uses separate UI Alpha");
+                    renderer.finish_frame(alpha_tag_late_ok, 0);
+                    EXPECT(renderer.read_back(true, px, w, h), "read back separate-alpha Latewarp UI");
+                    EXPECT(std::fabs(half_to_float(px[tag_centre]) - final_colour[0]) < 0.015f &&
+                           std::fabs(half_to_float(px[tag_centre + 1]) - final_colour[1]) < 0.015f &&
+                           std::fabs(half_to_float(px[tag_centre + 2]) - final_colour[2]) < 0.015f,
+                           "Latewarp recomposes packed UI color with full-precision alpha");
+                }
+            }
+
+            // Reproduce the game-reported BGRA8 UI / HDR10 frame pair. Here alpha is the
+            // transparent share (0.3), so the black dim layer leaves 30% of the background.
+            if (layer_desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+                constexpr std::uint64_t bgra_frame = 10002;
+                HANDLE bgra_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                EXPECT(bgra_event != nullptr, "create BGRA/HDR synchronization event");
+                if (!bgra_event) return 1;
+                const HRESULT bgra_event_hr = alpha_test_fence->SetEventOnCompletion(4, bgra_event);
+                EXPECT(SUCCEEDED(bgra_event_hr), "subscribe before submitting BGRA/HDR frame");
+                alloc->Reset();
+                list->Reset(alloc.Get(), nullptr);
+                D3D12_RESOURCE_BARRIER bgra_to_target{};
+                bgra_to_target.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                bgra_to_target.Transition = {alpha_backbuffer.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                             D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET};
+                list->ResourceBarrier(1, &bgra_to_target);
+                list->ClearRenderTargetView(layer_rtv0, inverted_alpha_final, 0, nullptr);
+                list->ClearRenderTargetView(layer_rtv1, hudless_colour, 0, nullptr);
+                list->ClearRenderTargetView(layer_rtv4, bgra_ui_colour, 0, nullptr);
+                std::swap(bgra_to_target.Transition.StateBefore, bgra_to_target.Transition.StateAfter);
+                list->ResourceBarrier(1, &bgra_to_target);
+                producer.on_constants(bgra_frame, cam);
+                producer.on_tag(bgra_frame, kDepth, depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 0, 0, DW, DH, list.Get());
+                producer.on_tag(bgra_frame, kHudless, hudless_layer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 0, 0, W, H, list.Get());
+                producer.on_tag(bgra_frame, kUi, bgra_ui_layer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 0, 0, W, H, list.Get());
+                const auto bgra_token = producer.begin_present(alpha_backbuffer.Get(), list.Get());
+                EXPECT(bgra_token != 0, "begin present with BGRA8 UI on HDR10 frame");
+                list->Close();
+                ID3D12CommandList* bgra_lists[] = {list.Get()};
+                queue->ExecuteCommandLists(1, bgra_lists);
+                producer.finish_present(queue.Get(), bgra_token);
+                const HRESULT bgra_signal_hr = queue->Signal(alpha_test_fence.Get(), 4);
+                EXPECT(SUCCEEDED(bgra_signal_hr), "signal BGRA/HDR frame completion");
+                const bool bgra_copies_complete = WaitForSingleObject(bgra_event, 10000) == WAIT_OBJECT_0;
+                EXPECT(bgra_copies_complete, "BGRA/HDR UI copies complete");
+                CloseHandle(bgra_event);
+                if (!bgra_copies_complete) return 1;
+
+                int bgra_slot = -1;
+                for (int i = 0; i < kSlots; ++i)
+                    if (sh.slots[i].state == kReady && sh.slots[i].frame_id == bgra_frame) bgra_slot = i;
+                EXPECT(bgra_slot >= 0, "BGRA/HDR UI frame published");
+                if (bgra_slot >= 0) {
+                    renderer.begin_frame();
+                    const IngestedSource bgra_source = renderer.ingest(sh, bgra_slot);
+                    EXPECT(bgra_source.has_hudless && bgra_source.has_ui, "BGRA/HDR tags remain split for reprojection");
+                    float identity[16]{};
+                    for (int i = 0; i < 16; ++i) identity[i] = i % 5 == 0 ? 1.0f : 0.0f;
+                    const bool bgra_own_ok = renderer.own_warp(bgra_source, true, false, identity, true);
+                    EXPECT(bgra_own_ok, "XPAR accepts BGRA8 UI on HDR10");
+                    renderer.finish_frame(bgra_own_ok, 0);
+                    EXPECT(renderer.read_back(true, px, w, h), "read back normalized BGRA/HDR XPAR UI");
+                    const std::size_t bgra_centre = (std::size_t(h / 2) * w + w / 2) * 4;
+                    EXPECT(std::fabs(half_to_float(px[bgra_centre]) - inverted_alpha_final[0]) < 0.015f &&
+                           std::fabs(half_to_float(px[bgra_centre + 1]) - inverted_alpha_final[1]) < 0.015f &&
+                           std::fabs(half_to_float(px[bgra_centre + 2]) - inverted_alpha_final[2]) < 0.015f,
+                           "XPAR chooses transparency alpha for the black dim layer");
+                    std::vector<std::uint16_t> bgra_raw_ui, bgra_normalized_ui;
+                    std::uint32_t raw_ui_w = 0, raw_ui_h = 0, normalized_ui_w = 0, normalized_ui_h = 0;
+                    const bool raw_ui_read = renderer.read_back(15, bgra_raw_ui, raw_ui_w, raw_ui_h);
+                    const bool normalized_ui_read = renderer.read_back(16, bgra_normalized_ui, normalized_ui_w, normalized_ui_h);
+                    EXPECT(raw_ui_read && raw_ui_w == W && raw_ui_h == H, "diagnostics expose the raw BGRA8 UI layer");
+                    EXPECT(normalized_ui_read && normalized_ui_w == W && normalized_ui_h == H,
+                           "diagnostics expose the normalized BGRA8 UI layer");
+                    if (raw_ui_read && normalized_ui_read) {
+                        const std::size_t raw_centre = (std::size_t(H / 2) * W + W / 2) * 4;
+                        const std::size_t normalized_centre = (std::size_t(H / 2) * W + W / 2) * 4;
+                        EXPECT(std::fabs(half_to_float(bgra_raw_ui[raw_centre + 3]) - 0.3f) < 0.01f,
+                               "raw BGRA8 UI diagnostic retains tagged alpha");
+                        EXPECT(std::fabs(half_to_float(bgra_normalized_ui[normalized_centre + 3]) - 0.7f) < 0.01f,
+                               "normalized BGRA8 UI diagnostic exposes reconstructed opacity");
+                    }
+
+                    auto* bgra_late_list = renderer.begin_frame();
+                    auto bgra_inputs = renderer.latewarp_inputs(bgra_source, true);
+                    bgra_inputs.depth_inverted = true;
+                    const bool bgra_late_ok = latewarp.evaluate(bgra_late_list, bgra_inputs, true,
+                                                                view_matrix(source, {}), view_matrix(source, {}), projection);
+                    EXPECT(bgra_late_ok, "Latewarp accepts BGRA8 UI on HDR10");
+                    renderer.finish_frame(bgra_late_ok, 0);
+                    EXPECT(renderer.read_back(true, px, w, h), "read back normalized BGRA/HDR Latewarp UI");
+                    EXPECT(std::fabs(half_to_float(px[bgra_centre]) - inverted_alpha_final[0]) < 0.015f &&
+                           std::fabs(half_to_float(px[bgra_centre + 1]) - inverted_alpha_final[1]) < 0.015f &&
+                           std::fabs(half_to_float(px[bgra_centre + 2]) - inverted_alpha_final[2]) < 0.015f,
+                           "Latewarp chooses transparency alpha for the black dim layer");
+
+                    // BGRA8 UI is not PQ-coded merely because the swapchain is HDR. Simulate a colored
+                    // SDR UI contribution represented in the final PQ frame; no raw BGRA blend mode fits.
+                    renderer.wait_idle();
+                    constexpr std::uint64_t colored_frame = 10003;
+                    const float colored_hudless[4] = {0.4f, 0.2f, 0.1f, 1.0f};
+                    const float colored_ui[4] = {0.8f, 0.3f, 0.5f, 0.4f};
+                    const float colored_final[4] = {0.6f, 0.25f, 0.20f, 1.0f};
+                    HANDLE colored_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                    EXPECT(colored_event != nullptr, "create colored BGRA/PQ synchronization event");
+                    if (!colored_event) return 1;
+                    const HRESULT colored_event_hr = alpha_test_fence->SetEventOnCompletion(5, colored_event);
+                    EXPECT(SUCCEEDED(colored_event_hr), "subscribe before submitting colored BGRA/PQ frame");
+                    alloc->Reset();
+                    list->Reset(alloc.Get(), nullptr);
+                    D3D12_RESOURCE_BARRIER colored_to_target{};
+                    colored_to_target.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    colored_to_target.Transition = {alpha_backbuffer.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                                    D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET};
+                    list->ResourceBarrier(1, &colored_to_target);
+                    list->ClearRenderTargetView(layer_rtv0, colored_final, 0, nullptr);
+                    list->ClearRenderTargetView(layer_rtv1, colored_hudless, 0, nullptr);
+                    list->ClearRenderTargetView(layer_rtv4, colored_ui, 0, nullptr);
+                    std::swap(colored_to_target.Transition.StateBefore, colored_to_target.Transition.StateAfter);
+                    list->ResourceBarrier(1, &colored_to_target);
+                    producer.on_constants(colored_frame, cam);
+                    producer.on_tag(colored_frame, kDepth, depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 0, 0, DW, DH, list.Get());
+                    producer.on_tag(colored_frame, kHudless, hudless_layer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 0, 0, W, H, list.Get());
+                    producer.on_tag(colored_frame, kUi, bgra_ui_layer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 0, 0, W, H, list.Get());
+                    const auto colored_token = producer.begin_present(alpha_backbuffer.Get(), list.Get());
+                    EXPECT(colored_token != 0, "begin present with colored BGRA8 UI in PQ output");
+                    list->Close();
+                    ID3D12CommandList* colored_lists[] = {list.Get()};
+                    queue->ExecuteCommandLists(1, colored_lists);
+                    producer.finish_present(queue.Get(), colored_token);
+                    const HRESULT colored_signal_hr = queue->Signal(alpha_test_fence.Get(), 5);
+                    EXPECT(SUCCEEDED(colored_signal_hr), "signal colored BGRA/PQ frame completion");
+                    const bool colored_copies_complete = WaitForSingleObject(colored_event, 10000) == WAIT_OBJECT_0;
+                    EXPECT(colored_copies_complete, "colored BGRA/PQ UI copies complete");
+                    CloseHandle(colored_event);
+                    if (!colored_copies_complete) return 1;
+
+                    int colored_slot = -1;
+                    for (int i = 0; i < kSlots; ++i)
+                        if (sh.slots[i].state == kReady && sh.slots[i].frame_id == colored_frame) colored_slot = i;
+                    EXPECT(colored_slot >= 0, "colored BGRA/PQ UI frame published");
+                    if (colored_slot >= 0) {
+                        renderer.begin_frame();
+                        const IngestedSource colored_source = renderer.ingest(sh, colored_slot);
+                        EXPECT(colored_source.has_hudless && colored_source.has_ui, "colored BGRA/PQ tags remain split");
+                        const bool colored_own_ok = renderer.own_warp(colored_source, true, false, identity, true);
+                        EXPECT(colored_own_ok, "XPAR accepts colored BGRA8 UI on PQ output");
+                        renderer.finish_frame(colored_own_ok, 0);
+                        EXPECT(renderer.read_back(true, px, w, h), "read back colored BGRA/PQ XPAR UI");
+                        const std::size_t colored_centre = (std::size_t(h / 2) * w + w / 2) * 4;
+                        EXPECT(std::fabs(half_to_float(px[colored_centre]) - colored_final[0]) < 0.015f &&
+                               std::fabs(half_to_float(px[colored_centre + 1]) - colored_final[1]) < 0.015f &&
+                               std::fabs(half_to_float(px[colored_centre + 2]) - colored_final[2]) < 0.015f,
+                               "XPAR preserves colored SDR UI contribution represented in the HDR frame");
+                    }
+                }
+            }
+        }
+    }
     renderer.wait_idle();
     latewarp.shutdown();
     if (failures) { std::printf("%d failure(s)\n", failures); return 1; }
