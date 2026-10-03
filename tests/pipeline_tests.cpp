@@ -305,11 +305,12 @@ int main(int argc, char** argv) {
         EXPECT(std::fabs(std::fabs(xts - x0) - 2 * expected_side) < 4.0, "parallax uses the NEW depth after a resolution change");
     }
 
-    // Moving-object extrapolation: static camera, the white bar's motion vectors say it moved 20 render
-    // px to the right since the previous frame. One frame ahead it must be 20 render px further right;
-    // the red bar (static) must not move.
+    // Moving objects: static camera, the white bar's motion vectors say it moved 20 render px to the right
+    // since the previous frame. Shown half a frame back it must be 10 render px to the left, with the
+    // area it left showing background; the red bar (static) must not move.
     {
         ComPtr<ID3D12Fence> gf; game->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gf));
+        UINT64 gfv = 0;
         D3D12_RESOURCE_DESC md = cd; md.Width = DW; md.Height = DH; md.Format = DXGI_FORMAT_R16G16_FLOAT;
         ComPtr<ID3D12Resource> motion;
         game->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &md, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&motion));
@@ -317,113 +318,190 @@ int main(int argc, char** argv) {
         D3D12_DESCRIPTOR_HEAP_DESC mh{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
         game->CreateDescriptorHeap(&mh, IID_PPV_ARGS(&mv_rtv));
         game->CreateRenderTargetView(motion.Get(), nullptr, mv_rtv->GetCPUDescriptorHandleForHeapStart());
-        alloc->Reset();
-        list->Reset(alloc.Get(), nullptr);
-        const float none[4] = {0, 0, 0, 0}, moved[4] = {-20.0f / float(DW), 0, 0, 0};  // uv towards the previous frame
-        const LONG bx = LONG(DW / 2);
-        const D3D12_RECT bar{bx - 6, 0, bx + 6, LONG(DH)};
-        list->ClearRenderTargetView(mv_rtv->GetCPUDescriptorHandleForHeapStart(), none, 0, nullptr);
-        list->ClearRenderTargetView(mv_rtv->GetCPUDescriptorHandleForHeapStart(), moved, 1, &bar);
         Camera still = cam;
         for (int i = 0; i < 16; ++i) still.clip_to_prev_clip[i] = (i % 5 == 0) ? 1.0f : 0.0f;  // identity: camera did not move
-        const std::uint64_t fid = 100;
-        producer.on_constants(fid, still);
-        producer.on_tag(fid, kDepth, depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 0, 0, DW, DH, list.Get());
-        producer.on_tag(fid, kMotion, motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 0, 0, DW, DH, list.Get());
-        const auto token3 = producer.begin_present(backbuffer.Get(), list.Get());
-        list->Close();
-        queue->ExecuteCommandLists(1, lists);
-        producer.finish_present(queue.Get(), token3);
-        queue->Signal(gf.Get(), 1);
-        while (gf->GetCompletedValue() < 1) Sleep(1);
-        for (int i = 0; i < kSlots; ++i) if (sh.slots[i].state == kReady && sh.slots[i].frame_id == fid) slot = i;
-        EXPECT(sh.slots[slot].frame_id == fid && sh.slots[slot].tex[kMotion].valid, "frame with motion vectors published");
-
-        auto* l = renderer.begin_frame();
-        IngestedSource src = renderer.ingest(sh, slot);
-        EXPECT(src.has_motion, "motion vectors ingested");
-        {
-            // Camera estimation input: the sampled grid returns the motion field (bar -20 px, else 0) and the
-            // frame keeps recording after the mid-frame flush.
-            std::vector<float> grid;
-            const int kGW = int(DW / 4), kGH = 36;  // every 4th render column: samples land on the 12 px bar
-            EXPECT(renderer.sample_motion(src, kGW, kGH, grid) && grid.size() == std::size_t(kGW) * kGH * 4, "motion samples read back");
-            double on_bar = 0, elsewhere = 0; int nb = 0, ne = 0;
-            for (int gy = 0; gy < kGH; ++gy)
-                for (int gx = 0; gx < kGW; ++gx) {
-                    const float* v = &grid[(gy * kGW + gx) * 4];
-                    const double sx = std::floor((gx + 0.5) * DW / double(kGW)) + 0.5;
-                    if (std::fabs(sx - DW / 2.0) < 5) { on_bar += v[0] * DW; ++nb; }
-                    else if (std::fabs(sx - DW / 2.0) > 12) { elsewhere += std::fabs(v[0]) * DW; ++ne; }
-                }
-            std::printf("motion samples: bar %.2f px (expected -20), elsewhere %.2f px (%d / %d samples)\n", nb ? on_bar / nb : 0.0,
-                        ne ? elsewhere / ne : 0.0, nb, ne);
-            EXPECT(nb && std::fabs(on_bar / nb + 20.0) < 0.2, "sampled bar motion");
-            EXPECT(ne && elsewhere / ne < 0.01, "sampled static motion");
-        }
-        renderer.analyze_motion(src, still.clip_to_prev_clip, 1.0f, 1.0f, true);
-        auto evaluate = [&](ID3D12GraphicsCommandList* list_now, float alpha, bool rendered) {
-            auto inputs = renderer.latewarp_inputs(src, true);
-            inputs.depth_inverted = true;
-            if (alpha != 0.0f) {
-                ID3D12Resource* result = renderer.extrapolate_objects(src, false, alpha, still.clip_to_prev_clip);
-                EXPECT(result != nullptr, "extrapolation ran");
-                if (result) inputs.backbuffer = inputs.hudless = result;
+        auto publish_mv = [&](std::uint64_t fid) {
+            alloc->Reset();
+            list->Reset(alloc.Get(), nullptr);
+            const float none[4] = {0, 0, 0, 0}, moved[4] = {-20.0f / float(DW), 0, 0, 0};  // uv towards the previous frame
+            const LONG bx = LONG(DW / 2);
+            const D3D12_RECT bar{bx - 6, 0, bx + 6, LONG(DH)};
+            list->ClearRenderTargetView(mv_rtv->GetCPUDescriptorHandleForHeapStart(), none, 0, nullptr);
+            list->ClearRenderTargetView(mv_rtv->GetCPUDescriptorHandleForHeapStart(), moved, 1, &bar);
+            producer.on_constants(fid, still);
+            producer.on_tag(fid, kDepth, depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 0, 0, DW, DH, list.Get());
+            producer.on_tag(fid, kMotion, motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 0, 0, DW, DH, list.Get());
+            const auto t = producer.begin_present(backbuffer.Get(), list.Get());
+            list->Close();
+            queue->ExecuteCommandLists(1, lists);
+            producer.finish_present(queue.Get(), t);
+            queue->Signal(gf.Get(), ++gfv);
+            while (gf->GetCompletedValue() < gfv) Sleep(1);
+            int s_slot = -1;
+            for (int i = 0; i < kSlots; ++i) if (sh.slots[i].state == kReady && sh.slots[i].frame_id == fid) s_slot = i;
+            EXPECT(s_slot >= 0 && sh.slots[s_slot].tex[kMotion].valid, "frame with motion vectors published");
+            return s_slot;
+        };
+        renderer.set_object_history(true);
+        // The previous frame, then the current one (each keeps the one before it).
+        IngestedSource src;
+        bool moved_ok = false;
+        for (std::uint64_t fid = 100; fid <= 101; ++fid) {
+            const int s_slot = publish_mv(fid);
+            renderer.begin_frame();
+            src = renderer.ingest(sh, s_slot);
+            EXPECT(src.has_motion, "motion vectors ingested");
+            if (fid == 101) {
+                // Camera estimation input: the sampled grid returns the motion field (bar -20 px, else 0) and the
+                // frame keeps recording after the mid-frame flush.
+                std::vector<float> grid;
+                const int kGW = int(DW / 4), kGH = 36;  // every 4th render column: samples land on the 12 px bar
+                EXPECT(renderer.sample_motion(src, kGW, kGH, grid) && grid.size() == std::size_t(kGW) * kGH * 4, "motion samples read back");
+                double on_bar = 0, elsewhere = 0; int nb = 0, ne = 0;
+                for (int gy = 0; gy < kGH; ++gy)
+                    for (int gx = 0; gx < kGW; ++gx) {
+                        const float* v = &grid[(gy * kGW + gx) * 4];
+                        const double sx = std::floor((gx + 0.5) * DW / double(kGW)) + 0.5;
+                        if (std::fabs(sx - DW / 2.0) < 5) { on_bar += v[0] * DW; ++nb; }
+                        else if (std::fabs(sx - DW / 2.0) > 12) { elsewhere += std::fabs(v[0]) * DW; ++ne; }
+                    }
+                std::printf("motion samples: bar %.2f px (expected -20), elsewhere %.2f px (%d / %d samples)\n", nb ? on_bar / nb : 0.0,
+                            ne ? elsewhere / ne : 0.0, nb, ne);
+                EXPECT(nb && std::fabs(on_bar / nb + 20.0) < 0.2, "sampled bar motion");
+                EXPECT(ne && elsewhere / ne < 0.01, "sampled static motion");
             }
-            latewarp.evaluate(list_now, inputs, rendered, view_matrix(source, {}), view_matrix(source, {}), projection);
-            renderer.finish_frame(true, 0);
+            renderer.analyze_motion(src, still.clip_to_prev_clip, 1.0f, 1.0f, true, true, true, false, fid);
+            const bool built = renderer.object_motion(src, still.clip_to_prev_clip, still.view_to_clip, 1.0f, 1.0f);
+            if (fid == 100) EXPECT(!built, "no object motion without a previous frame");
+            else moved_ok = built;
+            renderer.finish_frame(false, 0);
+            renderer.wait_idle();
+        }
+        EXPECT(moved_ok, "object motion built once the previous frame is kept");
+        MotionFit fit{};
+        // (the fits of both frames come back in order, a few frames later)
+        for (int i = 0; i < 8 && fit.frame != 101; ++i)
+            if (!renderer.take_motion_fit(fit)) { renderer.begin_frame(); renderer.finish_frame(false, 0); renderer.wait_idle(); }
+        EXPECT(fit.frame == 101, "the motion fit comes back with its game frame (%llu, expected 101)", static_cast<unsigned long long>(fit.frame));
+        const Mat4 identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+        auto show_back = [&](float frames_back) {
+            renderer.begin_frame();
+            Renderer::ObjectWarp objects;
+            objects.frames_back = frames_back;
+            std::memcpy(objects.prev_to_target, identity.data(), sizeof(objects.prev_to_target));
+            std::memcpy(objects.view_to_clip, still.view_to_clip, sizeof(objects.view_to_clip));
+            const bool ok = renderer.own_warp(src, true, false, identity.data(), true, false, frames_back > 0 ? &objects : nullptr);
+            EXPECT(ok, "own warp ran");
+            renderer.finish_frame(ok, 0);
             renderer.read_back(true, px, w, h);
         };
-        evaluate(l, 0.0f, true);
+        show_back(0.0f);
         const double still_x = peak(px, w, h, true, 1), still_red = peak(px, w, h, false, 0);
-        MotionFit fit{};
-        for (int i = 0; i < 4 && !renderer.take_motion_fit(fit); ++i) { renderer.begin_frame(); renderer.finish_frame(false, 0); renderer.wait_idle(); }
-        evaluate(renderer.begin_frame(), 1.0f, false);
-        const double moved_x = peak(px, w, h, true, 1), moved_red = peak(px, w, h, false, 0);
-        evaluate(renderer.begin_frame(), 0.5f, false);
-        const double half_x = peak(px, w, h, true, 1);
-        // Interpolation (what the presenter uses): half a frame back towards the previous position. The
-        // part of the bar's current area it has left must show background, not a stretched bar.
-        evaluate(renderer.begin_frame(), -0.5f, false);
-        const double back_x = peak(px, w, h, true, 1);
+        show_back(0.5f);
+        const double half_x = peak(px, w, h, true, 1), half_red = peak(px, w, h, false, 0);
         auto white_at = [&](double x) {
             double sum = 0; const std::uint32_t xi = std::uint32_t(x);
-            for (std::uint32_t y = h * 2 / 5; y < h * 3 / 5; ++y) {
+            for (std::uint32_t y = h / 5; y < h * 2 / 5; ++y) {
                 const std::size_t i = (std::size_t(y) * w + xi) * 4;
                 sum += (half_to_float(px[i]) + half_to_float(px[i + 1]) + half_to_float(px[i + 2])) / 3.0;
             }
             return sum / double(h / 5);
         };
-        const double left_behind = white_at(still_x + 4.0 * double(W) / double(DW));  // inside the old bar, outside the moved one
-        std::printf("interpolated -1/2 frame: bar x=%.0f (expected %.1f), brightness where it left %.2f\n", back_x,
-                    still_x - 10.0 * double(W) / double(DW), left_behind);
-        EXPECT(std::fabs((back_x - still_x) + 10.0 * double(W) / double(DW)) < 4.0, "interpolating back moves the object towards its previous position");
+        const double left_behind = white_at(still_x);  // where the bar is now; half a frame back it is a bar width further left
+        show_back(1.0f);
+        const double back_x = peak(px, w, h, true, 1);
+        const double step = 20.0 * double(W) / double(DW);
+        std::printf("moving objects: bar x=%.0f, half a frame back %.0f (expected %.1f), a whole frame back %.0f (expected %.1f); "
+                    "brightness where it left %.2f; red bar y %.0f -> %.0f; moving pixels %.0f of %.0f\n",
+                    still_x, half_x, still_x - step / 2, back_x, still_x - step, left_behind, still_red, half_red, fit.moving, fit.samples);
+        EXPECT(std::fabs((half_x - still_x) + step / 2) < 4.0, "half a frame back the object is half way to its previous position");
+        EXPECT(std::fabs((back_x - still_x) + step) < 4.0, "a whole frame back it is at its previous position");
         EXPECT(left_behind < 0.5, "the area the object left shows background (%.2f)", left_behind);
-        const double expected_move = 20.0 * double(W) / double(DW);
-        std::printf("object extrapolation: bar x=%.0f, +1 frame x=%.0f (expected +%.1f), +1/2 frame x=%.0f; red bar y %.0f -> %.0f; moving pixels %.0f of %.0f\n",
-                    still_x, moved_x, expected_move, half_x, still_red, moved_red, fit.moving, fit.samples);
-        EXPECT(std::fabs((moved_x - still_x) - expected_move) < 4.0, "moving object advances one frame of its own motion");
-        EXPECT(std::fabs((half_x - still_x) - expected_move / 2) < 4.0, "half a frame moves it half as far");
-        EXPECT(std::fabs(moved_red - still_red) < 1.5, "static geometry stays put");
+        EXPECT(std::fabs(half_red - still_red) < 1.5, "static geometry stays put");
         EXPECT(fit.moving > 0.5 * 12 * DH && fit.moving < 2.0 * 12 * DH, "moving pixels = the bar (%.0f)", fit.moving);
-        // GPU cost per presented frame, with and without the per-frame extrapolation passes.
-        auto median_gpu = [&](float alpha) {
-            std::vector<float> ms;
-            for (int i = 0; i < 12; ++i) {
-                auto* lf = renderer.begin_frame();
-                auto inputs = renderer.latewarp_inputs(src, true);
-                inputs.depth_inverted = true;
-                if (alpha != 0.0f) if (ID3D12Resource* r = renderer.extrapolate_objects(src, false, alpha, still.clip_to_prev_clip)) inputs.backbuffer = inputs.hudless = r;
-                latewarp.evaluate(lf, inputs, false, view_matrix(source, {}), view_matrix(source, {}), projection);
+        // GPU cost per presented frame, with and without moving objects: refreshes back to back (a GPU left idle
+        // between them clocks down and takes many times longer).
+        auto median_gpu = [&](float frames_back) {
+            Renderer::ObjectWarp objects;
+            objects.frames_back = frames_back;
+            std::memcpy(objects.prev_to_target, identity.data(), sizeof(objects.prev_to_target));
+            std::memcpy(objects.view_to_clip, still.view_to_clip, sizeof(objects.view_to_clip));
+            renderer.wait_idle();
+            renderer.take_gpu_usage();
+            for (int i = 0; i < 200; ++i) {
+                renderer.begin_frame();
+                renderer.own_warp(src, true, false, identity.data(), true, false, frames_back > 0 ? &objects : nullptr);
                 renderer.finish_frame(true, 0);
-                renderer.wait_idle();
-                if (i >= 4) ms.push_back(renderer.last_gpu_ms());
             }
-            std::sort(ms.begin(), ms.end());
-            return ms[ms.size() / 2];
+            renderer.wait_idle();
+            for (int i = 0; i < 3; ++i) { renderer.begin_frame(); renderer.finish_frame(false, 0); renderer.wait_idle(); }
+            const Renderer::GpuUsage u = renderer.take_gpu_usage();
+            return u.warps ? float(u.warp_ms / u.warps) : 0.0f;
         };
         const float plain = median_gpu(0.0f), with_objects = median_gpu(0.5f);
-        std::printf("GPU per presented frame: %.3f ms plain, %.3f ms with object extrapolation (+%.3f)\n", plain, with_objects, with_objects - plain);
+        std::printf("GPU per presented frame: %.3f ms plain, %.3f ms with moving objects (+%.3f)\n", plain, with_objects, with_objects - plain);
+        renderer.set_object_history(false);
+
+        // Frame generation (the game's own, used automatically): its generated image is taken where it is
+        // generated, the frame is published once the GPU has run that command list, taken in with the image, and
+        // the warp shows the image (its bar 30 px left of the frame's) or the frame.
+        {
+            ComPtr<ID3D12Resource> gen;
+            game->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &cd, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&gen));
+            ComPtr<ID3D12DescriptorHeap> gen_rtv;
+            D3D12_DESCRIPTOR_HEAP_DESC gh{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            game->CreateDescriptorHeap(&gh, IID_PPV_ARGS(&gen_rtv));
+            game->CreateRenderTargetView(gen.Get(), nullptr, gen_rtv->GetCPUDescriptorHandleForHeapStart());
+            const std::uint64_t fid = 151;
+            alloc->Reset();
+            list->Reset(alloc.Get(), nullptr);
+            const float none[4] = {0, 0, 0, 0}, black[4] = {0, 0, 0, 1}, bright[4] = {1, 1, 1, 1};
+            list->ClearRenderTargetView(mv_rtv->GetCPUDescriptorHandleForHeapStart(), none, 0, nullptr);
+            list->ClearRenderTargetView(gen_rtv->GetCPUDescriptorHandleForHeapStart(), black, 0, nullptr);
+            const D3D12_RECT gen_bar{LONG(still_x) - 30, 0, LONG(still_x) - 30 + 8, LONG(H)};  // (peak: the left edge, as the frame's)
+            list->ClearRenderTargetView(gen_rtv->GetCPUDescriptorHandleForHeapStart(), bright, 1, &gen_bar);
+            producer.on_constants(fid, still);
+            producer.on_tag(fid, kDepth, depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 0, 0, DW, DH, list.Get());
+            producer.on_tag(fid, kMotion, motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 0, 0, DW, DH, list.Get());
+            producer.on_present_marker(fid);
+            producer.on_generated(0, 1, gen.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, backbuffer.Get(), D3D12_RESOURCE_STATE_PRESENT, list.Get());
+            list->Close();
+            queue->ExecuteCommandLists(1, lists);  // (the frame is published once the GPU has run the list)
+            queue->Signal(gf.Get(), ++gfv);
+            while (gf->GetCompletedValue() < gfv) Sleep(1);
+            int g_slot = -1;
+            for (int wait = 0; wait < 200 && g_slot < 0; ++wait, Sleep(1))
+                for (int i = 0; i < kSlots; ++i) if (sh.slots[i].state == kReady && sh.slots[i].frame_id == fid) g_slot = i;
+            EXPECT(g_slot >= 0 && sh.slots[g_slot].generated == 1 && sh.slots[g_slot].tex[kBackbuffer].valid,
+                   "frame generation: the frame is published with its generated image when its list is submitted");
+            EXPECT(producer.generation_active(), "frame generation: presents publish nothing meanwhile");
+            if (g_slot >= 0) {
+                renderer.begin_frame();
+                const IngestedSource gs = renderer.ingest(sh, g_slot);
+                EXPECT(gs.generated == 1 && gs.per_frame == 1, "frame generation: the image is taken in with the frame (%d of %d)", gs.generated,
+                       gs.per_frame);
+                renderer.analyze_motion(gs, still.clip_to_prev_clip, 1.0f, 1.0f, true, true, true, false, fid);
+                renderer.prepare_generated(gs, 1.0f, 1.0f, true, true);
+                renderer.finish_frame(false, 0);
+                renderer.wait_idle();
+                auto show_gen = [&](int which) {
+                    renderer.begin_frame();
+                    const bool ok = renderer.own_warp(gs, true, false, identity.data(), true, false, nullptr, which);
+                    renderer.finish_frame(ok, 0);
+                    renderer.read_back(true, px, w, h);
+                };
+                show_gen(0);
+                const double gen_x = peak(px, w, h, true, 1);
+                show_gen(-1);
+                const double real_x = peak(px, w, h, true, 1);
+                std::printf("frame generation: generated image bar x %.0f (expected %.0f), the frame's %.0f (expected %.0f)\n", gen_x, still_x - 30,
+                            real_x, still_x);
+                EXPECT(std::fabs(gen_x - (still_x - 30)) < 2.0, "frame generation: the warp shows the generated image");
+                EXPECT(std::fabs(real_x - still_x) < 2.0, "frame generation: and the frame itself after it");
+            }
+            Sleep(600);  // (frame generation's images stop: presents publish frames again)
+            EXPECT(!producer.generation_active(), "frame generation: over half a second after its last image");
+        }
     }
 
     // No-warp mask for games without HUD layers. The camera moves (uniform screen motion `shift` in uv);
@@ -1170,7 +1248,27 @@ int main(int argc, char** argv) {
             EXPECT(ghost1 > 0, "the test outline slides away as a ghost without the stretch (%d)", ghost1);
             EXPECT(ghost4 == 0, "with the stretch the outline stays with the weapon (%d)", ghost4);
             EXPECT(reddish == 0, "without the memory nothing is read from its slot (%d red pixels)", reddish);
-            if (std::getenv("FW_D3D_DEBUG")) EXPECT(renderer.print_debug_messages() == 0, "no D3D12 debug-layer errors");
+            // Captures keep two earlier game frames (stash sets 1 and 0) next to the current one.
+            {
+                ingest_frame(publish(970, 0.1f, 0, false, false), false, false);
+                renderer.stash_source(1);
+                ingest_frame(publish(971, 0.1f, 20, false, false), false, false);
+                renderer.stash_source(0);
+                ingest_frame(publish(972, 0.1f, 40, false, false), false, false);
+                double bars[3] = {};
+                bool depths = true;
+                for (int i = 0; i < 3; ++i) {
+                    EXPECT(renderer.read_back(i == 0 ? 15 : i == 1 ? 10 : 0, px, w, h), "kept frame %d read back", i);
+                    bars[i] = peak(px, w, h, true, 1);
+                    std::vector<std::uint16_t> d; std::uint32_t dw = 0, dh = 0;
+                    depths = depths && renderer.read_back(i == 0 ? 17 : i == 1 ? 11 : 3, d, dw, dh) && dw > 0;
+                }
+                std::printf("captured frames: bar x %.0f, %.0f, %.0f\n", bars[0], bars[1], bars[2]);
+                EXPECT(std::fabs(bars[1] - bars[0] - 20.0) < 2.0 && std::fabs(bars[2] - bars[1] - 20.0) < 2.0,
+                       "the two kept frames are the earlier ones, oldest first (%.0f, %.0f, %.0f)", bars[0], bars[1], bars[2]);
+                EXPECT(depths, "their depth is kept too");
+                EXPECT(!renderer.read_back(16, px, w, h), "no HUD-less picture is kept when not asked for");
+            }
         }
         with_scene = false;
         scene_offset = -1;

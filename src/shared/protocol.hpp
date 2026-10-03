@@ -10,14 +10,17 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 40;
+constexpr std::uint32_t kVersion = 41;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
 // kScene: the upscaler's output (games without Streamline): the scene before post-processing and HUD.
-enum Tex : int { kBackbuffer = 0, kHudless, kUi, kDepth, kMotion, kScene, kTexCount };
+// kGen0..2: the game's frame generation (DLSS / FSR), the images it generated between the previous frame
+// and this one, in order (SlotMeta::generated).
+enum Tex : int { kBackbuffer = 0, kHudless, kUi, kDepth, kMotion, kScene, kGen0, kGen1, kGen2, kTexCount };
+constexpr int kMaxGenerated = 3;
 inline const char* tex_name(int t) {
-    static const char* n[] = {"backbuffer", "hudless", "ui", "depth", "motion", "scene"};
+    static const char* n[] = {"backbuffer", "hudless", "ui", "depth", "motion", "scene", "gen0", "gen1", "gen2"};
     return t >= 0 && t < kTexCount ? n[t] : "?";
 }
 
@@ -56,6 +59,10 @@ struct SlotMeta {
     std::int64_t qpc_present;    // when the game presented frame_id
     Camera camera;
     TexInfo tex[kTexCount];
+    // Frame generation: images generated between the previous frame and this one (kGen0..), of `per_frame`
+    // per frame (2x: 1, 4x: 3); image i shows the moment (i + 1) / (per_frame + 1) of the way from the previous
+    // frame to this one. 0: none (no frame generation, or not taken for this frame).
+    std::uint32_t generated, per_frame;
 };
 
 // Settings are written by the add-on UI and read by the presenter.
@@ -78,7 +85,7 @@ struct Settings {
     std::uint32_t auto_prediction; // 0: manual slider; 1, 2, 4: -(1/n of the measured game frame); 3: 1/2 with HUD layers, 1/4 without, 1 with XPAR's own motion vectors
     float present_lead_ms;         // render this long before the next vblank (0: right after the previous one)
     std::uint32_t gpu_priority;    // presenter GPU scheduling class: 0 realtime (default), 1 high, 2 normal
-    std::uint32_t extrapolate_objects;  // shelved experiment (no UI): interpolate moving objects with the game's motion vectors
+    std::uint32_t moving_objects;  // XPAR engine: objects move at the display rate, between the game's frames (option, off by default)
     std::uint32_t no_warp_mask;    // games without HUD layers: detect the HUD and keep it unwarped
     std::uint32_t show_mask;       // debug: tint the no-warp mask (magenta) and the HUD score still learning (green)
     std::uint32_t hud_from_scene;  // HUD detection, saved per game in ReShade.ini: 0 learned, 1 from the upscaler's output,
@@ -134,7 +141,12 @@ struct HookStats {
 };
 
 // Game-side event log (lock-free ring) written by the add-on, dumped to CSV by the presenter.
-enum EventKind : std::uint32_t { kEvConstants = 1, kEvTag = 2, kEvSimStart = 3, kEvPresentMarker = 4, kEvPresent = 5, kEvPublished = 6 };
+// Frame generation (diagnostics): kEvFrameGen per call into it (extra: the source, see ffx_hooks.cpp /
+// ngx_hooks.cpp; FFX API calls carry the description type above the low byte), kEvImage per reshade_present
+// (frame: the effect runtime, extra: its back buffer), kEvSwapPresent per present ReShade sees (frame: the
+// swapchain, extra: its current back buffer).
+enum EventKind : std::uint32_t { kEvConstants = 1, kEvTag = 2, kEvSimStart = 3, kEvPresentMarker = 4, kEvPresent = 5, kEvPublished = 6,
+                                 kEvFrameGen = 7, kEvImage = 8, kEvSwapPresent = 9 };
 struct TimelineEvent {
     std::int64_t qpc;
     std::uint32_t kind, tid;
@@ -161,7 +173,7 @@ struct NgxStats {
 
 // AMD FidelityFX (FSR 3.1 / FSR 4) upscaler calls, for diagnostics and games without Streamline.
 struct FsrStats {
-    std::uint32_t hooks;  // bits: 2*i create, 2*i+1 dispatch for amd_fidelityfx_dx12 / _loader_dx12 / _upscaler_dx12; 6/7: FSR 3.0 SDK create/dispatch; 8/9: FSR 2 create/dispatch
+    std::uint32_t hooks;  // bits: 2*i create, 2*i+1 dispatch for amd_fidelityfx_dx12 / _loader_dx12 / _upscaler_dx12; 6/7: FSR 3.0 SDK create/dispatch; 8/9: FSR 2 create/dispatch; 10-12: FFX API configure; 13-18: frame generation entry points (diagnostics, ffx_hooks.cpp kFgEntries)
     std::uint32_t upscale_creates, upscale_dispatches, resets, create_flags;
     std::uint32_t render_w, render_h, out_w, out_h, depth_format, mv_format, depth_state, output_state;
     float jitter[2], mv_scale[2];

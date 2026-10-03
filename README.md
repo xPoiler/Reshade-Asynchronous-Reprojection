@@ -51,9 +51,9 @@ Other games may work but are untested.
   Display > Graphics, then restart). Without it the output may not reach the refresh rate; the XPAR
   panel warns you if it is off.
 * [ReShade](https://reshade.me) 6.x **with full add-on support**, installed for the game.
-* **Frame generation off** (DLSS, FSR or XeSS frame generation). FrameWarp does the same job, filling
-  your display's refresh rate, and the two can't be combined. While a game has frame generation on,
-  FrameWarp pauses and says so in its panel.
+* Frame generation: **DLSS Frame Generation and FSR 3.1 frame generation work with FrameWarp** (its own
+  warp engine): each generated image is moved to the current camera like any frame. Other kinds (FSR 3.0,
+  XeSS) can't be combined with it: while one is on, FrameWarp pauses and says so in its panel.
 * The [Microsoft Visual C++ Redistributable 2015–2022 (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe).
 
 Optional: **NVIDIA Latewarp** (`nvngx_latewarp.dll`, NVIDIA GPUs only), NVIDIA's Reflex 2 Frame Warp
@@ -111,6 +111,7 @@ Advanced: both files also accept a game name or folder directly (`install.bat "E
 | **Keep near-camera motion still** | On by default, remembered per game. Part of *Character/weapon*: things close to the camera that move against it (a weapon mid-animation, hands) are kept still. Turn it off if the floor near the camera is kept still while strafing; a weapon that stays put on screen is still kept still. |
 | **Keep still what the camera turns around (third-person)** | On by default, remembered per game. Part of *Character/weapon*: while the camera turns, anything that moves less than a fifth of what the turn alone would move it on screen is kept still. Over-the-shoulder cameras circle the character, so it barely moves on screen while the room swings around it; the warp turns the view around the camera and would otherwise swing the character away until the next game frame snaps it back. |
 | **Stretch around character/weapon** | 0-32 render pixels, 1 by default (0 turns it off), remembered per game, XPAR engine. Where the scenery slides away from a kept-still character or weapon, the warp uncovers a gap and fills it from the nearest scenery pixel, which draws streaks and smears the outline its motion vectors miss (anti-aliasing, the upscaler's softening). With a width set, the scenery that close follows the warp less and less towards the character or weapon: the gap is covered by slightly stretched scenery, and the outline stays with it. |
+| **Move objects at the display rate even without frame generation** | Off by default (experimental), remembered per game, XPAR engine, games with DLSS or FSR. The game's own DLSS or FSR 3.1 frame generation is used by itself when it is on; this is XPAR's own frame generation for what moves on its own, for when it is not: cars, people and anything else moving are shown one game frame late and move at the display rate, between two real frames, instead of at the game's frame rate; the camera is not delayed. What they uncover shows the previous frame. The character/weapon kept still moves at the display rate too (one frame late, still not warped with the camera). Shadows stay where the game drew them. |
 | **Background memory for uncovered areas** | On by default, remembered per game, XPAR engine. The scenery last seen around the kept-still character or weapon is remembered (half resolution, up to a second) and shown where the warp uncovers it while turning, instead of stretched edge pixels. About 80 MB of video memory at 4K and about 0.1 ms of GPU time per game frame, on the intake queue. |
 | **Find the HUD** | Remembered per game. **Upscaler output + camera motion check** (default): compares the final picture with the upscaler's (DLSS or FSR) own output, which has no HUD, and leaves out what is seen moving with the world when the camera turns (bright lights, neon or effects drawn after upscaling). **From the upscaler output**: the comparison alone. **Learned from camera motion**: finds the HUD from what stays put on screen while the camera moves; it needs a few seconds of camera movement, and is used whenever there is no upscaler output. |
 | **Fill behind the HUD from the upscaler output** | On by default, remembered per game; XPAR engine, with the HUD found from the upscaler output. When the camera turns, the scenery the HUD covered is taken from the upscaler's output (colour-matched to the game's picture) instead of being smeared from the surroundings, so the HUD leaves no trail. Effects the game adds after upscaling, such as bloom or film grain, may be missing in those spots. |
@@ -145,8 +146,9 @@ diagnostics) are for fine-tuning and troubleshooting.
 
 ## Troubleshooting
 
-If the XPAR panel says frame generation is on, turn frame generation off in the game's graphics
-settings; FrameWarp resumes by itself.
+If the XPAR panel says frame generation is on and XPAR is paused, the game uses a kind of frame
+generation XPAR can't take (or NVIDIA Latewarp is the warp engine): turn frame generation off in the
+game's graphics settings, or switch to DLSS or FSR 3.1 frame generation; FrameWarp resumes by itself.
 
 Logs are written to `FrameWarp\logs\`, next to the game's ReShade. The previous run is kept in
 `logs\previous\`. For a problem report, tick **Record detailed diagnostics** in the XPAR panel,

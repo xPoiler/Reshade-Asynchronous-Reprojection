@@ -106,6 +106,21 @@ inline Mat4 clip_source_to_target(const Mat4& projection, const Mat4& view_sourc
     return mat_mul(mat_mul(mat_mul(inv_p, inv_vs), view_target), projection);
 }
 
+// Frame generation: an image generated `back` (0..1) of the way from a frame to the previous one is seen from
+// the frame's camera moved that part of the way back. The game's own reprojection clipToPrevClip C (this frame's
+// clip space -> the previous frame's) is the view-space motion between the two cameras seen through the
+// projection (P^-1 T P), so blending it, (1 - back) I + back C, blends that motion - exact at both ends, nearly
+// rigid in between for a frame's worth of motion, whatever the engine's units and projection.
+// frame_to_target: the frame's clip space -> the displayed camera's; returned: the image's clip space -> the
+// displayed camera's (the same when there is nothing to blend).
+inline Mat4 generated_to_target(const float clip_to_prev_clip[16], double back, const Mat4& frame_to_target) {
+    if (back <= 0) return frame_to_target;
+    Mat4 blend{}, to_frame{};
+    for (int i = 0; i < 16; ++i) blend[i] = float((i % 5 == 0 ? 1.0 - back : 0.0) + back * double(clip_to_prev_clip[i]));
+    if (!mat_inverse(blend, to_frame)) return frame_to_target;
+    return mat_mul(to_frame, frame_to_target);
+}
+
 // Signed yaw about world up from a to b, and elevation of a forward vector.
 inline double yaw_between(Vec3 a, Vec3 b, Vec3 up) {
     const Vec3 ah = normalize(a - up * dot(a, up)), bh = normalize(b - up * dot(b, up));

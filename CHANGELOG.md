@@ -1,5 +1,42 @@
 # Changelog
 
+## Unreleased
+
+* **The game's own frame generation works with XPAR** (DLSS Frame Generation, including multi frame
+  generation, and FSR 3.1 frame generation; XPAR engine). It used to be one or the other: with frame
+  generation on, XPAR paused. Now XPAR takes each image the game's frame generation makes, right where it
+  is made, and over each game frame shows them in turn and then the frame itself - every one of them moved
+  to the current camera, as with any frame. Moving objects move at the frame generation's rate, one game
+  frame late as frame generation always is; the camera is not delayed. Nothing to switch on: it starts by
+  itself when frame generation is on in the game. With NVIDIA Latewarp as the warp engine, XPAR still
+  pauses while frame generation is on. The ReShade menu, drawn after these images are taken, shows the
+  game's own picture while it is open. FSR 3.0 frame generation (the older FidelityFX SDK) is not taken
+  yet: XPAR pauses as before.
+* With FSR in a game that sends its depth and motion vectors through Streamline, the HUD is found from
+  the upscaler's output too, as with DLSS (it fell back to the learned HUD map).
+* **Move objects at the display rate even without frame generation** (new option, experimental, off by
+  default; XPAR engine, games with DLSS or FSR): XPAR's own frame generation for what moves on its own,
+  for when the game's is off or not available. Cars, people and everything else the
+  game's motion vectors show moving are shown one game frame late and move at the display rate, always
+  between two real frames (never guessed ahead), instead of stepping at the game's frame rate; the camera
+  is not delayed (the warp shows it at the displayed moment, as before). Each moving pixel goes in a
+  straight line in 3D between its two positions (both frames' depth), so things that move with the camera,
+  such as a car's interior while driving, stay where they belong; what an object uncovers shows the
+  previous frame behind it. The character/weapon kept still by **Keep still** moves at the display rate
+  too (its own on-screen motion, one frame late, still not warped with the camera); where the warp fills
+  the area beside it from a moving object, the piece it copies moves with that object.
+  Replaces an earlier attempt that never reached a release (it left halos around moving objects).
+  Shadows (drawn on the ground, with the ground's motion vectors) stay where the game drew them.
+* The motion analysis behind the masks, the motion vector scale and the camera check runs for every game
+  frame with depth and motion vectors, whatever **Keep still** is set to. Since 1.4.0 it already did, by
+  accident of a missing pair of braces; the camera check (1.6.1) relies on it, so it is now on purpose.
+  The frame numbers in `motion.csv` were wrong whenever **Keep still** was *Off* (or *HUD only* in a game
+  with HUD layers) and could drift by a frame or two otherwise; each fit now carries its own frame.
+* The capture key (Ctrl+Shift+D) saves three consecutive game frames (`prev2_`, `prev_` and the current
+  one), the HUD-less picture where the game has one, and each frame's camera (`_cameras.txt`). A capture
+  is only taken while no newer frame is half taken in, so depth and motion vectors are always the same
+  frame's.
+
 ## 1.7.0
 
 * **Games without DLSS or FSR, or with both switched off (experimental, DirectX 12 and 11):** XPAR now works

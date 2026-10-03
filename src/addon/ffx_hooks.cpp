@@ -4,6 +4,7 @@
 #include "common/inline_hook.hpp"
 #include <d3d12.h>
 #include <atomic>
+#include <algorithm>
 #include <cstring>
 #include <string>
 
@@ -41,6 +42,24 @@ struct ffxDispatchDescUpscale {
 static_assert(sizeof(FfxApiResource) == 48, "FfxApiResource layout");
 static_assert(offsetof(ffxDispatchDescUpscale, output) == 312 && offsetof(ffxDispatchDescUpscale, flags) == 428, "dispatch layout");
 constexpr ffxStructType_t kCreateUpscale = 0x00010000u, kDispatchUpscale = 0x00010001u;
+// Frame generation (ffx_framegeneration.h): the dispatch that generates the images between the previous frame
+// and the one being presented, recorded on commandList.
+struct FfxApiRect2D { std::int32_t left, top, width, height; };
+struct ffxDispatchDescFrameGeneration {
+    ffxApiHeader header;
+    void* commandList;
+    FfxApiResource presentColor;  // the frame being presented
+    FfxApiResource outputs[4];    // the generated images, numGeneratedFrames of them
+    std::uint32_t numGeneratedFrames;
+    bool reset;
+    std::uint32_t backbufferTransferFunction;
+    float minMaxLuminance[2];
+    FfxApiRect2D generationRect;
+    std::uint64_t frameID;
+};
+static_assert(offsetof(ffxDispatchDescFrameGeneration, numGeneratedFrames) == 264 && offsetof(ffxDispatchDescFrameGeneration, frameID) == 304,
+              "frame generation dispatch layout");
+constexpr ffxStructType_t kDispatchFrameGeneration = 0x00020003u;
 constexpr std::uint32_t kDepthInverted = 1u << 3;  // the same bit in both APIs' upscaler creation flags
 
 // FidelityFX SDK 1.0 (FSR 3.0; ffx_types.h and ffx_fsr3upscaler.h of tags fsr3-v3.0.3 / fsr3-v3.0.4),
@@ -116,18 +135,39 @@ using SdkCreateFn = std::int32_t (*)(void*, const FfxSdkUpscalerContextDescripti
 using SdkDispatchFn = std::int32_t (*)(void*, const FfxSdkUpscalerDispatchDescription*);
 using Fsr2CreateFn = std::int32_t (*)(void*, const Fsr2ContextDescription*);
 using Fsr2DispatchFn = std::int32_t (*)(void*, const void*);
+using ConfigureFn = ffxReturnCode_t (*)(ffxContext*, const ffxApiHeader*);
+using PassFn = std::int32_t (*)(void*, void*);  // (frame generation entry points, looked at but not read)
 
 Producer* g_producer = nullptr;
 // One pair per DLL that exports the API (the FSR 4 loader forwards to the upscaler DLL, so both may be
 // hooked; only the outermost call is looked at).
 constexpr const wchar_t* kModules[] = {L"amd_fidelityfx_dx12.dll", L"amd_fidelityfx_loader_dx12.dll", L"amd_fidelityfx_upscaler_dx12.dll"};
-InlineHook g_create_hooks[3], g_dispatch_hooks[3];
+InlineHook g_create_hooks[3], g_dispatch_hooks[3], g_configure_hooks[3];
 // FSR 3.0 (FidelityFX SDK 1.0): its own upscaler DLL and entry points.
 constexpr const wchar_t* kSdkModule = L"ffx_fsr3upscaler_x64.dll";
 InlineHook g_sdk_create_hook, g_sdk_dispatch_hook;
 // FSR 2: its API DLL.
 constexpr const wchar_t* kFsr2Module = L"ffx_fsr2_api_x64.dll";
 InlineHook g_fsr2_create_hook, g_fsr2_dispatch_hook;
+// Frame generation (diagnostics for now): FSR 3.0's (FidelityFX SDK 1.0) entry points, each call a
+// kEvFrameGen event with its source: 3 ffxFsr3DispatchFrameGeneration, 4 ffxFrameInterpolationDispatch,
+// 5 ffxFsr3ConfigureFrameGeneration, 6 ffxFsr3ContextDispatchUpscale; and FSR 3.1's frame generation DLL
+// called directly (not through the loader, e.g. from its own presenting thread): 8 ffxDispatch, 9 ffxConfigure.
+// (1: an FFX API dispatch and 2: an FFX API configure of a frame generation or swapchain description; FFX API
+// calls carry the description's type above the low byte.)
+struct FgEntry { const wchar_t* module; const char* name; std::uint64_t source; };
+constexpr FgEntry kFgEntries[] = {{L"ffx_fsr3_x64.dll", "ffxFsr3DispatchFrameGeneration", 3},
+                                  {L"ffx_frameinterpolation_x64.dll", "ffxFrameInterpolationDispatch", 4},
+                                  {L"ffx_fsr3_x64.dll", "ffxFsr3ConfigureFrameGeneration", 5},
+                                  {L"ffx_fsr3_x64.dll", "ffxFsr3ContextDispatchUpscale", 6},
+                                  {L"amd_fidelityfx_framegeneration_dx12.dll", "ffxDispatch", 8},
+                                  {L"amd_fidelityfx_framegeneration_dx12.dll", "ffxConfigure", 9}};
+constexpr int kFgCount = int(sizeof(kFgEntries) / sizeof(kFgEntries[0]));
+InlineHook g_fg_hooks[kFgCount];
+bool frame_generation_type(ffxStructType_t type) { return (type >> 16) == 2 || (type >> 16) == 3; }
+void note_frame_generation(std::uint64_t extra) {
+    if (g_producer && g_producer->shared()) push_event(g_producer->shared(), kEvFrameGen, 0, extra);
+}
 std::atomic<int> g_fsr2_layout{0};  // 0 not known yet, 21: 2.1 and later, 20: 2.0 release, -1: neither (not used)
 thread_local int t_depth = 0;
 
@@ -193,6 +233,11 @@ std::uint64_t before_upscale(const Upscale& u) {
     auto* shared = g_producer->shared();
     // (a Streamline camera found unusable counts as none: the camera is estimated)
     const bool own_camera = !g_producer->game_camera_unusable();
+    // Depth and motion vectors from the game's Streamline tags (some games tag them with FSR too): only the
+    // upscaler's output is taken here, for the frame being rendered (for the HUD found from it, as with DLSS).
+    if (shared && !dlss_publishing() && own_camera && streamline_depth_recent() && streamline_camera_recent() && u.list && u.output &&
+        shared->settings.hud_from_scene && s->upscale_dispatches > 60)
+        return g_producer->rendering_frame() ? g_producer->rendering_frame() : streamline_current_frame();
     if (!shared || dlss_publishing() || (own_camera && streamline_depth_recent()) || s->upscale_dispatches <= 60 || !u.list || !u.depth ||
         !u.motion)
         return 0;
@@ -247,7 +292,27 @@ ffxReturnCode_t hk_create(ffxContext* context, ffxApiHeader* desc, const void* m
 }
 
 template <int I>
+ffxReturnCode_t hk_configure(ffxContext* context, const ffxApiHeader* desc) {
+    if (t_depth == 0 && desc && frame_generation_type(desc->type)) note_frame_generation(2 | (desc->type << 8));
+    ++t_depth;
+    const ffxReturnCode_t result = reinterpret_cast<ConfigureFn>(g_configure_hooks[I].original())(context, desc);
+    --t_depth;
+    return result;
+}
+
+template <int I>
+std::int32_t hk_fg(void* a, void* b) {
+    if (kFgEntries[I].source < 8) note_frame_generation(kFgEntries[I].source);
+    else if (t_depth == 0 && b) note_frame_generation(kFgEntries[I].source | (static_cast<const ffxApiHeader*>(b)->type << 8));
+    ++t_depth;
+    const std::int32_t result = reinterpret_cast<PassFn>(g_fg_hooks[I].original())(a, b);
+    --t_depth;
+    return result;
+}
+
+template <int I>
 ffxReturnCode_t hk_dispatch(ffxContext* context, const ffxApiHeader* desc) {
+    if (t_depth == 0 && desc && frame_generation_type(desc->type)) note_frame_generation(1 | (desc->type << 8));
     const ffxDispatchDescUpscale* up = t_depth == 0 ? find_desc<ffxDispatchDescUpscale>(desc, kDispatchUpscale) : nullptr;
     Upscale u{};
     std::uint64_t published = 0;
@@ -265,6 +330,16 @@ ffxReturnCode_t hk_dispatch(ffxContext* context, const ffxApiHeader* desc) {
     const ffxReturnCode_t result = reinterpret_cast<DispatchFn>(g_dispatch_hooks[I].original())(context, desc);
     --t_depth;
     if (up && result == 0) after_upscale(u, published);
+    // Frame generation (FSR 3.1): its images, taken right after it recorded them (with the frame itself).
+    if (t_depth == 0 && result == 0 && desc && desc->type == kDispatchFrameGeneration && g_producer && g_producer->generation_wanted()) {
+        const auto* fg = reinterpret_cast<const ffxDispatchDescFrameGeneration*>(desc);
+        auto* list = static_cast<ID3D12GraphicsCommandList*>(fg->commandList);
+        const std::uint32_t n = std::min<std::uint32_t>(fg->numGeneratedFrames, 4);
+        for (std::uint32_t i = 0; i < n && list; ++i)
+            if (fg->outputs[i].resource)
+                g_producer->on_generated(0, n, static_cast<ID3D12Resource*>(fg->outputs[i].resource), d3d12_state(fg->outputs[i].state),
+                                         static_cast<ID3D12Resource*>(fg->presentColor.resource), d3d12_state(fg->presentColor.state), list);
+    }
     return result;
 }
 
@@ -375,13 +450,21 @@ void install_ffx_hooks(Producer* producer) {
     void* const creates[3] = {reinterpret_cast<void*>(&hk_create<0>), reinterpret_cast<void*>(&hk_create<1>), reinterpret_cast<void*>(&hk_create<2>)};
     void* const dispatches[3] = {reinterpret_cast<void*>(&hk_dispatch<0>), reinterpret_cast<void*>(&hk_dispatch<1>),
                                  reinterpret_cast<void*>(&hk_dispatch<2>)};
+    void* const configures[3] = {reinterpret_cast<void*>(&hk_configure<0>), reinterpret_cast<void*>(&hk_configure<1>),
+                                 reinterpret_cast<void*>(&hk_configure<2>)};
     for (int i = 0; i < 3; ++i) {
-        if (g_create_hooks[i].installed() && g_dispatch_hooks[i].installed()) continue;
+        if (g_create_hooks[i].installed() && g_dispatch_hooks[i].installed() && g_configure_hooks[i].installed()) continue;
         HMODULE module = GetModuleHandleW(kModules[i]);
         if (!module) continue;
         install(module, "ffxCreateContext", g_create_hooks[i], creates[i], 1u << (i * 2), producer);
         install(module, "ffxDispatch", g_dispatch_hooks[i], dispatches[i], 1u << (i * 2 + 1), producer);
+        install(module, "ffxConfigure", g_configure_hooks[i], configures[i], 1u << (10 + i), producer);
     }
+    void* const fg[kFgCount] = {reinterpret_cast<void*>(&hk_fg<0>), reinterpret_cast<void*>(&hk_fg<1>), reinterpret_cast<void*>(&hk_fg<2>),
+                                reinterpret_cast<void*>(&hk_fg<3>), reinterpret_cast<void*>(&hk_fg<4>), reinterpret_cast<void*>(&hk_fg<5>)};
+    for (int i = 0; i < kFgCount; ++i)
+        if (HMODULE module = g_fg_hooks[i].installed() ? nullptr : GetModuleHandleW(kFgEntries[i].module))
+            install(module, kFgEntries[i].name, g_fg_hooks[i], fg[i], 1u << (13 + i), producer);
     if (!g_sdk_create_hook.installed() || !g_sdk_dispatch_hook.installed()) {
         if (HMODULE module = GetModuleHandleW(kSdkModule)) {
             install(module, "ffxFsr3UpscalerContextCreate", g_sdk_create_hook, reinterpret_cast<void*>(&hk_sdk_create), 1u << 6, producer);

@@ -110,7 +110,7 @@ void on_init_swapchain(swapchain* sc, bool) {
     struct Saved { const char* key; int default_value; };
     static constexpr Saved kSaved[] = {{"HudFromDlssOutput", 2}, {"FillBehindHud", 1}, {"HoldOrbitedCharacter", 1},
                                        {"NearCameraRule", 1}, {"RecordDiagnostics", 0}, {"BackgroundMemory", 1},
-                                       {"StretchWidth", 1}, {"GameCameraCheck", 0}};
+                                       {"StretchWidth", 1}, {"GameCameraCheck", 0}, {"MovingObjects", 0}};
     char saved_version[32] = "";
     size_t size = sizeof(saved_version);
     if (!reshade::get_config_value(nullptr, "FrameWarp", "SettingsVersion", saved_version, &size) ||
@@ -141,6 +141,7 @@ void on_init_swapchain(swapchain* sc, bool) {
         shared->settings.near_camera_rule = saved("NearCameraRule") != 0;
         shared->settings.record_diagnostics = saved("RecordDiagnostics") != 0;
         shared->settings.background_memory = saved("BackgroundMemory") != 0;
+        shared->settings.moving_objects = saved("MovingObjects") != 0;
         shared->settings.stretch_width = static_cast<std::uint32_t>(std::clamp(saved("StretchWidth"), 0, 32));
         // What the presenter found out about the game's own camera in an earlier run (Shared::game_camera_check).
         InterlockedExchange(&shared->game_camera_check, std::clamp(saved("GameCameraCheck"), 0, 2));
@@ -206,6 +207,12 @@ void present_vulkan(effect_runtime* runtime, command_queue* queue) {
     if (token && g_producer->shared()->settings.enabled && !presenter_running()) launch_presenter();
 }
 
+// Every present ReShade sees (frame generation diagnostics: which swapchains get which images).
+void on_present(command_queue*, swapchain* chain, const rect*, const rect*, uint32_t, const rect*) {
+    if (g_producer && g_producer->ready() && chain)
+        fw::push_event(g_producer->shared(), fw::kEvSwapPresent, reinterpret_cast<std::uintptr_t>(chain), chain->get_current_back_buffer_index());
+}
+
 void on_finish_present(command_queue* queue, swapchain*) {
     if (!queue || queue->get_device()->get_api() != device_api::vulkan) return;
     g_finish_present_seen = true;
@@ -234,6 +241,7 @@ void on_reshade_present(effect_runtime* runtime) {
         return;
     }
     if (queue->get_device()->get_api() != device_api::d3d12) return;
+    fw::push_event(g_producer->shared(), fw::kEvImage, reinterpret_cast<std::uintptr_t>(runtime), runtime->get_current_back_buffer().handle);
     fw::install_streamline_hooks(g_producer.get());  // no-op once everything is hooked
     fw::install_ngx_hooks(g_producer.get());
     fw::install_ffx_hooks(g_producer.get());
@@ -301,10 +309,12 @@ void draw_overlay(effect_runtime*) {
         ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
                            "Hardware-accelerated GPU scheduling is OFF: output may not reach the refresh rate.\n"
                            "Turn it on in Windows Settings > System > Display > Graphics, then restart the PC.");
-    if (alive && p.frame_generation)
+    if (alive && p.frame_generation == 1)
         ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
-                           "Frame generation is on in the game. XPAR is paused: turn frame generation off -\n"
-                           "XPAR already fills your display's refresh rate, and the two cannot be combined.");
+                           "Frame generation is on in the game and XPAR cannot use this kind: XPAR is paused. It uses\n"
+                           "DLSS and FSR 3.1 frame generation with its own warp engine; otherwise turn frame generation off.");
+    else if (alive && p.frame_generation == 2)
+        ImGui::TextDisabled("Frame generation: XPAR shows the game's generated images, each moved to the current camera");
     if (fw::reshade_feed_status()[0]) ImGui::TextWrapped("%s", fw::reshade_feed_status());
     if (sh.game_camera_check == 1)
         ImGui::TextDisabled("Camera: estimated from the motion vectors (the game's own camera data does not match them)");
@@ -356,6 +366,13 @@ void draw_overlay(effect_runtime*) {
             reshade::set_config_value(nullptr, "FrameWarp", "BackgroundMemory", memory ? "1" : "0");
         }
         ImGui::TextDisabled("  beside the character/weapon and at the screen edges: the scenery as last seen there, when recent");
+        bool moving = s.moving_objects != 0;
+        if (ImGui::Checkbox("Move objects at the display rate even without frame generation (XPAR engine, experimental)", &moving)) {
+            s.moving_objects = moving;
+            reshade::set_config_value(nullptr, "FrameWarp", "MovingObjects", moving ? "1" : "0");
+        }
+        ImGui::TextDisabled("  the game's own DLSS or FSR frame generation is used by itself when it is on; this moves cars, people and your");
+        ImGui::TextDisabled("  character/weapon at the display rate without it, one game frame late (the camera is not delayed); games with DLSS or FSR");
         if (!latewarp)
             ImGui::TextDisabled("  NVIDIA Latewarp is not installed (optional: nvngx_latewarp.dll, NVIDIA GPUs only)");
         bool invert = s.invert_warp != 0;
@@ -522,6 +539,7 @@ void register_callbacks() {
     reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(fw::on_reshade_reloaded_effects);
     fw::register_depth_choice_events();
     reshade::register_event<reshade::addon_event::finish_present>(on_finish_present);
+    reshade::register_event<reshade::addon_event::present>(on_present);
     reshade::register_event<reshade::addon_event::create_resource>(on_create_resource);
     reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
     reshade::register_event<reshade::addon_event::reshade_open_overlay>(on_open_overlay);
@@ -532,6 +550,7 @@ void unregister_callbacks() {
     reshade::unregister_event<reshade::addon_event::reshade_open_overlay>(on_open_overlay);
     reshade::unregister_event<reshade::addon_event::destroy_device>(on_destroy_device);
     reshade::unregister_event<reshade::addon_event::create_resource>(on_create_resource);
+    reshade::unregister_event<reshade::addon_event::present>(on_present);
     reshade::unregister_event<reshade::addon_event::finish_present>(on_finish_present);
     fw::unregister_depth_choice_events();
     reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(fw::on_reshade_reloaded_effects);
