@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+* **Warning when a frame rate cap outside XPAR holds its output back.** XPAR's window is never the
+  focused one (the game keeps the keyboard and mouse), so NVIDIA's "Background Application Max Frame
+  Rate" caps it, and can cap the game it covers. The XPAR panel now warns when XPAR's output stays well
+  below the refresh rate because its presents are held back from outside. The README's troubleshooting
+  section explains the fix.
+* The presenter GPU priority is remembered per game, like the other saved options.
+* Installer: the update question shows the version again ("Update it to 1.8.0?"), and games without DLSS
+  or FSR are no longer marked as not working in the game list.
+
 ## 1.8.0
 
 * **The game's own frame generation works with XPAR** (DLSS Frame Generation, including multi frame

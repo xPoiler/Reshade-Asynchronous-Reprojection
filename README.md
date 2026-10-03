@@ -163,6 +163,13 @@ game's graphics settings, or switch to DLSS or FSR 3.1 frame generation; FrameWa
 If the XPAR panel warns that video memory is nearly full, the game and FrameWarp don't both fit and both
 stutter: lower the game's texture quality or resolution, or turn off frame generation.
 
+If the output is stuck at a low frame rate on an NVIDIA GPU, check **Background Application Max Frame
+Rate** in the NVIDIA Control Panel (Manage 3D settings). FrameWarp's window is never the focused one, as
+the game keeps your keyboard and mouse, so the driver treats it as a background application and caps
+it; the game it covers can be capped too. Turn the setting off, for all programs or for
+`FrameWarpPresenter.exe` and the game. The XPAR panel warns when its output is held back by a frame
+rate cap like this.
+
 Logs are written to `FrameWarp\logs\`, next to the game's ReShade. The previous run is kept in
 `logs\previous\`. For a problem report, tick **Record detailed diagnostics** in the XPAR panel,
 reproduce the problem (pressing **Ctrl+Shift+M** marks the moment it looks wrong in the logs), and

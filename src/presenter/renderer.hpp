@@ -214,6 +214,7 @@ public:
     bool record_motion_samples(const IngestedSource& src, std::uint32_t grid_w, std::uint32_t grid_h);
     bool read_motion_samples(std::vector<float>& out);
     float last_flush_ms() const { return last_flush_ms_; }  // how long sample_motion waited for the GPU
+    float last_present_call_ms() const { return last_present_call_ms_; }  // how long the last Present call took (CPU)
     ID3D12Resource* no_warp_mask() const {
         if (split_) return shown_mask_ ? front_[kPMask].texture.Get() : nullptr;
         return mask_ready_ ? private_[kPMask].texture.Get() : nullptr;
@@ -316,6 +317,7 @@ private:
     ComPtr<ID3D12Resource> samples_, samples_readback_;
     UINT samples_count_ = 0;
     float last_flush_ms_ = 0;
+    float last_present_call_ms_ = 0;
     ComPtr<ID3D12Resource> hud_counts_, hud_readback_, scene_fit_, scene_stamps_readback_;
     ComPtr<ID3D12QueryHeap> scene_stamps_;
     bool hud_pending_[kRing] = {}, hud_scene_pending_[kRing] = {}, hud_from_scene_ = false;

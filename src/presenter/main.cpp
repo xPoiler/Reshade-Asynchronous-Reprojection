@@ -524,11 +524,21 @@ void render_thread() {
     std::uint64_t waiting_frame = 0;  // newest game frame seen while waiting for a refresh, and since when
     std::int64_t waiting_since = 0;
     std::uint64_t intakes = 0;
+    // Where the refresh loop is held (per status window, and per 5 s for the log): the swapchain wait (the GPU
+    // still busy with earlier refreshes) and the Present call (a frame rate cap of the graphics driver holds
+    // the presents there). Output well below the refresh rate with the presents held: a cap from outside.
+    double swap_wait_ms = 0, present_call_ms = 0, log_swap_wait_ms = 0, log_present_call_ms = 0, log_present_call_max = 0;
+    std::uint32_t log_presents = 0, capped_windows = 0;
+    double log_since = now_seconds();
 
     while (g_app.running) {
         // (the swapchain frees a buffer only after a present: after a refresh with nothing new to show, none
         // to wait for - without pacing, a short sleep instead)
-        if (presented_last) WaitForSingleObjectEx(renderer.waitable(), 100, FALSE);
+        if (presented_last) {
+            const double w0 = now_seconds();
+            WaitForSingleObjectEx(renderer.waitable(), 100, FALSE);
+            swap_wait_ms += (now_seconds() - w0) * 1000.0;
+        }
         else if (!paced_last) sleep_until(qpc_now() + g_qpc_frequency / 1000);
         if (!g_app.running) break;
         const Settings settings = sh.settings;
@@ -1257,6 +1267,8 @@ void render_thread() {
         }
         record_timeline(sh, settings);
         ++stat_frames;
+        present_call_ms += renderer.last_present_call_ms();
+        log_present_call_max = std::max(log_present_call_max, double(renderer.last_present_call_ms()));
 
         {
             const auto notes = renderer.take_notes();
@@ -1379,6 +1391,29 @@ void render_thread() {
             else set_status("%s | queue %s, process %s | HUD split %s | mouse %s | %s", warped ? "warping" : "passthrough", renderer.queue_priority(), g_gpu_priority,
                             (source.has_hudless && source.has_ui) ? "yes" : "no",
                             !g_app.model.mouse_gate() ? "cursor visible (ignored)" : g_app.model.camera_follows_mouse() ? "camera" : "camera not following (ignored)", latewarp.status().c_str());
+            {
+                // Held back from outside: under 80% of the refresh rate, and the presents themselves took more
+                // than half of each output frame's time - for 3 s in a row (6 windows); cleared the same way.
+                const double span_ms = (now - stat_start) * 1000.0;
+                const bool capped = st.display_hz > 1.0f && stat_frames >= 2 && st.output_fps < 0.8f * st.display_hz &&
+                                    present_call_ms > 0.5 * span_ms;
+                capped_windows = capped ? std::min(capped_windows + 1, 12u) : (capped_windows > 6 ? 6u : capped_windows > 0 ? capped_windows - 1 : 0u);
+                const std::uint32_t before = st.outside_cap_fps;
+                st.outside_cap_fps = capped_windows >= 6 ? std::max(1u, std::uint32_t(st.output_fps + 0.5f)) : 0u;
+                if (!before && st.outside_cap_fps)
+                    logf("output held at %u fps from outside XPAR (the presents themselves are held: a frame rate cap of the graphics driver?)", st.outside_cap_fps);
+                else if (before && !st.outside_cap_fps)
+                    logf("output no longer held from outside XPAR");
+                log_swap_wait_ms += swap_wait_ms; log_present_call_ms += present_call_ms; log_presents += stat_frames;
+                swap_wait_ms = present_call_ms = 0;
+                if (now - log_since >= 5.0) {
+                    const double span = now - log_since;
+                    logf("refresh loop: %.1f presents/s | per present: Present call %.2f ms (max %.1f), swapchain wait %.2f ms | display %.1f Hz",
+                         log_presents / span, log_presents ? log_present_call_ms / log_presents : 0.0, log_present_call_max,
+                         log_presents ? log_swap_wait_ms / log_presents : 0.0, st.display_hz);
+                    log_swap_wait_ms = log_present_call_ms = log_present_call_max = 0; log_presents = 0; log_since = now;
+                }
+            }
             stat_frames = stat_sources = 0; stat_start = now;
             if (now - last_profile_save > 10.0) { save_profile(); last_profile_save = now; }
         }

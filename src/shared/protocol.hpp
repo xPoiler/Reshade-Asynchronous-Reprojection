@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 43;
+constexpr std::uint32_t kVersion = 44;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -126,6 +126,10 @@ struct PresenterStatus {
     // processes, -1 unknown) and its size; the presenter's use and budget.
     std::uint32_t vram_pressure;
     float vram_adapter_mb, vram_adapter_size_mb, vram_own_mb, vram_budget_mb;
+    // Output held below the refresh rate by something outside XPAR (fps, 0: not seen): for 3 s the presents
+    // themselves were held back while XPAR had little to do - a frame rate cap of the graphics driver, such as
+    // NVIDIA's "Background Application Max Frame Rate" (the presenter's window is never the focused one).
+    std::uint32_t outside_cap_fps;
     char message[256];
 };
 

@@ -330,6 +330,12 @@ void draw_overlay(effect_runtime*) {
             ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "Video memory is nearly full: the game and XPAR don't both fit,");
         ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "which makes both stutter. Lower the game's texture quality or resolution, or turn off frame generation.");
     }
+    if (alive && p.outside_cap_fps)
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
+                           "XPAR's output seems held up at %u fps by a frame rate limiter outside XPAR. On NVIDIA GPUs it is usually\n"
+                           "\"Background Application Max Frame Rate\": XPAR's window is never the focused one, so it counts as a background\n"
+                           "application. Turn it off in the NVIDIA Control Panel > Manage 3D settings (for all programs, or for\n"
+                           "FrameWarpPresenter.exe and this game). Other frame rate limiters can do the same.", p.outside_cap_fps);
     if (fw::reshade_feed_status()[0]) ImGui::TextWrapped("%s", fw::reshade_feed_status());
     if (sh.game_camera_check == 1)
         ImGui::TextDisabled("Camera: estimated from the motion vectors (the game's own camera data does not match them)");

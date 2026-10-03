@@ -3434,7 +3434,13 @@ void Renderer::finish_frame(bool warped, int marker) {
         LARGE_INTEGER q; QueryPerformanceCounter(&q);
         submit_qpc_[frame_index_] = q.QuadPart;
     }
-    swapchain_->Present(1, 0);
+    {
+        LARGE_INTEGER a, b, f;
+        QueryPerformanceCounter(&a);
+        swapchain_->Present(1, 0);
+        QueryPerformanceCounter(&b); QueryPerformanceFrequency(&f);
+        last_present_call_ms_ = float(double(b.QuadPart - a.QuadPart) * 1000.0 / double(f.QuadPart));
+    }
     {
         DXGI_FRAME_STATISTICS st{};
         present_stats_.hr = swapchain_->GetFrameStatistics(&st);
