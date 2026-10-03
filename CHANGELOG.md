@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.9.0
+## 1.8.0
 
 * **The game's own frame generation works with XPAR** (DLSS Frame Generation, including multi frame
   generation, and FSR 3.1 frame generation; XPAR engine). It used to be one or the other: with frame
