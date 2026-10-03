@@ -115,7 +115,8 @@ void on_init_swapchain(swapchain* sc, bool) {
     struct Saved { const char* key; int default_value; };
     static constexpr Saved kSaved[] = {{"HudFromDlssOutput", 2}, {"FillBehindHud", 1}, {"HoldOrbitedCharacter", 1},
                                        {"NearCameraRule", 1}, {"RecordDiagnostics", 0}, {"BackgroundMemory", 1},
-                                       {"StretchWidth", 1}, {"GameCameraCheck", 0}, {"MovingObjects", 0}};
+                                       {"StretchWidth", 1}, {"GameCameraCheck", 0}, {"MovingObjects", 0},
+                                       {"VrrTargetMode", 0}, {"PanelMaxHzOverride", 0}, {"ManualWarpTargetHz", 0}};
     char saved_version[32] = "";
     size_t size = sizeof(saved_version);
     if (!reshade::get_config_value(nullptr, "FrameWarp", "SettingsVersion", saved_version, &size) ||
@@ -148,6 +149,10 @@ void on_init_swapchain(swapchain* sc, bool) {
         shared->settings.background_memory = saved("BackgroundMemory") != 0;
         shared->settings.moving_objects = saved("MovingObjects") != 0;
         shared->settings.stretch_width = static_cast<std::uint32_t>(std::clamp(saved("StretchWidth"), 0, 32));
+        shared->settings.vrr_target_mode =
+            static_cast<fw::VrrTargetMode>(std::clamp(saved("VrrTargetMode"), 0, static_cast<int>(fw::VrrTargetMode::manual)));
+        shared->settings.panel_max_hz_override = static_cast<std::uint32_t>(std::clamp(saved("PanelMaxHzOverride"), 0, 1000));
+        shared->settings.manual_warp_target_hz = static_cast<std::uint32_t>(std::clamp(saved("ManualWarpTargetHz"), 0, 1000));
         // What the presenter found out about the game's own camera in an earlier run (Shared::game_camera_check).
         InterlockedExchange(&shared->game_camera_check, std::clamp(saved("GameCameraCheck"), 0, 2));
     }
@@ -299,10 +304,11 @@ void draw_overlay(effect_runtime*) {
     ImGui::TextDisabled("XPAR (xPoiler's Asynchronous Reprojection) " FW_VERSION);
 
     bool enabled = s.enabled != 0;
-    // Label follows the refresh rate the presenter measures on the overlay's display.
+    // The panel rate is read from the display mode or the user's explicit override, not instantaneous VRR cadence.
     char enable_label[64] = "Enable reprojection###enable";
-    if (p.pid && p.display_hz > 1.0f)
-        std::snprintf(enable_label, sizeof(enable_label), "Enable reprojection (%.0f Hz)###enable", p.display_hz);
+    if (p.pid && p.panel_max_hz > 1.0f)
+        std::snprintf(enable_label, sizeof(enable_label), "Enable reprojection (%.0f Hz %s)###enable", p.panel_max_hz,
+                      s.panel_max_hz_override > 1 ? "max override" : "display mode");
     if (ImGui::Checkbox(enable_label, &enabled)) s.enabled = enabled;
     ImGui::SameLine();
     bool original = s.show_original != 0;
@@ -362,7 +368,42 @@ void draw_overlay(effect_runtime*) {
         bool strip = s.overlay_debug != 0;
         if (ImGui::Checkbox("Debug strip (top-left, shows every presented frame)", &strip)) s.overlay_debug = strip;
         ImGui::SliderFloat("Present lead (ms)", &s.present_lead_ms, 0.0f, 7.0f, "%.1f");
-        ImGui::TextDisabled("  render this long before the next refresh; 0 = right after the previous one");
+        ImGui::TextDisabled("  render this long before the next refresh; 0 = right after the previous one unless a VRR target is active");
+        auto save_vrr_int = [](const char* key, int value) {
+            char text[16];
+            std::snprintf(text, sizeof(text), "%d", value);
+            reshade::set_config_value(nullptr, "FrameWarp", key, static_cast<const char*>(text));
+        };
+        static const char* const kVrrModes[] = {"Off (follow display mode)", "Auto VRR bias", "Manual async target"};
+        int vrr_mode = std::clamp(static_cast<int>(s.vrr_target_mode), 0, 2);
+        if (ImGui::Combo("VRR warp target", &vrr_mode, kVrrModes, 3)) {
+            s.vrr_target_mode = static_cast<fw::VrrTargetMode>(vrr_mode);
+            save_vrr_int("VrrTargetMode", vrr_mode);
+        }
+        int panel_max_override = static_cast<int>(std::min(s.panel_max_hz_override, 1000u));
+        if (ImGui::SliderInt("Panel max Hz override (0 = current display mode)", &panel_max_override, 0, 1000)) {
+            s.panel_max_hz_override = static_cast<std::uint32_t>(panel_max_override);
+            save_vrr_int("PanelMaxHzOverride", panel_max_override);
+        }
+        const double panel_max_hz = panel_max_override > 1 ? panel_max_override : p.display_mode_hz;
+        if (s.vrr_target_mode == fw::VrrTargetMode::automatic) {
+            const double target = fw::automatic_vrr_target_hz(panel_max_hz);
+            if (target > 1.0)
+                ImGui::TextDisabled("  %.0f Hz %s -> %.1f Hz target (R - R^2/3600 - 1%% of R)", panel_max_hz,
+                                    panel_max_override > 1 ? "max override" : "display mode", target);
+            else
+                ImGui::TextDisabled("  display mode unavailable; enter a panel max Hz override to enable automatic VRR bias");
+        } else if (s.vrr_target_mode == fw::VrrTargetMode::manual) {
+            int manual_target = static_cast<int>(std::clamp(s.manual_warp_target_hz, 0u, 1000u));
+            if (ImGui::SliderInt("Manual async warp target (Hz)", &manual_target, 0, 1000)) {
+                s.manual_warp_target_hz = static_cast<std::uint32_t>(manual_target);
+                save_vrr_int("ManualWarpTargetHz", manual_target);
+            }
+            ImGui::TextDisabled("  choose a target below the panel max to stay inside the VRR range");
+        }
+        if (p.vrr_target_hz > 1.0f)
+            ImGui::TextDisabled("  target %.1f Hz; rate basis %.1f Hz; display mode %.1f Hz; output %.1f fps",
+                                p.vrr_target_hz, p.panel_max_hz, p.display_mode_hz, p.output_fps);
         static const char* const kPriorities[] = {"Realtime (default)", "High", "Normal"};
         int priority = s.gpu_priority <= 2 ? static_cast<int>(s.gpu_priority) : 0;
         if (ImGui::Combo("Presenter GPU priority", &priority, kPriorities, 3)) s.gpu_priority = static_cast<std::uint32_t>(priority);

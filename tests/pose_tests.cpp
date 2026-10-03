@@ -1,5 +1,6 @@
 #include "presenter/pose.hpp"
 #include "presenter/frame_clock.hpp"
+#include "shared/vrr_timing.hpp"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -285,8 +286,41 @@ static void frame_clock_tests() {
     EXPECT(gap == 10.0, "a skipped frame starts again from the presented time");
 }
 
+static void vrr_target_tests() {
+    EXPECT(std::fabs(automatic_vrr_target_hz(120.0) - 114.8) < 1e-6, "automatic VRR target at 120 Hz");
+    EXPECT(std::fabs(automatic_vrr_target_hz(240.0) - 221.6) < 1e-6, "automatic VRR target at 240 Hz");
+    EXPECT(std::fabs(automatic_vrr_target_hz(360.0) - 320.4) < 1e-6, "automatic VRR target at 360 Hz");
+    EXPECT(std::fabs(resolve_vrr_target_hz(VrrTargetMode::automatic, 144.0, 240.0, 0.0) - 221.6) < 1e-6,
+           "panel max override drives the automatic bias target");
+    EXPECT(std::fabs(resolve_vrr_target_hz(VrrTargetMode::automatic, 144.0, 0.0, 0.0) - 136.8) < 1e-6,
+           "automatic VRR mode uses the detected display mode when no override is set");
+    EXPECT(std::fabs(resolve_vrr_target_hz(VrrTargetMode::manual, 240.0, 360.0, 200.0) - 200.0) < 1e-6,
+           "manual mode uses the exact async warp target");
+    EXPECT(resolve_vrr_target_hz(VrrTargetMode::disabled, 240.0, 360.0, 200.0) == 0.0,
+           "disabled mode preserves the existing measured-refresh schedule");
+    EXPECT(automatic_vrr_target_hz(0.0) == 0.0, "automatic VRR mode requires a valid panel rate");
+
+    constexpr double qpc_frequency = 1'000'000.0;
+    constexpr double measured_cadence_period = qpc_frequency / 240.0;
+    const VrrSchedule automatic =
+        resolve_vrr_schedule(VrrTargetMode::automatic, 144.0, 0.0, 0.0, qpc_frequency, measured_cadence_period);
+    EXPECT(std::fabs(automatic.target_hz - 136.8) < 1e-6 &&
+               std::fabs(automatic.period_qpc - qpc_frequency / 136.8) < 1e-6,
+           "automatic target and scheduler period use display mode, not measured cadence");
+    const VrrSchedule manual =
+        resolve_vrr_schedule(VrrTargetMode::manual, 240.0, 360.0, 200.0, qpc_frequency, measured_cadence_period);
+    EXPECT(manual.target_hz == 200.0 && manual.period_qpc == qpc_frequency / 200.0,
+           "manual target sets the scheduler period directly");
+    constexpr double legacy_period = qpc_frequency / 90.0;
+    const VrrSchedule disabled =
+        resolve_vrr_schedule(VrrTargetMode::disabled, 240.0, 360.0, 200.0, qpc_frequency, legacy_period);
+    EXPECT(disabled.target_hz == 0.0 && disabled.period_qpc == legacy_period,
+           "disabled mode keeps the legacy scheduler period unchanged");
+}
+
 int main() {
     frame_clock_tests();
+    vrr_target_tests();
     rotation_conventions();
     right_handed_projection();
     fit_recovers_smoothed_camera();

@@ -1,6 +1,7 @@
 #pragma once
 // Shared-memory contract between the in-game add-on (producer) and FrameWarpPresenter (consumer).
 // Everything here is plain data: both sides are x64 MSVC builds of this same header.
+#include "shared/vrr_timing.hpp"
 #include <windows.h>
 #include <cstdint>
 #include <string>
@@ -10,7 +11,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 43;
+constexpr std::uint32_t kVersion = 44;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -102,6 +103,9 @@ struct Settings {
     std::uint32_t background_memory;   // default on, own warp: uncovered areas shown from the scenery last seen there (saved per game)
     std::uint32_t stretch_width;       // own warp: render px the scenery around the character/weapon stretches over, 0 off, default 1 (saved per game)
     std::uint32_t near_camera_rule;    // character/weapon detection: near-camera pixels moving against the camera count (default on, saved per game)
+    VrrTargetMode vrr_target_mode;     // off, automatic VRR bias, or direct manual async warp target
+    std::uint32_t panel_max_hz_override; // 0: use the current display mode; otherwise override its reported maximum
+    std::uint32_t manual_warp_target_hz; // used only by VrrTargetMode::manual
 };
 
 // Presenter status, displayed by the add-on UI.
@@ -116,7 +120,9 @@ struct PresenterStatus {
     std::uint32_t frame_generation;  // 1: the game presents more images than it renders (frame generation): stepped aside
     float tau_x_ms, tau_y_ms, latency_ms, orbit_cm;
     float frame_interval_ms, effective_prediction_ms;
-    float display_hz;  // measured refresh rate of the display the overlay is on (0 = not measured yet)
+    float display_mode_hz;  // current display mode from the display query (0 = unavailable), independent of output cadence
+    float panel_max_hz;  // display-mode rate or the user's manual maximum-Hz override used by VRR policy
+    float vrr_target_hz; // effective async warp target (0 = current behavior / VRR mode disabled)
     float mv_scale_x, mv_scale_y;  // fitted game motion vector -> uv scale (0: not fitted)
     float mv_fit_quality;          // R^2 of the fit on the latest frames
     float moving_fraction;         // share of pixels flagged as moving objects

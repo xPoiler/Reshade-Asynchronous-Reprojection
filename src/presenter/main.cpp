@@ -373,9 +373,10 @@ struct VblankClock {
         }
     }
     bool valid() const { return ref_qpc && period > 0; }
-    std::int64_t next_after(std::int64_t t) const {
-        const double k = std::ceil(double(t - ref_qpc) / period);
-        return ref_qpc + static_cast<std::int64_t>(k * period);
+    std::int64_t next_after(std::int64_t t, double target_period = 0.0) const {
+        const double step = target_period > 0.0 ? target_period : period;
+        const double k = std::ceil(double(t - ref_qpc) / step);
+        return ref_qpc + static_cast<std::int64_t>(k * step);
     }
 };
 
@@ -475,6 +476,7 @@ void render_thread() {
     VblankClock vblank;
     std::int64_t wake_qpc = 0;
     std::int64_t last_target_vblank = 0;
+    double last_target_period = 0.0;
     bool pacing_paused = false;
     bool device_loss_logged = false;
     MotionVectorScale mv_scale;
@@ -835,13 +837,23 @@ void render_thread() {
         // DWM composes shortly after each vblank; a frame that is not finished by then waits a
         // whole refresh. Render `lead` ms before the next vblank so the GPU has room even when the
         // game delays our work.
-        vblank.set_display_hz(g_app.display_mode_hz.load());
+        const double display_mode_hz = g_app.display_mode_hz.load();
+        vblank.set_display_hz(display_mode_hz);
         vblank.update(renderer.present_stats());
+        const double panel_max_hz = settings.panel_max_hz_override > 1 ? double(settings.panel_max_hz_override) : display_mode_hz;
+        const VrrSchedule vrr_schedule =
+            resolve_vrr_schedule(settings.vrr_target_mode, display_mode_hz, double(settings.panel_max_hz_override),
+                                 double(settings.manual_warp_target_hz), double(g_qpc_frequency), vblank.period);
+        const double target_hz = vrr_schedule.target_hz;
+        const double schedule_period = vrr_schedule.period_qpc;
+        if (last_target_period > 0.0 && schedule_period > 0.0 &&
+            std::fabs(schedule_period / last_target_period - 1.0) > 0.01) last_target_vblank = 0;
+        last_target_period = schedule_period;
         // DWM composes ~3 ms after each vblank and shows the result at the following vblank; with a
         // frame latency of 1 the swapchain only frees us at that display vblank, leaving ~2.5 ms. With a
         // lead we allow one queued frame and wake `lead` ms before each composition instead, one frame
         // per refresh (a new target is always a later vblank than the previous one).
-        const bool paced = settings.present_lead_ms > 0 && vblank.valid();
+        const bool paced = (settings.present_lead_ms > 0 || target_hz > 1.0) && vblank.valid();
         paced_last = paced;
         // Split queues with XPAR's own engine when paced (Latewarp and the unpaced path record everything on
         // the realtime queue). Switched only while no frame is being taken in.
@@ -863,9 +875,9 @@ void render_thread() {
             const std::int64_t lead = static_cast<std::int64_t>(settings.present_lead_ms * 1e-3 * f);
             const std::int64_t compose = static_cast<std::int64_t>(2.5e-3 * f);  // composition deadline after a vblank
             const std::int64_t now_q = qpc_now();
-            std::int64_t v = vblank.next_after(now_q - compose + lead);  // first vblank whose deadline - lead is ahead
-            if (last_target_vblank && v <= last_target_vblank + static_cast<std::int64_t>(vblank.period / 2))
-                v = last_target_vblank + static_cast<std::int64_t>(vblank.period);
+            std::int64_t v = vblank.next_after(now_q - compose + lead, schedule_period);  // first target whose deadline - lead is ahead
+            if (last_target_vblank && v <= last_target_vblank + static_cast<std::int64_t>(schedule_period / 2))
+                v = last_target_vblank + static_cast<std::int64_t>(schedule_period);
             last_target_vblank = v;
             // New game frames are taken in while waiting for the refresh, each as its own GPU submission, so
             // the refresh itself only warps (taking a frame in costs several ms of GPU at 4K). One that
@@ -1058,6 +1070,7 @@ void render_thread() {
             vblank = VblankClock{};
             vblank.set_display_hz(g_app.display_mode_hz.load());
             last_target_vblank = 0;
+            last_target_period = 0.0;
             renderer.set_frame_latency(1);
             logf("pacing re-synchronised after a pause");
         }
@@ -1365,10 +1378,9 @@ void render_thread() {
                          u.skipped / span);
                 }
             }
-            {
-                LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);
-                st.display_hz = vblank.period > 0 ? float(double(qf.QuadPart) / vblank.period) : 0.0f;
-            }
+            st.display_mode_hz = static_cast<float>(display_mode_hz);
+            st.panel_max_hz = static_cast<float>(panel_max_hz);
+            st.vrr_target_hz = static_cast<float>(target_hz);
             st.fit_quality_x = float(px.quality); st.fit_quality_y = float(py.quality);
             st.calibrated_x = px.fitted; st.calibrated_y = py.fitted;
             st.frames_presented += stat_frames; st.sources_consumed += stat_sources;
