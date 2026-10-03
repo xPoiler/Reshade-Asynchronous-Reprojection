@@ -79,6 +79,18 @@
   upscaler writes it (after `slEvaluateFeature` for Streamline games, after the NGX evaluation or the
   FSR dispatch otherwise).
 * **Counters.** Presented images and rendered frames are counted for frame-generation detection.
+* **Frame generation (the game's own).** ReShade sits below frame generation's swapchain, so it sees every
+  presented image, from frame generation's own thread and order. The images are therefore taken where they
+  are generated instead: each DLSS-G evaluation (NGX feature 11: `DLSSG.OutputInterpolated`, `DLSSG.Backbuffer`,
+  `DLSSG.MultiFrameCount`) and each FSR 3.1 frame-generation dispatch (`ffxDispatch` of
+  `ffxDispatchDescFrameGeneration`: `outputs`, `presentColor`, `numGeneratedFrames`) gets the generated images
+  and the frame's own picture copied into the frame's slot (`kGen0..2`, `SlotMeta::generated`), on the
+  command list that generated them. The frame is the one whose present the game started last, or the next
+  one when that one has its images already (FSR may generate just before the present marker). At the end of
+  the copies a `WriteBufferImmediate` marker goes into a small readback buffer; a thread publishes the frame
+  (the shared fence signalled from the CPU) once the GPU has written it, whichever queue frame generation
+  submits on. Meanwhile presents publish nothing. With more than three images per frame (6x multi frame
+  generation), three are taken, spread evenly (`SlotMeta::gen_index`: the game's numbers of the ones taken).
 
 ## Presenter
 
@@ -129,8 +141,16 @@
   its up-down angle back towards level, and carries the last frame's motion over up to two frames it
   cannot explain. These frames are timed by `FrameClock`, and *Auto* latency shows them a whole game
   frame back.
-* **Frame generation.** When the game presents 1.6 or more images per rendered frame for a second, the
-  presenter steps aside (overlay hidden, no GPU work) until the ratio is back near 1.
+* **Frame generation.** When the game presents 1.6 or more images per rendered frame, or calls its frame
+  generation (DLSS-G evaluations, FSR frame-generation dispatches, `Shared::generation_calls`) at least every
+  other frame, for a second, and no
+  generated images come with its frames (a kind XPAR does not take, or NVIDIA Latewarp as the engine), the
+  presenter steps aside (overlay hidden, no GPU work) until the ratio is back near 1. With them, each image
+  gets its depth once per game frame (this frame's, moved back along the motion vectors to the image's
+  moment) and, with HUD layers, the UI taken back out (the warp puts the frame's UI back); over each frame
+  interval the warp shows image i of n at (i + 1) / (n + 1) of it, then the frame, each from the camera of
+  its moment: the game's clipToPrevClip C blended, (1 - b) I + b C for an image b of the way back (exact at
+  both ends, whatever the engine's units and projection), then warped to the displayed camera.
 * **Warp engines.** The own engine (default, any D3D12 GPU): for each output pixel a short fixed-point
   search finds the rendered pixel that lands there at its own depth; masked pixels stay put and are
   never used as a source for others; revealed screen edges are filled with a short inward blend; no
@@ -141,11 +161,34 @@
   miss stays with it. Uncovered areas elsewhere come from the background memory when it holds them: a
   half-resolution colour + depth picture of the scenery last seen behind held pixels and just beyond the
   frame, updated once per game frame on the intake side and carried along with the camera at its
-  remembered depth, forgotten after 60 game frames. NVIDIA Latewarp (optional, `nvngx_latewarp.dll`, NVIDIA GPUs):
+  remembered depth, forgotten after 60 game frames. Moving objects (option): once per game frame,
+  each pixel the motion analysis finds moving on its own gets its straight-line 3D motion back to the
+  previous frame, as an offset in clip space (`cs_obj_move`, from both frames' depth, the game's
+  clipToPrevClip and projection; per 8x8 block a flag whether anything moves); every frame taken in keeps
+  the previous one's picture and depth (compute copies from the shown set). Per refresh the moving pixels
+  claim the output pixels they cover at the displayed moment, nearest first (`cs_obj_splat`, atomics on a
+  key texture; they also mark where they would land standing still), the warp runs as before, and
+  `cs_obj_fix` revisits only the marked blocks: a claim shows the object at its exact sub-pixel spot (a few
+  steps across the object's surface from the claiming pixel), and a
+  pixel the warp found on an object that has moved on shows the previous frame, warped with its own
+  depth (or, where that frame has the object there too, the nearest still scenery along its motion).
+  What "Keep still" holds as attached to the camera (character/weapon) gets its on-screen motion instead
+  (no camera warp; marked w = kHeld in the offset texture) and claims along it the same way; where it has
+  moved away, the fix-up shows the warp's scene there. Where the warp copies a moving object's pixel
+  without the fix-up looking again (beside held pixels), it takes it from where the object is at the
+  displayed moment. Objects run on their own clock, one game frame behind (frame generation): when a frame is first shown
+  they are where the previous one had them and reach this one's positions one frame interval later; the
+  camera is the warp's, at the displayed moment.
+  NVIDIA Latewarp (optional, `nvngx_latewarp.dll`, NVIDIA GPUs):
   on a new game frame a throwaway `IsRenderedFrame=1` evaluation registers it, followed by the real
   evaluation with the predicted camera. View matrices are built relative to the source camera
   position for precision.
-* **Pacing.** A vblank clock is built from our swapchain's DXGI frame statistics. With present lead
+* **Pacing.** A vblank clock: its period is the refresh rate of the display the game is on, from the display's
+  current mode (`QueryDisplayConfig`, read by the window thread once a second and when the game moves to
+  another display); its phase comes from our swapchain's DXGI frame statistics (measured from them alone when
+  the mode cannot be read). A refresh that would show the same picture as the one presented last (the frame
+  as it is again: camera unmoved, nothing drawn over it that changes) is submitted without drawing or
+  presenting; the composition keeps showing the picture. With present lead
   > 0 (default 6 ms) the swapchain allows one queued frame and the render thread wakes `lead` ms
   before each DWM composition deadline (vblank + 2.5 ms), rendering one frame per refresh; the
   schedule resets whenever the overlay becomes visible again. Lead 0: frame latency 1, render when

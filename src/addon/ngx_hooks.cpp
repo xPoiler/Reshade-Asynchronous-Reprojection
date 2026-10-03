@@ -58,6 +58,7 @@ std::uint32_t feature_of(const void* handle) {
 
 // DLSS Super Resolution, or DLSS Ray Reconstruction (which upscales too, from the same inputs).
 bool is_dlss(std::uint32_t feature) { return feature == NVSDK_NGX_Feature_SuperSampling || feature == NVSDK_NGX_Feature_RayReconstruction; }
+constexpr std::uint32_t kFrameGeneration = 11;  // DLSS Frame Generation (NVSDK_NGX_Feature_FrameGeneration)
 
 std::atomic<std::uint64_t> g_frame{0};
 std::atomic<std::int64_t> g_last_dlss_publish{0};
@@ -115,6 +116,7 @@ NVSDK_NGX_Result NVSDK_CONV hk_evaluate(ID3D12GraphicsCommandList* list, const N
     std::uint64_t published = 0;  // frame whose DLSS output is copied once the evaluation is recorded
     ID3D12Resource* output = nullptr;
     std::uint32_t output_w = 0, output_h = 0;
+    struct Generation { ID3D12Resource *image = nullptr, *real = nullptr; std::uint64_t frame = 0; std::uint32_t index = 0, per_frame = 1; } generation;
     if (auto* s = stats()) {
         ++s->evaluate_calls;
         std::uint32_t feature = feature_of(handle);
@@ -132,6 +134,29 @@ NVSDK_NGX_Result NVSDK_CONV hk_evaluate(ID3D12GraphicsCommandList* list, const N
         }
         if (feature < 16) ++s->feature_calls[feature];
         else ++s->unknown_handle_calls;
+        if (feature == kFrameGeneration && params) {
+            // (diagnostics: 7 | MultiFrameIndex << 8 | MultiFrameCount << 16, frame: BackbufferFrameID)
+            unsigned int index = 0, count = 0, enable = 1;
+            unsigned long long id = 0;
+            params->Get("DLSSG.MultiFrameIndex", &index);
+            params->Get("DLSSG.MultiFrameCount", &count);
+            params->Get("DLSSG.EnableInterp", &enable);
+            if (params->Get("DLSSG.BackbufferFrameID", &id) != NVSDK_NGX_Result_Success) {
+                unsigned int id32 = 0;
+                if (params->Get("DLSSG.BackbufferFrameID", &id32) == NVSDK_NGX_Result_Success) id = id32;
+            }
+            push_event(g_producer->shared(), kEvFrameGen, id, 7 | (std::uint64_t(index) << 8) | (std::uint64_t(count) << 16) | (std::uint64_t(enable) << 24));
+            if (enable) InterlockedIncrement(&g_producer->shared()->generation_calls);
+            ID3D12Resource *image = nullptr, *real = nullptr;
+            const auto skip = [&](GenSkip reason) { push_event(g_producer->shared(), kEvFrameGen, 0, 0x300 | (std::uint64_t(reason) << 16)); };
+            if (enable && !g_producer->generation_wanted()) skip(kGenSkipNotWanted);
+            else if (enable && (params->Get("DLSSG.OutputInterpolated", &image) != NVSDK_NGX_Result_Success || !image)) skip(kGenSkipNoOutput);
+            if (enable && g_producer->generation_wanted() && image) {
+                params->Get("DLSSG.Backbuffer", &real);
+                // (the frame: the one whose present started last; BackbufferFrameID is only logged. MultiFrameIndex: 1 .. count)
+                generation = {image, real, 0, index <= count ? index : 0u, count ? count : 1u};
+            }
+        }
         if (is_dlss(feature) && params) {
             ++s->dlss_calls;
             g_producer->note_game_depth();
@@ -206,6 +231,13 @@ NVSDK_NGX_Result NVSDK_CONV hk_evaluate(ID3D12GraphicsCommandList* list, const N
     // resource, recorded on this list just now.
     if (published && output && result == NVSDK_NGX_Result_Success)
         g_producer->on_tag(published, kScene, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 0, 0, output_w, output_h, list);
+    // DLSS Frame Generation: one evaluation per generated image (MultiFrameIndex of MultiFrameCount), written
+    // as an unordered-access output, from the frame's picture (an input, shader-readable like DLSS's).
+    if (generation.image && result != NVSDK_NGX_Result_Success)
+        push_event(g_producer->shared(), kEvFrameGen, static_cast<std::uint32_t>(result), 0x300 | (std::uint64_t(kGenSkipFailed) << 16));
+    if (generation.image && result == NVSDK_NGX_Result_Success)
+        g_producer->on_generated(generation.frame, generation.index, generation.per_frame, generation.image, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, generation.real,
+                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, list);
     return result;
 }
 

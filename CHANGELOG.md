@@ -1,5 +1,69 @@
 # Changelog
 
+## 1.8.0
+
+* **The game's own frame generation works with XPAR** (DLSS Frame Generation, including multi frame
+  generation, and FSR 3.1 frame generation; XPAR engine). It used to be one or the other: with frame
+  generation on, XPAR paused. Now XPAR takes each image the game's frame generation makes, right where it
+  is made, and over each game frame shows them in turn and then the frame itself - every one of them moved
+  to the current camera, as with any frame. Moving objects move at the frame generation's rate, one game
+  frame late as frame generation always is; the camera is not delayed. Nothing to switch on: it starts by
+  itself when frame generation is on in the game. With NVIDIA Latewarp as the warp engine, XPAR still
+  pauses while frame generation is on. The ReShade menu, drawn after these images are taken, shows the
+  game's own picture while it is open. FSR 3.0 frame generation (the older FidelityFX SDK) is not taken
+  yet: XPAR pauses as before. Multi frame generation up to 6x: with more than three generated images per
+  frame, three are shown, spread evenly (6x: the first, third and fifth).
+* Frame generation is also recognised from the game's calls to it (DLSS Frame Generation, FSR 3.x frame
+  generation), not only from the number of images presented. Where ReShade sees only the rendered frames'
+  presents (on some setups), 1.7.0 missed frame generation entirely: it neither paused nor
+  warned, and ran on top of it.
+* **No GPU work while nothing moves.** A refresh that would show the same picture as the one before (the camera
+  has not moved since the game's frame) is no longer drawn or presented at all; the window keeps showing the
+  picture. Since 1.5.0 such a refresh still went through the warp shader once per refresh (taking frames in on
+  their own GPU queue made the plain copy a full-screen pass), so a still camera cost as much as a moving one.
+  A refresh that does show a new frame as it is now copies it with a plain copy, not the warp shader: about
+  half the GPU time at 4K (0.2 ms instead of 0.4 ms).
+* **The refresh rate is taken from the display**, from its current mode (exactly: 119.88 Hz as such), instead of
+  being measured from FrameWarp's own presents. The measurement could lock onto a wrong rate at the start and
+  keep it until reprojection was switched off and on again. The presents now only tell when each refresh
+  happens; the rate is read again when the game moves to another display or the mode changes.
+* Less GPU time per game frame, with exactly the same results: the HUD detection's check against the camera
+  motion classifies each pixel once instead of twice, and the final mask reads each pixel's HUD state once
+  per tile instead of nine times. The log shows the work on each game frame pass by pass ("game frame GPU by
+  pass").
+* The XPAR panel warns when video memory is nearly full (Windows leaves FrameWarp too little of it): the game
+  and FrameWarp then don't both fit and both stutter. Frame generation needs extra video memory too; once it
+  has been off for a few seconds, the textures FrameWarp took its images into are released.
+* Games that send their HUD-less picture without a UI layer (Cyberpunk 2077 with frame generation on): the HUD
+  is found exactly, every frame, where the picture differs from the HUD-less one, which is also the scenery
+  behind the HUD (it fell back to the learned HUD map, which let parts of the HUD move with the camera).
+* With FSR in a game that sends its depth and motion vectors through Streamline, the HUD is found from
+  the upscaler's output too, as with DLSS (it fell back to the learned HUD map).
+* **Move objects at the display rate even without frame generation** (new option, experimental, off by
+  default; XPAR engine, games with DLSS or FSR): XPAR's own frame generation for what moves on its own,
+  for when the game's is off or not available. Cars, people and everything else the
+  game's motion vectors show moving are shown one game frame late and move at the display rate, always
+  between two real frames (never guessed ahead), instead of stepping at the game's frame rate; the camera
+  is not delayed (the warp shows it at the displayed moment, as before). Each moving pixel goes in a
+  straight line in 3D between its two positions (both frames' depth), so things that move with the camera,
+  such as a car's interior while driving, stay where they belong; what an object uncovers shows the
+  previous frame behind it. The character/weapon kept still by **Keep still** moves at the display rate
+  too (its own on-screen motion, one frame late, still not warped with the camera); where the warp fills
+  the area beside it from a moving object, the piece it copies moves with that object.
+  Replaces an earlier attempt that never reached a release (it left halos around moving objects).
+  Shadows (drawn on the ground, with the ground's motion vectors) stay where the game drew them.
+* The add-on stays intact until the game's process is gone: the game's DLSS or FSR may still call into it while
+  the game shuts down (FSR reconfigures its swapchain then).
+* The motion analysis behind the masks, the motion vector scale and the camera check runs for every game
+  frame with depth and motion vectors, whatever **Keep still** is set to. Since 1.4.0 it already did, by
+  accident of a missing pair of braces; the camera check (1.6.1) relies on it, so it is now on purpose.
+  The frame numbers in `motion.csv` were wrong whenever **Keep still** was *Off* (or *HUD only* in a game
+  with HUD layers) and could drift by a frame or two otherwise; each fit now carries its own frame.
+* The capture key (Ctrl+Shift+D) saves three consecutive game frames (`prev2_`, `prev_` and the current
+  one), the HUD-less picture where the game has one, and each frame's camera (`_cameras.txt`). A capture
+  is only taken while no newer frame is half taken in, so depth and motion vectors are always the same
+  frame's.
+
 ## 1.7.0
 
 * **Games without DLSS or FSR, or with both switched off (experimental, DirectX 12 and 11):** XPAR now works

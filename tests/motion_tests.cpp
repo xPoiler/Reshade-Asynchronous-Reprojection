@@ -1,6 +1,7 @@
 #include "shared/camera_motion.hpp"
 #include "shared/camera_check.hpp"
 #include "addon/depth_probe_score.hpp"
+#include "presenter/pose.hpp"
 #include <random>
 #include <vector>
 #include <cstdio>
@@ -38,6 +39,75 @@ static void recovers(double yaw, double pitch, V3 t, double near_plane) {
     for (int i = 0; i < 3; ++i) { for (int j = 0; j < 3; ++j) rerr = std::max(rerr, std::fabs(m.rotation[i][j] - R[i][j])); terr = std::max(terr, std::fabs(m.translation[i] - t[i])); }
     EXPECT(rerr < 1e-4, "rotation error %g (yaw %g pitch %g)", rerr, yaw, pitch);
     EXPECT(terr < 0.05 + 0.002 * std::sqrt(t[0] * t[0] + t[1] * t[1] + t[2] * t[2]), "translation error %g (t %g %g %g)", terr, t[0], t[1], t[2]);
+}
+
+// Frame generation: an image generated between two frames is seen from the frame's camera moved part of the way
+// back along the frame's own motion (generated_to_target). All the way back it is the previous frame's camera:
+// a point where the previous frame saw it lands where this frame sees it; no way back, nothing changes.
+static void generated_camera(double yaw, V3 t) {
+    const float P[16] = {1.1667f, 0, 0, 0, 0, 2.0741f, 0, 0, 0.00039f, 0.00108f, 0, 1, 0, 0, 10.0f, 0};
+    const double cy = std::cos(yaw), sy = std::sin(yaw);
+    M4 Mrow{};
+    Mrow[0][0] = cy; Mrow[0][2] = -sy; Mrow[1][1] = 1; Mrow[2][0] = sy; Mrow[2][2] = cy;  // (R^T of a yaw)
+    for (int j = 0; j < 3; ++j) Mrow[3][j] = t[j];
+    Mrow[3][3] = 1;
+    const M4 Pm = m4_from(P);
+    M4 Pinv; invert(Pm, Pinv);
+    const M4 C = mm(mm(Pinv, Mrow), Pm);
+    float Cf[16];
+    for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) Cf[i * 4 + j] = float(C[i][j]);
+    const Mat4 identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    const Mat4 back = generated_to_target(Cf, 1.0, identity), none = generated_to_target(Cf, 0.0, identity);
+    double worst = 0, worst_none = 0;
+    for (double x : {-0.6, 0.0, 0.6})
+        for (double y : {-0.5, 0.3})
+            for (double z : {10.0 / 100.0, 10.0 / 2000.0}) {  // (reversed depth: near / distance)
+                const std::array<double, 4> cur{x, y, z, 1.0};
+                std::array<double, 4> prev{};
+                for (int j = 0; j < 4; ++j) for (int k = 0; k < 4; ++k) prev[j] += cur[k] * C[k][j];
+                std::array<double, 4> again{}, same{};
+                for (int j = 0; j < 4; ++j)
+                    for (int k = 0; k < 4; ++k) { again[j] += prev[k] * back[k * 4 + j]; same[j] += cur[k] * none[k * 4 + j]; }
+                for (int j = 0; j < 2; ++j) {
+                    worst = std::max(worst, std::fabs(again[j] / again[3] - x * (j == 0) - y * (j == 1)));
+                    worst_none = std::max(worst_none, std::fabs(same[j] / same[3] - x * (j == 0) - y * (j == 1)));
+                }
+            }
+    std::printf("generated image camera (yaw %.3f, move %g %g %g): all the way back off by %.5f, no way back %.5f\n", yaw, t[0], t[1], t[2], worst,
+                worst_none);
+    EXPECT(worst < 2e-3, "all the way back is the previous frame's camera (%g)", worst);
+    EXPECT(worst_none < 1e-5, "no way back is the frame's camera (%g)", worst_none);
+}
+
+// The same with a game's own matrices (Resident Evil Requiem, RE Engine: right-handed, reversed depth with a far
+// plane): all the way back, a point where the previous frame saw it lands where this frame sees it.
+static void generated_camera_game() {
+    const float P[16] = {1.45260334f, 0, 0, 0, 0, 2.58240604f, 0, 0, 0, 0, 1.56164169e-05f, -1, 0, 0, 0.0626075864f, 0};
+    const float C[16] = {1.00079298f, -0.000647655746f, 3.45222304e-08f, -0.00219388981f, 0.000187643425f, 1.00075185f, 5.86583759e-08f,
+                         -0.0037277434f, -0.0730272681f, -0.293101788f, 1.00324225f, -0.012904115f, 0.00463666068f, 0.0248720516f,
+                         -6.77646312e-08f, 0.999948263f};
+    const Mat4 identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    const Mat4 g = generated_to_target(C, 1.0, identity), half = generated_to_target(C, 0.5, identity);
+    Mat4 half_inv{};
+    mat_inverse(half, half_inv);  // (this frame's clip space -> the half-way image's)
+    double worst = 0, worst_half = 0;
+    for (double d : {0.5, 2.0, 10.0, 100.0})
+        for (double x : {-0.5, 0.5}) {
+            const double cur[4] = {x, 0.3, 0.0626075864 / d - 1.56164169e-05, 1};
+            double prev[4] = {}, again[4] = {};
+            for (int j = 0; j < 4; ++j) for (int k = 0; k < 4; ++k) prev[j] += cur[k] * C[k * 4 + j];
+            for (int j = 0; j < 4; ++j) for (int k = 0; k < 4; ++k) again[j] += prev[k] * g[k * 4 + j];
+            const double ex = std::fabs(again[0] / again[3] - x), ey = std::fabs(again[1] / again[3] - 0.3);
+            worst = std::max({worst, ex, ey});
+            // Half way back, the point is seen about half way between where the two frames see it.
+            double mid[4] = {};
+            for (int j = 0; j < 4; ++j) for (int k = 0; k < 4; ++k) mid[j] += cur[k] * half_inv[k * 4 + j];
+            worst_half = std::max({worst_half, std::fabs(mid[0] / mid[3] - 0.5 * (x + prev[0] / prev[3])),
+                                   std::fabs(mid[1] / mid[3] - 0.5 * (0.3 + prev[1] / prev[3]))});
+        }
+    std::printf("  game camera: all the way back off by %.5f, half way off the midpoint by %.5f\n", worst, worst_half);
+    EXPECT(worst < 2e-3, "game camera: all the way back is the previous frame's camera (%g)", worst);
+    EXPECT(worst_half < 2e-3, "game camera: half way back sees points half way (%g)", worst_half);
 }
 
 // A zoom between the frames (aiming: the FOV narrows) with a still camera must not read as movement.
@@ -150,6 +220,9 @@ static void depth_probe_tests() {
 int main() {
     depth_probe_tests();
     camera_check_tests();
+    generated_camera(0.04, {0, 0, 0});
+    generated_camera(-0.02, {12, 0, 30});
+    generated_camera_game();
     zoom_is_not_motion(1.06, {0, 0, 0});
     zoom_is_not_motion(0.94, {0, 0, -30});
     zoom_is_not_motion(1.10, {5, 0, 20});

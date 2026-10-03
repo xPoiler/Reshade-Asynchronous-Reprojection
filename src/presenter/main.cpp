@@ -56,6 +56,11 @@ struct App {
     std::atomic<bool> visible{false};     // game window in front and reprojection enabled
     std::atomic<bool> has_frames{false};  // presenter has something valid to show
     std::atomic<std::uint32_t> client_w{0}, client_h{0};
+    // The refresh rate of the display the game is on, from its current mode (0: not known); read by the window
+    // thread (see follow_game_window), used by the render thread's vblank clock.
+    std::atomic<double> display_mode_hz{0.0};
+    HMONITOR display_monitor = nullptr;
+    double display_checked = 0;
     PoseModel model;
     std::filesystem::path base_dir, profile_path;
     std::filesystem::path data_dir;  // logs, calibration, captures: base_dir, or %LOCALAPPDATA%\FrameWarp\<game folder> when that is read-only
@@ -187,6 +192,31 @@ void logf(const char* format, ...) {
     g_files.write(g_app.log, line, std::size_t(n));
 }
 
+// Detailed diagnostics switched on/off, and the game-side timeline dumped while they are on (also while
+// FrameWarp steps aside for the game's frame generation).
+void record_timeline(Shared& sh, const Settings& settings, bool* ui_samples_written) {
+    if ((settings.record_diagnostics != 0) != g_recording.load()) {
+        if (settings.record_diagnostics) {
+            open_recordings();
+            if (ui_samples_written) *ui_samples_written = false;
+            logf("detailed diagnostics: recording to the logs folder");
+        } else {
+            g_recording = false;
+            if (ui_samples_written) *ui_samples_written = false;
+            logf("detailed diagnostics: off");
+        }
+    }
+    if (rec(g_app.csv_events)) {
+        const std::int64_t count = sh.timeline_count;
+        if (count - g_app.events_read > kTimeline) g_app.events_read = count - kTimeline;
+        for (; g_app.events_read < count; ++g_app.events_read) {
+            const auto& e = sh.timeline[g_app.events_read % kTimeline];
+            wr(g_app.csv_events, "%lld,%u,%u,%llu,%llu\n", e.qpc, e.kind, e.tid,
+                         static_cast<unsigned long long>(e.frame), static_cast<unsigned long long>(e.extra));
+        }
+    }
+}
+
 void set_status(const char* format, ...) {
     if (!g_app.shared) return;
     va_list args; va_start(args, format);
@@ -202,10 +232,14 @@ struct VramMonitor {
     PDH_HCOUNTER counter = nullptr;
     Microsoft::WRL::ComPtr<IDXGIAdapter3> adapter;
     wchar_t luid_tag[64]{};
-    double last_log = 0, logged_total = -1;
+    double last_log = 0, logged_total = -1, last_poll = 0;
+    // (the latest reading, every 2 s; pressure_until: the warning holds 10 s past the last tight reading)
+    double total_mb = -1, size_mb = 0, own_mb = 0, budget_mb = 0, pressure_until = -1;
     void init(const LUID& luid) {
         Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
         if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter));
+        DXGI_ADAPTER_DESC1 desc{};
+        if (adapter && SUCCEEDED(adapter->GetDesc1(&desc))) size_mb = double(desc.DedicatedVideoMemory) / 1048576.0;
         std::swprintf(luid_tag, 64, L"luid_0x%08lX_0x%08lX", static_cast<unsigned long>(luid.HighPart), luid.LowPart);
         if (PdhOpenQueryW(nullptr, 0, &query) == ERROR_SUCCESS &&
             PdhAddEnglishCounterW(query, L"\\GPU Adapter Memory(*)\\Dedicated Usage", 0, &counter) == ERROR_SUCCESS)
@@ -226,10 +260,19 @@ struct VramMonitor {
         return total / (1024.0 * 1024.0);
     }
     void poll(double now, const char* reason = nullptr) {
-        if (!reason && now - last_log < 2.0) return;
+        if (!reason && now - last_poll < 2.0) return;
+        last_poll = now;
         const double total = adapter_total_mb();
         DXGI_QUERY_VIDEO_MEMORY_INFO own{};
         if (adapter) adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &own);
+        total_mb = total; own_mb = own.CurrentUsage / 1048576.0; budget_mb = own.Budget / 1048576.0;
+        // Windows shrinks a process's budget when the GPU's memory runs out: less than a quarter of headroom
+        // left means the game and XPAR together no longer fit (they start to stutter and drop frames).
+        if (own.Budget && double(own.Budget) < double(own.CurrentUsage) * 1.25) {
+            if (pressure_until < now) logf("vram nearly full: presenter %.0f MB of a %.0f MB budget, adapter %.0f of %.0f MB in use", own_mb, budget_mb, total,
+                                           size_mb);
+            pressure_until = now + 10.0;
+        }
         if (!reason && std::abs(total - logged_total) < 100 && now - last_log < 30.0) return;
         logf("vram%s%s: adapter %.0f MB used (all processes) | presenter %.0f MB, budget %.0f MB", reason ? " at " : "", reason ? reason : "",
              total, own.CurrentUsage / 1048576.0, own.Budget / 1048576.0);
@@ -322,8 +365,22 @@ struct VblankClock {
     std::int64_t ref_qpc = 0;
     UINT ref_count = 0;
     double period = 0;  // QPC ticks per refresh
+    // The display's refresh rate from its current mode (set_display_hz): the period is that, exactly, and our
+    // presents only tell when the refreshes happen. (Measured from the presents alone, a first estimate taken
+    // from stale statistics could lock the period to a wrong rate until the next pause.)
+    double display_period = 0;
+    void set_display_hz(double hz) {
+        const double p = hz > 1.0 ? double(g_qpc_frequency) / hz : 0.0;
+        if (p > 0 && (display_period <= 0 || std::fabs(p / display_period - 1.0) > 1e-4)) period = p;
+        display_period = p;
+    }
     void update(const Renderer::PresentStats& st) {
         if (st.hr != S_OK || !st.sync_qpc || !st.sync_refresh) return;
+        if (display_period > 0) {
+            period = display_period;
+            ref_qpc = st.sync_qpc; ref_count = st.sync_refresh;  // (a real refresh time: the phase)
+            return;
+        }
         if (!ref_qpc || st.sync_refresh < ref_count) { ref_qpc = st.sync_qpc; ref_count = st.sync_refresh; return; }
         const UINT refreshes = st.sync_refresh - ref_count;
         if (refreshes >= 60) {  // measure over >= half a second, then move the reference forward
@@ -443,16 +500,30 @@ void render_thread() {
     bool pacing_paused = false;
     bool device_loss_logged = false;
     MotionVectorScale mv_scale;
-    bool dump_pending = false;       // Ctrl+Shift+D: the capture is written on the game frame after dump_after
+    bool dump_requested = false;
+    int dump_stage = 0;              // Ctrl+Shift+D: 1, 2 = frames kept so far; written on the game frame after dump_after
     bool ui_samples_written = false; // one sparse numeric sample set per detailed-diagnostics session
     std::uint64_t dump_after = 0;
+    struct DumpFrame { std::uint64_t frame = 0; double time = 0; Camera cam{}; IngestedSource s; double mv[2] = {}; bool mv_valid = false; };
+    DumpFrame dump_frames[3];        // (oldest first)
+    std::deque<std::pair<std::uint64_t, double>> frame_times;  // game frame -> its time (source_time), recent ones
     std::uint64_t shown_frame = 0;   // the game frame the warp shows (with split queues: after the one taken in last)
+    double shown_since = 0;          // ...since when (moving objects: their own clock)
+    double last_generated = -1e9;    // when a frame last came with generated images
+    bool was_enabled = false;        // ("Enable reprojection", for the frame generation message)
+    double last_pause_log = 0;
+    // The picture presented last, when it was a frame shown as it is (0: anything else): the same again is
+    // not drawn (see skip_frame).
+    std::uint64_t as_is_frame = 0;
+    std::uint32_t as_is_w = 0, as_is_h = 0;
+    bool presented_last = true, paced_last = false;
+    double enabled_since = 0;
+    bool generation_logged = false;
     CameraCheck camera_check;        // the game's own camera against its motion vectors
     int poor_estimate_windows = 0;   // ...and, once it was found unusable, whether the estimate does any better
-    std::deque<std::uint64_t> analyzed_frames;  // game frames whose motion fit is on its way back
     bool have_source_kind = false, source_was_estimated = false, source_motion_estimated = false;
     double last_mv_log = 0, last_usage_log = 0;
-    bool game_has_hud_layers = false, mask_logged = false, source_masked = false;
+    bool game_has_hud_layers = false, mask_logged = false, source_masked = false, hudless_hud_logged = false;
     CameraEstimator estimator;
     bool estimator_logged = false, fov_logged = false;
     bool fsr_logged = false;
@@ -471,17 +542,36 @@ void render_thread() {
     // Frame generation detection: presented images vs rendered frames per half-second window.
     bool frame_generation = false;
     int fg_votes = 0;
-    LONG fg_presents = 0, fg_frames = 0;
+    LONG fg_presents = 0, fg_frames = 0, fg_calls = 0;
     std::int64_t fg_window_start = 0;
     std::uint64_t waiting_frame = 0;  // newest game frame seen while waiting for a refresh, and since when
     std::int64_t waiting_since = 0;
     std::uint64_t intakes = 0;
 
     while (g_app.running) {
-        WaitForSingleObjectEx(renderer.waitable(), 100, FALSE);
+        // (the swapchain frees a buffer only after a present: after a refresh with nothing new to show, none
+        // to wait for - without pacing, a short sleep instead)
+        if (presented_last) WaitForSingleObjectEx(renderer.waitable(), 100, FALSE);
+        else if (!paced_last) sleep_until(qpc_now() + g_qpc_frequency / 1000);
         if (!g_app.running) break;
         const Settings settings = sh.settings;
         apply_gpu_priority(settings.gpu_priority);
+        // Moving objects at the display rate: an option of the XPAR engine.
+        // XPAR's own warp engine (chosen, or Latewarp not available): the one that moves objects and shows the
+        // game's generated images.
+        auto own_engine_on = [&]() { return settings.warp_engine == 1 || !latewarp.ready(); };
+        // Moving objects without frame generation (option): XPAR moves them itself, one game frame late.
+        auto moving_objects_on = [&]() { return settings.moving_objects != 0 && own_engine_on(); };
+        // The game's frame generation is on and its images are not coming with the frames (NVIDIA Latewarp
+        // chosen, or a kind of frame generation XPAR does not take): step aside.
+        auto generation_aside = [&]() {
+            if (!frame_generation) return false;
+            if (!own_engine_on()) return true;
+            const auto latest = static_cast<std::uint64_t>(sh.latest_ready_frame);
+            for (const auto& m : sh.slots)
+                if (m.frame_id == latest && m.state != kFree && m.generated) last_generated = std::max(last_generated, now_seconds());
+            return now_seconds() - last_generated >= 0.5;
+        };
         // Newest published frame whose GPU work is already complete (-1: none).
         auto find_newest = [&]() {
             const std::uint64_t game_done = renderer.game_fence_completed();
@@ -515,11 +605,12 @@ void render_thread() {
         auto take_in_start = [&](int newest) {
             if (InterlockedCompareExchange(&sh.slots[newest].state, kReading, kReady) != kReady) return false;
             const SlotMeta& m = sh.slots[newest];
-            // The previous frame's colour feeds the learned HUD detector (and the shelved object
-            // interpolation); not needed while the HUD comes from the upscaler's output.
+            // The previous frame's colour feeds the learned HUD detector; not needed while the HUD comes from
+            // the upscaler's output.
             const bool hud_from_output = settings.hud_from_scene == 1 && m.tex[kScene].valid;  // (combined: 2 needs it)
-            renderer.set_keep_previous_colour(settings.extrapolate_objects != 0 ||
-                                              (settings.no_warp_mask != 0 && !game_has_hud_layers && !hud_from_output));
+            renderer.set_keep_previous_colour(settings.no_warp_mask != 0 && !game_has_hud_layers && !hud_from_output);
+            // Moving objects (option, XPAR engine): every frame keeps the previous one's picture and depth.
+            renderer.set_object_history(moving_objects_on());
             intake = {};
             intake.slot = newest;
             const bool wants_samples = m.camera.estimated != 0;
@@ -535,6 +626,7 @@ void render_thread() {
             source_basis = incoming.basis;
             source_masked = incoming.masked;
             first_eval = true;
+            if (shown_frame != source_frame) shown_since = now_seconds();
             shown_frame = source_frame;
         };
         auto take_in_finish = [&]() {  // true: a valid frame was taken in
@@ -654,6 +746,8 @@ void render_thread() {
                 if (!m.qpc_sim_start && s.motion_estimated) source_time = frame_clock.next(m.frame_id, presented);
                 else { source_time = presented; frame_clock.reset(); }
                 source_frame = m.frame_id;
+                frame_times.emplace_back(m.frame_id, source_time);
+                if (frame_times.size() > 8) frame_times.pop_front();
                 g_app.model.add_source(m.frame_id, source_time, seconds(qpc_now()), incoming.basis, cam.reset != 0, now_seconds(),
                                        cam.position_epoch);
                 if (rec(g_app.csv_sources)) {
@@ -676,12 +770,35 @@ void render_thread() {
                 const bool attached_mask = settings.keep_attached && s.has_depth && s.has_motion;
                 const bool mask = hud_mask || attached_mask;
                 incoming.masked = mask;
-                if ((settings.extrapolate_objects || mask) && s.has_motion)
-                    analyzed_frames.push_back(m.frame_id);
-                    if (analyzed_frames.size() > 16) analyzed_frames.pop_front();
-                    renderer.analyze_motion(s, cam.clip_to_prev_clip, float(mv_scale.scale(0, s.depth_rect.w)),
-                                            float(mv_scale.scale(1, s.depth_rect.h)), mv_scale.valid, cam.depth_inverted != 0,
-                                            settings.near_camera_rule != 0, settings.turn_rule != 0);
+                // Every frame with depth and motion vectors is analysed, whatever is kept still: besides the masks
+                // (and the shelved object interpolation) the analysis gives the per-frame fit that locks the motion
+                // vector scale and checks the game's camera (camera_check.hpp), which every game needs. (It does
+                // nothing without depth or motion vectors.)
+                renderer.pass_stamp(Renderer::kPassStart);
+                renderer.analyze_motion(s, cam.clip_to_prev_clip, float(mv_scale.scale(0, s.depth_rect.w)),
+                                        float(mv_scale.scale(1, s.depth_rect.h)), mv_scale.valid, cam.depth_inverted != 0,
+                                        settings.near_camera_rule != 0, settings.turn_rule != 0, m.frame_id);
+                // Moving objects (option): what moves on its own, as a straight line back to the previous frame.
+                // Only with the game's own motion vectors (an upscaler's): those estimated from the picture are
+                // too rough at the edges of things.
+                // (with the motion seen in the picture, for what the game's motion vectors miss: shadows, glare)
+                // Frame generation (the game's own): objects move in its generated images instead - made
+                // ready for the warp here.
+                renderer.pass_stamp(Renderer::kPassAnalyze);
+                if (own_engine_on() && s.generated > 0) {
+                    renderer.prepare_generated(s, float(mv_scale.scale(0, s.depth_rect.w)), float(mv_scale.scale(1, s.depth_rect.h)), mv_scale.valid,
+                                               settings.use_ui_tags != 0);
+                    last_generated = now_seconds();
+                    if (!generation_logged) {
+                        logf("frame generation: showing the game's generated images (%d per frame), each moved to the displayed camera", s.per_frame);
+                        generation_logged = true;
+                    }
+                } else if (moving_objects_on() && s.has_motion && !s.motion_estimated && mv_scale.valid) {
+                    const bool picture = renderer.picture_motion();
+                    renderer.object_motion(s, cam.clip_to_prev_clip, cam.view_to_clip, float(mv_scale.scale(0, s.depth_rect.w)),
+                                           float(mv_scale.scale(1, s.depth_rect.h)), attached_mask, picture);
+                }
+                renderer.pass_stamp(Renderer::kPassObjects);
                 if (mask) {
                     // HUD from the upscaler's output only when chosen (opt-in: its colour model cannot be
                     // proven for every game); otherwise the learned HUD map, which works everywhere.
@@ -696,6 +813,7 @@ void render_thread() {
                     if (settings.background_memory && (settings.warp_engine == 1 || !latewarp.ready())) {
                         renderer.update_memory(s, cam.clip_to_prev_clip, cam.depth_inverted != 0, m.frame_id == memory_frame + 1);
                         memory_frame = m.frame_id;
+                        renderer.pass_stamp(Renderer::kPassMemory);
                     }
                     if (++mask_builds >= 300) {
                         mask_builds = 0;
@@ -712,6 +830,10 @@ void render_thread() {
                                  hs.frames, hs.learned, hs.learned ? 100.0 * hs.share_sum / hs.learned : 0.0, hs.too_little, hs.guarded);
                     }
                     if (!mask_logged) { logf("no-warp mask: %s%s", hud_mask ? "HUD (the game has no HUD layers)" : "", attached_mask ? (hud_mask ? " + character/weapon" : "character/weapon") : ""); mask_logged = true; }
+                    if (hud_mask && s.has_hudless && !s.has_ui && !hudless_hud_logged) {
+                        logf("HUD: found from the game's HUD-less picture (sent without a UI layer)");
+                        hudless_hud_logged = true;
+                    }
                 }
                 const double present_t = seconds(m.qpc_present);
                 if (last_source_present > 0) source_interval = present_t - last_source_present;
@@ -736,12 +858,14 @@ void render_thread() {
         // DWM composes shortly after each vblank; a frame that is not finished by then waits a
         // whole refresh. Render `lead` ms before the next vblank so the GPU has room even when the
         // game delays our work.
+        vblank.set_display_hz(g_app.display_mode_hz.load());
         vblank.update(renderer.present_stats());
         // DWM composes ~3 ms after each vblank and shows the result at the following vblank; with a
         // frame latency of 1 the swapchain only frees us at that display vblank, leaving ~2.5 ms. With a
         // lead we allow one queued frame and wake `lead` ms before each composition instead, one frame
         // per refresh (a new target is always a later vblank than the previous one).
         const bool paced = settings.present_lead_ms > 0 && vblank.valid();
+        paced_last = paced;
         // Split queues with XPAR's own engine when paced (Latewarp and the unpaced path record everything on
         // the realtime queue). Switched only while no frame is being taken in.
         {
@@ -771,7 +895,7 @@ void render_thread() {
             // arrives too close to the refresh waits until just after it.
             const std::int64_t tick = v + compose - lead;
             const std::int64_t budget = static_cast<std::int64_t>((intake_ms + 1.0) * 1e-3 * f);
-            const bool can_take_in = g_app.visible && !frame_generation && renderer.session_open(sh.session) &&
+            const bool can_take_in = g_app.visible && !generation_aside() && renderer.session_open(sh.session) &&
                                      sh.backbuffer_width == renderer.width() && sh.backbuffer_height == renderer.height();
             for (;;) {
                 const std::int64_t t = qpc_now();
@@ -895,31 +1019,58 @@ void render_thread() {
             } else ++it;
         }
 
-        // Frame generation (DLSS, FSR, XeSS - any kind) presents two or more images per rendered frame. It
-        // does the same job as FrameWarp and the two cannot be combined (generated images would be warped
-        // as if they were rendered ones): step aside and say so, and come back when it is turned off.
+        // Frame generation (DLSS, FSR, XeSS - any kind): two or more images presented per rendered frame, or the
+        // game calling its DLSS / FSR frame generation (where ReShade sees only the rendered frames' presents).
+        // Without its images coming with the frames, the two cannot be combined (generated images would be
+        // warped as if they were rendered ones): step aside and say so, and come back when it is turned off.
         if (qpc_now() - fg_window_start >= g_qpc_frequency / 2) {
-            const LONG presents = sh.presents_total, frames = sh.frames_total;
-            const LONG dp = presents - fg_presents, df = frames - fg_frames;
-            fg_presents = presents; fg_frames = frames; fg_window_start = qpc_now();
+            const LONG presents = sh.presents_total, frames = sh.frames_total, calls = sh.generation_calls;
+            const LONG dp = presents - fg_presents, df = frames - fg_frames, dc = calls - fg_calls;
+            fg_presents = presents; fg_frames = frames; fg_calls = calls; fg_window_start = qpc_now();
             if (df >= 5) {  // the game is rendering (menus and loading screens present without it)
-                const double ratio = double(dp) / double(df);
-                if (ratio >= 1.6) fg_votes = std::min(fg_votes + 1, 2);
-                else if (ratio <= 1.25) fg_votes = std::max(fg_votes - 1, -2);
+                const double ratio = double(dp) / double(df), called = double(dc) / double(df);
+                if (ratio >= 1.6 || called >= 0.5) fg_votes = std::min(fg_votes + 1, 2);
+                else if (ratio <= 1.25 && called < 0.1) fg_votes = std::max(fg_votes - 1, -2);
                 if (!frame_generation && fg_votes >= 2) {
                     frame_generation = true;
-                    logf("frame generation detected (%.1f presented images per rendered frame): stepping aside until it is off", ratio);
+                    logf("frame generation detected (%.1f presented images, %.1f frame generation calls per rendered frame)%s", ratio, called,
+                         own_engine_on() ? "" : ": stepping aside until it is off (XPAR's own warp engine uses it)");
                 } else if (frame_generation && fg_votes <= -2) {
                     frame_generation = false;
-                    logf("frame generation off: reprojecting again");
+                    logf("frame generation off");
                 }
             }
-            sh.presenter.frame_generation = frame_generation ? 1u : 0u;
         }
-        if (!g_app.visible || frame_generation) {  // game not in front / disabled / frame generation: don't compete with it for the GPU
-            if (frame_generation) g_app.has_frames = false;
+        // With XPAR's own engine, the game's frame generation is used (its images come with the frames).
+        const bool aside = generation_aside();
+        // (no message while reprojection is off - the add-on takes frame generation's images only while it is
+        // on - or for 2 s after it is turned back on, while they start coming again)
+        if (settings.enabled && !was_enabled) enabled_since = now_seconds();
+        was_enabled = settings.enabled != 0;
+        const bool settling = !settings.enabled || now_seconds() - enabled_since < 2.0;
+        sh.presenter.frame_generation = aside ? (settling ? 0u : 1u) : frame_generation ? 2u : 0u;
+        // Frame generation off for a while: the textures its images were taken into go (video memory).
+        if (renderer.has_generated() && !source.generated && !incoming.s.generated && now_seconds() - last_generated > 3.0) {
+            renderer.release_generated();
+            logf("frame generation: its textures released (no generated images for 3 s)");
+        }
+        if (!g_app.visible || aside) {  // game not in front / disabled / frame generation: don't compete with it for the GPU
+            if (aside) g_app.has_frames = false;
+            record_timeline(sh, settings, &ui_samples_written);
+            // (while paused, what keeps it so - every 5 s)
+            if (now_seconds() - last_pause_log > 5.0) {
+                last_pause_log = now_seconds();
+                const auto latest = static_cast<std::uint64_t>(sh.latest_ready_frame);
+                int latest_generated = -1;
+                for (const auto& m : sh.slots) if (m.frame_id == latest && m.state != kFree) latest_generated = int(m.generated);
+                logf("paused: visible %d, stepped aside %d, reprojection %s, frame generation %d (last generated image %.1f s ago), newest frame %llu "
+                     "with %d generated images, ReShade menu %s", int(g_app.visible), int(aside), settings.enabled ? "on" : "off", int(frame_generation),
+                     now_seconds() - last_generated, static_cast<unsigned long long>(latest), latest_generated, sh.overlay_open ? "open" : "closed");
+            }
             source_frame = sh.latest_ready_frame;
             pacing_paused = true;
+            as_is_frame = 0;  // (the window may have been hidden: drawn again when it comes back)
+            presented_last = true;
             Sleep(10);
             continue;
         }
@@ -928,6 +1079,7 @@ void render_thread() {
             // stale. Start over exactly like switching the present lead off and on again.
             pacing_paused = false;
             vblank = VblankClock{};
+            vblank.set_display_hz(g_app.display_mode_hz.load());
             last_target_vblank = 0;
             renderer.set_frame_latency(1);
             logf("pacing re-synchronised after a pause");
@@ -960,27 +1112,47 @@ void render_thread() {
                 inputs.no_warp_mask = renderer.no_warp_mask();
                 inputs.mask_rect = source.color_rect;
             }
-            if (settings.extrapolate_objects && source.has_motion && mv_scale.valid) {
-                const double interval = g_app.model.frame_interval();
-                // Interpolation only: between the object's exact previous and current positions (from the
-                // motion vectors). When the camera is shown ahead of the newest frame, objects hold there.
-                const float alpha = interval > 0 ? float(std::clamp(p.horizon / interval, -1.0, 0.0)) : 0.0f;
-                const bool split = inputs.hudless != inputs.backbuffer;
-                if (ID3D12Resource* moved = alpha < 0 ? renderer.extrapolate_objects(source, split, alpha, source_camera.clip_to_prev_clip) : nullptr) {
-                    inputs.hudless = moved;
-                    if (!split) inputs.backbuffer = moved;
-                }
-            }
             const double z_sign = view_z_sign(source_camera.view_to_clip);
             if (own_engine) {
-                const Mat4 m = clip_source_to_target(projection, view_matrix(source_basis, origin, z_sign), view_matrix(p.camera, origin, z_sign));
+                Mat4 m = clip_source_to_target(projection, view_matrix(source_basis, origin, z_sign), view_matrix(p.camera, origin, z_sign));
+                // Frame generation (the game's own): over each frame interval, the images it generated between the
+                // previous frame and this one, then the frame itself - objects one game frame late, moved by the
+                // game. Each image is seen from the camera of its moment: the frame's own motion from the previous
+                // frame (clipToPrevClip), taken part of the way back.
+                int generated = -1;
+                const double gen_interval = g_app.model.frame_interval();
+                if (own_engine_on() && source.generated > 0 && gen_interval > 0) {
+                    // (the image numbered for this part of the interval, or the nearest one taken: 6x keeps 3 of 5)
+                    const int images = source.per_frame + 1;
+                    const int wanted = int(std::floor(std::max(0.0, now - shown_since) / gen_interval * images)) + 1;
+                    if (wanted < images) {
+                        for (int i = 0; i < source.generated; ++i)
+                            if (generated < 0 || std::abs(source.gen_index[i] - wanted) < std::abs(source.gen_index[generated] - wanted)) generated = i;
+                        m = generated_to_target(source_camera.clip_to_prev_clip, 1.0 - double(source.gen_index[generated]) / images, m);
+                    }
+                }
+                // Moving objects (option), on their own clock, one game frame behind (frame generation): when a
+                // frame is first shown they are where the previous one had them, and over the next frame
+                // interval they move to where this one has them - always between two real frames, never guessed
+                // ahead. The camera is not delayed: it is the warp's, at the displayed moment.
+                Renderer::ObjectWarp objects;
+                const double interval = g_app.model.frame_interval();
+                objects.frames_back = interval > 0 ? float(std::clamp(1.0 - (now - shown_since) / interval, 0.0, 1.0)) : 0.0f;
+                Mat4 prev_clip{}, back{};
+                std::memcpy(prev_clip.data(), source_camera.clip_to_prev_clip, sizeof(float) * 16);
+                const bool with_objects = moving_objects_on() && source.generated == 0 && objects.frames_back > 0 && mat_inverse(prev_clip, back);
+                if (with_objects) {
+                    const Mat4 to_target = mat_mul(back, m);
+                    std::memcpy(objects.prev_to_target, to_target.data(), sizeof(objects.prev_to_target));
+                    std::memcpy(objects.view_to_clip, source_camera.view_to_clip, sizeof(objects.view_to_clip));
+                }
                 // Nothing moved since the frame (well under a hundredth of a pixel anywhere): every pixel stays
-                // where it is, so there is nothing to warp. (The mask's debug tint and the object extrapolation
-                // need the warp pass.)
-                unmoved = !settings.show_mask && !settings.extrapolate_objects;
+                // where it is, so there is nothing to warp. (The mask's debug tint and moving objects need the
+                // warp pass.)
+                unmoved = !settings.show_mask && !with_objects && generated < 0;
                 for (int i = 0; i < 16 && unmoved; ++i) unmoved = std::fabs(m.data()[i] - (i % 5 == 0 ? 1.0f : 0.0f)) < 2e-6f;
                 warped = unmoved || renderer.own_warp(source, settings.use_ui_tags != 0, inputs.no_warp_mask != nullptr, m.data(), inputs.depth_inverted,
-                                                     settings.background_memory != 0);
+                                                     settings.background_memory != 0, with_objects ? &objects : nullptr, generated);
             } else {
                 warped = latewarp.evaluate(list, inputs, first_eval, view_matrix(p.camera, origin, z_sign),
                                            view_matrix(source_basis, origin, z_sign), projection);
@@ -990,8 +1162,19 @@ void render_thread() {
         }
         // Menus and loading screens often skip the game's usual frame (no DLSS call, no tags): when several
         // presents in a row bring no frame, step aside and let the game's own picture show.
-        g_app.has_frames = source.valid && sh.presents_without_frame < 3;
-        renderer.finish_frame(warped && !unmoved, settings.overlay_debug ? (warped ? 1 : 2) : 0);
+        // (the ReShade menu is drawn on what the game presents, after the generated images XPAR shows were taken:
+        // with them, the game's own picture is shown while it is open)
+        g_app.has_frames = source.valid && sh.presents_without_frame < 3 && !(sh.overlay_open && source.generated > 0 && own_engine_on());
+        // The same picture as the one presented last - this frame shown as it is again (the camera has not
+        // moved, or nothing is warped), nothing drawn on it that changes: nothing to draw or present. With a still
+        // camera the GPU does nothing at all between game frames.
+        const bool as_is = !(warped && !unmoved) && !settings.overlay_debug && !settings.show_mask && g_app.has_frames;
+        const bool same_picture = as_is && shown_frame && as_is_frame == shown_frame && as_is_w == renderer.width() && as_is_h == renderer.height();
+        if (same_picture) renderer.skip_frame();
+        else renderer.finish_frame(warped && !unmoved, settings.overlay_debug ? (warped ? 1 : 2) : 0);
+        presented_last = !same_picture;
+        as_is_frame = as_is ? shown_frame : 0;
+        as_is_w = renderer.width(); as_is_h = renderer.height();
         // Ctrl+Shift+M marks "it looks bad now" in the log. Both keys (this and Ctrl+Shift+D below) only with
         // "Record detailed diagnostics" ticked: pressed by accident, a capture freezes the game for a second.
         const bool keys_on = settings.record_diagnostics != 0;
@@ -1003,16 +1186,34 @@ void render_thread() {
         // depth, motion vectors, the motion analysis and the masks (half-float RGBA, 8-byte header: width,
         // height) to captures\.
         const bool dump_down = keys_on && (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000) && (GetAsyncKeyState('D') & 0x8000);
-        // The key keeps the current game frame's picture, depth and motion vectors on the GPU (quick); the
-        // capture itself is written on the next game frame, together with that kept one ("prev_"): two
-        // consecutive game frames. (Reading everything back and writing it stalls the presenter for about a
-        // second, so the frame after a capture would be dozens of frames later.)
-        if (dump_down && !g_app.dump_was_down && source.valid && !dump_pending) {
-            renderer.stash_source();
-            dump_pending = true; dump_after = shown_frame;
-        }
-        if (dump_pending && source.valid && shown_frame != dump_after) {
-            dump_pending = false;
+        // The key keeps the current game frame's picture, depth and motion vectors on the GPU (quick), and the
+        // next game frame's too; the capture itself is written on the one after, together with the two kept
+        // ("prev2_", "prev_"): three consecutive game frames, and their cameras (_cameras.txt). (Reading
+        // everything back and writing it stalls the presenter for about a second, so the frame after a capture
+        // would be dozens of frames later.)
+        auto dump_frame = [&]() {
+            DumpFrame d;
+            d.frame = shown_frame; d.cam = source_camera; d.s = source; d.mv_valid = mv_scale.valid;
+            for (const auto& [f, t] : frame_times) if (f == shown_frame) d.time = t;
+            for (int k = 0; k < 2; ++k) d.mv[k] = mv_scale.scale(k, k ? source.depth_rect.h : source.depth_rect.w);
+            return d;
+        };
+        // (only while no newer frame is being taken in: with split queues its motion vectors would already be
+        // in place of the shown frame's)
+        const bool dump_now = source.valid && !renderer.intake_pending() && intake.slot < 0;
+        if (dump_down && !g_app.dump_was_down && !dump_stage) dump_requested = true;
+        if (dump_requested && dump_now) {
+            dump_requested = false;
+            renderer.stash_source(1, source.has_hudless);
+            dump_frames[0] = dump_frame();
+            dump_stage = 1; dump_after = shown_frame;
+        } else if (dump_stage == 1 && dump_now && shown_frame != dump_after) {
+            renderer.stash_source(0, source.has_hudless);
+            dump_frames[1] = dump_frame();
+            dump_stage = 2; dump_after = shown_frame;
+        } else if (dump_stage == 2 && dump_now && shown_frame != dump_after) {
+            dump_stage = 0;
+            dump_frames[2] = dump_frame();
             static int captures = 0;
             const auto dir = g_app.data_dir / L"captures";
             std::error_code ec;
@@ -1021,10 +1222,17 @@ void render_thread() {
             for (const auto& [which, name] : {std::pair{0, L"frame"}, std::pair{1, L"output"}, std::pair{2, L"scene"}, std::pair{3, L"depth"},
                                               std::pair{4, L"motion"}, std::pair{5, L"object"}, std::pair{6, L"mask"}, std::pair{7, L"hudscore"},
                                               std::pair{8, L"world"}, std::pair{9, L"fill"}, std::pair{10, L"prev_frame"},
-                                              std::pair{11, L"prev_depth"}, std::pair{12, L"prev_motion"}}) {
+                                              std::pair{11, L"prev_depth"}, std::pair{12, L"prev_motion"}, std::pair{14, L"prev_hudless"},
+                                              std::pair{15, L"prev2_frame"}, std::pair{16, L"prev2_hudless"}, std::pair{17, L"prev2_depth"},
+                                              std::pair{18, L"prev2_motion"}, std::pair{19, L"hudless"}, std::pair{20, L"gen0"},
+                                              std::pair{21, L"gen1"}, std::pair{22, L"gen2"}, std::pair{23, L"gen0_depth"},
+                                              std::pair{24, L"gen1_depth"}, std::pair{25, L"gen2_depth"}, std::pair{26, L"ui"}}) {
                 std::vector<std::uint16_t> px;
                 std::uint32_t cw = 0, ch = 0;
                 if (which == 2 && !source.has_scene) { logf("capture %d: no upscaler output this frame", n); continue; }
+                if (which == 19 && !source.has_hudless) continue;
+                if (which >= 20 && which <= 25 && (which - 20) % 3 >= source.generated) continue;  // (frame generation's images)
+                if (which == 26 && !source.has_ui) continue;
                 if (!renderer.read_back(which, px, cw, ch)) continue;
                 const auto path = dir / (L"capture_" + std::to_wstring(n) + L"_" + name + L".f16");
                 FILE* f = nullptr;
@@ -1035,8 +1243,28 @@ void render_thread() {
                     std::fclose(f);
                 }
             }
-            logf("capture %d saved: game frame %llu, and %llu before it (prev_)", n, static_cast<unsigned long long>(shown_frame),
-                 static_cast<unsigned long long>(dump_after));
+            // Per frame (prev2, prev, current): the frame, its time, the rectangles of the picture and the depth, the
+            // motion vector scale (to uv), depth_inverted, then the projection and the game's reprojection to the
+            // previous frame (row vector: prev = clip * M).
+            FILE* f = nullptr;
+            if (_wfopen_s(&f, (dir / (L"capture_" + std::to_wstring(n) + L"_cameras.txt")).c_str(), L"w") == 0 && f) {
+                static const char* const kNames[] = {"prev2", "prev", "current"};
+                for (int i = 0; i < 3; ++i) {
+                    const DumpFrame& d = dump_frames[i];
+                    std::fprintf(f, "%s frame %llu time %.6f color_rect %u %u %u %u depth_rect %u %u %u %u mv_scale %.9g %.9g %d depth_inverted %u estimated %u hudless %d generated %d per_frame %d\n",
+                                 kNames[i], static_cast<unsigned long long>(d.frame), d.time, d.s.color_rect.x, d.s.color_rect.y, d.s.color_rect.w,
+                                 d.s.color_rect.h, d.s.depth_rect.x, d.s.depth_rect.y, d.s.depth_rect.w, d.s.depth_rect.h, d.mv[0], d.mv[1],
+                                 int(d.mv_valid), d.cam.depth_inverted, d.cam.estimated, int(d.s.has_hudless), d.s.generated, d.s.per_frame);
+                    std::fprintf(f, "%s view_to_clip", kNames[i]);
+                    for (float v : d.cam.view_to_clip) std::fprintf(f, " %.9g", v);
+                    std::fprintf(f, "\n%s clip_to_prev_clip", kNames[i]);
+                    for (float v : d.cam.clip_to_prev_clip) std::fprintf(f, " %.9g", v);
+                    std::fprintf(f, "\n");
+                }
+                std::fclose(f);
+            }
+            logf("capture %d saved: game frames %llu (prev2_), %llu (prev_), %llu", n, static_cast<unsigned long long>(dump_frames[0].frame),
+                 static_cast<unsigned long long>(dump_frames[1].frame), static_cast<unsigned long long>(shown_frame));
         }
         g_app.dump_was_down = dump_down;
         if (rec(g_app.csv_outputs)) {
@@ -1045,23 +1273,12 @@ void render_thread() {
             // (the displayed camera too: position and forward, in the game's world)
             const auto& dc = applied.camera;
             wr(g_app.csv_outputs, "%lld,%llu,%d,%.6f,%.6f,%.4f,%.3f,%d,%lld,%lld,%lld,%u,%u,%u,%u,%lld,%ld,%lld,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f\n",
-                         qpc_now(), static_cast<unsigned long long>(source_frame), int(warped), applied.yaw, applied.pitch,
+                         qpc_now(), static_cast<unsigned long long>(source_frame), same_picture ? 2 : int(warped), applied.yaw, applied.pitch,
                          applied.horizon * 1000.0, renderer.last_gpu_ms(), mark, tm.submit, tm.gpu_start, tm.gpu_end, pstats.last_present_count,
                          pstats.present_count, pstats.present_refresh, pstats.sync_refresh, pstats.sync_qpc, static_cast<long>(pstats.hr), wake_qpc,
                          dc.pos.x, dc.pos.y, dc.pos.z, dc.fwd.x, dc.fwd.y, dc.fwd.z);
         }
-        // Dump the game-side timeline.
-        if ((settings.record_diagnostics != 0) != g_recording.load()) {
-            if (settings.record_diagnostics) {
-                open_recordings();
-                ui_samples_written = false;
-                logf("detailed diagnostics: recording to the logs folder; sparse UI samples will be written on the first tagged frame");
-            } else {
-                g_recording = false;
-                ui_samples_written = false;
-                logf("detailed diagnostics: off");
-            }
-        }
+        record_timeline(sh, settings, &ui_samples_written);
         if (settings.record_diagnostics && !ui_samples_written && source.valid && source.has_ui && source.has_hudless &&
             rec(g_app.csv_ui_samples)) {
             ui_samples_written = true;
@@ -1069,9 +1286,9 @@ void render_thread() {
             std::uint32_t frame_w = 0, frame_h = 0, hudless_w = 0, hudless_h = 0;
             std::uint32_t raw_ui_w = 0, raw_ui_h = 0, normalized_ui_w = 0, normalized_ui_h = 0;
             const bool read_ok = renderer.read_back(0, frame_px, frame_w, frame_h) &&
-                                 renderer.read_back(14, hudless_px, hudless_w, hudless_h) &&
-                                 renderer.read_back(15, raw_ui_px, raw_ui_w, raw_ui_h) &&
-                                 renderer.read_back(16, normalized_ui_px, normalized_ui_w, normalized_ui_h);
+                                 renderer.read_back(19, hudless_px, hudless_w, hudless_h) &&
+                                 renderer.read_back(28, raw_ui_px, raw_ui_w, raw_ui_h) &&
+                                 renderer.read_back(26, normalized_ui_px, normalized_ui_w, normalized_ui_h);
             if (!read_ok || frame_w != hudless_w || frame_h != hudless_h || frame_w != raw_ui_w || frame_h != raw_ui_h ||
                 frame_w != normalized_ui_w || frame_h != normalized_ui_h) {
                 logf("UI sample CSV readback failed or dimensions differed");
@@ -1122,16 +1339,16 @@ void render_thread() {
                         const float hud_r = half_sample_value(hudless_px[best]);
                         const float hud_g = half_sample_value(hudless_px[best + 1]);
                         const float hud_b = half_sample_value(hudless_px[best + 2]);
-                        const auto error = [&](float r, float g, float b, float a) {
+                        const auto recompose_error = [&](float r, float g, float b, float a) {
                             return std::max(std::max(std::fabs(r + (1.0f - a) * hud_r - frame_r),
                                                      std::fabs(g + (1.0f - a) * hud_g - frame_g)),
                                             std::fabs(b + (1.0f - a) * hud_b - frame_b));
                         };
-                        const float error_premultiplied = error(raw_r, raw_g, raw_b, alpha);
-                        const float error_straight = error(raw_r * alpha, raw_g * alpha, raw_b * alpha, alpha);
-                        const float error_inverted_premultiplied = error(raw_r, raw_g, raw_b, transmittance);
+                        const float error_premultiplied = recompose_error(raw_r, raw_g, raw_b, alpha);
+                        const float error_straight = recompose_error(raw_r * alpha, raw_g * alpha, raw_b * alpha, alpha);
+                        const float error_inverted_premultiplied = recompose_error(raw_r, raw_g, raw_b, transmittance);
                         const float error_inverted_straight =
-                            error(raw_r * transmittance, raw_g * transmittance, raw_b * transmittance, transmittance);
+                            recompose_error(raw_r * transmittance, raw_g * transmittance, raw_b * transmittance, transmittance);
                         wr(g_app.csv_ui_samples,
                            "%llu,%u,%u,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
                            static_cast<unsigned long long>(source_frame), best_x, best_y, raw_r, raw_g, raw_b, alpha,
@@ -1144,15 +1361,6 @@ void render_thread() {
                      static_cast<unsigned long long>(source_frame));
             }
         }
-        if (rec(g_app.csv_events)) {
-            const std::int64_t count = sh.timeline_count;
-            if (count - g_app.events_read > kTimeline) g_app.events_read = count - kTimeline;
-            for (; g_app.events_read < count; ++g_app.events_read) {
-                const auto& e = sh.timeline[g_app.events_read % kTimeline];
-                wr(g_app.csv_events, "%lld,%u,%u,%llu,%llu\n", e.qpc, e.kind, e.tid,
-                             static_cast<unsigned long long>(e.frame), static_cast<unsigned long long>(e.extra));
-            }
-        }
         ++stat_frames;
 
         {
@@ -1163,9 +1371,8 @@ void render_thread() {
             if (have_fit && rec(g_app.csv_motion)) {
                 // How well the game's motion vectors match the camera motion computed from depth (1: exactly, for
                 // the static scene), with the locked scale; a frame whose depth does not belong to its picture
-                // drops here. (Fits come back in order, a few frames later.)
-                const std::uint64_t f = analyzed_frames.empty() ? 0 : analyzed_frames.front();
-                if (!analyzed_frames.empty()) analyzed_frames.pop_front();
+                // drops here. (Fits come back a few frames later, each with its own frame.)
+                const std::uint64_t f = fit.frame;
                 double agree[2] = {-1, -1};
                 for (int k = 0; k < 2 && mv_scale.valid; ++k) {
                     const double sc = mv_scale.scale(k, k ? source.depth_rect.h : source.depth_rect.w);
@@ -1200,6 +1407,9 @@ void render_thread() {
                 }
             }
             vram.poll(now, notes.empty() ? nullptr : "texture change");
+            sh.presenter.vram_pressure = vram.pressure_until >= now ? 1u : 0u;
+            sh.presenter.vram_adapter_mb = float(vram.total_mb); sh.presenter.vram_adapter_size_mb = float(vram.size_mb);
+            sh.presenter.vram_own_mb = float(vram.own_mb); sh.presenter.vram_budget_mb = float(vram.budget_mb);
         }
         if (now - stat_start >= 0.5) {
             const HRESULT removed = renderer.device_removed_reason();
@@ -1232,8 +1442,8 @@ void render_thread() {
             st.mv_scale_y = mv_scale.valid ? float(mv_scale.scale(1, source.depth_rect.h)) : 0.0f;
             st.mv_fit_quality = float(mv_scale.quality);
             st.moving_fraction = float(mv_scale.moving_fraction);
-            if (settings.extrapolate_objects && mv_scale.valid && now - last_mv_log > 10.0) {
-                logf("objects: motion vectors %s, last fit quality %.3f, moving pixels %.1f%%",
+            if (moving_objects_on() && mv_scale.valid && now - last_mv_log > 10.0) {
+                logf("moving objects: motion vectors %s, last fit quality %.3f, moving pixels %.1f%%",
                      mv_scale.pixel_units ? "in render pixels" : "in custom units", mv_scale.quality, mv_scale.moving_fraction * 100.0);
                 last_mv_log = now;
             }
@@ -1242,12 +1452,22 @@ void render_thread() {
                 const Renderer::GpuUsage u = renderer.take_gpu_usage();
                 const double span = last_usage_log > 0 ? now - last_usage_log : 0.0;
                 last_usage_log = now;
+                // (the HUD/masks/motion part of it, pass by pass)
+                const Renderer::PassTimes pt = renderer.take_pass_times();
+                if (pt.frames) {
+                    const double k = 1.0 / pt.frames;
+                    logf("game frame GPU by pass (ms, %u frames): motion analysis %.2f, moving objects / generated images %.2f, HUD %.2f, "
+                         "character/weapon + stretch %.2f, mask %.2f, background memory %.2f", pt.frames, pt.ms[Renderer::kPassAnalyze] * k,
+                         pt.ms[Renderer::kPassObjects] * k, pt.ms[Renderer::kPassHud] * k, pt.ms[Renderer::kPassCharacter] * k,
+                         pt.ms[Renderer::kPassMask] * k, pt.ms[Renderer::kPassMemory] * k);
+                }
                 if (span > 0 && (u.intakes || u.warps)) {
                     const double n = std::max<double>(1, u.split);
                     logf("presenter GPU: %.0f%% of the time | game frames %.1f/s, %.2f ms each (reaching the game's textures %.2f, depth+motion %.2f, "
-                         "colour copies %.2f, HUD/masks/motion %.2f) | refreshes %.1f/s, warp %.2f ms each",
+                         "colour copies %.2f, HUD/masks/motion %.2f) | refreshes %.1f/s drawn (%.2f ms each), %.1f/s with nothing new (not drawn)",
                          (u.intake_ms + u.warp_ms) / (span * 10.0), u.intakes / span, u.intakes ? u.intake_ms / u.intakes : 0.0,
-                         u.access_ms / n, u.depth_ms / n, u.colour_ms / n, u.rest_ms / n, u.warps / span, u.warps ? u.warp_ms / u.warps : 0.0);
+                         u.access_ms / n, u.depth_ms / n, u.colour_ms / n, u.rest_ms / n, u.warps / span, u.warps ? u.warp_ms / u.warps : 0.0,
+                         u.skipped / span);
                 }
             }
             {
@@ -1274,7 +1494,49 @@ void render_thread() {
     latewarp.shutdown();
 }
 
+// The refresh rate of the display a window is on, as its current mode has it (exact: 119.88 Hz is 120000/1001),
+// from the display configuration; the whole-hertz value of the display settings if that is not available.
+double display_refresh_hz(HMONITOR monitor) {
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof(mi);
+    if (!monitor || !GetMonitorInfoW(monitor, &mi)) return 0;
+    UINT32 path_count = 0, mode_count = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &path_count, &mode_count) == ERROR_SUCCESS) {
+        std::vector<DISPLAYCONFIG_PATH_INFO> paths(path_count);
+        std::vector<DISPLAYCONFIG_MODE_INFO> modes(mode_count);
+        if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &path_count, paths.data(), &mode_count, modes.data(), nullptr) == ERROR_SUCCESS) {
+            for (UINT32 i = 0; i < path_count; ++i) {
+                DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
+                source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+                source.header.size = sizeof(source);
+                source.header.adapterId = paths[i].sourceInfo.adapterId;
+                source.header.id = paths[i].sourceInfo.id;
+                if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS || wcscmp(source.viewGdiDeviceName, mi.szDevice) != 0) continue;
+                const auto& r = paths[i].targetInfo.refreshRate;
+                if (r.Numerator && r.Denominator) return double(r.Numerator) / double(r.Denominator);
+            }
+        }
+    }
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1) return double(dm.dmDisplayFrequency);
+    return 0;
+}
+
 void follow_game_window() {
+    // The display's refresh rate: read again when the game is on another display, and every second (a mode change).
+    {
+        const HMONITOR monitor = MonitorFromWindow(g_app.game, MONITOR_DEFAULTTONEAREST);
+        const double now = now_seconds();
+        if (monitor != g_app.display_monitor || now - g_app.display_checked >= 1.0) {
+            const double hz = display_refresh_hz(monitor);
+            const double before = g_app.display_mode_hz.load();
+            if (std::fabs(hz - before) > 1e-3) logf("display refresh rate: %.3f Hz (its current mode)%s", hz, hz > 0 ? "" : " - not known: measured from the presents");
+            g_app.display_mode_hz = hz;
+            g_app.display_monitor = monitor;
+            g_app.display_checked = now;
+        }
+    }
     HWND game = g_app.game;
     const bool alive = IsWindow(game) != FALSE;
     RECT rc{};

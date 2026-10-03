@@ -88,7 +88,43 @@ public:
 
     void set_message(const char* text);
 
+    // Frame generation (the game's DLSS / FSR frame generation): image number `index` (1 .. per_frame, 0: the
+    // next one) of the `per_frame` it generates between the previous frame and `frame`, copied right where it is
+    // generated (recorded on `list`, after the generation) - at most kMaxGenerated of them per frame, spread
+    // evenly; `real` is the frame's own picture (taken with the first). `frame` 0 or unknown: the frame whose
+    // present the game started last. Once its last image is seen, the frame is published as soon as the GPU
+    // has run `list` that far (wherever it is submitted).
+    void on_generated(std::uint64_t frame, std::uint32_t index, std::uint32_t per_frame, ID3D12Resource* image, D3D12_RESOURCE_STATES image_state,
+                      ID3D12Resource* real, D3D12_RESOURCE_STATES real_state, ID3D12GraphicsCommandList* list);
+    // The game's frame generation is used (its images taken) with XPAR's own warp engine, the one that shows
+    // them; with NVIDIA Latewarp the presenter steps aside while frame generation is on.
+    bool generation_wanted() const {
+        return shared_ && shared_->settings.enabled && (shared_->settings.warp_engine == 1 || shared_->presenter.latewarp != 2);
+    }
+    // The game called its frame generation, its images wanted, within the last half second: frames are published
+    // from there, and the presents (generated and real images in frame generation's own order) publish nothing.
+    bool generation_active() const {
+        const std::int64_t last = generated_qpc_.load();
+        return last && shared_ && qpc_now() - last < shared_->qpc_frequency / 2;
+    }
+
 private:
+    std::atomic<std::int64_t> generated_qpc_{0};
+    // Frame generation: frames waiting for the GPU to reach their marker (see on_generated).
+    struct PendingPublish { std::uint64_t frame; std::uint32_t marker; std::int64_t qpc; };
+    std::vector<PendingPublish> pending_publish_;
+    std::atomic<int> pending_count_{0};
+    static constexpr int kMarkers = 64;
+    Microsoft::WRL::ComPtr<ID3D12Resource> markers_;  // readback buffer the marker values are written into
+    volatile std::uint32_t* marker_values_ = nullptr;
+    std::uint32_t marker_counter_ = 0;
+    HANDLE marker_event_ = nullptr;
+    bool marker_thread_started_ = false;
+    std::atomic<bool> stop_markers_{false};
+    bool ensure_markers();
+    void poll_markers();
+    void release_generated_if_idle();
+    void publish(int slot, ID3D12CommandQueue* queue);  // signals the fence on `queue`, marks the slot ready
     std::atomic<std::uint64_t> highest_frame_{0}, rendering_frame_{0};
     std::atomic<std::int64_t> game_depth_qpc_{0};
     std::atomic<std::int64_t> feed_qpc_{0};

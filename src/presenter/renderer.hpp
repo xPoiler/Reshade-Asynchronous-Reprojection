@@ -22,6 +22,11 @@ struct IngestedSource {
     Rect2 color_rect, depth_rect;
     bool has_motion = false;  // game motion vectors converted into the private motion texture
     bool motion_estimated = false;  // ...or none from the game: XPAR's own, estimated from the picture
+    // Frame generation (the game's own): images generated between the previous frame and this one, taken in
+    // with it (kPGen0..), of per_frame per frame; taken image i is the game's number gen_index[i], showing the
+    // moment gen_index[i] / (per_frame + 1) of the way from the previous frame.
+    int generated = 0, per_frame = 0;
+    int gen_index[kMaxGenerated] = {};
 };
 
 // HUD detection frames: learned from, skipped for too few telling pixels, or held back by the
@@ -39,6 +44,7 @@ struct HudStats {
 struct MotionFit {
     double gc[2] = {}, gg[2] = {}, cc[2] = {};
     double samples = 0, moving = 0;  // pixels used / pixels flagged as moving objects
+    std::uint64_t frame = 0;         // the game frame the sums are from
 };
 
 class Renderer {
@@ -92,6 +98,10 @@ public:
     // Blits the warped output (or the unwarped private backbuffer) to the swapchain and presents.
     // marker: 0 none, 1 green (warped), 2 red (original).
     void finish_frame(bool warped, int marker);
+    // Nothing new to show this refresh (the picture presented last is still the right one): what the refresh
+    // recorded so far (a frame taken in on the same queue, for one) is submitted, with no warp, no blit and no
+    // present - the composition keeps showing the last picture.
+    void skip_frame();
     // Submits the work recorded since begin_frame without presenting (a new game frame taken in between
     // refreshes, so the refresh itself only warps).
     // continuation: the second half of a frame taken in over two submissions (for the GPU usage log).
@@ -101,18 +111,42 @@ public:
     // into depth/motion incl. the camera-estimation readback, 4K colour copies, and the rest: HUD
     // detection, masks, motion analysis) and warped refreshes.
     struct GpuUsage {
-        std::uint32_t intakes = 0, warps = 0, split = 0;
+        std::uint32_t intakes = 0, warps = 0, split = 0, skipped = 0;
         double intake_ms = 0, access_ms = 0, depth_ms = 0, colour_ms = 0, rest_ms = 0, warp_ms = 0;
     };
     GpuUsage take_gpu_usage() { const GpuUsage u = usage_; usage_ = {}; return u; }
+    // The work on each game frame after its textures are taken in, pass by pass (GPU timestamps): pass_stamp(p)
+    // marks the end of pass p (kPassStart its beginning); each pass's time is from the stamp before it.
+    enum IntakePass { kPassStart, kPassAnalyze, kPassObjects, kPassHud, kPassCharacter, kPassMask, kPassMemory, kPassKinds };
+    struct PassTimes { double ms[kPassKinds] = {}; std::uint32_t frames = 0; };
+    void pass_stamp(IntakePass pass);
+    PassTimes take_pass_times() { const PassTimes t = pass_times_; pass_times_ = {}; return t; }
     // Debug: tints the no-warp mask and the HUD score onto the warped output (call after Latewarp).
     void tint_mask();
     // FrameWarp's own warp engine (experimental): writes the warped output like Latewarp would.
     // source_to_target maps the rendered frame's clip space (with depth) to the displayed camera's (row vectors).
     // memory: what the warp uncovers beside held pixels and at the frame's edges comes from the background
     // memory when it holds that spot (see update_memory).
+    // objects: moving objects are shown where they are at the displayed moment (see object_motion).
+    struct ObjectWarp {
+        float frames_back = 0;       // the displayed moment, in game frames before the shown one (0..1)
+        float prev_to_target[16];    // the previous frame's clip space -> the displayed camera's
+        float view_to_clip[16];      // the shown frame's projection
+        bool debug = false;          // development: colour the pixels by what the moving-object pass did
+    };
+    // generated: show the game's generated image of that index (frame generation, see prepare_generated)
+    // instead of the frame; source_to_target is then that image's camera's.
     bool own_warp(const IngestedSource& src, bool use_ui_tags, bool use_mask, const float source_to_target[16], bool depth_inverted,
-                  bool memory = false);
+                  bool memory = false, const ObjectWarp* objects = nullptr, int generated = -1);
+    // Frame generation, once per game frame (after the motion analysis): the generated images taken in with
+    // the frame made ready for the warp - each one's depth (this frame's, moved back along the motion vectors
+    // to the image's moment) and, with the HUD-less picture and UI layer, the UI they show taken back out
+    // (the warp puts the frame's UI back over it, as on every frame).
+    void prepare_generated(const IngestedSource& src, float scale_x, float scale_y, bool scale_valid, bool use_ui_tags);
+    // ...and once frame generation is off: whether its textures are still held, and letting them go (both
+    // texture sets and the game's shared copies; waits for the GPU).
+    bool has_generated() const;
+    void release_generated();
     // Background memory (once per game frame, after the no-warp mask): the scenery around the view as last
     // seen, behind held pixels and just beyond the frame, carried along with the camera (clip_to_prev_clip
     // of this frame) and forgotten after about a second. consecutive: the previous frame taken in was the
@@ -134,16 +168,27 @@ public:
     // DXGI frame statistics after the latest present (0 when unavailable).
     struct PresentStats { UINT last_present_count = 0, present_count = 0, present_refresh = 0, sync_refresh = 0; std::int64_t sync_qpc = 0; HRESULT hr = S_OK; };
     PresentStats present_stats() const { return present_stats_; }
-    // Moving-object extrapolation (experimental). Once per new game frame: per-pixel object motion
-    // (scaled game motion vectors minus the camera-only motion from depth + clipToPrevClip), plus the
-    // motion-vector scale fit (read back a few frames later, see take_motion_fit).
+    // Once per new game frame with depth and motion vectors: per-pixel object motion (scaled game motion
+    // vectors minus the camera-only motion from depth + clipToPrevClip), for the masks, plus the
+    // motion-vector scale fit of `frame` (read back a few frames later, see take_motion_fit).
     // near_rule: pixels near the camera that move against the camera model count as attached; turn_rule:
     // so do pixels nearly still on screen while the camera turns (third-person orbit cameras). See cs_analyze.
     void analyze_motion(const IngestedSource& src, const float clip_to_prev_clip[16], float scale_x, float scale_y, bool scale_valid,
-                        bool depth_inverted = true, bool near_rule = true, bool turn_rule = false);
-    // Per output frame: moves object pixels `alpha` game frames forward (negative: back) into a copy of
-    // the hud-less colour (or the backbuffer). Returns the result, or nullptr when unavailable.
-    ID3D12Resource* extrapolate_objects(const IngestedSource& src, bool from_hudless, float alpha, const float clip_to_prev_clip[16]);
+                        bool depth_inverted = true, bool near_rule = true, bool turn_rule = false, std::uint64_t frame = 0);
+    // Moving objects (option, XPAR engine). set_object_history: each game frame taken in keeps the previous
+    // one's picture and depth (what objects uncover, and where they were). object_motion: once per game
+    // frame, after analyze_motion: for each pixel the analysis found moving on its own, its straight-line
+    // motion in 3D to the previous frame (both frames' depth; the game's clipToPrevClip and projection).
+    // False when there is nothing for the warp to move (no previous frame kept, a size change).
+    void set_object_history(bool on) { object_history_ = on; if (!on) history_valid_ = objects_built_ = shown_objects_ = false; }
+    // held: what is attached to the camera and kept still (character/weapon) moves along its own on-screen motion.
+    // picture: also what the picture shows moving differently from the game's motion vectors (shadows, glare,
+    // markers), from picture_motion of the same frame.
+    bool object_motion(const IngestedSource& src, const float clip_to_prev_clip[16], const float view_to_clip[16], float scale_x, float scale_y,
+                       bool held = false, bool picture = false);
+    // Moving objects: the motion seen in the picture between the previous game frame and this one (XPAR's own
+    // motion estimation, without replacing the game's motion vectors). False: none this frame (no previous picture).
+    bool picture_motion();
     // Keep a copy of the previous game frame's colour at each ingest (background for uncovered areas).
     void set_keep_previous_colour(bool on) { keep_previous_ = on; if (!on) previous_valid_ = false; }
     bool take_motion_fit(MotionFit& fit);
@@ -177,12 +222,14 @@ public:
 
     // Test/diagnostic helper: synchronously reads back the warped output (RGBA16F) or private backbuffer.
     // which: 0 the game's frame, 1 the warped output, 2 the upscaler's output (scene before HUD).
-    // (10-12: stashed picture/depth/motion; 13: own displacements; 14-17: hudless/raw UI/normalized UI/UI alpha)
+    // (10-12: the picture, depth and motion vectors kept by stash_source; 13: own motion estimation's displacements;
+    // 14: the HUD-less picture kept; 15-18: the second kept set's picture, HUD-less picture, depth and motion vectors;
+    // 19: the game's HUD-less picture; 26: normalized UI; 28: raw UI; 29: UI alpha)
     bool read_back(int which, std::vector<std::uint16_t>& pixels, std::uint32_t& w, std::uint32_t& h);
-    // Diagnostics: keeps a copy of the current game frame's picture, depth and motion vectors on the GPU (a
-    // few milliseconds, nothing is read back), so a capture taken on the next game frame holds two
-    // consecutive ones.
-    void stash_source();
+    // Diagnostics: keeps a copy of the current game frame's picture (and HUD-less picture), depth and motion
+    // vectors on the GPU (a few milliseconds, nothing is read back), so a capture taken on a later game frame
+    // holds consecutive ones. Two sets: 0 is read back as 10-14, 1 as 15-18.
+    void stash_source(int set = 0, bool hudless = false);
 
 private:
     struct Private {
@@ -191,7 +238,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     };
-    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPUiAlpha, kPUiRebuilt, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPDest, kPExtrap, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPStashColor, kPStashDepth, kPStashMotion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPCount };
+    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKeys, kPObjMove, kPObjTiles, kPObjOutTiles, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevColour, kPPrevDepth, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPUiRebuilt, kPUiAlpha, kPCount };
 
     bool create_pipelines(std::string& error);
     // The format a private copy of a game colour image is kept in: the game's own 4-byte format when it
@@ -201,7 +248,8 @@ private:
     bool ensure_private(PrivateId id, std::uint32_t w, std::uint32_t h, DXGI_FORMAT format);
     // The textures the warp reads, kept twice with split queues (front_: the shown set).
     static bool shown_id(PrivateId id) {
-        return id == kPBackbuffer || id == kPHudless || id == kPUi || id == kPDepth || id == kPMask || id == kPFill || id == kPWarpMask;
+        return id == kPBackbuffer || id == kPHudless || id == kPUi || id == kPDepth || id == kPMask || id == kPFill || id == kPWarpMask ||
+               id == kPObjMove || id == kPObjTiles || id == kPPrevColour || id == kPPrevDepth || (id >= kPGen0 && id <= kPGenZ2);
     }
     const Private& shown(PrivateId id) const { return split_ && shown_id(id) ? front_[id] : private_[id]; }
     void swap_shown();  // exchanges the two sets (and the per-texture descriptors)
@@ -240,7 +288,7 @@ private:
     // Own motion estimation (games that give depth but no motion vectors): fills the motion texture from
     // the picture of this game frame and the previous one. Called by ingest, between the depth and the
     // motion samples.
-    void estimate_motion(DXGI_FORMAT colour);
+    bool estimate_motion(DXGI_FORMAT colour, bool write_motion = true);  // false: no previous picture
     int flow_luma_ = 0;            // which brightness pyramid holds the previous frame
     bool flow_previous_ = false;   // ...and whether it does (false: no motion this frame)
     bool own_motion_ = false;      // the current frame's motion vectors are XPAR's own (samples: confident ones only)
@@ -256,8 +304,15 @@ private:
     std::uint32_t width_ = 0, height_ = 0, frame_index_ = 0;
     const char* priority_name_ = "normal";
 
-    ComPtr<ID3D12RootSignature> root_, root_x_;
-    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_clear_, cs_splat_, cs_gather_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_memory_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_, cs_ui_alpha_;
+    ComPtr<ID3D12RootSignature> root_, root_x_, root_w_;
+    // Passes with the second constant block and 10 SRVs (the XPAR warp and the moving objects).
+    void w_dispatch(ID3D12PipelineState* pso, const void* constants, const float w[20], UINT table, UINT groups_x, UINT groups_y);
+    // Moving objects: the previous frame's picture and depth (ingest; the new frame's sizes and colour format).
+    void keep_history(PrivateId colour, std::uint32_t depth_w, std::uint32_t depth_h, std::uint32_t colour_w, std::uint32_t colour_h,
+                      DXGI_FORMAT colour_format);
+    ComPtr<ID3D12PipelineState> cs_obj_move_, cs_gen_depth_, cs_gen_unui_, cs_hudless_clear_, cs_hudless_count_, cs_hudless_score_, cs_hudless_fill_, cs_obj_join_init_, cs_obj_join_, cs_obj_join_final_, cs_obj_clear_, cs_obj_clear_tiles_, cs_obj_splat_, cs_obj_fix_, cs_copy4_, cs_copy1_;
+    bool object_history_ = false, history_valid_ = false, objects_built_ = false, shown_objects_ = false;
+    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_memory_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_, cs_ui_alpha_;
     ComPtr<ID3D12Resource> samples_, samples_readback_;
     UINT samples_count_ = 0;
     float last_flush_ms_ = 0;
@@ -271,6 +326,7 @@ private:
     ComPtr<ID3D12Resource> partials_, sums_, fit_readback_;
     UINT partial_groups_ = 0;
     bool fit_pending_[kRing] = {};
+    std::uint64_t fit_frame_[kRing] = {};
     bool fit_ready_ = false;
     bool keep_previous_ = false, previous_valid_ = false, previous_from_hudless_ = false, ingested_ = false, last_had_hudless_ = false;
     MotionFit fit_latest_;
@@ -288,7 +344,7 @@ private:
     UINT frame_latency_ = 1;
     PresentStats present_stats_;
     float gpu_ms_ = 0, intake_gpu_ms_ = 0;
-    bool intake_slot_[kRing] = {}, continuation_slot_[kRing] = {};
+    bool intake_slot_[kRing] = {}, continuation_slot_[kRing] = {}, skipped_slot_[kRing] = {};
     // Three stamps inside an intake (shared textures made readable, after depth/motion, after the colour
     // copies), one set per frame in flight.
     UINT samples_pending_bytes_ = 0;  // motion samples recorded, not read yet
@@ -297,6 +353,12 @@ private:
     int stages_marked_ = 0;
     bool stage_valid_[kRing] = {};
     GpuUsage usage_;
+    static constexpr int kPassStamps = 12;
+    ComPtr<ID3D12QueryHeap> pass_stamps_;
+    ComPtr<ID3D12Resource> pass_readback_;
+    std::uint8_t pass_ids_[kRing][kPassStamps] = {};
+    int pass_count_[kRing] = {};
+    PassTimes pass_times_;
     void mark_stage() {
         if (stage_stamps_ && stages_marked_ < 3) list_->EndQuery(stage_stamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * 3 + stages_marked_++);
     }
@@ -310,7 +372,7 @@ private:
     struct SharedTex { ComPtr<ID3D12Resource> resource; std::uint32_t generation = 0; };
     SharedTex shared_[kSlots][kTexCount];
     std::vector<ID3D12Resource*> reading_;  // shared textures transitioned for this frame
-    ID3D12Resource* srv_resource_[32] = {};  // resource currently described at each source SRV index
+    ID3D12Resource* srv_resource_[kSlots * kTexCount] = {};  // resource currently described at each source SRV index
 };
 
 }  // namespace fw

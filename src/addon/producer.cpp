@@ -4,9 +4,11 @@
 #include "shared/camera_motion.hpp"
 #include <dxgi1_6.h>
 #include <string>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 
 namespace fw {
 using Microsoft::WRL::ComPtr;
@@ -26,6 +28,7 @@ DXGI_FORMAT copy_format(DXGI_FORMAT f) {
 
 Producer::Producer() {
     const DWORD pid = GetCurrentProcessId();
+    marker_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     mapping_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(Shared), map_name(pid).c_str());
     if (!mapping_) return;
     shared_ = static_cast<Shared*>(MapViewOfFile(mapping_, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Shared)));
@@ -59,6 +62,8 @@ Producer::Producer() {
 }
 
 Producer::~Producer() {
+    stop_markers_ = true;  // (the marker thread ends by itself; at process exit it is gone already)
+    SetEvent(marker_event_);
     detach_vulkan();
     for (auto& slot : textures_)
         for (auto& t : slot) if (t.handle) CloseHandle(t.handle);
@@ -112,6 +117,7 @@ int Producer::slot_for_frame(std::uint64_t frame, bool create) {
         m.frame_id = frame; m.fence_value = 0; m.qpc_sim_start = 0; m.qpc_constants = 0; m.qpc_present = 0;
         m.camera.valid = 0;
         for (auto& t : m.tex) t.valid = 0;
+        m.generated = m.per_frame = m.gen_last = 0;
         return true;
     };
     for (int i = 0; i < kSlots; ++i) if (shared_->slots[i].state == kFree && claim(i, kFree)) return i;
@@ -319,8 +325,32 @@ void Producer::on_tag(std::uint64_t frame, Tex kind, ID3D12Resource* source, D3D
     push_event(shared_, kEvTag, frame, static_cast<std::uint64_t>(kind) | (static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(source)) << 8));
 }
 
+void Producer::release_generated_if_idle() {
+    const std::int64_t last = generated_qpc_.load();
+    if (!last || qpc_now() - last < shared_->qpc_frequency * 3) return;
+    for (int slot = 0; slot < kSlots; ++slot)
+        for (int i = 0; i < kMaxGenerated; ++i) {
+            auto& t = textures_[slot][kGen0 + i];
+            if (!t.resource) continue;
+            retired_.push_back({t.resource, t.handle, fence_value_ + 1, t.vk, t.d11});
+            const std::uint32_t generation = t.generation;  // (a new one gets a new name: the old may still be open)
+            t = Texture{};
+            t.generation = generation;
+            if (shared_->slots[slot].state == kWriting) shared_->slots[slot].tex[kGen0 + i].valid = 0;
+        }
+    generated_qpc_ = 0;
+}
+
 int Producer::present_slot() {
+    release_generated_if_idle();
     InterlockedIncrement(&shared_->presents_total);
+    // Frame generation's own presents (generated and real images, from its own thread): the frames are
+    // published where their images are generated (on_generated).
+    if (generation_active()) {
+        InterlockedExchange(&shared_->presents_without_frame, 0);
+        push_event(shared_, kEvPresent, pending_present_frame_, 0);
+        return -1;
+    }
     // Which frame is being presented: the PCL present-start marker when the game sends it,
     // otherwise the oldest frame still being written (frames present in submission order).
     int slot = -1;
@@ -373,13 +403,159 @@ void Producer::finish_present(ID3D12CommandQueue* queue, std::uint64_t token) {
     const std::uint64_t frame = token - 1;
     const int slot = slot_for_frame(frame, false);
     if (slot < 0) return;
+    publish(slot, queue);
+}
+
+void Producer::publish(int slot, ID3D12CommandQueue* queue) {
     if (FAILED(queue->Signal(fence_.Get(), ++fence_value_))) return;
     auto& m = shared_->slots[slot];
     m.fence_value = fence_value_;
     InterlockedExchange(&m.state, kReady);
-    InterlockedExchange64(&shared_->latest_ready_frame, static_cast<LONG64>(frame));
+    InterlockedExchange64(&shared_->latest_ready_frame, static_cast<LONG64>(m.frame_id));
     ++shared_->hooks.frames_published;
-    push_event(shared_, kEvPublished, frame, fence_value_);
+    push_event(shared_, kEvPublished, m.frame_id, fence_value_);
+}
+
+// Frame generation: the command list a frame's generated images are copied on is the game's frame generation's
+// own, submitted wherever it submits it. At its end the frame's marker value is written into a small buffer the
+// CPU reads (WriteBufferImmediate, written once everything before it on the list has completed); a thread
+// watches for it and publishes the frame (the shared fence signalled from the CPU) as soon as it is there.
+bool Producer::ensure_markers() {
+    if (markers_) return true;
+    D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd{}; bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = kMarkers * 4; bd.Height = 1;
+    bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&markers_)))) return false;
+    void* mapped = nullptr;
+    if (FAILED(markers_->Map(0, nullptr, &mapped))) { markers_.Reset(); return false; }
+    marker_values_ = static_cast<volatile std::uint32_t*>(mapped);
+    for (int i = 0; i < kMarkers; ++i) marker_values_[i] = 0;
+    if (!marker_thread_started_) {
+        marker_thread_started_ = true;
+        std::thread([this]() {
+            HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+            while (!stop_markers_.load()) {
+                if (pending_count_.load() == 0) { WaitForSingleObject(marker_event_, 100); continue; }
+                poll_markers();
+                LARGE_INTEGER due; due.QuadPart = -2500;  // 0.25 ms
+                if (timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(timer, 5);
+                else Sleep(1);
+            }
+            if (timer) CloseHandle(timer);
+        }).detach();
+    }
+    return true;
+}
+
+void Producer::poll_markers() {
+    if (pending_count_.load() == 0) return;
+    std::lock_guard lock(mutex_);
+    if (!fence_ || !marker_values_) return;
+    for (auto it = pending_publish_.begin(); it != pending_publish_.end();) {
+        if (marker_values_[it->marker % kMarkers] == it->marker) {
+            const int slot = slot_for_frame(it->frame, false);
+            if (slot >= 0 && SUCCEEDED(fence_->Signal(++fence_value_))) {
+                auto& m = shared_->slots[slot];
+                m.fence_value = fence_value_;
+                InterlockedExchange(&m.state, kReady);
+                InterlockedExchange64(&shared_->latest_ready_frame, static_cast<LONG64>(m.frame_id));
+                ++shared_->hooks.frames_published;
+                push_event(shared_, kEvPublished, m.frame_id, fence_value_);
+            }
+            it = pending_publish_.erase(it);
+        } else if (qpc_now() - it->qpc > shared_->qpc_frequency / 4) {
+            push_event(shared_, kEvFrameGen, it->frame, 0x200);  // (diagnostics: never completed)
+            it = pending_publish_.erase(it);
+        } else ++it;
+    }
+    pending_count_ = static_cast<int>(pending_publish_.size());
+}
+
+void Producer::on_generated(std::uint64_t frame, std::uint32_t index, std::uint32_t per_frame, ID3D12Resource* image, D3D12_RESOURCE_STATES image_state,
+                            ID3D12Resource* real, D3D12_RESOURCE_STATES real_state, ID3D12GraphicsCommandList* list) {
+    std::lock_guard lock(mutex_);
+    // (diagnostics: why an image is not taken)
+    auto skip = [&](GenSkip reason) { push_event(shared_, kEvFrameGen, frame, 0x300 | (static_cast<std::uint64_t>(reason) << 16)); };
+    if (!shared_) return;
+    if (!generation_wanted()) return skip(kGenSkipNotWanted);
+    // The game is calling its frame generation and its images are wanted: the presents stop publishing frames
+    // right away - not only once an image has been taken. (FSR in Cyberpunk 2077 generates a frame's images
+    // after that frame's present: with the presents publishing, the frame was already gone each time, no
+    // image could ever be taken, and the presents never stopped.)
+    generated_qpc_ = qpc_now();
+    if (!ready() || !image || !list || !fence_ || !ensure_markers()) return skip(kGenSkipNotReady);
+    if (!frame || slot_for_frame(frame, false) < 0) {
+        // The frame whose present the game started last - or the next one: frame generation for a frame may
+        // also run just before the game's present marker for it (FSR), so when the frame the marker names has
+        // all its images already (or is published), these are the next frame's.
+        frame = pending_present_frame_;
+        const int named = slot_for_frame(frame, false);
+        if (named < 0 || (shared_->slots[named].gen_last && shared_->slots[named].gen_last >= shared_->slots[named].per_frame)) ++frame;
+    }
+    const int slot = slot_for_frame(frame, false);
+    if (slot < 0) return skip(kGenSkipNoSlot);
+    auto& m = shared_->slots[slot];
+    if (!m.camera.valid) return skip(kGenSkipNoCamera);
+    per_frame = std::max<std::uint32_t>(per_frame, 1);
+    if (!index) index = m.gen_last + 1;
+    if (index > per_frame || index <= m.gen_last) return skip(kGenSkipOrder);
+    m.per_frame = per_frame;
+    m.gen_last = index;
+    const bool last = index == per_frame;
+    // More than kMaxGenerated per frame (6x: 5): the first, the last and evenly in between (1, 3, 5).
+    bool wanted = per_frame <= static_cast<std::uint32_t>(kMaxGenerated);
+    constexpr std::uint32_t gaps = kMaxGenerated - 1;
+    for (std::uint32_t k = 0; k < static_cast<std::uint32_t>(kMaxGenerated) && !wanted; ++k)
+        wanted = index == 1 + (2 * k * (per_frame - 1) + gaps) / (2 * gaps);
+    const bool take = wanted && m.generated < static_cast<std::uint32_t>(kMaxGenerated);
+    if (!take && !(last && m.generated)) return skip(kGenSkipNotKept);
+    ComPtr<ID3D12GraphicsCommandList2> list2;
+    if (FAILED(list->QueryInterface(IID_PPV_ARGS(&list2)))) return skip(kGenSkipNoList2);
+    // (a compute list - frame generation on async compute - cannot leave graphics-only states)
+    const auto graphics_only = D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_DEPTH_WRITE |
+                               D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_INDEX_BUFFER;
+    const bool compute = list->GetType() == D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    if (compute && (image_state & graphics_only)) { ++shared_->hooks.copies_failed; return skip(kGenSkipComputeState); }
+    if (compute && (real_state & graphics_only)) real = nullptr;
+    collect_retired();
+    auto set_info = [&](Tex k) {
+        const auto& t = textures_[slot][k];
+        auto& info = m.tex[k];
+        info.width = static_cast<std::uint32_t>(t.desc.Width); info.height = t.desc.Height; info.format = t.desc.Format;
+        info.generation = t.generation; info.ext_x = info.ext_y = 0; info.ext_w = info.width; info.ext_h = info.height;
+        info.valid = 1;
+    };
+    if (take) {
+        const Tex kind = static_cast<Tex>(kGen0 + m.generated);
+        const auto desc = image->GetDesc();
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 || !ensure_texture(slot, kind, desc)) {
+            ++shared_->hooks.copies_failed; return skip(kGenSkipTexture);
+        }
+        copy_into(list, image, image_state, textures_[slot][kind].resource.Get());
+        set_info(kind);
+    }
+    if (take && m.generated == 0 && real) {
+        const auto rd = real->GetDesc();
+        if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && rd.SampleDesc.Count == 1 && ensure_texture(slot, kBackbuffer, rd)) {
+            copy_into(list, real, real_state, textures_[slot][kBackbuffer].resource.Get());
+            set_info(kBackbuffer);
+            m.qpc_present = qpc_now();
+        }
+    }
+    if (take) m.gen_index[m.generated++] = index;
+    generated_qpc_ = qpc_now();
+    // (diagnostics: 0x100 | image number << 16 | per frame << 24 | taken << 32)
+    push_event(shared_, kEvFrameGen, frame, 0x100 | (static_cast<std::uint64_t>(index) << 16) | (static_cast<std::uint64_t>(per_frame) << 24) |
+                                                (static_cast<std::uint64_t>(take) << 32));
+    if (last && m.generated && m.tex[kBackbuffer].valid) {
+        const std::uint32_t marker = ++marker_counter_ ? marker_counter_ : ++marker_counter_;  // (never 0: the buffer starts at 0)
+        D3D12_WRITEBUFFERIMMEDIATE_PARAMETER write{markers_->GetGPUVirtualAddress() + (marker % kMarkers) * 4, marker};
+        const D3D12_WRITEBUFFERIMMEDIATE_MODE mode = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
+        list2->WriteBufferImmediate(1, &write, &mode);
+        pending_publish_.push_back({frame, marker, qpc_now()});
+        pending_count_ = static_cast<int>(pending_publish_.size());
+        SetEvent(marker_event_);
+    }
 }
 
 bool Producer::attach_vulkan(reshade::api::device* device) {
