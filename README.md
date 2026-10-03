@@ -18,6 +18,10 @@ in games without one, from ReShade and the picture itself:
   is also used when a game's DLSS and FSR are switched off, and FrameWarp switches back by itself when
   they are switched on again.
 
+**Frame generation works with it**: with the game's DLSS Frame Generation or FSR 3.1 frame generation on,
+FrameWarp shows the generated images too, each moved to where the camera is now, so moving things get
+frame generation's smoothness while the camera keeps FrameWarp's low latency.
+
 Without the game's own camera data, FrameWarp works out the camera's movement from the motion
 vectors. It does the same when a game's camera data turns out not to match its motion vectors, which
 it checks by itself while the camera moves. It then draws the result in a click-through overlay above the game, with its own warp engine
@@ -28,8 +32,8 @@ it checks by itself while the camera moves. It then draws the result in a click-
 | Game | Notes |
 |---|---|
 | *Clair Obscur: Expedition 33* (Steam, DLSS) | Add the launch options `-slforcetagging -slviewextension` (see Install). The game provides HUD layers, so the HUD stays still; FrameWarp also holds the character while the camera turns around it. |
-| *Resident Evil Requiem* (Steam, DLSS or FSR) | **Requires [REFramework](https://github.com/praydog/REFramework)**: without it the game's DRM crashes with ReShade. The game doesn't provide HUD layers, so FrameWarp detects the HUD itself. With FSR, turn the camera for a second or two after loading while FrameWarp checks the field of view. |
-| *Cyberpunk 2077* (Steam, DLSS or FSR 3) | No launch options needed. The game doesn't provide HUD layers: FrameWarp detects the HUD and V's weapon itself. Semi-transparent HUD panels may still move slightly. The game's FSR 2.1 option is built into the game itself and can't be used. |
+| *Resident Evil Requiem* (Steam, DLSS or FSR) | **Requires [REFramework](https://github.com/praydog/REFramework)**: without it the game's DRM crashes with ReShade. The game doesn't provide HUD layers, so FrameWarp detects the HUD itself. With FSR, turn the camera for a second or two after loading while FrameWarp checks the field of view. DLSS Frame Generation (2x to 4x) and FSR 3.1 frame generation work with FrameWarp. |
+| *Cyberpunk 2077* (Steam, DLSS or FSR 3) | No launch options needed. The game doesn't provide HUD layers: FrameWarp detects the HUD and V's weapon itself. Semi-transparent HUD panels may still move slightly. The game's FSR 2.1 option is built into the game itself and can't be used. DLSS Frame Generation and FSR 3 frame generation work with FrameWarp; with frame generation on, the game provides a HUD-less picture and FrameWarp finds the HUD exactly from it. |
 | *DOOM Eternal* (Steam, Vulkan, DLSS) | Install ReShade for Vulkan (see Install). The game calls DLSS without Streamline, so FrameWarp works out the camera from DLSS's motion vectors; turn the camera for a few seconds after loading. FrameWarp finds the HUD and holds the weapon itself. If the ReShade menu hides behind the game, turn off *Present From Compute* in the game's advanced video settings. |
 | *Assassin's Creed Black Flag Resynced* (DLSS or FSR) | No launch options needed. The game's camera data doesn't match its picture: FrameWarp notices within the first seconds of camera movement on the first launch (the picture may warp wrongly until then), switches to working out the camera from the motion vectors, and remembers that for the game. Turn the camera for a few seconds after loading while it calibrates. |
 | *Returnal* (Steam, DLSS) | No launch options needed. The game calls DLSS without Streamline, so FrameWarp works out the camera from DLSS's motion vectors; turn the camera for a few seconds after loading while it calibrates. |
@@ -44,7 +48,8 @@ Other games may work but are untested.
   DOOM Eternal), or a DirectX 12 or 11 game **without** them (experimental). Without DLSS or FSR,
   ReShade has to be able to see the game's depth buffer, as for any depth effect (online games
   often block it). DirectX 11 games need Windows 10 version 1703 or later.
-* About 1 GB of free video memory at 4K for the presenter.
+* About 1 GB of free video memory at 4K for the presenter, a little more with frame generation. The XPAR
+  panel warns when video memory is nearly full.
 * A GPU for DirectX 12. FrameWarp is tested on NVIDIA GPUs; its own warp engine uses plain DirectX 12,
   so AMD and Intel GPUs should work too, but they are untested (reports welcome).
 * Windows 11 (tested; Windows 10 may work) with **Hardware-accelerated GPU scheduling** turned on (Settings > System >
@@ -95,14 +100,14 @@ Advanced: both files also accept a game name or folder directly (`install.bat "E
 
 ## Use
 
-1. Run the game in **borderless** mode, with DLSS or FSR on if the game has them, and frame
-   generation off.
+1. Run the game in **borderless** mode, with DLSS or FSR on if the game has them. Frame generation can be
+   on (DLSS Frame Generation or FSR 3.1 frame generation) or off.
 2. Open the ReShade overlay (Home key) and go to **Add-ons > XPAR**. The presenter starts
    automatically with the game.
 
 | Setting | What it does |
 |---|---|
-| **Enable reprojection (N Hz)** | Turns reprojection on or off. N is your display's measured refresh rate. |
+| **Enable reprojection (N Hz)** | Turns reprojection on or off. N is the refresh rate of the display the game is on, from its current display mode. |
 | **Show original (A/B)** | Shows the game's own frames, for comparison. |
 | **Auto latency** | How far behind the newest game frame the displayed camera sits. **Auto** (default) uses 1/2 frame, or 1/4 frame in games without HUD layers, where a shorter warp keeps any undetected HUD steadier, and a whole frame in games without DLSS or FSR, where the camera worked out from the picture can't be carried ahead as well. You can also pick **1 frame** (smoothest), **1/2** or **1/4** (less latency, cleaner screen edges), or turn it **Off** to set the latency by hand. |
 | **Present lead (ms)** | How early each frame is rendered before the display refresh (default 6). Raise it if the output drops below your refresh rate. With the XPAR engine and a lead above 0, new game frames are taken in on their own GPU queue, so their processing never delays a refresh (about 50–100 MB more video memory at 4K). |
@@ -129,6 +134,11 @@ diagnostics) are for fine-tuning and troubleshooting.
 
 * Frame rates that swing a lot degrade the result, because the camera model assumes a steady frame
   cadence.
+* With frame generation, moving things are shown one game frame late, as frame generation always does
+  (the camera is not delayed). FSR 3.0 frame generation (the older FidelityFX SDK) and XeSS frame
+  generation aren't used: FrameWarp pauses while they are on. Beyond 4x, three generated images per game
+  frame are shown, spread evenly. Frame generation and FrameWarp together need GPU headroom: at 3x and 4x
+  the output may not reach the refresh rate on mid-range GPUs.
 * During fast turns, the screen edges show fill for areas the game never rendered.
 * Without the game's own camera data (DLSS called directly, most FSR games, games whose camera data
   doesn't match their motion vectors), the camera is estimated from motion vectors, which is a little
@@ -149,6 +159,9 @@ diagnostics) are for fine-tuning and troubleshooting.
 If the XPAR panel says frame generation is on and XPAR is paused, the game uses a kind of frame
 generation XPAR can't take (or NVIDIA Latewarp is the warp engine): turn frame generation off in the
 game's graphics settings, or switch to DLSS or FSR 3.1 frame generation; FrameWarp resumes by itself.
+
+If the XPAR panel warns that video memory is nearly full, the game and FrameWarp don't both fit and both
+stutter: lower the game's texture quality or resolution, or turn off frame generation.
 
 Logs are written to `FrameWarp\logs\`, next to the game's ReShade. The previous run is kept in
 `logs\previous\`. For a problem report, tick **Record detailed diagnostics** in the XPAR panel,

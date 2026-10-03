@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.9.0
 
 * **The game's own frame generation works with XPAR** (DLSS Frame Generation, including multi frame
   generation, and FSR 3.1 frame generation; XPAR engine). It used to be one or the other: with frame
@@ -52,6 +52,8 @@
   the area beside it from a moving object, the piece it copies moves with that object.
   Replaces an earlier attempt that never reached a release (it left halos around moving objects).
   Shadows (drawn on the ground, with the ground's motion vectors) stay where the game drew them.
+* The add-on stays intact until the game's process is gone: the game's DLSS or FSR may still call into it while
+  the game shuts down (FSR reconfigures its swapchain then).
 * The motion analysis behind the masks, the motion vector scale and the camera check runs for every game
   frame with depth and motion vectors, whatever **Keep still** is set to. Since 1.4.0 it already did, by
   accident of a missing pair of braces; the camera check (1.6.1) relies on it, so it is now on purpose.
