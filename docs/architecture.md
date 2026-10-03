@@ -89,7 +89,8 @@
   one when that one has its images already (FSR may generate just before the present marker). At the end of
   the copies a `WriteBufferImmediate` marker goes into a small readback buffer; a thread publishes the frame
   (the shared fence signalled from the CPU) once the GPU has written it, whichever queue frame generation
-  submits on. Meanwhile presents publish nothing.
+  submits on. Meanwhile presents publish nothing. With more than three images per frame (6x multi frame
+  generation), three are taken, spread evenly (`SlotMeta::gen_index`: the game's numbers of the ones taken).
 
 ## Presenter
 
@@ -140,7 +141,9 @@
   its up-down angle back towards level, and carries the last frame's motion over up to two frames it
   cannot explain. These frames are timed by `FrameClock`, and *Auto* latency shows them a whole game
   frame back.
-* **Frame generation.** When the game presents 1.6 or more images per rendered frame for a second and no
+* **Frame generation.** When the game presents 1.6 or more images per rendered frame, or calls its frame
+  generation (DLSS-G evaluations, FSR frame-generation dispatches, `Shared::generation_calls`) at least every
+  other frame, for a second, and no
   generated images come with its frames (a kind XPAR does not take, or NVIDIA Latewarp as the engine), the
   presenter steps aside (overlay hidden, no GPU work) until the ratio is back near 1. With them, each image
   gets its depth once per game frame (this frame's, moved back along the motion vectors to the image's

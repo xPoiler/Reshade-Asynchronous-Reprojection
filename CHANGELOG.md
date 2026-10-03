@@ -11,7 +11,22 @@
   itself when frame generation is on in the game. With NVIDIA Latewarp as the warp engine, XPAR still
   pauses while frame generation is on. The ReShade menu, drawn after these images are taken, shows the
   game's own picture while it is open. FSR 3.0 frame generation (the older FidelityFX SDK) is not taken
-  yet: XPAR pauses as before.
+  yet: XPAR pauses as before. Multi frame generation up to 6x: with more than three generated images per
+  frame, three are shown, spread evenly (6x: the first, third and fifth).
+* Frame generation is also recognised from the game's calls to it (DLSS Frame Generation, FSR 3.x frame
+  generation), not only from the number of images presented. Where ReShade sees only the rendered frames'
+  presents (on some setups), 1.7.0 missed frame generation entirely: it neither paused nor
+  warned, and ran on top of it.
+* **No GPU work while nothing moves.** A refresh that would show the same picture as the one before (the camera
+  has not moved since the game's frame) is no longer drawn or presented at all; the window keeps showing the
+  picture. Since 1.5.0 such a refresh still went through the warp shader once per refresh (taking frames in on
+  their own GPU queue made the plain copy a full-screen pass), so a still camera cost as much as a moving one.
+* The XPAR panel warns when video memory is nearly full (Windows leaves FrameWarp too little of it): the game
+  and FrameWarp then don't both fit and both stutter. Frame generation needs extra video memory too; once it
+  has been off for a few seconds, the textures FrameWarp took its images into are released.
+* Games that send their HUD-less picture without a UI layer (Cyberpunk 2077 with frame generation on): the HUD
+  is found exactly, every frame, where the picture differs from the HUD-less one, which is also the scenery
+  behind the HUD (it fell back to the learned HUD map, which let parts of the HUD move with the camera).
 * With FSR in a game that sends its depth and motion vectors through Streamline, the HUD is found from
   the upscaler's output too, as with DLSS (it fell back to the learned HUD map).
 * **Move objects at the display rate even without frame generation** (new option, experimental, off by

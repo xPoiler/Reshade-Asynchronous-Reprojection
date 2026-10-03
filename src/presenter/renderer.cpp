@@ -543,6 +543,37 @@ RWStructuredBuffer<float4> sample_u : register(u0);
 
 [numthreads(8, 8, 1)] void cs_clear_score(uint3 id : SV_DispatchThreadID) { if (all(id.xy < out_size)) hud_score_u[id.xy] = 0; }
 
+// HUD from the game's HUD-less picture (a game that sends it without a UI layer - Cyberpunk 2077 with frame
+// generation): exactly where the frame differs from it, every frame (the mask widens it by a pixel). Unless
+// they differ over half the screen or more: then the HUD-less picture is not this frame's picture without its
+// HUD (an effect drawn after the HUD, another frame) and gives no HUD. The picture itself is the scene behind
+// the HUD (the fill, alpha 1 on HUD pixels).
+Texture2D<float4> hh_frame_t : register(t0);
+Texture2D<float4> hh_hudless_t : register(t1);
+RWByteAddressBuffer hh_counts_u : register(u1);  // [8] pixels that differ
+bool hh_differs(uint2 p) {
+    const float3 a = hh_frame_t.Load(int3(p, 0)).rgb, b = hh_hudless_t.Load(int3(p, 0)).rgb;
+    const float3 d = abs(a - b);
+    return max(d.r, max(d.g, d.b)) > max(threshold, 0.02 * max(max(b.r, b.g), b.b));
+}
+[numthreads(1, 1, 1)] void cs_hudless_clear(uint3 id : SV_DispatchThreadID) { hh_counts_u.Store(8, 0); }
+[numthreads(8, 8, 1)] void cs_hudless_count(uint3 id : SV_DispatchThreadID) {
+    uint ignored;
+    if (all(id.xy < out_size) && hh_differs(id.xy)) hh_counts_u.InterlockedAdd(8, 1, ignored);
+}
+[numthreads(8, 8, 1)] void cs_hudless_score(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= out_size)) return;
+    const bool matches = hh_counts_u.Load(8) * 2 < out_size.x * out_size.y;
+    hud_score_u[id.xy] = matches && hh_differs(id.xy) ? 1.0 : 0.0;
+}
+Texture2D<float4> hh_fill_from_t : register(t0);  // (the fill pass: the HUD-less picture, then the score)
+Texture2D<float> hh_score_t : register(t1);
+RWTexture2D<float4> hh_fill_u : register(u0);
+[numthreads(8, 8, 1)] void cs_hudless_fill(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= out_size)) return;
+    hh_fill_u[id.xy] = float4(hh_fill_from_t.Load(int3(id.xy, 0)).rgb, hh_score_t.Load(int3(id.xy, 0)) > 0.5 ? 1.0 : 0.0);
+}
+
 // Camera-attached pixels widened by 1 render px, at render resolution (R8), for the mask below.
 Texture2D<float4> att_object_t : register(t0);
 RWTexture2D<unorm float> att_u : register(u0);
@@ -1575,7 +1606,8 @@ constexpr UINT kXSrvCount = 6;
 constexpr UINT kX = kPrivSrv + kPrivMax;  // first table
 constexpr UINT kXAnalyzeSrv = kX + 0, kXAnalyzeUav = kX + 6, kXReduceUav = kX + 8;  // (kX + 10 .. 31: free)
 constexpr UINT kXHudSrv = kX + 32, kXHudUav = kX + 38, kXMaskSrv = kX + 40, kXMaskUav = kX + 46, kXSampleSrv = kX + 48, kXSampleUav = kX + 54;
-constexpr UINT kXTintSrv = kX + 56, kXTintUav = kX + 62, kXSceneSrv = kX + 64, kXSceneUav = kX + 70;  // (kX + 72 .. 79: free)
+constexpr UINT kXTintSrv = kX + 56, kXTintUav = kX + 62, kXSceneSrv = kX + 64, kXSceneUav = kX + 70;
+constexpr UINT kXHudlessSrv = kX + 72, kXHudlessUav = kX + 78;
 constexpr UINT kXAttSrv = kX + 80, kXAttUav = kX + 86, kXWorldUav = kX + 88, kXFillSrv = kX + 90, kXFillUav = kX + 96;
 constexpr UINT kXMemSrv = kX + 98, kXMemUav = kX + 104, kXRowsSrv = kX + 106, kXRowsUav = kX + 112;
 constexpr UINT kXRampSrv = kX + 114, kXRampUav = kX + 120;
@@ -1829,7 +1861,8 @@ bool Renderer::create_pipelines(std::string& error) {
     }
     struct { const char* entry; ComPtr<ID3D12PipelineState>* pso; } xs[] = {
         {"cs_analyze", &cs_analyze_}, {"cs_reduce", &cs_reduce_},
-        {"cs_hud", &cs_hud_}, {"cs_hud_world", &cs_hud_world_}, {"cs_mask", &cs_mask_}, {"cs_clear_score", &cs_clear_score_},
+        {"cs_hud", &cs_hud_}, {"cs_hud_world", &cs_hud_world_}, {"cs_mask", &cs_mask_}, {"cs_clear_score", &cs_clear_score_}, {"cs_hudless_clear", &cs_hudless_clear_}, {"cs_hudless_count", &cs_hudless_count_},
+        {"cs_hudless_score", &cs_hudless_score_}, {"cs_hudless_fill", &cs_hudless_fill_},
         {"cs_hud_count", &cs_hud_count_}, {"cs_clear_counts", &cs_clear_counts_}, {"cs_sample", &cs_sample_}, {"cs_tint", &cs_tint_},
         {"cs_scene_clear", &cs_scene_clear_}, {"cs_scene_accum", &cs_scene_accum_}, {"cs_scene_finish", &cs_scene_finish_},
         {"cs_scene_tiles", &cs_scene_tiles_}, {"cs_scene_hud", &cs_scene_hud_}, {"cs_scene_fill", &cs_scene_fill_}, {"cs_scene_grey", &cs_scene_grey_},
@@ -2009,6 +2042,24 @@ static void projection_terms(const float view_to_clip[16], float out[4]) {
     out[0] = view_to_clip[10]; out[1] = view_to_clip[14]; out[2] = view_to_clip[11]; out[3] = view_to_clip[15];
 }
 
+bool Renderer::has_generated() const {
+    for (int id = kPGen0; id <= kPGenZ2; ++id)
+        if (private_[id].texture || front_[id].texture) return true;
+    for (int slot = 0; slot < kSlots; ++slot)
+        for (int i = 0; i < kMaxGenerated; ++i) if (shared_[slot][kGen0 + i].resource) return true;
+    return false;
+}
+
+void Renderer::release_generated() {
+    wait_idle();
+    for (int id = kPGen0; id <= kPGenZ2; ++id) private_[id] = Private{}, front_[id] = Private{};
+    for (int slot = 0; slot < kSlots; ++slot)
+        for (int i = 0; i < kMaxGenerated; ++i) {
+            shared_[slot][kGen0 + i] = SharedTex{};
+            srv_resource_[kSrcSrv + slot * kTexCount + kGen0 + i] = nullptr;
+        }
+}
+
 void Renderer::prepare_generated(const IngestedSource& src, float scale_x, float scale_y, bool scale_valid, bool use_ui_tags) {
     if (!src.generated || !src.has_depth || !private_[kPDepth].texture) return;
     const auto& depth = private_[kPDepth];
@@ -2026,7 +2077,7 @@ void Renderer::prepare_generated(const IngestedSource& src, float scale_x, float
     for (int i = 0; i < src.generated; ++i) {
         const auto z = static_cast<PrivateId>(kPGenZ0 + i), colour = static_cast<PrivateId>(kPGen0 + i);
         if (!ensure_private(z, w, h, DXGI_FORMAT_R32_FLOAT) || !private_[colour].texture) return;
-        c.alpha = float(i + 1) / float(src.per_frame + 1);
+        c.alpha = float(src.gen_index[i]) / float(src.per_frame + 1);
         const UINT d = kWGenDepth0 + i;
         for (UINT k = 0; k < kWSrvCount; ++k) set_x_srv(kWSrv(d) + k, kPDepth);
         if (motion) set_x_srv(kWSrv(d) + 1, kPMotion);
@@ -2181,8 +2232,44 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
         x_dispatch(cs_clear_score_.Get(), &z, kXHudSrv, kXHudUav, (ow + 7) / 8, (oh + 7) / 8);
     }
     fill_ready_ = false;
-    const bool from_scene = hud && src.has_scene && private_[kPScene].texture && private_[kPScene].width == ow && private_[kPScene].height == oh;
-    if (from_scene) {
+    // A HUD-less picture without a UI layer: the HUD is where the frame differs from it (see cs_hudless_*).
+    const bool from_hudless = hud && src.has_hudless && !src.has_ui && private_[kPHudless].texture && private_[kPHudless].width == ow &&
+                              private_[kPHudless].height == oh;
+    const bool from_scene = hud && !from_hudless && src.has_scene && private_[kPScene].texture && private_[kPScene].width == ow &&
+                            private_[kPScene].height == oh;
+    if (from_hudless) {
+        hud_from_scene_ = true;  // (the learned map starts over when this stops)
+        XConstants h = c;
+        h.threshold = 3.0f / 255.0f;
+        set_x_srv(kXHudlessSrv + 0, kPBackbuffer);
+        set_x_srv(kXHudlessSrv + 1, kPHudless);
+        for (UINT i = 2; i < kXSrvCount; ++i) set_x_srv(kXHudlessSrv + i, kPHudless);
+        set_x_uav(kXHudlessUav + 0, kPHudScore);
+        D3D12_UNORDERED_ACCESS_VIEW_DESC raw{};
+        raw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; raw.Format = DXGI_FORMAT_R32_TYPELESS;
+        raw.Buffer.NumElements = 4; raw.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        device_->CreateUnorderedAccessView(hud_counts_.Get(), nullptr, &raw, cpu(kXHudlessUav + 1));
+        transition(private_[kPHudScore], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        D3D12_RESOURCE_BARRIER counts{}; counts.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; counts.UAV.pResource = hud_counts_.Get();
+        x_dispatch(cs_hudless_clear_.Get(), &h, kXHudlessSrv, kXHudlessUav, 1, 1);
+        list_->ResourceBarrier(1, &counts);
+        x_dispatch(cs_hudless_count_.Get(), &h, kXHudlessSrv, kXHudlessUav, (ow + 7) / 8, (oh + 7) / 8);
+        list_->ResourceBarrier(1, &counts);
+        x_dispatch(cs_hudless_score_.Get(), &h, kXHudlessSrv, kXHudlessUav, (ow + 7) / 8, (oh + 7) / 8);
+        transition(private_[kPHudScore], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        const DXGI_FORMAT fill_format = private_[kPBackbuffer].format == DXGI_FORMAT_R11G11B10_FLOAT ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                                                                                                    : private_[kPBackbuffer].format;
+        if (fill && ensure_private(kPFill, ow, oh, fill_format)) {
+            set_x_srv(kXFillSrv + 0, kPHudless);
+            set_x_srv(kXFillSrv + 1, kPHudScore);
+            for (UINT i = 2; i < kXSrvCount; ++i) set_x_srv(kXFillSrv + i, kPHudless);
+            set_x_uav(kXFillUav + 0, kPFill); set_x_uav(kXFillUav + 1, kPFill);
+            transition(private_[kPFill], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            x_dispatch(cs_hudless_fill_.Get(), &h, kXFillSrv, kXFillUav, (ow + 7) / 8, (oh + 7) / 8);
+            transition(private_[kPFill], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            fill_ready_ = true;
+        }
+    } else if (from_scene) {
         hud_from_scene_ = true;
         detect_hud_from_scene(c, fill);
     } else if (hud_from_scene_) {
@@ -2226,7 +2313,7 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
             transition(private_[kPWorld], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         }
     }
-    if (hud && previous && !from_scene) {
+    if (hud && previous && !from_scene && !from_hudless) {
         set_x_srv(kXHudSrv + 0, kPBackbuffer);
         set_x_srv(kXHudSrv + 1, kPPrevious);
         set_x_srv(kXHudSrv + 2, kPDepth);
@@ -2840,8 +2927,11 @@ ID3D12GraphicsCommandList* Renderer::begin(int context) {
         fences_[context]->SetEventOnCompletion(frame_values_[frame_index_], fence_event_);
         WaitForSingleObject(fence_event_, 1000);
     }
-    // GPU time of the frame that last used this allocator.
-    if (readback_ && frame_values_[frame_index_]) {
+    // GPU time of the frame that last used this allocator (a skipped refresh has none).
+    const bool skipped = skipped_slot_[frame_index_];
+    skipped_slot_[frame_index_] = false;
+    if (skipped) ++usage_.skipped;
+    if (readback_ && frame_values_[frame_index_] && !skipped) {
         std::uint64_t* ts = nullptr;
         D3D12_RANGE range{frame_index_ * 16, frame_index_ * 16 + 16};
         if (SUCCEEDED(readback_->Map(0, &range, reinterpret_cast<void**>(&ts)))) {
@@ -3177,9 +3267,10 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
         if (!sources[kGen0 + i] || g.width != bb.width || g.height != bb.height ||
             !ensure_private(id, bb.width, bb.height, colour_format(static_cast<DXGI_FORMAT>(g.format)))) break;
         convert(sources[kGen0 + i], static_cast<DXGI_FORMAT>(g.format), slot, kGen0 + i, id, bb.width, bb.height);
+        out.gen_index[i] = int(m.gen_index[i]) >= 1 && m.gen_index[i] <= m.per_frame ? int(m.gen_index[i]) : i + 1;
         out.generated = i + 1;
     }
-    if (out.generated) out.per_frame = std::max<int>(int(m.per_frame), out.generated);
+    if (out.generated) out.per_frame = std::max<int>(int(m.per_frame), out.gen_index[out.generated - 1]);
     ingested_ = true;
     last_had_hudless_ = out.has_hudless;
     mark_stage();
@@ -3222,6 +3313,13 @@ void Renderer::submit_work(bool continuation) {
     signal();
     intake_slot_[frame_index_] = true;
     continuation_slot_[frame_index_] = continuation;
+}
+
+void Renderer::skip_frame() {
+    intake_slot_[frame_index_] = false;
+    skipped_slot_[frame_index_] = true;
+    execute();
+    signal();
 }
 
 void Renderer::finish_frame(bool warped, int marker) {

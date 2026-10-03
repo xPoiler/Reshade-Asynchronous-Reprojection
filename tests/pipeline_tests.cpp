@@ -442,6 +442,20 @@ int main(int argc, char** argv) {
         std::printf("GPU per presented frame: %.3f ms plain, %.3f ms with moving objects (+%.3f)\n", plain, with_objects, with_objects - plain);
         renderer.set_object_history(false);
 
+        // A refresh with nothing new to show is submitted without drawing or presenting (skip_frame): counted as
+        // such, and the frame slots go on as usual.
+        {
+            renderer.wait_idle();
+            renderer.take_gpu_usage();
+            for (int i = 0; i < 3; ++i) { renderer.begin_frame(); renderer.skip_frame(); }
+            for (int i = 0; i < 3; ++i) { renderer.begin_frame(); renderer.finish_frame(false, 0); }
+            renderer.wait_idle();
+            const Renderer::GpuUsage u = renderer.take_gpu_usage();
+            std::printf("refreshes with nothing new: %u skipped, %u drawn\n", u.skipped, u.warps);
+            EXPECT(u.skipped == 3, "skipped refreshes are counted, not timed as drawn ones (%u)", u.skipped);
+            EXPECT(renderer.device()->GetDeviceRemovedReason() == S_OK, "the device is fine after skipped refreshes");
+        }
+
         // Frame generation (the game's own, used automatically): its generated image is taken where it is
         // generated, the frame is published once the GPU has run that command list, taken in with the image, and
         // the warp shows the image (its bar 30 px left of the frame's) or the frame.
@@ -464,7 +478,7 @@ int main(int argc, char** argv) {
             producer.on_tag(fid, kDepth, depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 0, 0, DW, DH, list.Get());
             producer.on_tag(fid, kMotion, motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 0, 0, DW, DH, list.Get());
             producer.on_present_marker(fid);
-            producer.on_generated(0, 1, gen.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, backbuffer.Get(), D3D12_RESOURCE_STATE_PRESENT, list.Get());
+            producer.on_generated(0, 1, 1, gen.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, backbuffer.Get(), D3D12_RESOURCE_STATE_PRESENT, list.Get());
             list->Close();
             queue->ExecuteCommandLists(1, lists);  // (the frame is published once the GPU has run the list)
             queue->Signal(gf.Get(), ++gfv);
@@ -499,6 +513,36 @@ int main(int argc, char** argv) {
                 EXPECT(std::fabs(gen_x - (still_x - 30)) < 2.0, "frame generation: the warp shows the generated image");
                 EXPECT(std::fabs(real_x - still_x) < 2.0, "frame generation: and the frame itself after it");
             }
+            // 6x (5 images per frame, one call each): 3 are kept, evenly (1, 3, 5), and the frame is published
+            // after the last one only.
+            {
+                const std::uint64_t fid6 = 152;
+                alloc->Reset();
+                list->Reset(alloc.Get(), nullptr);
+                producer.on_constants(fid6, still);
+                producer.on_tag(fid6, kDepth, depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 0, 0, DW, DH, list.Get());
+                producer.on_tag(fid6, kMotion, motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 0, 0, DW, DH, list.Get());
+                producer.on_present_marker(fid6);
+                for (std::uint32_t n = 1; n <= 5; ++n)
+                    producer.on_generated(0, n, 5, gen.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, backbuffer.Get(), D3D12_RESOURCE_STATE_PRESENT,
+                                          list.Get());
+                list->Close();
+                queue->ExecuteCommandLists(1, lists);
+                queue->Signal(gf.Get(), ++gfv);
+                while (gf->GetCompletedValue() < gfv) Sleep(1);
+                int s6 = -1;
+                for (int wait = 0; wait < 200 && s6 < 0; ++wait, Sleep(1))
+                    for (int i = 0; i < kSlots; ++i) if (sh.slots[i].state == kReady && sh.slots[i].frame_id == fid6) s6 = i;
+                const auto& m6 = sh.slots[s6 >= 0 ? s6 : 0];
+                std::printf("frame generation 6x: %u of %u images kept (%u, %u, %u)\n", m6.generated, m6.per_frame, m6.gen_index[0], m6.gen_index[1],
+                            m6.gen_index[2]);
+                EXPECT(s6 >= 0 && m6.generated == 3 && m6.per_frame == 5 && m6.gen_index[0] == 1 && m6.gen_index[1] == 3 && m6.gen_index[2] == 5,
+                       "frame generation 6x: images 1, 3 and 5 kept, the frame published after the last");
+            }
+            // Frame generation off: its textures go (video memory), and come back with it.
+            EXPECT(renderer.has_generated(), "frame generation: its textures are held while it is on");
+            renderer.release_generated();
+            EXPECT(!renderer.has_generated(), "frame generation: its textures released once it is off");
             Sleep(600);  // (frame generation's images stop: presents publish frames again)
             EXPECT(!producer.generation_active(), "frame generation: over half a second after its last image");
         }
@@ -533,6 +577,9 @@ int main(int argc, char** argv) {
         // The upscaler's output (games calling DLSS directly): the same scene before tone mapping (here
         // frame = sqrt(scene / 4) per channel) and without the HUD.
         bool with_scene = false;
+        // The game's HUD-less picture without a UI layer (Cyberpunk 2077 with frame generation): the frame as it
+        // is just before the HUD patch is drawn.
+        bool with_hudless = false;
         // A bright yellow-white surface the tone mapping washes out towards white (as filmic tone mappers
         // do): scene (4, 4, 0.25) -> per channel (1, 1, 0.5), washed 80% towards its grey 0.964.
         bool washed_patch = false;
@@ -554,7 +601,8 @@ int main(int argc, char** argv) {
         bool hud_fill = false;      // own warp: fill behind the HUD from the upscaler's output
         bool near_rule = true;      // attached: near-camera pixels moving against the camera model count
         const D3D12_RECT washed_rect{LONG(W * 3 / 4), LONG(H * 5 / 8), LONG(W * 3 / 4) + 64, LONG(H * 5 / 8) + 64};
-        ComPtr<ID3D12Resource> scene_tex;
+        ComPtr<ID3D12Resource> scene_tex, hudless_tex;
+        game->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &cd, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&hudless_tex));
         ComPtr<ID3D12DescriptorHeap> scene_rtv;
         {
             D3D12_RESOURCE_DESC sd = cd; sd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -599,6 +647,18 @@ int main(int argc, char** argv) {
                     const D3D12_RECT stripe{x, neon_y0, x + 2, neon_y1};
                     list->ClearRenderTargetView(rtv, magenta, 1, &stripe);
                 }
+            }
+            if (with_hudless) {
+                D3D12_RESOURCE_BARRIER hb[2]{};
+                hb[0].Type = hb[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                hb[0].Transition = {backbuffer.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                    D3D12_RESOURCE_STATE_COPY_SOURCE};
+                hb[1].Transition = {hudless_tex.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                    D3D12_RESOURCE_STATE_COPY_DEST};
+                list->ResourceBarrier(2, hb);
+                list->CopyResource(hudless_tex.Get(), backbuffer.Get());
+                for (auto& x : hb) std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+                list->ResourceBarrier(2, hb);
             }
             if (hud_patch) {  // textured like real HUD (text, icons): 2 px stripes
                 // 0: opaque green; 1: teal, shifted 2 px (the content changed); 2: green at 50% over the scene
@@ -661,6 +721,7 @@ int main(int argc, char** argv) {
             producer.on_tag(fid, kDepth, depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 0, 0, DW, DH, list.Get());
             producer.on_tag(fid, kMotion, motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 0, 0, DW, DH, list.Get());
             if (with_scene) producer.on_tag(fid, kScene, scene_tex.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 0, 0, W, H, list.Get());
+            if (with_hudless) producer.on_tag(fid, kHudless, hudless_tex.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 0, 0, W, H, list.Get());
             const auto t = producer.begin_present(backbuffer.Get(), list.Get());
             list->Close();
             queue->ExecuteCommandLists(1, lists);
@@ -1272,6 +1333,24 @@ int main(int argc, char** argv) {
         }
         with_scene = false;
         scene_offset = -1;
+        // (L) HUD from the game's HUD-less picture without a UI layer: exactly where the frame differs from it,
+        // in the very first frame (nothing learned), through FrameWarp's own engine; the scene around it warps.
+        {
+            renderer.reset_hud_detection();
+            with_hudless = true;
+            IngestedSource hl_src = ingest_frame(publish(980, 0.1f, 0, false, true), true, false);
+            with_hudless = false;
+            own_engine = true;
+            show(hl_src, 0);
+            const double hp_x0 = green_x(), hb_x0 = peak(px, w, h, true, 1);
+            show(hl_src, yaw);
+            const double hp_x1 = green_x(), hb_x1 = peak(px, w, h, true, 1);
+            own_engine = false;
+            std::printf("HUD from the HUD-less picture: patch x %.1f -> %.1f, bar x %.0f -> %.0f\n", hp_x0, hp_x1, hb_x0, hb_x1);
+            EXPECT(hl_src.has_hudless && !hl_src.has_ui, "the HUD-less picture is ingested without a UI layer");
+            EXPECT(hp_x0 > 0 && std::fabs(hp_x1 - hp_x0) < 2.0, "HUD found from the HUD-less picture in one frame (%.1f -> %.1f)", hp_x0, hp_x1);
+            EXPECT(std::fabs(hb_x1 - hb_x0) > 20.0, "the scene next to that HUD still warps (%.0f -> %.0f)", hb_x0, hb_x1);
+        }
         std::printf("HUD from the upscaler's output: patch x %.1f -> %.1f, bar x %.0f -> %.0f; semi-transparent patch x %.1f -> %.1f; "
                     "no HUD: bar x %.0f -> %.0f\n", sp_x0, sp_x1, sb_x0, sb_x1, sg_x0, sg_x1, sc_x0, sc_x1);
         EXPECT(scene_src.has_scene, "the upscaler's output is ingested");

@@ -22,6 +22,11 @@ using namespace reshade::api;
 
 namespace {
 std::unique_ptr<fw::Producer> g_producer;
+// The producer outlives everything at exit: the hooks stay in the game's code, and the game's DLSS / FSR
+// may still call them while it shuts down (FSR reconfigures its swapchain then) - writing into a producer
+// already destroyed crashed the game on exit. (Destroyed first, this lets the producer go without deleting it;
+// the process is ending anyway.)
+struct KeepProducerAtExit { ~KeepProducerAtExit() { (void)g_producer.release(); } } g_keep_producer_at_exit;
 HMODULE g_module = nullptr;
 bool g_presenter_launched = false;
 HANDLE g_presenter_process = nullptr;
@@ -315,6 +320,14 @@ void draw_overlay(effect_runtime*) {
                            "DLSS and FSR 3.1 frame generation with its own warp engine; otherwise turn frame generation off.");
     else if (alive && p.frame_generation == 2)
         ImGui::TextDisabled("Frame generation: XPAR shows the game's generated images, each moved to the current camera");
+    if (alive && p.vram_pressure) {
+        if (p.vram_adapter_mb > 0 && p.vram_adapter_size_mb > 0)
+            ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "Video memory is nearly full (%.1f of %.1f GB in use): the game and XPAR don't both fit,",
+                               p.vram_adapter_mb / 1024.0f, p.vram_adapter_size_mb / 1024.0f);
+        else
+            ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "Video memory is nearly full: the game and XPAR don't both fit,");
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "which makes both stutter. Lower the game's texture quality or resolution, or turn off frame generation.");
+    }
     if (fw::reshade_feed_status()[0]) ImGui::TextWrapped("%s", fw::reshade_feed_status());
     if (sh.game_camera_check == 1)
         ImGui::TextDisabled("Camera: estimated from the motion vectors (the game's own camera data does not match them)");

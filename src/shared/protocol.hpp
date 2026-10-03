@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 41;
+constexpr std::uint32_t kVersion = 43;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -59,10 +59,13 @@ struct SlotMeta {
     std::int64_t qpc_present;    // when the game presented frame_id
     Camera camera;
     TexInfo tex[kTexCount];
-    // Frame generation: images generated between the previous frame and this one (kGen0..), of `per_frame`
-    // per frame (2x: 1, 4x: 3); image i shows the moment (i + 1) / (per_frame + 1) of the way from the previous
-    // frame to this one. 0: none (no frame generation, or not taken for this frame).
-    std::uint32_t generated, per_frame;
+    // Frame generation: images generated between the previous frame and this one, `per_frame` of them per frame
+    // (2x: 1, 4x: 3, 6x: 5), of which `generated` are taken (kGen0.., at most kMaxGenerated, spread evenly).
+    // Taken image i is the game's image number gen_index[i] (1 .. per_frame), showing the moment
+    // gen_index[i] / (per_frame + 1) of the way from the previous frame to this one. gen_last: the highest
+    // image number seen so far (all seen: gen_last == per_frame). 0: none (no frame generation).
+    std::uint32_t generated, per_frame, gen_last;
+    std::uint32_t gen_index[kMaxGenerated];
 };
 
 // Settings are written by the add-on UI and read by the presenter.
@@ -118,6 +121,11 @@ struct PresenterStatus {
     float mv_fit_quality;          // R^2 of the fit on the latest frames
     float moving_fraction;         // share of pixels flagged as moving objects
     std::uint32_t latewarp;        // NVIDIA Latewarp: 0 not known yet, 1 not available (no DLL, or not an NVIDIA GPU), 2 ready
+    // Video memory nearly full (within the last 10 s): Windows left the presenter less than a quarter more than
+    // it uses, as when the game and XPAR together need more than the GPU has. MB: the adapter's total use (all
+    // processes, -1 unknown) and its size; the presenter's use and budget.
+    std::uint32_t vram_pressure;
+    float vram_adapter_mb, vram_adapter_size_mb, vram_own_mb, vram_budget_mb;
     char message[256];
 };
 
@@ -144,9 +152,23 @@ struct HookStats {
 // Frame generation (diagnostics): kEvFrameGen per call into it (extra: the source, see ffx_hooks.cpp /
 // ngx_hooks.cpp; FFX API calls carry the description type above the low byte), kEvImage per reshade_present
 // (frame: the effect runtime, extra: its back buffer), kEvSwapPresent per present ReShade sees (frame: the
-// swapchain, extra: its current back buffer).
+// swapchain, extra: its current back buffer). An image of the game's frame generation not taken: kEvFrameGen
+// with extra 0x300 | reason << 16 (kGenSkip...; frame: the frame it was for, 0 when not known yet).
 enum EventKind : std::uint32_t { kEvConstants = 1, kEvTag = 2, kEvSimStart = 3, kEvPresentMarker = 4, kEvPresent = 5, kEvPublished = 6,
                                  kEvFrameGen = 7, kEvImage = 8, kEvSwapPresent = 9 };
+enum GenSkip : std::uint32_t {
+    kGenSkipNotReady = 1,      // the add-on has no device, fence or marker buffer (or no image / list)
+    kGenSkipNotWanted = 2,     // reprojection off, or NVIDIA Latewarp as the warp engine
+    kGenSkipNoSlot = 3,        // no frame waiting for it (the frame named and the next one)
+    kGenSkipNoCamera = 4,      // the frame has no camera yet
+    kGenSkipOrder = 5,         // image number out of order or repeated
+    kGenSkipNotKept = 6,       // more images per frame than taken (6x)
+    kGenSkipNoList2 = 7,       // the command list cannot write the marker (no ID3D12GraphicsCommandList2)
+    kGenSkipComputeState = 8,  // a compute list, the image in a graphics-only state
+    kGenSkipTexture = 9,       // the shared texture could not be created
+    kGenSkipNoOutput = 10,     // the frame generation call had no image (hook side)
+    kGenSkipFailed = 11,       // the frame generation call failed (hook side)
+};
 struct TimelineEvent {
     std::int64_t qpc;
     std::uint32_t kind, tid;
@@ -207,6 +229,9 @@ struct Shared {
     // Totals since start: images the game presented and frames it rendered (distinct frames with camera
     // data). Frame generation presents two or more images per rendered frame.
     volatile LONG presents_total, frames_total;
+    // ...and calls the game made to its frame generation (DLSS FG evaluations, FSR frame generation
+    // dispatches): frame generation is on even where ReShade sees only the rendered frames' presents.
+    volatile LONG generation_calls;
     volatile LONG64 timeline_count;
     TimelineEvent timeline[kTimeline];
 };

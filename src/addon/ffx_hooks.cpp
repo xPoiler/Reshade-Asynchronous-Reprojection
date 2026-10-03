@@ -303,6 +303,8 @@ ffxReturnCode_t hk_configure(ffxContext* context, const ffxApiHeader* desc) {
 template <int I>
 std::int32_t hk_fg(void* a, void* b) {
     if (kFgEntries[I].source < 8) note_frame_generation(kFgEntries[I].source);
+    // (FSR 3.0's frame generation is not taken, but counts: XPAR steps aside while it is on)
+    if (kFgEntries[I].source == 3 && g_producer && g_producer->shared()) InterlockedIncrement(&g_producer->shared()->generation_calls);
     else if (t_depth == 0 && b) note_frame_generation(kFgEntries[I].source | (static_cast<const ffxApiHeader*>(b)->type << 8));
     ++t_depth;
     const std::int32_t result = reinterpret_cast<PassFn>(g_fg_hooks[I].original())(a, b);
@@ -331,13 +333,21 @@ ffxReturnCode_t hk_dispatch(ffxContext* context, const ffxApiHeader* desc) {
     --t_depth;
     if (up && result == 0) after_upscale(u, published);
     // Frame generation (FSR 3.1): its images, taken right after it recorded them (with the frame itself).
+    if (t_depth == 0 && desc && desc->type == kDispatchFrameGeneration && g_producer && g_producer->shared()) {
+        if (result == 0) InterlockedIncrement(&g_producer->shared()->generation_calls);
+        // (diagnostics: why its images are not taken)
+        const auto* fg = reinterpret_cast<const ffxDispatchDescFrameGeneration*>(desc);
+        const GenSkip reason = result != 0 ? kGenSkipFailed : !g_producer->generation_wanted() ? kGenSkipNotWanted
+                               : !fg->commandList || !fg->numGeneratedFrames || !fg->outputs[0].resource ? kGenSkipNoOutput : GenSkip(0);
+        if (reason) push_event(g_producer->shared(), kEvFrameGen, result, 0x300 | (std::uint64_t(reason) << 16));
+    }
     if (t_depth == 0 && result == 0 && desc && desc->type == kDispatchFrameGeneration && g_producer && g_producer->generation_wanted()) {
         const auto* fg = reinterpret_cast<const ffxDispatchDescFrameGeneration*>(desc);
         auto* list = static_cast<ID3D12GraphicsCommandList*>(fg->commandList);
         const std::uint32_t n = std::min<std::uint32_t>(fg->numGeneratedFrames, 4);
         for (std::uint32_t i = 0; i < n && list; ++i)
             if (fg->outputs[i].resource)
-                g_producer->on_generated(0, n, static_cast<ID3D12Resource*>(fg->outputs[i].resource), d3d12_state(fg->outputs[i].state),
+                g_producer->on_generated(0, i + 1, n, static_cast<ID3D12Resource*>(fg->outputs[i].resource), d3d12_state(fg->outputs[i].state),
                                          static_cast<ID3D12Resource*>(fg->presentColor.resource), d3d12_state(fg->presentColor.state), list);
     }
     return result;

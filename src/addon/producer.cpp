@@ -117,7 +117,7 @@ int Producer::slot_for_frame(std::uint64_t frame, bool create) {
         m.frame_id = frame; m.fence_value = 0; m.qpc_sim_start = 0; m.qpc_constants = 0; m.qpc_present = 0;
         m.camera.valid = 0;
         for (auto& t : m.tex) t.valid = 0;
-        m.generated = m.per_frame = 0;
+        m.generated = m.per_frame = m.gen_last = 0;
         return true;
     };
     for (int i = 0; i < kSlots; ++i) if (shared_->slots[i].state == kFree && claim(i, kFree)) return i;
@@ -325,7 +325,24 @@ void Producer::on_tag(std::uint64_t frame, Tex kind, ID3D12Resource* source, D3D
     push_event(shared_, kEvTag, frame, static_cast<std::uint64_t>(kind) | (static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(source)) << 8));
 }
 
+void Producer::release_generated_if_idle() {
+    const std::int64_t last = generated_qpc_.load();
+    if (!last || qpc_now() - last < shared_->qpc_frequency * 3) return;
+    for (int slot = 0; slot < kSlots; ++slot)
+        for (int i = 0; i < kMaxGenerated; ++i) {
+            auto& t = textures_[slot][kGen0 + i];
+            if (!t.resource) continue;
+            retired_.push_back({t.resource, t.handle, fence_value_ + 1, t.vk, t.d11});
+            const std::uint32_t generation = t.generation;  // (a new one gets a new name: the old may still be open)
+            t = Texture{};
+            t.generation = generation;
+            if (shared_->slots[slot].state == kWriting) shared_->slots[slot].tex[kGen0 + i].valid = 0;
+        }
+    generated_qpc_ = 0;
+}
+
 int Producer::present_slot() {
+    release_generated_if_idle();
     InterlockedIncrement(&shared_->presents_total);
     // Frame generation's own presents (generated and real images, from its own thread): the frames are
     // published where their images are generated (on_generated).
@@ -454,37 +471,53 @@ void Producer::poll_markers() {
     pending_count_ = static_cast<int>(pending_publish_.size());
 }
 
-void Producer::on_generated(std::uint64_t frame, std::uint32_t per_frame, ID3D12Resource* image, D3D12_RESOURCE_STATES image_state,
+void Producer::on_generated(std::uint64_t frame, std::uint32_t index, std::uint32_t per_frame, ID3D12Resource* image, D3D12_RESOURCE_STATES image_state,
                             ID3D12Resource* real, D3D12_RESOURCE_STATES real_state, ID3D12GraphicsCommandList* list) {
     std::lock_guard lock(mutex_);
-    if (!ready() || !image || !list || !fence_ || !generation_wanted() || !ensure_markers()) return;
+    // (diagnostics: why an image is not taken)
+    auto skip = [&](GenSkip reason) { push_event(shared_, kEvFrameGen, frame, 0x300 | (static_cast<std::uint64_t>(reason) << 16)); };
+    if (!shared_) return;
+    if (!generation_wanted()) return skip(kGenSkipNotWanted);
+    // The game is calling its frame generation and its images are wanted: the presents stop publishing frames
+    // right away - not only once an image has been taken. (FSR in Cyberpunk 2077 generates a frame's images
+    // after that frame's present: with the presents publishing, the frame was already gone each time, no
+    // image could ever be taken, and the presents never stopped.)
+    generated_qpc_ = qpc_now();
+    if (!ready() || !image || !list || !fence_ || !ensure_markers()) return skip(kGenSkipNotReady);
     if (!frame || slot_for_frame(frame, false) < 0) {
         // The frame whose present the game started last - or the next one: frame generation for a frame may
         // also run just before the game's present marker for it (FSR), so when the frame the marker names has
         // all its images already (or is published), these are the next frame's.
         frame = pending_present_frame_;
         const int named = slot_for_frame(frame, false);
-        if (named < 0 || (shared_->slots[named].generated && shared_->slots[named].generated >= shared_->slots[named].per_frame)) ++frame;
+        if (named < 0 || (shared_->slots[named].gen_last && shared_->slots[named].gen_last >= shared_->slots[named].per_frame)) ++frame;
     }
     const int slot = slot_for_frame(frame, false);
-    if (slot < 0) return;
+    if (slot < 0) return skip(kGenSkipNoSlot);
     auto& m = shared_->slots[slot];
-    if (m.generated >= static_cast<std::uint32_t>(kMaxGenerated) || !m.camera.valid) return;
+    if (!m.camera.valid) return skip(kGenSkipNoCamera);
+    per_frame = std::max<std::uint32_t>(per_frame, 1);
+    if (!index) index = m.gen_last + 1;
+    if (index > per_frame || index <= m.gen_last) return skip(kGenSkipOrder);
+    m.per_frame = per_frame;
+    m.gen_last = index;
+    const bool last = index == per_frame;
+    // More than kMaxGenerated per frame (6x: 5): the first, the last and evenly in between (1, 3, 5).
+    bool wanted = per_frame <= static_cast<std::uint32_t>(kMaxGenerated);
+    constexpr std::uint32_t gaps = kMaxGenerated - 1;
+    for (std::uint32_t k = 0; k < static_cast<std::uint32_t>(kMaxGenerated) && !wanted; ++k)
+        wanted = index == 1 + (2 * k * (per_frame - 1) + gaps) / (2 * gaps);
+    const bool take = wanted && m.generated < static_cast<std::uint32_t>(kMaxGenerated);
+    if (!take && !(last && m.generated)) return skip(kGenSkipNotKept);
     ComPtr<ID3D12GraphicsCommandList2> list2;
-    if (FAILED(list->QueryInterface(IID_PPV_ARGS(&list2)))) return;
+    if (FAILED(list->QueryInterface(IID_PPV_ARGS(&list2)))) return skip(kGenSkipNoList2);
     // (a compute list - frame generation on async compute - cannot leave graphics-only states)
     const auto graphics_only = D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_DEPTH_WRITE |
                                D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_INDEX_BUFFER;
     const bool compute = list->GetType() == D3D12_COMMAND_LIST_TYPE_COMPUTE;
-    if (compute && (image_state & graphics_only)) { ++shared_->hooks.copies_failed; return; }
+    if (compute && (image_state & graphics_only)) { ++shared_->hooks.copies_failed; return skip(kGenSkipComputeState); }
     if (compute && (real_state & graphics_only)) real = nullptr;
     collect_retired();
-    const Tex kind = static_cast<Tex>(kGen0 + m.generated);
-    const auto desc = image->GetDesc();
-    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 || !ensure_texture(slot, kind, desc)) {
-        ++shared_->hooks.copies_failed; return;
-    }
-    copy_into(list, image, image_state, textures_[slot][kind].resource.Get());
     auto set_info = [&](Tex k) {
         const auto& t = textures_[slot][k];
         auto& info = m.tex[k];
@@ -492,8 +525,16 @@ void Producer::on_generated(std::uint64_t frame, std::uint32_t per_frame, ID3D12
         info.generation = t.generation; info.ext_x = info.ext_y = 0; info.ext_w = info.width; info.ext_h = info.height;
         info.valid = 1;
     };
-    set_info(kind);
-    if (m.generated == 0 && real) {
+    if (take) {
+        const Tex kind = static_cast<Tex>(kGen0 + m.generated);
+        const auto desc = image->GetDesc();
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 || !ensure_texture(slot, kind, desc)) {
+            ++shared_->hooks.copies_failed; return skip(kGenSkipTexture);
+        }
+        copy_into(list, image, image_state, textures_[slot][kind].resource.Get());
+        set_info(kind);
+    }
+    if (take && m.generated == 0 && real) {
         const auto rd = real->GetDesc();
         if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && rd.SampleDesc.Count == 1 && ensure_texture(slot, kBackbuffer, rd)) {
             copy_into(list, real, real_state, textures_[slot][kBackbuffer].resource.Get());
@@ -501,12 +542,12 @@ void Producer::on_generated(std::uint64_t frame, std::uint32_t per_frame, ID3D12
             m.qpc_present = qpc_now();
         }
     }
-    m.per_frame = std::clamp<std::uint32_t>(per_frame, 1, kMaxGenerated);
-    ++m.generated;
+    if (take) m.gen_index[m.generated++] = index;
     generated_qpc_ = qpc_now();
-    // (diagnostics: 0x100 | images taken so far << 16 | per frame << 24)
-    push_event(shared_, kEvFrameGen, frame, 0x100 | (static_cast<std::uint64_t>(m.generated) << 16) | (static_cast<std::uint64_t>(m.per_frame) << 24));
-    if (m.generated >= m.per_frame && m.tex[kBackbuffer].valid) {
+    // (diagnostics: 0x100 | image number << 16 | per frame << 24 | taken << 32)
+    push_event(shared_, kEvFrameGen, frame, 0x100 | (static_cast<std::uint64_t>(index) << 16) | (static_cast<std::uint64_t>(per_frame) << 24) |
+                                                (static_cast<std::uint64_t>(take) << 32));
+    if (last && m.generated && m.tex[kBackbuffer].valid) {
         const std::uint32_t marker = ++marker_counter_ ? marker_counter_ : ++marker_counter_;  // (never 0: the buffer starts at 0)
         D3D12_WRITEBUFFERIMMEDIATE_PARAMETER write{markers_->GetGPUVirtualAddress() + (marker % kMarkers) * 4, marker};
         const D3D12_WRITEBUFFERIMMEDIATE_MODE mode = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;

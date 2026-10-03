@@ -88,20 +88,21 @@ public:
 
     void set_message(const char* text);
 
-    // Frame generation (the game's DLSS / FSR frame generation, with "Moving objects at the display rate"
-    // on): one image it generated between the previous frame and `frame`, in order, copied right where it is
-    // generated (recorded on `list`, after the generation); `real` is the frame's own picture (taken with the
-    // first image). `frame` 0 or unknown: the frame whose present the game started last. Once the frame has
-    // `per_frame` images, it is published as soon as the GPU has run `list` that far (wherever it is submitted).
-    void on_generated(std::uint64_t frame, std::uint32_t per_frame, ID3D12Resource* image, D3D12_RESOURCE_STATES image_state,
+    // Frame generation (the game's DLSS / FSR frame generation): image number `index` (1 .. per_frame, 0: the
+    // next one) of the `per_frame` it generates between the previous frame and `frame`, copied right where it is
+    // generated (recorded on `list`, after the generation) - at most kMaxGenerated of them per frame, spread
+    // evenly; `real` is the frame's own picture (taken with the first). `frame` 0 or unknown: the frame whose
+    // present the game started last. Once its last image is seen, the frame is published as soon as the GPU
+    // has run `list` that far (wherever it is submitted).
+    void on_generated(std::uint64_t frame, std::uint32_t index, std::uint32_t per_frame, ID3D12Resource* image, D3D12_RESOURCE_STATES image_state,
                       ID3D12Resource* real, D3D12_RESOURCE_STATES real_state, ID3D12GraphicsCommandList* list);
     // The game's frame generation is used (its images taken) with XPAR's own warp engine, the one that shows
     // them; with NVIDIA Latewarp the presenter steps aside while frame generation is on.
     bool generation_wanted() const {
         return shared_ && shared_->settings.enabled && (shared_->settings.warp_engine == 1 || shared_->presenter.latewarp != 2);
     }
-    // Images taken from the game's frame generation within the last half second: frames are published from
-    // there, and the presents (generated and real images in frame generation's own order) publish nothing.
+    // The game called its frame generation, its images wanted, within the last half second: frames are published
+    // from there, and the presents (generated and real images in frame generation's own order) publish nothing.
     bool generation_active() const {
         const std::int64_t last = generated_qpc_.load();
         return last && shared_ && qpc_now() - last < shared_->qpc_frequency / 2;
@@ -122,6 +123,7 @@ private:
     std::atomic<bool> stop_markers_{false};
     bool ensure_markers();
     void poll_markers();
+    void release_generated_if_idle();
     void publish(int slot, ID3D12CommandQueue* queue);  // signals the fence on `queue`, marks the slot ready
     std::atomic<std::uint64_t> highest_frame_{0}, rendering_frame_{0};
     std::atomic<std::int64_t> game_depth_qpc_{0};

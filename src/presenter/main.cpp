@@ -205,10 +205,14 @@ struct VramMonitor {
     PDH_HCOUNTER counter = nullptr;
     Microsoft::WRL::ComPtr<IDXGIAdapter3> adapter;
     wchar_t luid_tag[64]{};
-    double last_log = 0, logged_total = -1;
+    double last_log = 0, logged_total = -1, last_poll = 0;
+    // (the latest reading, every 2 s; pressure_until: the warning holds 10 s past the last tight reading)
+    double total_mb = -1, size_mb = 0, own_mb = 0, budget_mb = 0, pressure_until = -1;
     void init(const LUID& luid) {
         Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
         if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter));
+        DXGI_ADAPTER_DESC1 desc{};
+        if (adapter && SUCCEEDED(adapter->GetDesc1(&desc))) size_mb = double(desc.DedicatedVideoMemory) / 1048576.0;
         std::swprintf(luid_tag, 64, L"luid_0x%08lX_0x%08lX", static_cast<unsigned long>(luid.HighPart), luid.LowPart);
         if (PdhOpenQueryW(nullptr, 0, &query) == ERROR_SUCCESS &&
             PdhAddEnglishCounterW(query, L"\\GPU Adapter Memory(*)\\Dedicated Usage", 0, &counter) == ERROR_SUCCESS)
@@ -229,10 +233,19 @@ struct VramMonitor {
         return total / (1024.0 * 1024.0);
     }
     void poll(double now, const char* reason = nullptr) {
-        if (!reason && now - last_log < 2.0) return;
+        if (!reason && now - last_poll < 2.0) return;
+        last_poll = now;
         const double total = adapter_total_mb();
         DXGI_QUERY_VIDEO_MEMORY_INFO own{};
         if (adapter) adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &own);
+        total_mb = total; own_mb = own.CurrentUsage / 1048576.0; budget_mb = own.Budget / 1048576.0;
+        // Windows shrinks a process's budget when the GPU's memory runs out: less than a quarter of headroom
+        // left means the game and XPAR together no longer fit (they start to stutter and drop frames).
+        if (own.Budget && double(own.Budget) < double(own.CurrentUsage) * 1.25) {
+            if (pressure_until < now) logf("vram nearly full: presenter %.0f MB of a %.0f MB budget, adapter %.0f of %.0f MB in use", own_mb, budget_mb, total,
+                                           size_mb);
+            pressure_until = now + 10.0;
+        }
         if (!reason && std::abs(total - logged_total) < 100 && now - last_log < 30.0) return;
         logf("vram%s%s: adapter %.0f MB used (all processes) | presenter %.0f MB, budget %.0f MB", reason ? " at " : "", reason ? reason : "",
              total, own.CurrentUsage / 1048576.0, own.Budget / 1048576.0);
@@ -455,12 +468,20 @@ void render_thread() {
     std::uint64_t shown_frame = 0;   // the game frame the warp shows (with split queues: after the one taken in last)
     double shown_since = 0;          // ...since when (moving objects: their own clock)
     double last_generated = -1e9;    // when a frame last came with generated images
+    bool was_enabled = false;        // ("Enable reprojection", for the frame generation message)
+    double last_pause_log = 0;
+    // The picture presented last, when it was a frame shown as it is (0: anything else): the same again is
+    // not drawn (see skip_frame).
+    std::uint64_t as_is_frame = 0;
+    std::uint32_t as_is_w = 0, as_is_h = 0;
+    bool presented_last = true, paced_last = false;
+    double enabled_since = 0;
     bool generation_logged = false;
     CameraCheck camera_check;        // the game's own camera against its motion vectors
     int poor_estimate_windows = 0;   // ...and, once it was found unusable, whether the estimate does any better
     bool have_source_kind = false, source_was_estimated = false, source_motion_estimated = false;
     double last_mv_log = 0, last_usage_log = 0;
-    bool game_has_hud_layers = false, mask_logged = false, source_masked = false;
+    bool game_has_hud_layers = false, mask_logged = false, source_masked = false, hudless_hud_logged = false;
     CameraEstimator estimator;
     bool estimator_logged = false, fov_logged = false;
     bool fsr_logged = false;
@@ -479,14 +500,17 @@ void render_thread() {
     // Frame generation detection: presented images vs rendered frames per half-second window.
     bool frame_generation = false;
     int fg_votes = 0;
-    LONG fg_presents = 0, fg_frames = 0;
+    LONG fg_presents = 0, fg_frames = 0, fg_calls = 0;
     std::int64_t fg_window_start = 0;
     std::uint64_t waiting_frame = 0;  // newest game frame seen while waiting for a refresh, and since when
     std::int64_t waiting_since = 0;
     std::uint64_t intakes = 0;
 
     while (g_app.running) {
-        WaitForSingleObjectEx(renderer.waitable(), 100, FALSE);
+        // (the swapchain frees a buffer only after a present: after a refresh with nothing new to show, none
+        // to wait for - without pacing, a short sleep instead)
+        if (presented_last) WaitForSingleObjectEx(renderer.waitable(), 100, FALSE);
+        else if (!paced_last) sleep_until(qpc_now() + g_qpc_frequency / 1000);
         if (!g_app.running) break;
         const Settings settings = sh.settings;
         apply_gpu_priority(settings.gpu_priority);
@@ -760,6 +784,10 @@ void render_thread() {
                                  hs.frames, hs.learned, hs.learned ? 100.0 * hs.share_sum / hs.learned : 0.0, hs.too_little, hs.guarded);
                     }
                     if (!mask_logged) { logf("no-warp mask: %s%s", hud_mask ? "HUD (the game has no HUD layers)" : "", attached_mask ? (hud_mask ? " + character/weapon" : "character/weapon") : ""); mask_logged = true; }
+                    if (hud_mask && s.has_hudless && !s.has_ui && !hudless_hud_logged) {
+                        logf("HUD: found from the game's HUD-less picture (sent without a UI layer)");
+                        hudless_hud_logged = true;
+                    }
                 }
                 const double present_t = seconds(m.qpc_present);
                 if (last_source_present > 0) source_interval = present_t - last_source_present;
@@ -790,6 +818,7 @@ void render_thread() {
         // lead we allow one queued frame and wake `lead` ms before each composition instead, one frame
         // per refresh (a new target is always a later vblank than the previous one).
         const bool paced = settings.present_lead_ms > 0 && vblank.valid();
+        paced_last = paced;
         // Split queues with XPAR's own engine when paced (Latewarp and the unpaced path record everything on
         // the realtime queue). Switched only while no frame is being taken in.
         {
@@ -943,20 +972,21 @@ void render_thread() {
             } else ++it;
         }
 
-        // Frame generation (DLSS, FSR, XeSS - any kind) presents two or more images per rendered frame. It
-        // does the same job as FrameWarp and the two cannot be combined (generated images would be warped
-        // as if they were rendered ones): step aside and say so, and come back when it is turned off.
+        // Frame generation (DLSS, FSR, XeSS - any kind): two or more images presented per rendered frame, or the
+        // game calling its DLSS / FSR frame generation (where ReShade sees only the rendered frames' presents).
+        // Without its images coming with the frames, the two cannot be combined (generated images would be
+        // warped as if they were rendered ones): step aside and say so, and come back when it is turned off.
         if (qpc_now() - fg_window_start >= g_qpc_frequency / 2) {
-            const LONG presents = sh.presents_total, frames = sh.frames_total;
-            const LONG dp = presents - fg_presents, df = frames - fg_frames;
-            fg_presents = presents; fg_frames = frames; fg_window_start = qpc_now();
+            const LONG presents = sh.presents_total, frames = sh.frames_total, calls = sh.generation_calls;
+            const LONG dp = presents - fg_presents, df = frames - fg_frames, dc = calls - fg_calls;
+            fg_presents = presents; fg_frames = frames; fg_calls = calls; fg_window_start = qpc_now();
             if (df >= 5) {  // the game is rendering (menus and loading screens present without it)
-                const double ratio = double(dp) / double(df);
-                if (ratio >= 1.6) fg_votes = std::min(fg_votes + 1, 2);
-                else if (ratio <= 1.25) fg_votes = std::max(fg_votes - 1, -2);
+                const double ratio = double(dp) / double(df), called = double(dc) / double(df);
+                if (ratio >= 1.6 || called >= 0.5) fg_votes = std::min(fg_votes + 1, 2);
+                else if (ratio <= 1.25 && called < 0.1) fg_votes = std::max(fg_votes - 1, -2);
                 if (!frame_generation && fg_votes >= 2) {
                     frame_generation = true;
-                    logf("frame generation detected (%.1f presented images per rendered frame)%s", ratio,
+                    logf("frame generation detected (%.1f presented images, %.1f frame generation calls per rendered frame)%s", ratio, called,
                          own_engine_on() ? "" : ": stepping aside until it is off (XPAR's own warp engine uses it)");
                 } else if (frame_generation && fg_votes <= -2) {
                     frame_generation = false;
@@ -964,13 +994,36 @@ void render_thread() {
                 }
             }
         }
-        // With moving objects on, the game's frame generation is used instead (its images come with the frames).
+        // With XPAR's own engine, the game's frame generation is used (its images come with the frames).
         const bool aside = generation_aside();
-        sh.presenter.frame_generation = aside ? 1u : frame_generation ? 2u : 0u;
+        // (no message while reprojection is off - the add-on takes frame generation's images only while it is
+        // on - or for 2 s after it is turned back on, while they start coming again)
+        if (settings.enabled && !was_enabled) enabled_since = now_seconds();
+        was_enabled = settings.enabled != 0;
+        const bool settling = !settings.enabled || now_seconds() - enabled_since < 2.0;
+        sh.presenter.frame_generation = aside ? (settling ? 0u : 1u) : frame_generation ? 2u : 0u;
+        // Frame generation off for a while: the textures its images were taken into go (video memory).
+        if (renderer.has_generated() && !source.generated && !incoming.s.generated && now_seconds() - last_generated > 3.0) {
+            renderer.release_generated();
+            logf("frame generation: its textures released (no generated images for 3 s)");
+        }
         if (!g_app.visible || aside) {  // game not in front / disabled / frame generation: don't compete with it for the GPU
-            if (aside) { g_app.has_frames = false; record_timeline(sh, settings); }
+            if (aside) g_app.has_frames = false;
+            record_timeline(sh, settings);
+            // (while paused, what keeps it so - every 5 s)
+            if (now_seconds() - last_pause_log > 5.0) {
+                last_pause_log = now_seconds();
+                const auto latest = static_cast<std::uint64_t>(sh.latest_ready_frame);
+                int latest_generated = -1;
+                for (const auto& m : sh.slots) if (m.frame_id == latest && m.state != kFree) latest_generated = int(m.generated);
+                logf("paused: visible %d, stepped aside %d, reprojection %s, frame generation %d (last generated image %.1f s ago), newest frame %llu "
+                     "with %d generated images, ReShade menu %s", int(g_app.visible), int(aside), settings.enabled ? "on" : "off", int(frame_generation),
+                     now_seconds() - last_generated, static_cast<unsigned long long>(latest), latest_generated, sh.overlay_open ? "open" : "closed");
+            }
             source_frame = sh.latest_ready_frame;
             pacing_paused = true;
+            as_is_frame = 0;  // (the window may have been hidden: drawn again when it comes back)
+            presented_last = true;
             Sleep(10);
             continue;
         }
@@ -1021,11 +1074,13 @@ void render_thread() {
                 int generated = -1;
                 const double gen_interval = g_app.model.frame_interval();
                 if (own_engine_on() && source.generated > 0 && gen_interval > 0) {
+                    // (the image numbered for this part of the interval, or the nearest one taken: 6x keeps 3 of 5)
                     const int images = source.per_frame + 1;
-                    const int i = int(std::floor(std::max(0.0, now - shown_since) / gen_interval * images));
-                    if (i < source.generated) {
-                        generated = i;
-                        m = generated_to_target(source_camera.clip_to_prev_clip, 1.0 - double(i + 1) / images, m);
+                    const int wanted = int(std::floor(std::max(0.0, now - shown_since) / gen_interval * images)) + 1;
+                    if (wanted < images) {
+                        for (int i = 0; i < source.generated; ++i)
+                            if (generated < 0 || std::abs(source.gen_index[i] - wanted) < std::abs(source.gen_index[generated] - wanted)) generated = i;
+                        m = generated_to_target(source_camera.clip_to_prev_clip, 1.0 - double(source.gen_index[generated]) / images, m);
                     }
                 }
                 // Moving objects (option), on their own clock, one game frame behind (frame generation): when a
@@ -1062,7 +1117,16 @@ void render_thread() {
         // (the ReShade menu is drawn on what the game presents, after the generated images XPAR shows were taken:
         // with them, the game's own picture is shown while it is open)
         g_app.has_frames = source.valid && sh.presents_without_frame < 3 && !(sh.overlay_open && source.generated > 0 && own_engine_on());
-        renderer.finish_frame(warped && !unmoved, settings.overlay_debug ? (warped ? 1 : 2) : 0);
+        // The same picture as the one presented last - this frame shown as it is again (the camera has not
+        // moved, or nothing is warped), nothing drawn on it that changes: nothing to draw or present. With a still
+        // camera the GPU does nothing at all between game frames.
+        const bool as_is = !(warped && !unmoved) && !settings.overlay_debug && !settings.show_mask && g_app.has_frames;
+        const bool same_picture = as_is && shown_frame && as_is_frame == shown_frame && as_is_w == renderer.width() && as_is_h == renderer.height();
+        if (same_picture) renderer.skip_frame();
+        else renderer.finish_frame(warped && !unmoved, settings.overlay_debug ? (warped ? 1 : 2) : 0);
+        presented_last = !same_picture;
+        as_is_frame = as_is ? shown_frame : 0;
+        as_is_w = renderer.width(); as_is_h = renderer.height();
         // Ctrl+Shift+M marks "it looks bad now" in the log. Both keys (this and Ctrl+Shift+D below) only with
         // "Record detailed diagnostics" ticked: pressed by accident, a capture freezes the game for a second.
         const bool keys_on = settings.record_diagnostics != 0;
@@ -1161,7 +1225,7 @@ void render_thread() {
             // (the displayed camera too: position and forward, in the game's world)
             const auto& dc = applied.camera;
             wr(g_app.csv_outputs, "%lld,%llu,%d,%.6f,%.6f,%.4f,%.3f,%d,%lld,%lld,%lld,%u,%u,%u,%u,%lld,%ld,%lld,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f\n",
-                         qpc_now(), static_cast<unsigned long long>(source_frame), int(warped), applied.yaw, applied.pitch,
+                         qpc_now(), static_cast<unsigned long long>(source_frame), same_picture ? 2 : int(warped), applied.yaw, applied.pitch,
                          applied.horizon * 1000.0, renderer.last_gpu_ms(), mark, tm.submit, tm.gpu_start, tm.gpu_end, pstats.last_present_count,
                          pstats.present_count, pstats.present_refresh, pstats.sync_refresh, pstats.sync_qpc, static_cast<long>(pstats.hr), wake_qpc,
                          dc.pos.x, dc.pos.y, dc.pos.z, dc.fwd.x, dc.fwd.y, dc.fwd.z);
@@ -1213,6 +1277,9 @@ void render_thread() {
                 }
             }
             vram.poll(now, notes.empty() ? nullptr : "texture change");
+            sh.presenter.vram_pressure = vram.pressure_until >= now ? 1u : 0u;
+            sh.presenter.vram_adapter_mb = float(vram.total_mb); sh.presenter.vram_adapter_size_mb = float(vram.size_mb);
+            sh.presenter.vram_own_mb = float(vram.own_mb); sh.presenter.vram_budget_mb = float(vram.budget_mb);
         }
         if (now - stat_start >= 0.5) {
             const HRESULT removed = renderer.device_removed_reason();
@@ -1258,9 +1325,10 @@ void render_thread() {
                 if (span > 0 && (u.intakes || u.warps)) {
                     const double n = std::max<double>(1, u.split);
                     logf("presenter GPU: %.0f%% of the time | game frames %.1f/s, %.2f ms each (reaching the game's textures %.2f, depth+motion %.2f, "
-                         "colour copies %.2f, HUD/masks/motion %.2f) | refreshes %.1f/s, warp %.2f ms each",
+                         "colour copies %.2f, HUD/masks/motion %.2f) | refreshes %.1f/s drawn (%.2f ms each), %.1f/s with nothing new (not drawn)",
                          (u.intake_ms + u.warp_ms) / (span * 10.0), u.intakes / span, u.intakes ? u.intake_ms / u.intakes : 0.0,
-                         u.access_ms / n, u.depth_ms / n, u.colour_ms / n, u.rest_ms / n, u.warps / span, u.warps ? u.warp_ms / u.warps : 0.0);
+                         u.access_ms / n, u.depth_ms / n, u.colour_ms / n, u.rest_ms / n, u.warps / span, u.warps ? u.warp_ms / u.warps : 0.0,
+                         u.skipped / span);
                 }
             }
             {
