@@ -45,6 +45,11 @@ struct App {
     std::atomic<bool> visible{false};     // game window in front and reprojection enabled
     std::atomic<bool> has_frames{false};  // presenter has something valid to show
     std::atomic<std::uint32_t> client_w{0}, client_h{0};
+    // The refresh rate of the display the game is on, from its current mode (0: not known); read by the window
+    // thread (see follow_game_window), used by the render thread's vblank clock.
+    std::atomic<double> display_mode_hz{0.0};
+    HMONITOR display_monitor = nullptr;
+    double display_checked = 0;
     PoseModel model;
     std::filesystem::path base_dir, profile_path;
     std::filesystem::path data_dir;  // logs, calibration, captures: base_dir, or %LOCALAPPDATA%\FrameWarp\<game folder> when that is read-only
@@ -338,8 +343,22 @@ struct VblankClock {
     std::int64_t ref_qpc = 0;
     UINT ref_count = 0;
     double period = 0;  // QPC ticks per refresh
+    // The display's refresh rate from its current mode (set_display_hz): the period is that, exactly, and our
+    // presents only tell when the refreshes happen. (Measured from the presents alone, a first estimate taken
+    // from stale statistics could lock the period to a wrong rate until the next pause.)
+    double display_period = 0;
+    void set_display_hz(double hz) {
+        const double p = hz > 1.0 ? double(g_qpc_frequency) / hz : 0.0;
+        if (p > 0 && (display_period <= 0 || std::fabs(p / display_period - 1.0) > 1e-4)) period = p;
+        display_period = p;
+    }
     void update(const Renderer::PresentStats& st) {
         if (st.hr != S_OK || !st.sync_qpc || !st.sync_refresh) return;
+        if (display_period > 0) {
+            period = display_period;
+            ref_qpc = st.sync_qpc; ref_count = st.sync_refresh;  // (a real refresh time: the phase)
+            return;
+        }
         if (!ref_qpc || st.sync_refresh < ref_count) { ref_qpc = st.sync_qpc; ref_count = st.sync_refresh; return; }
         const UINT refreshes = st.sync_refresh - ref_count;
         if (refreshes >= 60) {  // measure over >= half a second, then move the reference forward
@@ -732,6 +751,7 @@ void render_thread() {
                 // (and the shelved object interpolation) the analysis gives the per-frame fit that locks the motion
                 // vector scale and checks the game's camera (camera_check.hpp), which every game needs. (It does
                 // nothing without depth or motion vectors.)
+                renderer.pass_stamp(Renderer::kPassStart);
                 renderer.analyze_motion(s, cam.clip_to_prev_clip, float(mv_scale.scale(0, s.depth_rect.w)),
                                         float(mv_scale.scale(1, s.depth_rect.h)), mv_scale.valid, cam.depth_inverted != 0,
                                         settings.near_camera_rule != 0, settings.turn_rule != 0, m.frame_id);
@@ -741,6 +761,7 @@ void render_thread() {
                 // (with the motion seen in the picture, for what the game's motion vectors miss: shadows, glare)
                 // Frame generation (the game's own): objects move in its generated images instead - made
                 // ready for the warp here.
+                renderer.pass_stamp(Renderer::kPassAnalyze);
                 if (own_engine_on() && s.generated > 0) {
                     renderer.prepare_generated(s, float(mv_scale.scale(0, s.depth_rect.w)), float(mv_scale.scale(1, s.depth_rect.h)), mv_scale.valid,
                                                settings.use_ui_tags != 0);
@@ -754,6 +775,7 @@ void render_thread() {
                     renderer.object_motion(s, cam.clip_to_prev_clip, cam.view_to_clip, float(mv_scale.scale(0, s.depth_rect.w)),
                                            float(mv_scale.scale(1, s.depth_rect.h)), attached_mask, picture);
                 }
+                renderer.pass_stamp(Renderer::kPassObjects);
                 if (mask) {
                     // HUD from the upscaler's output only when chosen (opt-in: its colour model cannot be
                     // proven for every game); otherwise the learned HUD map, which works everywhere.
@@ -768,6 +790,7 @@ void render_thread() {
                     if (settings.background_memory && (settings.warp_engine == 1 || !latewarp.ready())) {
                         renderer.update_memory(s, cam.clip_to_prev_clip, cam.depth_inverted != 0, m.frame_id == memory_frame + 1);
                         memory_frame = m.frame_id;
+                        renderer.pass_stamp(Renderer::kPassMemory);
                     }
                     if (++mask_builds >= 300) {
                         mask_builds = 0;
@@ -812,6 +835,7 @@ void render_thread() {
         // DWM composes shortly after each vblank; a frame that is not finished by then waits a
         // whole refresh. Render `lead` ms before the next vblank so the GPU has room even when the
         // game delays our work.
+        vblank.set_display_hz(g_app.display_mode_hz.load());
         vblank.update(renderer.present_stats());
         // DWM composes ~3 ms after each vblank and shows the result at the following vblank; with a
         // frame latency of 1 the swapchain only frees us at that display vblank, leaving ~2.5 ms. With a
@@ -1032,6 +1056,7 @@ void render_thread() {
             // stale. Start over exactly like switching the present lead off and on again.
             pacing_paused = false;
             vblank = VblankClock{};
+            vblank.set_display_hz(g_app.display_mode_hz.load());
             last_target_vblank = 0;
             renderer.set_frame_latency(1);
             logf("pacing re-synchronised after a pause");
@@ -1322,6 +1347,15 @@ void render_thread() {
                 const Renderer::GpuUsage u = renderer.take_gpu_usage();
                 const double span = last_usage_log > 0 ? now - last_usage_log : 0.0;
                 last_usage_log = now;
+                // (the HUD/masks/motion part of it, pass by pass)
+                const Renderer::PassTimes pt = renderer.take_pass_times();
+                if (pt.frames) {
+                    const double k = 1.0 / pt.frames;
+                    logf("game frame GPU by pass (ms, %u frames): motion analysis %.2f, moving objects / generated images %.2f, HUD %.2f, "
+                         "character/weapon + stretch %.2f, mask %.2f, background memory %.2f", pt.frames, pt.ms[Renderer::kPassAnalyze] * k,
+                         pt.ms[Renderer::kPassObjects] * k, pt.ms[Renderer::kPassHud] * k, pt.ms[Renderer::kPassCharacter] * k,
+                         pt.ms[Renderer::kPassMask] * k, pt.ms[Renderer::kPassMemory] * k);
+                }
                 if (span > 0 && (u.intakes || u.warps)) {
                     const double n = std::max<double>(1, u.split);
                     logf("presenter GPU: %.0f%% of the time | game frames %.1f/s, %.2f ms each (reaching the game's textures %.2f, depth+motion %.2f, "
@@ -1355,7 +1389,49 @@ void render_thread() {
     latewarp.shutdown();
 }
 
+// The refresh rate of the display a window is on, as its current mode has it (exact: 119.88 Hz is 120000/1001),
+// from the display configuration; the whole-hertz value of the display settings if that is not available.
+double display_refresh_hz(HMONITOR monitor) {
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof(mi);
+    if (!monitor || !GetMonitorInfoW(monitor, &mi)) return 0;
+    UINT32 path_count = 0, mode_count = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &path_count, &mode_count) == ERROR_SUCCESS) {
+        std::vector<DISPLAYCONFIG_PATH_INFO> paths(path_count);
+        std::vector<DISPLAYCONFIG_MODE_INFO> modes(mode_count);
+        if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &path_count, paths.data(), &mode_count, modes.data(), nullptr) == ERROR_SUCCESS) {
+            for (UINT32 i = 0; i < path_count; ++i) {
+                DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
+                source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+                source.header.size = sizeof(source);
+                source.header.adapterId = paths[i].sourceInfo.adapterId;
+                source.header.id = paths[i].sourceInfo.id;
+                if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS || wcscmp(source.viewGdiDeviceName, mi.szDevice) != 0) continue;
+                const auto& r = paths[i].targetInfo.refreshRate;
+                if (r.Numerator && r.Denominator) return double(r.Numerator) / double(r.Denominator);
+            }
+        }
+    }
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1) return double(dm.dmDisplayFrequency);
+    return 0;
+}
+
 void follow_game_window() {
+    // The display's refresh rate: read again when the game is on another display, and every second (a mode change).
+    {
+        const HMONITOR monitor = MonitorFromWindow(g_app.game, MONITOR_DEFAULTTONEAREST);
+        const double now = now_seconds();
+        if (monitor != g_app.display_monitor || now - g_app.display_checked >= 1.0) {
+            const double hz = display_refresh_hz(monitor);
+            const double before = g_app.display_mode_hz.load();
+            if (std::fabs(hz - before) > 1e-3) logf("display refresh rate: %.3f Hz (its current mode)%s", hz, hz > 0 ? "" : " - not known: measured from the presents");
+            g_app.display_mode_hz = hz;
+            g_app.display_monitor = monitor;
+            g_app.display_checked = now;
+        }
+    }
     HWND game = g_app.game;
     const bool alive = IsWindow(game) != FALSE;
     RECT rc{};

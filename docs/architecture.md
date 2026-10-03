@@ -183,7 +183,12 @@
   on a new game frame a throwaway `IsRenderedFrame=1` evaluation registers it, followed by the real
   evaluation with the predicted camera. View matrices are built relative to the source camera
   position for precision.
-* **Pacing.** A vblank clock is built from our swapchain's DXGI frame statistics. With present lead
+* **Pacing.** A vblank clock: its period is the refresh rate of the display the game is on, from the display's
+  current mode (`QueryDisplayConfig`, read by the window thread once a second and when the game moves to
+  another display); its phase comes from our swapchain's DXGI frame statistics (measured from them alone when
+  the mode cannot be read). A refresh that would show the same picture as the one presented last (the frame
+  as it is again: camera unmoved, nothing drawn over it that changes) is submitted without drawing or
+  presenting; the composition keeps showing the picture. With present lead
   > 0 (default 6 ms) the swapchain allows one queued frame and the render thread wakes `lead` ms
   before each DWM composition deadline (vblank + 2.5 ms), rendering one frame per refresh; the
   schedule resets whenever the overlay becomes visible again. Lead 0: frame latency 1, render when

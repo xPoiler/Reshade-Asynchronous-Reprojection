@@ -115,6 +115,12 @@ public:
         double intake_ms = 0, access_ms = 0, depth_ms = 0, colour_ms = 0, rest_ms = 0, warp_ms = 0;
     };
     GpuUsage take_gpu_usage() { const GpuUsage u = usage_; usage_ = {}; return u; }
+    // The work on each game frame after its textures are taken in, pass by pass (GPU timestamps): pass_stamp(p)
+    // marks the end of pass p (kPassStart its beginning); each pass's time is from the stamp before it.
+    enum IntakePass { kPassStart, kPassAnalyze, kPassObjects, kPassHud, kPassCharacter, kPassMask, kPassMemory, kPassKinds };
+    struct PassTimes { double ms[kPassKinds] = {}; std::uint32_t frames = 0; };
+    void pass_stamp(IntakePass pass);
+    PassTimes take_pass_times() { const PassTimes t = pass_times_; pass_times_ = {}; return t; }
     // Debug: tints the no-warp mask and the HUD score onto the warped output (call after Latewarp).
     void tint_mask();
     // FrameWarp's own warp engine (experimental): writes the warped output like Latewarp would.
@@ -232,7 +238,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     };
-    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKeys, kPObjMove, kPObjTiles, kPObjOutTiles, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevColour, kPPrevDepth, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPCount };
+    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKeys, kPObjMove, kPObjTiles, kPObjOutTiles, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevColour, kPPrevDepth, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPCount };
 
     bool create_pipelines(std::string& error);
     // The format a private copy of a game colour image is kept in: the game's own 4-byte format when it
@@ -347,6 +353,12 @@ private:
     int stages_marked_ = 0;
     bool stage_valid_[kRing] = {};
     GpuUsage usage_;
+    static constexpr int kPassStamps = 12;
+    ComPtr<ID3D12QueryHeap> pass_stamps_;
+    ComPtr<ID3D12Resource> pass_readback_;
+    std::uint8_t pass_ids_[kRing][kPassStamps] = {};
+    int pass_count_[kRing] = {};
+    PassTimes pass_times_;
     void mark_stage() {
         if (stage_stamps_ && stages_marked_ < 3) list_->EndQuery(stage_stamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * 3 + stages_marked_++);
     }

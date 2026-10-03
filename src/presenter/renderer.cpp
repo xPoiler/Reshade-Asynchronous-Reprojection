@@ -449,10 +449,19 @@ uint hud_classify(uint2 id, out float weight) {
     return 1;
 }
 [numthreads(1, 1, 1)] void cs_clear_counts(uint3 id : SV_DispatchThreadID) { hud_counts_u.Store2(0, uint2(0, 0)); }
+// The classification of each pixel, made once (cs_hud_count) for the passes after it: kind, weight.
+RWTexture2D<float2> hud_kind_u : register(u0);  // (cs_hud_count)
+Texture2D<float2> hud_kind_t : register(t5);     // (cs_hud, cs_hud_world)
+uint hud_kind_of(uint2 id, out float weight) {
+    const float2 kw = hud_kind_t.Load(int3(id, 0));
+    weight = kw.y;
+    return uint(kw.x);
+}
 [numthreads(8, 8, 1)] void cs_hud_count(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= out_size) || !(flags & 2)) return;
     float weight;
     const uint kind = hud_classify(id.xy, weight);
+    hud_kind_u[id.xy] = float2(float(kind), weight);
     uint ignored;
     if (kind == 1) hud_counts_u.InterlockedAdd(0, 1, ignored);
     else if (kind == 2) hud_counts_u.InterlockedAdd(4, 1, ignored);
@@ -460,7 +469,7 @@ uint hud_classify(uint2 id, out float weight) {
 [numthreads(8, 8, 1)] void cs_hud(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= out_size) || !(flags & 2)) return;
     float weight;
-    const uint kind = hud_classify(id.xy, weight);
+    const uint kind = hud_kind_of(id.xy, weight);
     if (kind == 3) { hud_score_u[id.xy] = 0; return; }
     if (kind == 2 || kind == 4) { hud_score_u[id.xy] = hud_score_u[id.xy] * 0.5; return; }
     if (kind != 1) return;
@@ -518,7 +527,7 @@ bool hud_follows_world(uint2 id) {
     const float moved = came.z > 0 ? length(came.xy - float2(id.xy)) : 0.0;
     persist = hud_found_t.Load(int3(id.xy, 0)) > 0.5 ? persist + moved : floor(persist * 0.5);
     float weight;
-    const uint kind = hud_classify(id.xy, weight);
+    const uint kind = hud_kind_of(id.xy, weight);
     if (kind == 1) {
         const uint evidence = hud_counts_u.Load(0), changed = hud_counts_u.Load(4);
         if (evidence + changed >= 256 && evidence <= 0.35 * (evidence + changed)) world = lerp(world, 0.0, weight);
@@ -635,17 +644,25 @@ bool mask_follows_world(int3 q) {
 }
 RWTexture2D<unorm float> mask_u : register(u0);
 RWTexture2D<unorm float> warp_mask_u : register(u1);
-[numthreads(8, 8, 1)] void cs_mask(uint3 id : SV_DispatchThreadID) {
+groupshared uint mask_hud_gs[10 * 10];  // the group's pixels and a 1 px border: HUD kept there (see cs_mask)
+[numthreads(8, 8, 1)] void cs_mask(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex, uint3 gid : SV_GroupID) {
+    // Whether the HUD is kept at each pixel of the group and its 1 px border, worked out once per pixel
+    // (positions clamped to the screen, as the 3x3 test below reads them).
+    if (flags & 4) {
+        for (uint k = gi; k < 100; k += 64) {
+            const int3 q = int3(clamp(int2(gid.xy * 8) + int2(k % 10, k / 10) - 1, int2(0, 0), int2(out_size) - 1), 0);
+            mask_hud_gs[k] = (mask_score_t.Load(q) > 0.6 && (!(flags & 64) || !mask_follows_world(q))) ? 1u : 0u;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
     if (any(id.xy >= out_size)) return;
     const float2 uv = (float2(id.xy) + 0.5) / float2(out_size);
     const int2 pr = int2(rect.xy) + int2(min(uint2(uv * float2(rect.zw)), rect.zw - 1));
     bool keep = false;
     if (flags & 4) {
-        [unroll] for (int y = -1; y <= 1; ++y)
-            [unroll] for (int x = -1; x <= 1; ++x) {
-                const int3 q = int3(clamp(int2(id.xy) + int2(x, y), int2(0, 0), int2(out_size) - 1), 0);
-                keep = keep || (mask_score_t.Load(q) > 0.6 && (!(flags & 64) || !mask_follows_world(q)));
-            }
+        const uint2 l = id.xy - gid.xy * 8;
+        [unroll] for (int y = 0; y <= 2; ++y)
+            [unroll] for (int x = 0; x <= 2; ++x) keep = keep || mask_hud_gs[(l.y + y) * 10 + l.x + x] != 0;
     }
     if (!keep && (flags & 8)) keep = mask_attached_t.Load(int3(pr, 0)) > 0.5;
     mask_u[id.xy] = keep ? 1.0 : 0.0;
@@ -1604,7 +1621,8 @@ constexpr UINT kPrivSrv = kPrivUav + kPrivMax;  // + private id
 // Compute pass tables (6 SRVs t0-t5, 2 UAVs u0-u1 each).
 constexpr UINT kXSrvCount = 6;
 constexpr UINT kX = kPrivSrv + kPrivMax;  // first table
-constexpr UINT kXAnalyzeSrv = kX + 0, kXAnalyzeUav = kX + 6, kXReduceUav = kX + 8;  // (kX + 10 .. 31: free)
+constexpr UINT kXAnalyzeSrv = kX + 0, kXAnalyzeUav = kX + 6, kXReduceUav = kX + 8;
+constexpr UINT kXKindUav = kX + 10, kXHudAfterSrv = kX + 12;  // (kX + 18 .. 31: free)
 constexpr UINT kXHudSrv = kX + 32, kXHudUav = kX + 38, kXMaskSrv = kX + 40, kXMaskUav = kX + 46, kXSampleSrv = kX + 48, kXSampleUav = kX + 54;
 constexpr UINT kXTintSrv = kX + 56, kXTintUav = kX + 62, kXSceneSrv = kX + 64, kXSceneUav = kX + 70;
 constexpr UINT kXHudlessSrv = kX + 72, kXHudlessUav = kX + 78;
@@ -1751,6 +1769,12 @@ bool Renderer::init(const LUID& adapter_luid, HWND window, std::uint32_t width, 
     queue_->GetClockCalibration(&calib_gpu_, &calib_cpu_);
     D3D12_QUERY_HEAP_DESC stq{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 3 * kRing, 0};
     device_->CreateQueryHeap(&stq, IID_PPV_ARGS(&stage_stamps_));
+    D3D12_QUERY_HEAP_DESC ptq{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, kPassStamps * kRing, 0};
+    device_->CreateQueryHeap(&ptq, IID_PPV_ARGS(&pass_stamps_));
+    {
+        D3D12_RESOURCE_DESC pd = bd; pd.Width = kPassStamps * kRing * 8;
+        device_->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &pd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&pass_readback_));
+    }
     bd.Width = 3 * kRing * 8;
     device_->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&stage_readback_));
     // GPU time of each scene-HUD pass (one set per frame in flight), for the log.
@@ -2212,6 +2236,7 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
     const UINT ow = private_[kPBackbuffer].width, oh = private_[kPBackbuffer].height;
     const bool new_score = !private_[kPHudScore].texture || private_[kPHudScore].width != ow || private_[kPHudScore].height != oh;
     if (!ensure_private(kPHudScore, ow, oh, DXGI_FORMAT_R32_FLOAT) || !ensure_private(kPMask, ow, oh, DXGI_FORMAT_R8_UNORM)) return nullptr;
+    if (hud && !ensure_private(kPHudKind, ow, oh, DXGI_FORMAT_R32G32_FLOAT)) return nullptr;
     XConstants c{};
     std::memcpy(c.clip_to_prev, clip_to_prev_clip, sizeof(c.clip_to_prev));
     const UINT w = private_[kPObject].width, h = private_[kPObject].height;
@@ -2290,6 +2315,9 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
             set_x_srv(kXHudSrv + 3, kPObject);
             set_x_srv(kXHudSrv + 4, kPHudScore);
             for (UINT i = 5; i < kXSrvCount; ++i) set_x_srv(kXHudSrv + i, kPDepth);
+            // (the pass after the count reads each pixel's classification at t5)
+            for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXHudAfterSrv + i, i == 0 ? kPBackbuffer : i == 1 ? kPPrevious : i == 2 ? kPDepth :
+                                                                                i == 3 ? kPObject : i == 4 ? kPHudScore : kPHudKind);
             transition(private_[kPHudScore], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             set_x_uav(kXWorldUav + 0, kPWorld);
             D3D12_UNORDERED_ACCESS_VIEW_DESC raw{};
@@ -2307,9 +2335,13 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
             D3D12_RESOURCE_BARRIER counts{}; counts.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; counts.UAV.pResource = hud_counts_.Get();
             x_dispatch(cs_clear_counts_.Get(), &c, kXHudSrv, kXWorldUav, 1, 1);
             list_->ResourceBarrier(1, &counts);
-            x_dispatch(cs_hud_count_.Get(), &c, kXHudSrv, kXWorldUav, (ow + 7) / 8, (oh + 7) / 8);
+            set_x_uav(kXKindUav + 0, kPHudKind);
+            device_->CreateUnorderedAccessView(hud_counts_.Get(), nullptr, &raw, cpu(kXKindUav + 1));
+            transition(private_[kPHudKind], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            x_dispatch(cs_hud_count_.Get(), &c, kXHudSrv, kXKindUav, (ow + 7) / 8, (oh + 7) / 8);
             list_->ResourceBarrier(1, &counts);
-            x_dispatch(cs_hud_world_.Get(), &c, kXHudSrv, kXWorldUav, (ow + 7) / 8, (oh + 7) / 8);
+            transition(private_[kPHudKind], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            x_dispatch(cs_hud_world_.Get(), &c, kXHudAfterSrv, kXWorldUav, (ow + 7) / 8, (oh + 7) / 8);
             transition(private_[kPWorld], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         }
     }
@@ -2319,6 +2351,9 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
         set_x_srv(kXHudSrv + 2, kPDepth);
         set_x_srv(kXHudSrv + 3, kPObject);
         for (UINT i = 4; i < kXSrvCount; ++i) set_x_srv(kXHudSrv + i, kPDepth);
+        // (the pass after the count reads each pixel's classification at t5)
+        for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXHudAfterSrv + i, i == 0 ? kPBackbuffer : i == 1 ? kPPrevious : i == 2 ? kPDepth :
+                                                                            i == 3 ? kPObject : i == 4 ? kPDepth : kPHudKind);
         set_x_uav(kXHudUav + 0, kPHudScore);
         D3D12_UNORDERED_ACCESS_VIEW_DESC raw{};
         raw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; raw.Format = DXGI_FORMAT_R32_TYPELESS;
@@ -2329,9 +2364,13 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
         D3D12_RESOURCE_BARRIER counts{}; counts.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; counts.UAV.pResource = hud_counts_.Get();
         x_dispatch(cs_clear_counts_.Get(), &c, kXHudSrv, kXHudUav, 1, 1);
         list_->ResourceBarrier(1, &counts);
-        x_dispatch(cs_hud_count_.Get(), &c, kXHudSrv, kXHudUav, (ow + 7) / 8, (oh + 7) / 8);
+        set_x_uav(kXKindUav + 0, kPHudKind);
+        device_->CreateUnorderedAccessView(hud_counts_.Get(), nullptr, &raw, cpu(kXKindUav + 1));
+        transition(private_[kPHudKind], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        x_dispatch(cs_hud_count_.Get(), &c, kXHudSrv, kXKindUav, (ow + 7) / 8, (oh + 7) / 8);
         list_->ResourceBarrier(1, &counts);
-        x_dispatch(cs_hud_.Get(), &c, kXHudSrv, kXHudUav, (ow + 7) / 8, (oh + 7) / 8);
+        transition(private_[kPHudKind], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        x_dispatch(cs_hud_.Get(), &c, kXHudAfterSrv, kXHudUav, (ow + 7) / 8, (oh + 7) / 8);
         // The counters go to the log (how often the whole-frame guard holds learning back).
         auto to_copy = transition_barrier(hud_counts_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         list_->ResourceBarrier(1, &to_copy);
@@ -2341,6 +2380,7 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
         hud_pending_[frame_index_] = true;
     }
     transition(private_[kPHudScore], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    pass_stamp(kPassHud);
     // Camera-attached pixels, widened once at render resolution (the mask reads one value per pixel).
     const bool keep_att = attached && keep_attached && ensure_private(kPAttached, w, h, DXGI_FORMAT_R8_UNORM);
     if (keep_att) {
@@ -2367,6 +2407,7 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
         x_dispatch(cs_ramp_.Get(), &a, kXRampSrv, kXRampUav, (c.rect[2] + 7) / 8, (c.rect[3] + 7) / 8);
         transition(private_[kPRamp], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
+    pass_stamp(kPassCharacter);
     if (!ensure_private(kPWarpMask, ow, oh, DXGI_FORMAT_R8_UNORM)) return nullptr;
     set_x_srv(kXMaskSrv + 0, kPHudScore);
     set_x_srv(kXMaskSrv + 1, keep_att ? kPAttached : kPHudScore);
@@ -2383,6 +2424,7 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
     transition(private_[kPWarpMask], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     mask_ready_ = true;
     built_mask_ = true;
+    pass_stamp(kPassMask);
     return private_[kPMask].texture.Get();
 }
 
@@ -2577,7 +2619,17 @@ void Renderer::tint_mask() {
     x_dispatch(cs_tint_.Get(), &c, kXTintSrv, kXTintUav, (ow + 7) / 8, (oh + 7) / 8);
 }
 
+void Renderer::pass_stamp(IntakePass pass) {
+    int& n = pass_count_[frame_index_];
+    if (!pass_stamps_ || !pass_readback_ || n >= kPassStamps) return;
+    list_->EndQuery(pass_stamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * kPassStamps + n);
+    pass_ids_[frame_index_][n++] = static_cast<std::uint8_t>(pass);
+}
+
 void Renderer::execute() {
+    if (const int n = pass_count_[frame_index_]; n > 0 && pass_stamps_)
+        list_->ResolveQueryData(pass_stamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * kPassStamps, n, pass_readback_.Get(),
+                                UINT64(frame_index_) * kPassStamps * 8);
     list_->Close();
     ID3D12CommandQueue* q = context_queue();
     std::uint64_t& game_wait = pending_game_waits_[context_];
@@ -2795,20 +2847,18 @@ bool Renderer::update_memory(const IngestedSource& src, const float clip_to_prev
 }
 
 void Renderer::copy_shown_to_output() {
-    // An unwarped refresh: the shown frame as it is, through the warp shader with the identity (the
-    // shown textures stay in the shader-read state both queues use).
+    // An unwarped refresh: the shown frame as it is, copied by a compute shader (the shown textures stay in the
+    // shader-read state both queues use, so they cannot be blitted or copied by the copy engine directly). A
+    // plain copy: through the warp shader with the identity, this cost as much as a warp.
     const auto& bb = shown(kPBackbuffer);
     if (!bb.texture || !private_[kPOutput].texture || bb.width != private_[kPOutput].width || bb.height != private_[kPOutput].height) return;
     XConstants c{};
-    for (int i = 0; i < 16; ++i) c.clip_to_prev[i] = (i % 5 == 0) ? 1.0f : 0.0f;
-    c.out_size[0] = bb.width; c.out_size[1] = bb.height;
-    c.rect[2] = c.rect[3] = 1; c.grid[0] = c.grid[1] = 1;
-    c.flags = 32u;  // depth-independent: no depth reads
+    c.grid[0] = bb.width; c.grid[1] = bb.height;
     const float wc[20] = {};
     for (UINT i = 0; i < kWSrvCount; ++i) set_x_srv(kWSrv(kWShown) + i, kPBackbuffer, true);
     set_x_uav(kWUav(kWShown) + 0, kPOutput); set_x_uav(kWUav(kWShown) + 1, kPOutput);
     transition(private_[kPOutput], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    w_dispatch(cs_own_warp_.Get(), &c, wc, kWShown, (bb.width + 7) / 8, (bb.height + 7) / 8);
+    w_dispatch(cs_copy4_.Get(), &c, wc, kWShown, (bb.width + 7) / 8, (bb.height + 7) / 8);
 }
 
 bool Renderer::take_motion_fit(MotionFit& fit) {
@@ -3021,6 +3071,24 @@ ID3D12GraphicsCommandList* Renderer::begin(int context) {
             hud_readback_->Unmap(0, &none);
         }
     }
+    // The game frame's passes recorded in this slot last time (see pass_stamp).
+    if (pass_count_[frame_index_] > 1 && pass_readback_ && frame_values_[frame_index_]) {
+        std::uint64_t* t = nullptr;
+        D3D12_RANGE pr{SIZE_T(frame_index_) * kPassStamps * 8, SIZE_T(frame_index_ + 1) * kPassStamps * 8};
+        if (SUCCEEDED(pass_readback_->Map(0, &pr, reinterpret_cast<void**>(&t)))) {
+            const std::uint64_t* s = t + frame_index_ * kPassStamps;
+            bool ordered = true;
+            for (int k = 1; k < pass_count_[frame_index_]; ++k) ordered = ordered && s[k] >= s[k - 1];
+            if (ordered) {
+                for (int k = 1; k < pass_count_[frame_index_]; ++k)
+                    pass_times_.ms[pass_ids_[frame_index_][k]] += double(s[k] - s[k - 1]) * 1000.0 / double(timestamp_frequency_);
+                ++pass_times_.frames;
+            }
+            D3D12_RANGE none{0, 0};
+            pass_readback_->Unmap(0, &none);
+        }
+    }
+    pass_count_[frame_index_] = 0;
     allocators_[frame_index_]->Reset();
     list_->Reset(allocators_[frame_index_].Get(), nullptr);
     if (timestamps_) list_->EndQuery(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * 2);
@@ -3413,7 +3481,7 @@ void Renderer::stash_source(int set, bool hudless) {
 bool Renderer::read_back(int which, std::vector<std::uint16_t>& pixels, std::uint32_t& w, std::uint32_t& h) {
     static const PrivateId kWhich[] = {kPBackbuffer, kPOutput, kPScene, kPDepth, kPMotion, kPObject, kPMask, kPHudScore, kPWorld, kPFill,
                                        kPStashColor, kPStashDepth, kPStashMotion, kPFlowB, kPStashHudless, kPStash2Color, kPStash2Hudless,
-                                       kPStash2Depth, kPStash2Motion, kPHudless, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPUi};
+                                       kPStash2Depth, kPStash2Motion, kPHudless, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPUi, kPWarpMask};
     if (which < 0 || which >= int(std::size(kWhich))) return false;
     auto& p = split_ && shown_id(kWhich[which]) ? front_[kWhich[which]] : private_[kWhich[which]];
     if (!p.texture) return false;

@@ -21,6 +21,16 @@
   has not moved since the game's frame) is no longer drawn or presented at all; the window keeps showing the
   picture. Since 1.5.0 such a refresh still went through the warp shader once per refresh (taking frames in on
   their own GPU queue made the plain copy a full-screen pass), so a still camera cost as much as a moving one.
+  A refresh that does show a new frame as it is now copies it with a plain copy, not the warp shader: about
+  half the GPU time at 4K (0.2 ms instead of 0.4 ms).
+* **The refresh rate is taken from the display**, from its current mode (exactly: 119.88 Hz as such), instead of
+  being measured from FrameWarp's own presents. The measurement could lock onto a wrong rate at the start and
+  keep it until reprojection was switched off and on again. The presents now only tell when each refresh
+  happens; the rate is read again when the game moves to another display or the mode changes.
+* Less GPU time per game frame, with exactly the same results: the HUD detection's check against the camera
+  motion classifies each pixel once instead of twice, and the final mask reads each pixel's HUD state once
+  per tile instead of nine times. The log shows the work on each game frame pass by pass ("game frame GPU by
+  pass").
 * The XPAR panel warns when video memory is nearly full (Windows leaves FrameWarp too little of it): the game
   and FrameWarp then don't both fit and both stutter. Frame generation needs extra video memory too; once it
   has been off for a few seconds, the textures FrameWarp took its images into are released.

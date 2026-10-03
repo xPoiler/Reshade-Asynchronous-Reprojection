@@ -781,6 +781,20 @@ int main(int argc, char** argv) {
             if (memory) renderer.update_memory(s, analyze_cam->clip_to_prev_clip, true, memory_consecutive);
             renderer.finish_frame(false, 0);
             renderer.wait_idle();
+            // (FW_MASKHASH: every mask this builds, hashed - to check an optimisation changes nothing)
+            if (std::getenv("FW_MASKHASH")) {
+                static int built = 0;
+                ++built;
+                for (const int which : {6, 7, 8, 9, 27}) {
+                    std::vector<std::uint16_t> data;
+                    std::uint32_t dw = 0, dh = 0;
+                    std::uint64_t hash = 1469598103934665603ull;
+                    if (renderer.read_back(which, data, dw, dh))
+                        for (const std::uint16_t v : data) { hash ^= v; hash *= 1099511628211ull; }
+                    else hash = 0;
+                    std::printf("maskhash %d %d %016llx\n", built, which, static_cast<unsigned long long>(hash));
+                }
+            }
             return s;
         };
         // (A) first-person weapon from motion vectors.
@@ -1166,11 +1180,17 @@ int main(int argc, char** argv) {
                 if (bs < 0) continue;
                 renderer.begin_frame();
                 IngestedSource s = renderer.ingest(sh, bs);
+                renderer.pass_stamp(Renderer::kPassStart);
                 renderer.analyze_motion(s, moving_cam.clip_to_prev_clip, 1.0f, 1.0f, true);
+                renderer.pass_stamp(Renderer::kPassAnalyze);
+                renderer.pass_stamp(Renderer::kPassObjects);
                 renderer.build_no_warp_mask(s, moving_cam.clip_to_prev_clip, true, true, true);
                 renderer.submit_work();
                 renderer.wait_idle();
-                if (i == 3) { renderer.begin_frame(); renderer.finish_frame(false, 0); renderer.wait_idle(); renderer.take_gpu_usage(); }
+                if (i == 3) {
+                    renderer.begin_frame(); renderer.finish_frame(false, 0); renderer.wait_idle(); renderer.take_gpu_usage();
+                    (void)renderer.take_pass_times();
+                }
             }
             for (int i = 0; i < 3; ++i) { renderer.begin_frame(); renderer.finish_frame(false, 0); renderer.wait_idle(); }
             const Renderer::GpuUsage u = renderer.take_gpu_usage();
@@ -1182,6 +1202,36 @@ int main(int argc, char** argv) {
                         "HUD from output: fits %.3f ms, final %.3f ms (%u frames)\n",
                         W, H, DW, DH, u.intakes ? u.intake_ms / u.intakes : 0.0, u.access_ms / n, u.depth_ms / n, u.colour_ms / n, u.rest_ms / n,
                         hs.scene_frames ? fits / hs.scene_frames : 0.0, hs.scene_frames ? hs.scene_pass_ms[17] / hs.scene_frames : 0.0, u.intakes);
+            const Renderer::PassTimes pt = renderer.take_pass_times();
+            if (pt.frames)
+                std::printf("game frame GPU by pass (ms, %u frames): motion analysis %.3f, HUD %.3f, character/weapon + stretch %.3f, mask %.3f\n", pt.frames,
+                            pt.ms[Renderer::kPassAnalyze] / pt.frames, pt.ms[Renderer::kPassHud] / pt.frames, pt.ms[Renderer::kPassCharacter] / pt.frames,
+                            pt.ms[Renderer::kPassMask] / pt.frames);
+            EXPECT(pt.frames > 0, "the game frame's passes are timed");
+            {  // ...and with the camera-motion check of the combined HUD detection (the default)
+                (void)renderer.take_pass_times();
+                for (int i = 0; i < 24; ++i) {
+                    const int bs = publish(930 + i, 0.1f, 0, true, true);
+                    if (bs < 0) continue;
+                    renderer.begin_frame();
+                    IngestedSource s = renderer.ingest(sh, bs);
+                    renderer.pass_stamp(Renderer::kPassStart);
+                    renderer.analyze_motion(s, moving_cam.clip_to_prev_clip, 1.0f, 1.0f, true);
+                    renderer.pass_stamp(Renderer::kPassAnalyze);
+                    renderer.pass_stamp(Renderer::kPassObjects);
+                    renderer.build_no_warp_mask(s, moving_cam.clip_to_prev_clip, true, true, true, true, true);
+                    renderer.submit_work();
+                    renderer.wait_idle();
+                    if (i == 3) (void)renderer.take_pass_times();
+                }
+                for (int i = 0; i < 3; ++i) { renderer.begin_frame(); renderer.finish_frame(false, 0); renderer.wait_idle(); }
+                const Renderer::PassTimes pc = renderer.take_pass_times();
+                if (pc.frames)
+                    std::printf("game frame GPU by pass with the camera-motion check (ms, %u frames): HUD %.3f, mask %.3f\n", pc.frames,
+                                pc.ms[Renderer::kPassHud] / pc.frames, pc.ms[Renderer::kPassMask] / pc.frames);
+                (void)renderer.take_hud_stats();
+                renderer.take_gpu_usage();
+            }
             if (hs.scene_frames) {
                 std::printf("HUD from output: %.6f%% of the screen; GPU ms per pass:", 100.0 * hs.scene_share_sum / hs.scene_frames);
                 for (int i = 0; i < 18; ++i) std::printf(" %.3f", hs.scene_pass_ms[i] / hs.scene_frames);
@@ -1250,10 +1300,37 @@ int main(int argc, char** argv) {
             renderer.finish_frame(false, 0);
             renderer.read_back(1, px, w, h);
             const double plain_x = peak(px, w, h, true, 1);
+            // ...exactly the shown frame, and its GPU time per refresh (back to back: a GPU left idle in between
+            // clocks down).
+            {
+                std::vector<std::uint16_t> shown_px;
+                std::uint32_t sw = 0, sh2 = 0;
+                renderer.read_back(0, shown_px, sw, sh2);
+                std::size_t differ = 0;
+                for (std::size_t i = 0; i < std::min(px.size(), shown_px.size()); ++i) differ += px[i] != shown_px[i];
+                renderer.wait_idle();
+                renderer.take_gpu_usage();
+                for (int i = 0; i < 200; ++i) { renderer.begin_frame(); renderer.finish_frame(false, 0); }
+                renderer.wait_idle();
+                for (int i = 0; i < 3; ++i) { renderer.begin_frame(); renderer.finish_frame(false, 0); renderer.wait_idle(); }
+                const Renderer::GpuUsage u = renderer.take_gpu_usage();
+                std::printf("unwarped refresh with split queues: %.3f ms GPU, %zu values differ from the shown frame\n",
+                            u.warps ? u.warp_ms / u.warps : 0.0, differ);
+                EXPECT(sw == w && sh2 == h && differ == 0, "an unwarped refresh shows exactly the shown frame (%zu values differ)", differ);
+            }
             // Back to the single queue: the shown frame stays.
             const bool back = renderer.set_split(false);
             show(second, 0);
             const double after_x = peak(px, w, h, true, 1);
+            {  // (for comparison: an unwarped refresh on one queue - the blit alone)
+                renderer.wait_idle();
+                renderer.take_gpu_usage();
+                for (int i = 0; i < 200; ++i) { renderer.begin_frame(); renderer.finish_frame(false, 0); }
+                renderer.wait_idle();
+                for (int i = 0; i < 3; ++i) { renderer.begin_frame(); renderer.finish_frame(false, 0); renderer.wait_idle(); }
+                const Renderer::GpuUsage u = renderer.take_gpu_usage();
+                std::printf("unwarped refresh on one queue: %.3f ms GPU\n", u.warps ? u.warp_ms / u.warps : 0.0);
+            }
             own_engine = false;
             std::printf("split queues: first frame bar x %.0f; while the second is taken in %.0f; second %.0f (turned %.0f), unwarped %.0f, "
                         "back on one queue %.0f\n", a_x, during_x, b_x, b_turned, plain_x, after_x);
