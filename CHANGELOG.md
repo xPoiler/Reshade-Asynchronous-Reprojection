@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+* **Controller support.** The right stick of a controller (XInput: Xbox pads, or others through Steam
+  Input) now drives the reprojected camera, as the mouse does: XPAR learns from the game's own camera how
+  fast the stick turns it and the game's response curve, and moves the camera with the held stick between
+  the game's frames. On by default (**Controller right stick drives rotation**, remembered per game).
+* The presenter starts by itself again in games started with frame generation already on (it had to be
+  started from the XPAR panel).
+* **Fewer missed refreshes with the mouse too.** The camera model's fit used to run on the presenter's
+  render thread every 30 game frames and took long enough to miss a refresh at 120 Hz now and then; it
+  runs on its own thread now, in half the time, with exactly the same results.
 * **Games without a usable depth buffer work too: camera turns only.** Without DLSS or FSR, XPAR takes the
   depth from ReShade; some games have no depth buffer that belongs to the picture (every one reads empty
   or unrelated). XPAR used to wait for one, or used whatever ReShade had selected, which moved parts of

@@ -74,6 +74,9 @@ static void right_handed_projection() {
 // rendering at `fps` and consuming input `delay` after each simulation start.
 struct Game {
     double gain_x = -0.0023, gain_y = 0.0015, tau = 0.15, delay = 0.01, fps = 30.0, latency = 0.02;
+    // Controller: the right stick (sx, sy) turns the camera at stick_gain * |s|^stick_power rad/s; the
+    // presenter reads it every 4 ms.
+    double stick_gain_x = 0, stick_gain_y = 0, stick_power = 2.0, sx = 0, sy = 0;
     double cam[2] = {0, 0}, target[2] = {0, 0};
     double t = 0, next_frame = 0.0, last_sim = 0;
     std::uint64_t frame = 0;
@@ -88,6 +91,10 @@ struct Game {
         t += 0.001;
         if (dx || dy) model->mouse.add(t, dx, dy);
         if (!menu) { target[0] += gain_x * dx; target[1] += gain_y * dy; }
+        target[0] += stick_gain_x * StickHistory::curve(sx, stick_power) * 0.001;
+        target[1] += stick_gain_y * StickHistory::curve(sy, stick_power) * 0.001;
+        if ((stick_gain_x != 0 || stick_gain_y != 0) && (static_cast<long>(std::lround(t * 1000.0)) % 4) == 0)
+            model->stick.add(t, std::round(sx * 1000.0) / 1000.0, std::round(sy * 1000.0) / 1000.0);
         // The game applies input with `delay`, smoothing continuously.
         const double a = 1.0 - std::exp(-0.001 / tau);
         cam[0] += (target_at_delay(0) - cam[0]) * a;
@@ -285,6 +292,77 @@ static void frame_clock_tests() {
     EXPECT(gap == 10.0, "a skipped frame starts again from the presented time");
 }
 
+// A game played with a controller: the camera turns at a rate the right stick sets, through a squared
+// response curve. The model learns gain and curve; predicting with the held stick beats both holding the
+// frame and the same model with the controller option off.
+static double stick_x(double t) { return 0.9 * std::sin(t * 0.9) + 0.3 * std::sin(t * 3.1); }
+static double stick_y(double t) { return 0.5 * std::sin(t * 0.6 + 1.0); }
+static void controller_stick() {
+    PoseModel model;
+    Game g; g.model = &model;
+    g.gain_x = g.gain_y = 0;  // no mouse
+    g.stick_gain_x = 2.5; g.stick_gain_y = -1.2;
+    for (int i = 0; i < 20000; ++i) { g.sx = stick_x(g.t); g.sy = stick_y(g.t); g.step(0, 0); }
+    model.fit();
+    const auto& x = model.params(0);
+    const auto& y = model.params(1);
+    std::printf("  stick fit: yaw %.2f rad/s curve %.0f, pitch %.2f rad/s curve %.0f (true %.2f, %.2f, curve %.0f)\n", x.stick_gain,
+                x.stick_power, y.stick_gain, y.stick_power, g.stick_gain_x, g.stick_gain_y, g.stick_power);
+    EXPECT(std::fabs(x.stick_gain / g.stick_gain_x - 1.0) < 0.2 && x.stick_power == g.stick_power, "yaw stick gain and curve learned");
+    EXPECT(std::fabs(y.stick_gain / g.stick_gain_y - 1.0) < 0.25, "pitch stick gain learned (sign included)");
+    EXPECT(x.gain == 0, "no mouse gain from stick-only play (%g)", x.gain);
+    // Tracking with the latency the presenter uses in games without HUD layers (1/4 frame behind): two
+    // identical sessions (the patterns are deterministic), with the controller option on and off.
+    auto track = [&](bool use_stick) {
+        PoseModel m;
+        Game h; h.model = &m;
+        h.gain_x = h.gain_y = 0; h.stick_gain_x = g.stick_gain_x; h.stick_gain_y = g.stick_gain_y;
+        PoseSettings ps; ps.auto_fraction = 0.25; ps.use_stick = use_stick;
+        m.configure(ps);
+        double sse = 0, hold_sse = 0;
+        int n = 0;
+        for (int i = 0; i < 23000; ++i) {
+            h.sx = stick_x(h.t); h.sy = stick_y(h.t); h.step(0, 0);
+            if (i < 20000 || i % 8) continue;  // learn, then measure at 125 Hz
+            const Prediction p = m.predict(h.t);
+            const double shown = m.source_theta(0) + p.yaw, truth = h.truth_at(h.last_sim + p.horizon, 0);
+            sse += (shown - truth) * (shown - truth);
+            hold_sse += (m.source_theta(0) - truth) * (m.source_theta(0) - truth);
+            ++n;
+        }
+        return std::make_pair(std::sqrt(sse / n), std::sqrt(hold_sse / n));
+    };
+    const auto with_stick = track(true), without = track(false);
+    std::printf("  stick tracking rms %.2f mrad, option off %.2f mrad, holding the frame %.2f mrad\n",
+                with_stick.first * 1000, without.first * 1000, with_stick.second * 1000);
+    EXPECT(with_stick.first < without.first * 0.5, "the held stick predicts the camera clearly better than without it");
+}
+
+// The presenter fits on a worker thread: same parameters as the fit done right away, mouse and stick.
+static void worker_fit_matches() {
+    auto run = [](bool async_fit, bool stick) {
+        PoseModel m;
+        Game g; g.model = &m;
+        if (stick) { g.stick_gain_x = 2.0; g.stick_gain_y = -1.0; }
+        PoseSettings ps; ps.async_fit = async_fit;
+        m.configure(ps);
+        for (int i = 0; i < 12000; ++i) {
+            g.sx = stick_x(g.t); g.sy = stick_y(g.t);
+            g.step(pattern_x(g.t), pattern_y(g.t));
+            if (async_fit) m.finish_fit();  // (each fit is applied before the next frame, as with the fit done right away)
+        }
+        return std::make_pair(m.params(0), m.params(1));
+    };
+    for (bool stick : {false, true}) {
+        const auto now = run(false, stick), worker = run(true, stick);
+        const bool same = now.first.gain == worker.first.gain && now.first.tau == worker.first.tau && now.first.delay == worker.first.delay &&
+                          now.second.gain == worker.second.gain && now.first.stick_gain == worker.first.stick_gain &&
+                          now.first.stick_power == worker.first.stick_power && now.second.stick_gain == worker.second.stick_gain;
+        EXPECT(same, "worker-thread fit gives the same parameters (%s): yaw gain %.6g vs %.6g, stick %.4g vs %.4g", stick ? "mouse + stick" : "mouse",
+               now.first.gain, worker.first.gain, now.first.stick_gain, worker.first.stick_gain);
+    }
+}
+
 int main() {
     frame_clock_tests();
     rotation_conventions();
@@ -295,6 +373,8 @@ int main() {
     auto_latency_tracks_frame_interval();
     world_up_detection();
     mouse_ignored_in_menus();
+    controller_stick();
+    worker_fit_matches();
     if (failures) { std::printf("%d failure(s)\n", failures); return 1; }
     std::printf("pose tests passed\n");
     return 0;

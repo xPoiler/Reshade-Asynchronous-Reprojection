@@ -45,7 +45,7 @@ target_include_directories(fw_presenter_core SYSTEM PUBLIC "${FW_NGX_INCLUDE}")
 set_target_properties(fw_presenter_core PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
 
 add_executable(FrameWarpPresenter WIN32 src/presenter/main.cpp)
-target_link_libraries(FrameWarpPresenter PRIVATE fw_presenter_core user32 pdh)
+target_link_libraries(FrameWarpPresenter PRIVATE fw_presenter_core user32 pdh xinput)
 set_target_properties(FrameWarpPresenter PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreadedDLL"
                       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>/FrameWarp")
 if(EXISTS "${LATEWARP_DLL}")

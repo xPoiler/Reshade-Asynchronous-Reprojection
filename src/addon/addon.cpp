@@ -212,7 +212,7 @@ void on_init_swapchain(swapchain* sc, bool) {
     static constexpr Saved kSaved[] = {{"HudFromDlssOutput", 2}, {"FillBehindHud", 1}, {"HoldOrbitedCharacter", 1},
                                        {"NearCameraRule", 1}, {"RecordDiagnostics", 0}, {"BackgroundMemory", 1},
                                        {"StretchWidth", 1}, {"GameCameraCheck", 0}, {"MovingObjects", 0},
-                                       {"GpuPriority", 0}, {"ForceBorderless", 0}};
+                                       {"GpuPriority", 0}, {"ForceBorderless", 0}, {"Controller", 1}};
     char saved_version[32] = "";
     size_t size = sizeof(saved_version);
     if (!reshade::get_config_value(nullptr, "FrameWarp", "SettingsVersion", saved_version, &size) ||
@@ -246,6 +246,7 @@ void on_init_swapchain(swapchain* sc, bool) {
         shared->settings.moving_objects = saved("MovingObjects") != 0;
         shared->settings.stretch_width = static_cast<std::uint32_t>(std::clamp(saved("StretchWidth"), 0, 32));
         shared->settings.gpu_priority = static_cast<std::uint32_t>(std::clamp(saved("GpuPriority"), 0, 2));
+        shared->settings.use_controller = saved("Controller") != 0;
         // What the presenter found out about the game's own camera in an earlier run (Shared::game_camera_check).
         InterlockedExchange(&shared->game_camera_check, std::clamp(saved("GameCameraCheck"), 0, 2));
     }
@@ -363,7 +364,8 @@ void on_reshade_present(effect_runtime* runtime) {
     const auto token = g_producer->begin_present(bb, reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native()));
     queue->flush_immediate_command_list();
     g_producer->finish_present(reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()), token);
-    if (token && g_producer->shared()->settings.enabled && !presenter_running()) launch_presenter();
+    // (with the game's frame generation on, frames are handed over where its images are made, not here)
+    if ((token || g_producer->generation_active()) && g_producer->shared()->settings.enabled && !presenter_running()) launch_presenter();
 }
 
 const char* format_name(std::uint32_t f) {
@@ -445,6 +447,11 @@ void draw_overlay(effect_runtime*) {
     if (ImGui::CollapsingHeader("Camera motion", ImGuiTreeNodeFlags_DefaultOpen)) {
         bool mouse = s.use_mouse != 0;
         if (ImGui::Checkbox("Raw mouse drives rotation", &mouse)) s.use_mouse = mouse;
+        bool controller = s.use_controller != 0;
+        if (ImGui::Checkbox("Controller right stick drives rotation", &controller)) {
+            s.use_controller = controller;
+            reshade::set_config_value(nullptr, "FrameWarp", "Controller", controller ? "1" : "0");
+        }
         ImGui::SliderFloat("Rotation extrapolation", &s.rotation_extrapolation, 0.0f, 1.0f);
         static const char* const kAutoModes[] = {"Off (manual slider)", "Auto (1/2, 1/4 without HUD layers, 1 without DLSS/FSR)", "1 game frame", "1/2 game frame",
                                                  "1/4 game frame"};
@@ -575,6 +582,13 @@ void draw_overlay(effect_runtime*) {
         ImGui::Text("            pitch: %s gain %.3g mrad/count, smoothing %.0f ms, quality %.2f",
                     p.calibrated_y ? "fitted" : "learning", p.gain_y * 1000.0f, p.tau_y_ms, p.fit_quality_y);
         ImGui::Text("Input delay %.0f ms | game latency %.1f ms | measured orbit %.0f cm", p.delay_ms, p.latency_ms, p.orbit_cm);
+        if (!p.controller)
+            ImGui::TextDisabled("Controller: none connected (XInput)");
+        else if (p.stick_gain_x == 0.0f && p.stick_gain_y == 0.0f)
+            ImGui::Text("Controller: connected, learning how the right stick turns the camera");
+        else
+            ImGui::Text("Controller: yaw %.2f rad/s (curve %.0f), pitch %.2f rad/s (curve %.0f) at full stick%s", p.stick_gain_x, p.stick_power_x,
+                        p.stick_gain_y, p.stick_power_y, s.use_controller ? "" : " (learned, not applied: option off)");
         if (ImGui::Button("Reset camera model")) ++s.reset_calibration;
         bool manual = s.manual_gain != 0;
         if (ImGui::Checkbox("Manual mouse gain", &manual)) s.manual_gain = manual;

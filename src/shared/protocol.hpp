@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 44;
+constexpr std::uint32_t kVersion = 45;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -102,6 +102,7 @@ struct Settings {
     std::uint32_t background_memory;   // default on, own warp: uncovered areas shown from the scenery last seen there (saved per game)
     std::uint32_t stretch_width;       // own warp: render px the scenery around the character/weapon stretches over, 0 off, default 1 (saved per game)
     std::uint32_t near_camera_rule;    // character/weapon detection: near-camera pixels moving against the camera count (default on, saved per game)
+    std::uint32_t use_controller;      // the controller's right stick drives rotation too (option, on by default, saved per game)
 };
 
 // Presenter status, displayed by the add-on UI.
@@ -130,6 +131,10 @@ struct PresenterStatus {
     // themselves were held back while XPAR had little to do - a frame rate cap of the graphics driver, such as
     // NVIDIA's "Background Application Max Frame Rate" (the presenter's window is never the focused one).
     std::uint32_t outside_cap_fps;
+    // Controller (XInput): 1 connected and read; the learned camera turn rate at full right-stick deflection
+    // (rad/s, 0: not learned yet) and the response curve (|s|^power) per axis.
+    std::uint32_t controller;
+    float stick_gain_x, stick_gain_y, stick_power_x, stick_power_y;
     char message[256];
 };
 

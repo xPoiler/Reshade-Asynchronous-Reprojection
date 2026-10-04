@@ -15,8 +15,11 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <condition_variable>
 #include <deque>
+#include <iterator>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace fw {
@@ -171,9 +174,71 @@ public:
     }
     double counts(int axis, double t0, double t1) const { return filtered(axis, t0, t1, t1, 0.0); }
     void reset() { std::lock_guard lock(mutex_); samples_.clear(); }
+    // The events after `from`, for the fit (which works on its own copy, without the lock).
+    void copy_since(double from, std::vector<double>& t, std::vector<double>& dx, std::vector<double>& dy) const {
+        std::lock_guard lock(mutex_);
+        auto it = std::upper_bound(samples_.begin(), samples_.end(), from, [](double v, const Sample& s) { return v < s.t; });
+        if (it != samples_.begin()) --it;  // (one before: the windows start after `from`)
+        for (; it != samples_.end(); ++it) { t.push_back(it->t); dx.push_back(double(it->dx)); dy.push_back(double(it->dy)); }
+    }
 
 private:
     struct Sample { double t; long dx, dy; };
+    mutable std::mutex mutex_;
+    std::deque<Sample> samples_;
+};
+
+// Controller right stick history (thread-safe: the controller thread appends, the render thread queries). A
+// stick sets a turn *rate*: deflection s in [-1, 1] turns the camera by gain * curve(s) per second. Each
+// sample holds until the next one (only changes are stored), so "deflection x time" plays the role the
+// mouse counts play in the camera model.
+class StickHistory {
+public:
+    void add(double t, double sx, double sy) {
+        std::lock_guard lock(mutex_);
+        if (!samples_.empty() && (t <= samples_.back().t || (samples_.back().x == sx && samples_.back().y == sy))) return;
+        samples_.push_back({t, sx, sy});
+        while (samples_.size() > 2 && samples_[1].t < t - 60.0) samples_.pop_front();
+    }
+    // Games shape the deflection before using it: sign(s) * |s|^power (power 1: linear).
+    static double curve(double s, double power) { return s >= 0 ? std::pow(s, power) : -std::pow(-s, power); }
+    // Integral over (t0, t1] of curve(s(t)) * (1 - exp(-(t_end - t)/tau)) dt: the stick's part of the camera
+    // by t_end under first-order smoothing (tau 0: the plain integral). The newest sample holds until t1
+    // (the stick is still held where it is).
+    double filtered(int axis, double t0, double t1, double t_end, double tau, double power) const {
+        std::lock_guard lock(mutex_);
+        if (samples_.empty() || t1 <= t0) return 0;
+        auto it = std::upper_bound(samples_.begin(), samples_.end(), t0, [](double v, const Sample& x) { return v < x.t; });
+        double value = it == samples_.begin() ? 0.0 : (axis ? std::prev(it)->y : std::prev(it)->x);
+        double total = 0, from = t0;
+        for (; it != samples_.end() && it->t <= t1; ++it) {
+            total += segment(from, it->t, value, t_end, tau, power);
+            from = it->t;
+            value = axis ? it->y : it->x;
+        }
+        return total + segment(from, t1, value, t_end, tau, power);
+    }
+    // One held value over [a, b].
+    static double segment(double a, double b, double v, double t_end, double tau, double power) {
+        if (b <= a || v == 0.0) return 0.0;
+        return curved_segment(a, b, curve(v, power), t_end, tau);
+    }
+    // ... with the response curve already applied (c = curve(v, power)).
+    static double curved_segment(double a, double b, double c, double t_end, double tau) {
+        if (b <= a || c == 0.0) return 0.0;
+        if (tau <= 0) return c * (b - a);
+        return c * ((b - a) - tau * (std::exp(-(t_end - b) / tau) - std::exp(-(t_end - a) / tau)));
+    }
+    void copy_since(double from, std::vector<double>& t, std::vector<double>& x, std::vector<double>& y) const {
+        std::lock_guard lock(mutex_);
+        auto it = std::upper_bound(samples_.begin(), samples_.end(), from, [](double v, const Sample& s) { return v < s.t; });
+        if (it != samples_.begin()) --it;  // (the value in effect at `from`)
+        for (; it != samples_.end(); ++it) { t.push_back(it->t); x.push_back(it->x); y.push_back(it->y); }
+    }
+    void reset() { std::lock_guard lock(mutex_); samples_.clear(); }
+
+private:
+    struct Sample { double t, x, y; };
     mutable std::mutex mutex_;
     std::deque<Sample> samples_;
 };
@@ -275,6 +340,8 @@ struct AxisParams {
     double delay = 0;  // input delay, s
     double quality = 0;  // 1 - rms(model)/rms(hold) on the fit window
     bool fitted = false;
+    double stick_gain = 0;   // controller: radians per second at full right-stick deflection (0: not learned)
+    double stick_power = 1;  // the game's response curve for the stick: |s|^power
 };
 
 // Camera-only motion over h seconds from angular velocity w under first-order smoothing.
@@ -296,6 +363,8 @@ struct PoseSettings {
     bool manual_gain = false;
     double manual_gain_x = 0, manual_gain_y = 0, manual_delay = 0;
     bool freeze_fit = false;  // (testing: the mouse parameters stay as seeded)
+    bool use_stick = false;   // the controller's right stick drives rotation too (it is learned either way)
+    bool async_fit = false;   // fit on a worker thread (the presenter: the render thread only copies the history)
 };
 
 struct Prediction {
@@ -307,6 +376,19 @@ struct Prediction {
 class PoseModel {
 public:
     MouseHistory mouse;
+    StickHistory stick;
+
+    PoseModel() = default;
+    PoseModel(const PoseModel&) = delete;
+    PoseModel& operator=(const PoseModel&) = delete;
+    ~PoseModel() {
+        {
+            std::lock_guard lock(job_mutex_);
+            stop_ = true;
+        }
+        job_cv_.notify_all();
+        if (worker_.joinable()) worker_.join();
+    }
 
     void configure(const PoseSettings& s) { settings_ = s; }
     void set_mouse_gate(bool open) { gate_ = open; }
@@ -325,8 +407,8 @@ public:
     // already contains the orbit motion and predicts position better, measured on recorded play sessions).
     double orbit() const { return settings_.orbit_distance; }
     double learned_orbit() const { return orbit_fit_; }
-    void seed(const AxisParams& yaw, const AxisParams& pitch) { params_[0] = yaw; params_[1] = pitch; }
-    void reset_fit() { params_[0] = params_[1] = AxisParams{}; frames_.clear(); since_fit_ = 0; }
+    void seed(const AxisParams& yaw, const AxisParams& pitch) { params_[0] = yaw; params_[1] = pitch; ++generation_; }
+    void reset_fit() { params_[0] = params_[1] = AxisParams{}; frames_.clear(); since_fit_ = 0; ++generation_; }
     // The camera source changed (the game's own camera <-> one estimated from motion vectors): their
     // orientations have nothing in common, so the history starts over. The fitted calibration stays.
     void reset_history() {
@@ -338,6 +420,7 @@ public:
     // A new rendered frame: t is the game's simulation (input) time, ingest_t when we received it.
     void add_source(std::uint64_t id, double t, double ingest_t, const CameraBasis& camera, bool reset, double now,
                     std::uint32_t epoch = 0) {
+        take_fit_result();
         up_.add(camera);
         const Vec3 world_up = up_.get();
         // Absolute prediction with the previous source, for handoff blending.
@@ -404,7 +487,10 @@ public:
 
         update_follows();
         frames_.back().gate = frames_.back().gate && follows_;  // (the fit learns only from mouse the camera follows)
-        if (++since_fit_ >= 30) { fit(); since_fit_ = 0; }
+        if (++since_fit_ >= 30) {
+            since_fit_ = 0;
+            if (settings_.async_fit) post_fit(); else fit();
+        }
 
         // Blend: keep the output continuous across the source change.
         blend_[0] = blend_[1] = 0;
@@ -469,6 +555,11 @@ public:
                 const double end = src_.t + h + d;
                 delta[k] += g * mouse.filtered(k, src_.t + d, std::min(now, end), end, tau);
             }
+            if (settings_.use_stick && gate_ && p.stick_gain != 0.0) {
+                // The stick up to the displayed camera time; beyond now it is taken as still held where it is.
+                const double end = src_.t + h + p.delay;
+                delta[k] += p.stick_gain * stick.filtered(k, src_.t + p.delay, end, end, tau, p.stick_power);
+            }
             const double fade = std::exp(-(now - blend_t_) / std::max(settings_.blend_tau, 1e-4));
             delta[k] += blend_[k] * fade;
         }
@@ -521,49 +612,221 @@ public:
     double source_time() const { return src_.t; }
     Vec3 world_up() const { return up_.get(); }
 
-    // Refit tau / delay (grid) and gain (least squares) per axis on the frame history.
+    // Refit tau / delay (grid) and the mouse and stick gains (least squares) per axis on the frame history,
+    // right here (tests, the replay tool; the presenter fits on a worker thread: post_fit).
     void fit() {
         if (settings_.freeze_fit) return;
+        FitJob job;
+        snapshot(job);
+        fit_params(job);
+        params_[0] = job.params[0]; params_[1] = job.params[1];
+    }
+    // Tests: wait for the worker's fit in progress and apply it.
+    void finish_fit() {
+        std::unique_lock lock(job_mutex_);
+        job_cv_.wait(lock, [&] { return !job_pending_ && !busy_; });
+        lock.unlock();
+        take_fit_result();
+    }
+
+private:
+    // What a fit works on: the frames (yaw/pitch over time) and copies of the input since the oldest of them.
+    struct FitFrame { double t; double theta[2]; bool gate, consecutive; };
+    struct FitJob {
+        std::vector<FitFrame> frames;
+        std::vector<double> mouse_t, mouse_v[2], stick_t, stick_v[2];
+        AxisParams params[2];
+        std::uint64_t generation = 0;
+    };
+    void snapshot(FitJob& job) const {
+        job.frames.reserve(frames_.size());
+        for (const Frame& f : frames_) job.frames.push_back({f.t, {f.theta[0], f.theta[1]}, f.gate, f.consecutive});
+        const double from = frames_.empty() ? 0.0 : frames_.front().t - 0.05;  // (the delay grid reaches 10 ms before)
+        mouse.copy_since(from, job.mouse_t, job.mouse_v[0], job.mouse_v[1]);
+        stick.copy_since(from, job.stick_t, job.stick_v[0], job.stick_v[1]);
+        job.params[0] = params_[0]; job.params[1] = params_[1];
+        job.generation = generation_;
+    }
+
+    // Forward cursors over the copied input: the fit's windows only move forward through the frames (a window
+    // starting earlier than the last one - a cut in the history - looks the start up again).
+    struct MouseCursor {
+        const std::vector<double>& t;
+        const std::vector<double>& v;
+        std::size_t i = 0;
+        double last_t0 = -1e300;
+        // Sum over events with t0 < t_i <= t1 of v_i * (1 - exp(-(t_end - t_i)/tau)): MouseHistory::filtered.
+        double sum(double t0, double t1, double t_end, double tau) {
+            if (t0 < last_t0) i = 0;
+            last_t0 = t0;
+            while (i < t.size() && t[i] <= t0) ++i;
+            double total = 0;
+            for (std::size_t j = i; j < t.size() && t[j] <= t1; ++j)
+                total += tau > 0 ? v[j] * (1.0 - std::exp(-(t_end - t[j]) / tau)) : v[j];
+            return total;
+        }
+    };
+    struct StickCursor {
+        const std::vector<double>& t;
+        const std::vector<double>& c;  // the samples with the response curve applied
+        std::size_t i = 0;  // first sample after t0
+        double last_t0 = -1e300;
+        double sum(double t0, double t1, double t_end, double tau) {
+            if (t1 <= t0) return 0;
+            if (t0 < last_t0) i = 0;
+            last_t0 = t0;
+            while (i < t.size() && t[i] <= t0) ++i;
+            double value = i == 0 ? 0.0 : c[i - 1], from = t0, total = 0;
+            for (std::size_t j = i; j < t.size() && t[j] <= t1; ++j) {
+                total += StickHistory::curved_segment(from, t[j], value, t_end, tau);
+                from = t[j];
+                value = c[j];
+            }
+            return total + StickHistory::curved_segment(from, t1, value, t_end, tau);
+        }
+    };
+
+    // The fit: tau and delay on a grid, the gains by least squares; with stick input in the history, the
+    // mouse and stick gains together and the stick's response curve on the grid too. Without stick input it
+    // is exactly the mouse-only fit it always was.
+    static void fit_params(FitJob& job) {
         static constexpr double kTaus[] = {0.0, 0.03, 0.05, 0.07, 0.09, 0.12, 0.15, 0.2, 0.3};
         static constexpr double kDelays[] = {-0.01, 0.0, 0.01, 0.02, 0.03};
+        static constexpr double kPowers[] = {1.0, 2.0, 3.0};
+        const auto& frames = job.frames;
         for (int k = 0; k < 2; ++k) {
-            double best_rms = 1e30, best_tau = params_[k].tau, best_delay = params_[k].delay, best_gain = 0, hold_rms = 0;
-            bool informative = false;  // enough mouse movement in the history to judge a gain
-            for (double tau : kTaus)
-                for (double d : kDelays) {
-                    double suy = 0, suu = 0, syy = 0, excitation = 0, hold = 0;
-                    int n = 0;
-                    for (std::size_t i = 2; i < frames_.size(); ++i) {
-                        const Frame &a = frames_[i - 2], &b = frames_[i - 1], &c = frames_[i];
-                        if (!b.consecutive || !c.consecutive || !a.gate || !b.gate || !c.gate) continue;
-                        const double h = c.t - b.t;
-                        const double w = (b.theta[k] - a.theta[k]) / (b.t - a.t);
-                        const double y = c.theta[k] - b.theta[k] - velocity_term(tau, w, h);
-                        const double u = mouse.filtered(k, b.t + d, c.t + d, c.t + d, tau);
-                        suy += u * y; suu += u * u; syy += y * y; excitation += std::fabs(u);
-                        hold += (c.theta[k] - b.theta[k]) * (c.theta[k] - b.theta[k]);
-                        ++n;
-                    }
-                    if (n < 30) continue;
-                    double g = suu > 0 ? suy / suu : 0;
-                    if (excitation < 200) g = 0;  // not enough mouse movement to trust a gain
-                    else informative = true;
-                    const double sse = syy - 2 * g * suy + g * g * suu;
-                    const double rms = std::sqrt(std::max(0.0, sse) / n);
-                    if (rms < best_rms) { best_rms = rms; best_tau = tau; best_delay = d; best_gain = g; hold_rms = std::sqrt(hold / n); }
+            AxisParams& out = job.params[k];
+            // Any stick movement worth fitting (deflection x seconds: half a second at full tilt)?
+            bool stick_used = false;
+            std::vector<double> curved[3];  // the samples through each response curve of the grid
+            if (!job.stick_t.empty()) {
+                for (int p = 0; p < 3; ++p) {
+                    curved[p].reserve(job.stick_v[k].size());
+                    for (double v : job.stick_v[k]) curved[p].push_back(StickHistory::curve(v, kPowers[p]));
                 }
-            // Too little mouse movement lately (standing still, menus, the ReShade menu open): keep what was
-            // learned instead of dropping to no mouse at all until the next movement is learned again.
-            if (!informative && params_[k].fitted) continue;
+                StickCursor sc{job.stick_t, curved[0]};
+                double moved = 0;
+                for (std::size_t i = 2; i < frames.size(); ++i) {
+                    const FitFrame &a = frames[i - 2], &b = frames[i - 1], &c = frames[i];
+                    if (!b.consecutive || !c.consecutive || !a.gate || !b.gate || !c.gate) continue;
+                    moved += std::fabs(sc.sum(b.t, c.t, c.t, 0.0));
+                }
+                stick_used = moved >= 0.5;
+            }
+            double best_rms = 1e30, best_tau = out.tau, best_delay = out.delay, best_gain = 0, hold_rms = 0;
+            double best_stick = out.stick_gain, best_power = out.stick_power;
+            bool informative = false;        // enough mouse movement in the history to judge a gain
+            bool stick_informative = false;  // ... stick movement
+            for (double tau : kTaus)
+                for (double d : kDelays)
+                    for (int pi = 0; pi < 3; ++pi) {
+                        const double power = kPowers[pi];
+                        if (pi > 0 && !stick_used) break;  // (no stick input: the curve does not matter)
+                        MouseCursor mc{job.mouse_t, job.mouse_v[k]};
+                        StickCursor sc{job.stick_t, curved[pi]};
+                        double suy = 0, suu = 0, syy = 0, excitation = 0, hold = 0;
+                        double svy = 0, svv = 0, suv = 0, stick_excitation = 0;
+                        int n = 0;
+                        for (std::size_t i = 2; i < frames.size(); ++i) {
+                            const FitFrame &a = frames[i - 2], &b = frames[i - 1], &c = frames[i];
+                            if (!b.consecutive || !c.consecutive || !a.gate || !b.gate || !c.gate) continue;
+                            const double h = c.t - b.t;
+                            const double w = (b.theta[k] - a.theta[k]) / (b.t - a.t);
+                            const double y = c.theta[k] - b.theta[k] - velocity_term(tau, w, h);
+                            const double u = mc.sum(b.t + d, c.t + d, c.t + d, tau);
+                            suy += u * y; suu += u * u; syy += y * y; excitation += std::fabs(u);
+                            if (stick_used) {
+                                const double v = sc.sum(b.t + d, c.t + d, c.t + d, tau);
+                                svy += v * y; svv += v * v; suv += u * v; stick_excitation += std::fabs(v);
+                            }
+                            hold += (c.theta[k] - b.theta[k]) * (c.theta[k] - b.theta[k]);
+                            ++n;
+                        }
+                        if (n < 30) continue;
+                        double g = 0, gs = 0, sse = 0;
+                        if (!stick_used) {
+                            g = suu > 0 ? suy / suu : 0;
+                            if (excitation < 200) g = 0;  // not enough mouse movement to trust a gain
+                            else informative = true;
+                            sse = syy - 2 * g * suy + g * g * suu;
+                        } else {
+                            const bool use_mouse = excitation >= 200, use_stick = stick_excitation >= 0.5;
+                            if (use_mouse) informative = true;
+                            if (use_stick) stick_informative = true;
+                            if (use_mouse && use_stick) {
+                                const double det = suu * svv - suv * suv;
+                                if (det > 1e-12 * suu * svv) { g = (suy * svv - svy * suv) / det; gs = (svy * suu - suy * suv) / det; }
+                            } else if (use_mouse) {
+                                g = suu > 0 ? suy / suu : 0;
+                            } else if (use_stick) {
+                                gs = svv > 0 ? svy / svv : 0;
+                            }
+                            sse = syy - 2 * g * suy - 2 * gs * svy + g * g * suu + gs * gs * svv + 2 * g * gs * suv;
+                        }
+                        const double rms = std::sqrt(std::max(0.0, sse) / n);
+                        if (rms < best_rms) {
+                            best_rms = rms; best_tau = tau; best_delay = d; best_gain = g; hold_rms = std::sqrt(hold / n);
+                            if (stick_used) { best_stick = gs; best_power = power; }
+                        }
+                    }
+            // Too little movement lately (standing still, menus, the ReShade menu open): keep what was learned
+            // instead of dropping to no mouse at all until the next movement is learned again. Each input keeps
+            // its own gain while only the other one moves (switching between mouse and controller).
+            if (!informative && !stick_informative && out.fitted) continue;
             if (best_rms < 1e29) {
-                params_[k].tau = best_tau; params_[k].delay = best_delay; params_[k].gain = best_gain;
-                params_[k].quality = hold_rms > 0 ? 1.0 - best_rms / hold_rms : 0;
-                params_[k].fitted = true;
+                out.tau = best_tau; out.delay = best_delay;
+                if (informative || !stick_informative) out.gain = best_gain;
+                if (stick_informative) { out.stick_gain = best_stick; out.stick_power = best_power; }
+                out.quality = hold_rms > 0 ? 1.0 - best_rms / hold_rms : 0;
+                out.fitted = true;
             }
         }
     }
 
-private:
+    // Worker thread: the render thread hands over a copy of the history (post_fit) and picks the result up
+    // with the next frame (take_fit_result); a fit still running when the next is due skips that one.
+    void post_fit() {
+        if (settings_.freeze_fit) return;
+        {
+            std::lock_guard lock(job_mutex_);
+            if (busy_ || job_pending_) return;
+        }
+        FitJob job;
+        snapshot(job);
+        {
+            std::lock_guard lock(job_mutex_);
+            job_ = std::move(job);
+            job_pending_ = true;
+            if (!worker_.joinable()) worker_ = std::thread([this] { worker_loop(); });
+        }
+        job_cv_.notify_all();
+    }
+    void worker_loop() {
+        std::unique_lock lock(job_mutex_);
+        for (;;) {
+            job_cv_.wait(lock, [&] { return stop_ || job_pending_; });
+            if (stop_) return;
+            FitJob job = std::move(job_);
+            job_pending_ = false;
+            busy_ = true;
+            lock.unlock();
+            fit_params(job);
+            lock.lock();
+            result_ = std::move(job);
+            have_result_ = true;
+            busy_ = false;
+            job_cv_.notify_all();
+        }
+    }
+    void take_fit_result() {
+        if (!settings_.async_fit && !worker_.joinable()) return;
+        std::lock_guard lock(job_mutex_);
+        if (!have_result_) return;
+        have_result_ = false;
+        // (a fit started before a reset or a loaded profile is dropped)
+        if (result_.generation == generation_) { params_[0] = result_.params[0]; params_[1] = result_.params[1]; }
+    }
+
     struct Frame {
         std::uint64_t id;
         double t;
@@ -597,6 +860,12 @@ private:
     int since_fit_ = 0;
     std::deque<double> intervals_;
     double frame_interval_ = 0;
+    std::uint64_t generation_ = 0;  // bumped by reset_fit and seed: fits from before are dropped
+    std::thread worker_;
+    std::mutex job_mutex_;
+    std::condition_variable job_cv_;
+    FitJob job_, result_;
+    bool job_pending_ = false, busy_ = false, have_result_ = false, stop_ = false;
 };
 
 }  // namespace fw

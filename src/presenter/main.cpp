@@ -10,6 +10,7 @@
 #include <d3dkmthk.h>
 #include <dxgi1_4.h>
 #include <pdh.h>
+#include <Xinput.h>
 #include <wrl/client.h>
 #include <atomic>
 #include <condition_variable>
@@ -57,6 +58,8 @@ struct App {
     // Analysis logs (all times are raw QPC ticks, same clock in both processes).
     FILE* csv_events = nullptr;   // game-side timeline
     FILE* csv_mouse = nullptr;    // raw input
+    FILE* csv_stick = nullptr;    // controller right stick (on change)
+    std::atomic<bool> controller{false};  // an XInput controller is connected and read
     FILE* csv_motion = nullptr;   // per game frame: agreement of the motion vectors with depth + camera
     FILE* csv_sources = nullptr;  // ingested frames + camera
     FILE* csv_outputs = nullptr;  // presented frames + applied warp
@@ -153,6 +156,7 @@ void open_recordings() {
         };
         g_app.csv_events = open_csv(L"events.csv", "qpc,kind,tid,frame,extra");
         g_app.csv_mouse = open_csv(L"mouse.csv", "qpc,dx,dy");
+        g_app.csv_stick = open_csv(L"stick.csv", "qpc,x,y");
         g_app.csv_motion = open_csv(L"motion.csv", "qpc,frame,samples,moving_fraction,agree_x,agree_y,render_w,render_h,camera_fit");
         g_app.csv_sources = open_csv(L"sources.csv",
             "frame,qpc_sim,qpc_constants,qpc_present,qpc_ingest,px,py,pz,fx,fy,fz,ux,uy,uz,rx,ry,rz,fov,aspect,reset,mouse_gate,has_depth,has_hudless,"
@@ -323,8 +327,10 @@ void load_profile() {
     std::ifstream in(g_app.profile_path);
     AxisParams p[2];
     int version = 0;
-    if (in >> version && version == 2 &&
+    if (in >> version && (version == 2 || version == 3) &&
         in >> p[0].gain >> p[0].tau >> p[0].delay >> p[1].gain >> p[1].tau >> p[1].delay) {
+        if (version == 3 && !(in >> p[0].stick_gain >> p[0].stick_power >> p[1].stick_gain >> p[1].stick_power))
+            p[0].stick_gain = p[1].stick_gain = 0, p[0].stick_power = p[1].stick_power = 1;
         p[0].fitted = p[1].fitted = true;
         g_app.model.seed(p[0], p[1]);
         logf("profile loaded: yaw gain %.4g tau %.0f ms, pitch gain %.4g tau %.0f ms", p[0].gain, p[0].tau * 1000, p[1].gain, p[1].tau * 1000);
@@ -334,7 +340,8 @@ void save_profile() {
     const auto &x = g_app.model.params(0), &y = g_app.model.params(1);
     if (!x.fitted && !y.fitted) return;
     std::ostringstream out;
-    out << 2 << ' ' << x.gain << ' ' << x.tau << ' ' << x.delay << ' ' << y.gain << ' ' << y.tau << ' ' << y.delay << '\n';
+    out << 3 << ' ' << x.gain << ' ' << x.tau << ' ' << x.delay << ' ' << y.gain << ' ' << y.tau << ' ' << y.delay << ' '
+        << x.stick_gain << ' ' << x.stick_power << ' ' << y.stick_gain << ' ' << y.stick_power << '\n';
     g_files.replace(g_app.profile_path, out.str());  // (written by the file thread: see FileWriter)
 }
 
@@ -380,16 +387,59 @@ struct VblankClock {
 };
 
 // Sleeps until an absolute QPC time with a high-resolution waitable timer (+ short spin).
-void sleep_until(std::int64_t target) {
-    static HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    const std::int64_t spin = g_qpc_frequency / 2000;  // last 0.5 ms spun for precision
+// One timer per thread: a timer shared between threads is re-armed by each caller, waking the others early or
+// late (the render thread's refresh schedule must not depend on any other thread's waits). precise: the last
+// 0.5 ms spun (the render thread's pacing); other threads just wait.
+void sleep_until(std::int64_t target, bool precise = true) {
+    static thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    const std::int64_t spin = precise ? g_qpc_frequency / 2000 : 0;
     const std::int64_t now = qpc_now();
     if (target - now > spin && timer) {
         LARGE_INTEGER due;
         due.QuadPart = -static_cast<LONGLONG>(double(target - now - spin) * 1e7 / double(g_qpc_frequency));
         if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(timer, 100);
     }
-    while (qpc_now() < target) YieldProcessor();
+    if (precise) while (qpc_now() < target) YieldProcessor();
+}
+
+// Controller: the right stick of the first connected XInput pad, every 4 ms, into the camera model (the stick
+// sets a turn rate, learned from the game's own camera as the mouse gain is - also while the option is off,
+// so that switching it on applies at once). Its own thread: XInput calls can take a while.
+void controller_thread() {
+    int pad = -1;
+    double next_scan = 0, last_x = 2, last_y = 2;
+    while (g_app.running) {
+        const double now = now_seconds();
+        if (pad < 0 && now >= next_scan) {
+            next_scan = now + 2.0;  // (looking for a pad on empty slots is slow: every 2 s)
+            for (DWORD i = 0; i < XUSER_MAX_COUNT && pad < 0; ++i) {
+                XINPUT_STATE state{};
+                if (XInputGetState(i, &state) == ERROR_SUCCESS) pad = static_cast<int>(i);
+            }
+            if (pad >= 0) { logf("controller connected (XInput pad %d)", pad); g_app.controller = true; }
+        }
+        if (pad >= 0) {
+            XINPUT_STATE state{};
+            if (XInputGetState(static_cast<DWORD>(pad), &state) != ERROR_SUCCESS) {
+                logf("controller disconnected");
+                pad = -1; g_app.controller = false;
+                g_app.model.stick.add(now, 0, 0);
+            } else {
+                // Radial dead zone (XInput's recommended size), rescaled so that deflection starts at 0 past it.
+                double x = std::clamp(state.Gamepad.sThumbRX / 32767.0, -1.0, 1.0), y = std::clamp(state.Gamepad.sThumbRY / 32767.0, -1.0, 1.0);
+                const double magnitude = std::hypot(x, y), dead = XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE / 32767.0;
+                if (magnitude <= dead) x = y = 0;
+                else { const double scale = std::min(1.0, (magnitude - dead) / (1.0 - dead)) / magnitude; x *= scale; y *= scale; }
+                x = std::round(x * 1000.0) / 1000.0; y = std::round(y * 1000.0) / 1000.0;
+                // (not while the ReShade menu is open: the game's camera does not move then)
+                if (g_app.shared && g_app.shared->overlay_open) x = y = 0;
+                g_app.model.stick.add(now, x, y);
+                if ((x != last_x || y != last_y) && rec(g_app.csv_stick)) wr(g_app.csv_stick, "%lld,%.3f,%.3f\n", static_cast<long long>(qpc_now()), x, y);
+                last_x = x; last_y = y;
+            }
+        }
+        sleep_until(qpc_now() + g_qpc_frequency / 250, false);
+    }
 }
 
 // GPU scheduler priority class for the whole process, from the UI (applied live).
@@ -971,6 +1021,8 @@ void render_thread() {
 
         PoseSettings ps;
         ps.use_mouse = settings.use_mouse != 0;
+        ps.use_stick = settings.use_controller != 0;
+        ps.async_fit = true;  // (the fit runs on its own thread: tens of ms with a controller)
         ps.rotation_extrapolation = settings.rotation_extrapolation;
         ps.prediction = settings.prediction_ms / 1000.0;
         // Auto: half a game frame, or a quarter when the game sends no HUD layers - the HUD/weapon mask
@@ -1382,6 +1434,9 @@ void render_thread() {
                 st.display_hz = vblank.period > 0 ? float(double(qf.QuadPart) / vblank.period) : 0.0f;
             }
             st.fit_quality_x = float(px.quality); st.fit_quality_y = float(py.quality);
+            st.controller = g_app.controller ? 1u : 0u;
+            st.stick_gain_x = float(px.stick_gain); st.stick_gain_y = float(py.stick_gain);
+            st.stick_power_x = float(px.stick_power); st.stick_power_y = float(py.stick_power);
             st.calibrated_x = px.fitted; st.calibrated_y = py.fitted;
             st.frames_presented += stat_frames; st.sources_consumed += stat_sources;
             st.heartbeat_qpc = qpc_now();
@@ -1624,14 +1679,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
 
     std::thread renderer(render_thread);
     SetThreadPriority(renderer.native_handle(), THREAD_PRIORITY_TIME_CRITICAL);
+    std::thread controller(controller_thread);
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
     g_app.running = false;
     renderer.join();
+    controller.join();
     if (g_app.shared) g_app.shared->presenter.pid = 0;
     logf("exit");
     g_files.stop();
-    for (FILE* csv : {g_app.csv_events, g_app.csv_mouse, g_app.csv_sources, g_app.csv_outputs, g_app.csv_motion}) if (csv) std::fclose(csv);
+    for (FILE* csv : {g_app.csv_events, g_app.csv_mouse, g_app.csv_sources, g_app.csv_outputs, g_app.csv_motion, g_app.csv_stick}) if (csv) std::fclose(csv);
     if (g_app.log) std::fclose(g_app.log);
     if (single) CloseHandle(single);
     return 0;
