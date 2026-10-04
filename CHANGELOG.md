@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.8.5
 
 * **The HUD stays still with FSR frame generation too.** Games that hand FSR frame generation a picture
   without the HUD (Resident Evil Requiem) get their HUD found exactly from it, every frame, as Cyberpunk
