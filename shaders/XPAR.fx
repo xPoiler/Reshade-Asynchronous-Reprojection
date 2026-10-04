@@ -19,10 +19,13 @@
 // Set by the add-on when the depth comes the other way round (ReShade's RESHADE_DEPTH_INPUT_IS_REVERSED
 // not matching the game): it checks that itself, so the setting does not have to be right.
 uniform bool XPAR_Flip < hidden = true; > = false;
+// Set by the add-on when none of the game's depth buffers belongs to the picture: everything is handed over
+// as far away, and XPAR warps the camera's turns only (they need no depth).
+uniform bool XPAR_Far < hidden = true; > = false;
 
 texture XPAR_Depth { Width = BUFFER_WIDTH / XPAR_FEED_DIV; Height = BUFFER_HEIGHT / XPAR_FEED_DIV; Format = R32F; };
 
-float XPAR_FeedPS(in float4 position : SV_Position, in float2 texcoord : TEXCOORD) : SV_Target
+float XPAR_GameDepth(float2 texcoord)
 {
     // ReShade.fxh orients the depth buffer (upside down, reversed, logarithmic, scaled) and then makes it
     // linear with a near plane of 1 and the configured far plane. XPAR wants the oriented buffer itself,
@@ -33,15 +36,20 @@ float XPAR_FeedPS(in float4 position : SV_Position, in float2 texcoord : TEXCOOR
     return XPAR_Flip ? 1.0 - depth : depth;
 }
 
+float XPAR_FeedPS(in float4 position : SV_Position, in float2 texcoord : TEXCOORD) : SV_Target
+{
+    return XPAR_Far ? 0.0 : XPAR_GameDepth(texcoord);
+}
+
 // A small probe of the depth and of the picture's brightness: the add-on reads it to tell which of the
-// game's depth buffers belongs to the picture (it tries them in turn when the feed starts).
+// game's depth buffers belongs to the picture (it tries them in turn when the feed starts). Always the
+// game's depth, also while the far-away depth is handed over.
 texture XPAR_Probe { Width = 256; Height = 144; Format = RG32F; };
-sampler XPAR_DepthPoint { Texture = XPAR_Depth; MagFilter = POINT; MinFilter = POINT; MipFilter = POINT; };
 
 float2 XPAR_ProbePS(in float4 position : SV_Position, in float2 texcoord : TEXCOORD) : SV_Target
 {
     const float3 colour = tex2Dlod(ReShade::BackBuffer, float4(texcoord, 0, 0)).rgb;
-    return float2(tex2Dlod(XPAR_DepthPoint, float4(texcoord, 0, 0)).x, sqrt(saturate(dot(colour, float3(0.299, 0.587, 0.114)))));
+    return float2(XPAR_GameDepth(texcoord), sqrt(saturate(dot(colour, float3(0.299, 0.587, 0.114)))));
 }
 
 technique XPAR_Feed <

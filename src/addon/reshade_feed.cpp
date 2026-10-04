@@ -18,7 +18,8 @@ struct State {
     unsigned waited = 0;
     effect_technique feed{0};
     effect_texture_variable depth{0}, probe{0}, bound{0};
-    effect_uniform_variable flip{0};
+    effect_uniform_variable flip{0}, far_switch{0};
+    bool far_on = false;  // XPAR_Far as last set
     char status[200] = "";
 } g;
 
@@ -35,6 +36,8 @@ void scan(effect_runtime* runtime) {
     g.feed = runtime->find_technique("XPAR.fx", "XPAR_Feed");
     g.depth = {0}; g.probe = {0}; g.bound = {0};
     g.flip = runtime->find_uniform_variable("XPAR.fx", "XPAR_Flip");
+    g.far_switch = runtime->find_uniform_variable("XPAR.fx", "XPAR_Far");
+    g.far_on = false;  // (a reloaded effect starts with its default)
     runtime->enumerate_texture_variables("XPAR.fx", [&](effect_runtime* r, effect_texture_variable v) {
         char name[160] = "";
         r->get_texture_variable_name(v, name);
@@ -93,12 +96,25 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
     resource_view probe_view{0}, bound_view{0};
     if (g.probe.handle) runtime->get_texture_binding(g.probe, &probe_view, &unused);
     if (g.bound.handle) runtime->get_texture_binding(g.bound, &bound_view, &unused);
-    if (choose_depth_buffer(runtime, cmd_list, probe_view, bound_view) == DepthChoice::kChoosing) {
-        set_status("No DLSS or FSR data from this game: finding the game's depth buffer...");
-        return;
+    const bool choosing = choose_depth_buffer(runtime, cmd_list, probe_view, bound_view) == DepthChoice::kChoosing;
+    // Without a depth buffer that belongs to the picture (none stands out, or one is still being looked for, or
+    // its orientation is not known yet), everything is handed over as far away: the camera's turns are warped
+    // exactly all the same (they need no depth), walking and strafing move at the game's frame rate. Better
+    // than an unrelated buffer's depth, which moves parts of the picture by distances that are not there.
+    // (An older XPAR.fx without the switch: the depth is not published until it is known, as before.)
+    const bool usable = depth_usable() && !choosing;
+    const bool oriented = usable && depth_orientation_ready(runtime, cmd_list, probe_view, g.flip);
+    const bool far_only = !oriented;
+    if (g.far_switch.handle) {
+        // (applies from the next frame's depth: this frame's was drawn with the switch as it was)
+        const bool was = g.far_on;
+        runtime->set_uniform_value_bool(g.far_switch, far_only);
+        g.far_on = far_only;
+        if (far_only && !was) return;
     }
-    if (!depth_orientation_ready(runtime, cmd_list, probe_view, g.flip)) {
-        set_status("No DLSS or FSR data from this game: checking which way round its depth is stored...");
+    if (far_only && !g.far_switch.handle) {
+        set_status(choosing ? "No DLSS or FSR data from this game: finding the game's depth buffer..."
+                            : "No DLSS or FSR data from this game: checking which way round its depth is stored...");
         return;
     }
 
@@ -123,7 +139,11 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
                   reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()));
     }
     char text[200];
-    if (depth_restart_needed())
+    if (far_only)
+        std::snprintf(text, sizeof(text), "%s", choosing && depth_usable()
+            ? "No DLSS or FSR data from this game: checking the depth buffer (camera turns only meanwhile)."
+            : "No DLSS or FSR data and no usable depth buffer: XPAR warps camera turns only (walking and strafing move at the game's frame rate).");
+    else if (depth_restart_needed())
         std::snprintf(text, sizeof(text), "No DLSS or FSR data from this game. Its depth reads empty: XPAR switched on ReShade's depth copy - restart the game once.");
     else
         std::snprintf(text, sizeof(text), "No DLSS or FSR data from this game: depth from ReShade (%ux%u), motion and camera estimated by XPAR.", w, h);

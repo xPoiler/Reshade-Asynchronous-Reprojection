@@ -32,6 +32,10 @@ DepthChoice choose_depth_buffer(reshade::api::effect_runtime* runtime, reshade::
 // depth of such frames is not to be used.
 bool depth_orientation_ready(reshade::api::effect_runtime* runtime, reshade::api::command_list* cmd_list,
                              reshade::api::resource_view probe, reshade::api::effect_uniform_variable flip_variable);
+// Whether the depth ReShade hands over belongs to the picture: a buffer chosen here or ticked by the user (or a
+// Generic Depth this cannot steer: its own choice, as before). False while none stands out - nothing in use,
+// or none whose depth lies on the picture's edges (Cyber Hook: every one reads empty or unrelated).
+bool depth_usable();
 // ReShade's depth copy setting was switched on (the depth read empty): the game has to be restarted once.
 bool depth_restart_needed();
 // The feed stopped (an upscaler gives depth again, XPAR disabled): Generic Depth's own choice again.

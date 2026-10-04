@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+* **Games without a usable depth buffer work too: camera turns only.** Without DLSS or FSR, XPAR takes the
+  depth from ReShade; some games have no depth buffer that belongs to the picture (every one reads empty
+  or unrelated). XPAR used to wait for one, or used whatever ReShade had selected, which moved parts of
+  the picture by distances that are not there. Now, while no depth buffer stands out, XPAR treats
+  everything as far away: camera turns are reprojected exactly (they need no depth), and walking and
+  strafing move at the game's frame rate. It keeps looking for a usable buffer and switches to it when
+  one turns up, without pausing reprojection while it looks. A buffer ticked by hand in ReShade's list
+  is still used as it is. Needs the updated XPAR.fx (the installer puts it in place).
+* **New option: Force a borderless window** (off by default, remembered per game), for games that only
+  run in exclusive fullscreen, where nothing can be shown over the game. The game stays in a window that
+  covers the screen, and is told it is fullscreen (games that check would otherwise keep switching).
+  Applies when the game is restarted.
 * **Warning when a frame rate cap outside XPAR holds its output back.** XPAR's window is never the
   focused one (the game keeps the keyboard and mouse), so NVIDIA's "Background Application Max Frame
   Rate" caps it, and can cap the game it covers. The XPAR panel now warns when XPAR's output stays well

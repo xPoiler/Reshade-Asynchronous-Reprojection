@@ -11,7 +11,9 @@
 #include "addon/depth_choice.hpp"
 #include "addon/reshade_feed.hpp"
 #include <d3d12.h>
+#include <dxgi1_2.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <string>
 #include <cstring>
@@ -88,7 +90,101 @@ bool presenter_running() {
     return false;
 }
 
+// Games that only run in exclusive fullscreen (option, saved per game, read when the game sets up its picture):
+// nothing can be shown over exclusive fullscreen, so the game's swap chain stays windowed - at the game's
+// resolution its window covers the screen like a borderless one - and its requests to go fullscreen are refused.
+//
+// Some games check that they got exclusive fullscreen and rebuild their swap chain until they do (Metro Redux:
+// every ~50 ms once it came back into focus). So the game is also told it is fullscreen: the swap chain's
+// GetFullscreenState, GetDesc and GetFullscreenDesc answer "fullscreen" while the option is on. These are
+// patched in the DXGI swap chain's function table (no ReShade event for them), shared by every swap chain of
+// the process, and pass everything else through unchanged.
+bool force_borderless() {
+    int value = 0;
+    reshade::get_config_value(nullptr, "FrameWarp", "ForceBorderless", value);
+    return value != 0;
+}
+
+std::atomic<bool> g_report_fullscreen{false};  // a fullscreen request was refused: the game is told it got it
+std::atomic<int> g_refusals{0};
+using GetFullscreenStateFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, BOOL*, IDXGIOutput**);
+using GetDescFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, DXGI_SWAP_CHAIN_DESC*);
+using GetFullscreenDescFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, DXGI_SWAP_CHAIN_FULLSCREEN_DESC*);
+GetFullscreenStateFn g_get_fullscreen_state = nullptr;
+GetDescFn g_get_desc = nullptr;
+GetFullscreenDescFn g_get_fullscreen_desc = nullptr;
+
+HRESULT STDMETHODCALLTYPE reported_fullscreen_state(IDXGISwapChain* sc, BOOL* fullscreen, IDXGIOutput** target) {
+    const HRESULT hr = g_get_fullscreen_state(sc, fullscreen, target);
+    if (SUCCEEDED(hr) && g_report_fullscreen) {
+        if (fullscreen) *fullscreen = TRUE;
+        if (target && !*target) sc->GetContainingOutput(target);
+    }
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE reported_desc(IDXGISwapChain* sc, DXGI_SWAP_CHAIN_DESC* desc) {
+    const HRESULT hr = g_get_desc(sc, desc);
+    if (SUCCEEDED(hr) && desc && g_report_fullscreen) desc->Windowed = FALSE;
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE reported_fullscreen_desc(IDXGISwapChain1* sc, DXGI_SWAP_CHAIN_FULLSCREEN_DESC* desc) {
+    const HRESULT hr = g_get_fullscreen_desc(sc, desc);
+    if (SUCCEEDED(hr) && desc && g_report_fullscreen) desc->Windowed = FALSE;
+    return hr;
+}
+
+template <typename Fn>
+void patch_slot(void** table, int index, Fn hook, Fn& original) {
+    if (table[index] == reinterpret_cast<void*>(hook)) return;
+    DWORD protect = 0;
+    if (!VirtualProtect(&table[index], sizeof(void*), PAGE_EXECUTE_READWRITE, &protect)) return;
+    original = reinterpret_cast<Fn>(table[index]);
+    table[index] = reinterpret_cast<void*>(hook);
+    VirtualProtect(&table[index], sizeof(void*), protect, &protect);
+    FlushInstructionCache(GetCurrentProcess(), &table[index], sizeof(void*));
+}
+
+// Function table slots: IDXGISwapChain GetFullscreenState 11, GetDesc 12; IDXGISwapChain1 GetFullscreenDesc 19.
+void report_fullscreen_for(swapchain* sc) {
+    const auto api = sc->get_device()->get_api();
+    if (!g_report_fullscreen || (api != device_api::d3d10 && api != device_api::d3d11 && api != device_api::d3d12)) return;
+    auto* dxgi = reinterpret_cast<IDXGISwapChain*>(sc->get_native());
+    if (!dxgi) return;
+    void** table = *reinterpret_cast<void***>(dxgi);
+    patch_slot(table, 11, &reported_fullscreen_state, g_get_fullscreen_state);
+    patch_slot(table, 12, &reported_desc, g_get_desc);
+    IDXGISwapChain1* dxgi1 = nullptr;
+    if (SUCCEEDED(dxgi->QueryInterface(IID_PPV_ARGS(&dxgi1))) && dxgi1) {
+        patch_slot(*reinterpret_cast<void***>(dxgi1), 19, &reported_fullscreen_desc, g_get_fullscreen_desc);
+        dxgi1->Release();
+    }
+}
+
+void log_refusal() {
+    // (once, then every 100th: a game asking again and again is worth seeing, not a log full of it)
+    const int n = ++g_refusals;
+    if (n == 1 || n % 100 == 0) {
+        char text[160];
+        std::snprintf(text, sizeof(text), "XPAR: exclusive fullscreen refused (%d so far): the game stays in a window and is told it is fullscreen", n);
+        reshade::log::message(reshade::log::level::info, text);
+    }
+}
+bool on_create_swapchain(reshade::api::device_api, reshade::api::swapchain_desc& desc, void*) {
+    if (!desc.fullscreen_state || !force_borderless()) return false;
+    desc.fullscreen_state = false;
+    g_report_fullscreen = true;
+    log_refusal();
+    return true;
+}
+bool on_set_fullscreen_state(reshade::api::swapchain*, bool fullscreen, void*) {
+    if (!fullscreen || !force_borderless()) return false;
+    g_report_fullscreen = true;
+    log_refusal();
+    return true;
+}
+
 void on_init_swapchain(swapchain* sc, bool) {
+    report_fullscreen_for(sc);
     device* dev = sc->get_device();
     if (!g_producer) return;
     if (dev->get_api() == device_api::d3d12) {
@@ -116,7 +212,7 @@ void on_init_swapchain(swapchain* sc, bool) {
     static constexpr Saved kSaved[] = {{"HudFromDlssOutput", 2}, {"FillBehindHud", 1}, {"HoldOrbitedCharacter", 1},
                                        {"NearCameraRule", 1}, {"RecordDiagnostics", 0}, {"BackgroundMemory", 1},
                                        {"StretchWidth", 1}, {"GameCameraCheck", 0}, {"MovingObjects", 0},
-                                       {"GpuPriority", 0}};
+                                       {"GpuPriority", 0}, {"ForceBorderless", 0}};
     char saved_version[32] = "";
     size_t size = sizeof(saved_version);
     if (!reshade::get_config_value(nullptr, "FrameWarp", "SettingsVersion", saved_version, &size) ||
@@ -399,6 +495,10 @@ void draw_overlay(effect_runtime*) {
         ImGui::TextDisabled("  character/weapon at the display rate without it, one game frame late (the camera is not delayed); games with DLSS or FSR");
         if (!latewarp)
             ImGui::TextDisabled("  NVIDIA Latewarp is not installed (optional: nvngx_latewarp.dll, NVIDIA GPUs only)");
+        bool borderless = force_borderless();
+        if (ImGui::Checkbox("Force a borderless window (for games that only run in exclusive fullscreen)", &borderless))
+            reshade::set_config_value(nullptr, "FrameWarp", "ForceBorderless", borderless ? "1" : "0");
+        ImGui::TextDisabled("  XPAR can't show over exclusive fullscreen; applies when the game is restarted; remembered for this game");
         bool invert = s.invert_warp != 0;
         if (ImGui::Checkbox("Invert warp (debug)", &invert)) s.invert_warp = invert;
         bool record = s.record_diagnostics != 0;
@@ -567,10 +667,14 @@ void register_callbacks() {
     reshade::register_event<reshade::addon_event::create_resource>(on_create_resource);
     reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
     reshade::register_event<reshade::addon_event::reshade_open_overlay>(on_open_overlay);
+    reshade::register_event<reshade::addon_event::create_swapchain>(on_create_swapchain);
+    reshade::register_event<reshade::addon_event::set_fullscreen_state>(on_set_fullscreen_state);
     reshade::register_overlay("XPAR", draw_overlay);
 }
 void unregister_callbacks() {
     reshade::unregister_overlay("XPAR", draw_overlay);
+    reshade::unregister_event<reshade::addon_event::set_fullscreen_state>(on_set_fullscreen_state);
+    reshade::unregister_event<reshade::addon_event::create_swapchain>(on_create_swapchain);
     reshade::unregister_event<reshade::addon_event::reshade_open_overlay>(on_open_overlay);
     reshade::unregister_event<reshade::addon_event::destroy_device>(on_destroy_device);
     reshade::unregister_event<reshade::addon_event::create_resource>(on_create_resource);

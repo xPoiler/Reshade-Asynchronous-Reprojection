@@ -16,7 +16,8 @@ in games without one, from ReShade and the picture itself:
 * **No DLSS or FSR** (DirectX 12 and DirectX 11, experimental): the depth from ReShade's depth buffer,
   which FrameWarp picks and sets up by itself, and the motion worked out from the picture itself. This
   is also used when a game's DLSS and FSR are switched off, and FrameWarp switches back by itself when
-  they are switched on again.
+  they are switched on again. In a game without a usable depth buffer, camera turns are still
+  reprojected (walking and strafing move at the game's frame rate).
 
 **Frame generation works with it**: with the game's DLSS Frame Generation or FSR 3.1 frame generation on,
 FrameWarp shows the generated images too, each moved to where the camera is now, so moving things get
@@ -101,7 +102,8 @@ Advanced: both files also accept a game name or folder directly (`install.bat "E
 ## Use
 
 1. Run the game in **borderless** mode, with DLSS or FSR on if the game has them. Frame generation can be
-   on (DLSS Frame Generation or FSR 3.1 frame generation) or off.
+   on (DLSS Frame Generation or FSR 3.1 frame generation) or off. For a game that only runs in exclusive
+   fullscreen, tick **Force a borderless window** and restart the game.
 2. Open the ReShade overlay (Home key) and go to **Add-ons > XPAR**. The presenter starts
    automatically with the game.
 
@@ -123,6 +125,7 @@ Advanced: both files also accept a game name or folder directly (`install.bat "E
 | **Show the mask** | Tints what is kept still (magenta), to check the options above. With *Learned from camera motion* and NVIDIA Latewarp (or *Present lead* 0), the HUD still being learned shows green too. |
 | **Warp engine** | **XPAR** (default): FrameWarp's own engine, any GPU. **NVIDIA Latewarp**: selectable when `nvngx_latewarp.dll` is installed and the GPU is NVIDIA's. |
 | **Presenter GPU priority** | Keep **Realtime**. Lower priorities cannot hold the refresh rate while the game loads the GPU. |
+| **Force a borderless window** | Off by default, remembered per game, applies when the game is restarted. For games that only run in exclusive fullscreen, where nothing can be shown over the game: the game stays in a window that covers the screen and is told it is fullscreen. |
 | **Record detailed diagnostics** | Off by default, remembered per game. Writes frame-by-frame recordings to the logs folder, for troubleshooting, and turns on the **Ctrl+Shift+M** (mark a moment in the log) and **Ctrl+Shift+D** (capture the current frames; the game pauses for about a second) keys. |
 | **Reset camera model** | Re-learns how the game's camera responds to your mouse. This also happens automatically within seconds of play. |
 | **Start presenter** | Restarts the presenter if it was closed. |
@@ -146,9 +149,9 @@ diagnostics) are for fine-tuning and troubleshooting.
 * Upscalers built into a game's executable instead of a DLL (Cyberpunk 2077's FSR 2.1) can't be used.
 * Without DLSS or FSR, the motion is worked out from the picture: very fast turns, dark or blurry
   scenes and flat surfaces are where it is least sure, and the result is less exact than with an
-  upscaler's motion vectors. A game whose depth buffer ReShade can't see doesn't work this way. When
-  the depth reads empty, FrameWarp switches on ReShade's depth copy and asks for one restart of the
-  game. DirectX 9, DirectX 10 and OpenGL games aren't supported, and Vulkan games only with DLSS.
+  upscaler's motion vectors. When the depth reads empty, FrameWarp switches on ReShade's depth copy and
+  asks for one restart of the game. In a game whose depth buffer ReShade can't see, or that has none
+  belonging to the picture, only camera turns are reprojected. DirectX 9, DirectX 10 and OpenGL games aren't supported, and Vulkan games only with DLSS.
 * Very fast motion goes beyond what re-projecting a single frame can hide. In Expedition 33's
   overworld, very fast camera turns can make the picture shake slightly.
 * The Expedition 33 support targets the current Steam build. It switches itself off safely if a game

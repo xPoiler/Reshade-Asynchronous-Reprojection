@@ -552,6 +552,8 @@ bool depth_orientation_ready(effect_runtime* runtime, command_list* cmd_list, re
 
 bool depth_restart_needed() { return c.restart_needed; }
 
+bool depth_usable() { return c.disabled || c.users || c.chosen.handle != 0; }
+
 void track_depth_buffers() {
     g_track = true;
     ++g_frame;
