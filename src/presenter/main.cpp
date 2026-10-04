@@ -59,6 +59,7 @@ struct App {
     FILE* csv_events = nullptr;   // game-side timeline
     FILE* csv_mouse = nullptr;    // raw input
     FILE* csv_stick = nullptr;    // controller right stick (on change)
+    FILE* csv_hooks = nullptr;    // the add-on's call counters (Streamline, NGX, FSR, frame generation), cumulative, once a second
     std::atomic<bool> controller{false};  // an XInput controller is connected and read
     FILE* csv_motion = nullptr;   // per game frame: agreement of the motion vectors with depth + camera
     FILE* csv_sources = nullptr;  // ingested frames + camera
@@ -157,6 +158,10 @@ void open_recordings() {
         g_app.csv_events = open_csv(L"events.csv", "qpc,kind,tid,frame,extra");
         g_app.csv_mouse = open_csv(L"mouse.csv", "qpc,dx,dy");
         g_app.csv_stick = open_csv(L"stick.csv", "qpc,x,y");
+        g_app.csv_hooks = open_csv(L"hooks.csv",
+            "qpc,sl_constants,sl_tags,sl_tags_for_frame,sl_markers,sl_evaluate,sl_new_frame_token,sl_set_feature_loaded,sl_allocate,sl_free,"
+            "sl_get_feature_function,ngx_creates,ngx_dlss_creates,ngx_evaluates,ngx_dlss_evaluates,ngx_feature1,ngx_feature11,ngx_feature13,"
+            "ngx_published,ngx_joined,fsr_creates,fsr_dispatches,fsr_published,generation_calls,presents,frames,frames_published,slots_dropped");
         g_app.csv_motion = open_csv(L"motion.csv", "qpc,frame,samples,moving_fraction,agree_x,agree_y,render_w,render_h,camera_fit");
         g_app.csv_sources = open_csv(L"sources.csv",
             "frame,qpc_sim,qpc_constants,qpc_present,qpc_ingest,px,py,pz,fx,fy,fz,ux,uy,uz,rx,ry,rz,fov,aspect,reset,mouse_gate,has_depth,has_hudless,"
@@ -179,6 +184,21 @@ void logf(const char* format, ...) {
     if (m > 0) n += std::min(m, int(sizeof(line)) - n - 2);
     line[n++] = '\n';
     g_files.write(g_app.log, line, std::size_t(n));
+}
+
+// Detailed diagnostics: the add-on's call counters once a second (hooks.csv) - which calls stop when the frames
+// stop; also while paused.
+void record_hooks(const Shared& sh, double now) {
+    static double last = 0;
+    if (now - last < 1.0 || !rec(g_app.csv_hooks)) return;
+    last = now;
+    const auto &h = sh.hooks; const auto &n = sh.ngx; const auto &f = sh.fsr;
+    wr(g_app.csv_hooks, "%lld,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%ld,%ld,%ld,%u,%u\n",
+       static_cast<long long>(qpc_now()), h.constants_calls, h.tag_calls, h.tag_for_frame_calls, h.marker_calls, h.export_calls[3],
+       h.export_calls[2], h.export_calls[5], h.export_calls[6], h.export_calls[7], h.export_calls[8], n.create_calls, n.dlss_creates,
+       n.evaluate_calls, n.dlss_calls, n.feature_calls[1], n.feature_calls[11], n.feature_calls[13], n.frames_published, n.frames_joined,
+       f.upscale_creates, f.upscale_dispatches, f.frames_published, static_cast<long>(sh.generation_calls), static_cast<long>(sh.presents_total),
+       static_cast<long>(sh.frames_total), h.frames_published, h.slots_dropped);
 }
 
 // Detailed diagnostics switched on/off, and the game-side timeline dumped while they are on (also while
@@ -1096,6 +1116,7 @@ void render_thread() {
         if (!g_app.visible || aside) {  // game not in front / disabled / frame generation: don't compete with it for the GPU
             if (aside) g_app.has_frames = false;
             record_timeline(sh, settings);
+            record_hooks(sh, now_seconds());
             // (while paused, what keeps it so - every 5 s)
             if (now_seconds() - last_pause_log > 5.0) {
                 last_pause_log = now_seconds();
@@ -1469,6 +1490,7 @@ void render_thread() {
                     log_swap_wait_ms = log_present_call_ms = log_present_call_max = 0; log_presents = 0; log_since = now;
                 }
             }
+            record_hooks(sh, now);
             stat_frames = stat_sources = 0; stat_start = now;
             if (now - last_profile_save > 10.0) { save_profile(); last_profile_save = now; }
         }
@@ -1688,7 +1710,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (g_app.shared) g_app.shared->presenter.pid = 0;
     logf("exit");
     g_files.stop();
-    for (FILE* csv : {g_app.csv_events, g_app.csv_mouse, g_app.csv_sources, g_app.csv_outputs, g_app.csv_motion, g_app.csv_stick}) if (csv) std::fclose(csv);
+    for (FILE* csv : {g_app.csv_events, g_app.csv_mouse, g_app.csv_sources, g_app.csv_outputs, g_app.csv_motion, g_app.csv_stick, g_app.csv_hooks}) if (csv) std::fclose(csv);
     if (g_app.log) std::fclose(g_app.log);
     if (single) CloseHandle(single);
     return 0;

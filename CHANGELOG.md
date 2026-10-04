@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+* **The HUD stays still with FSR frame generation too.** Games that hand FSR frame generation a picture
+  without the HUD (Resident Evil Requiem) get their HUD found exactly from it, every frame, as Cyberpunk
+  2077's already was with its Streamline HUD-less picture.
+* **FSR frame generation no longer stalls when the game stops sending its depth** (Cyberpunk 2077 with
+  FSR frame generation and DLSS: "this kind of frame generation is not supported" until the DLSS quality
+  mode was changed). XPAR's fallback for games without DLSS or FSR started then and took the frames frame
+  generation's images belong to; it stays off while the game's frame generation is in use.
+* Record detailed diagnostics also saves the add-on's call counters once a second (`hooks.csv`).
 * **Controller support.** The right stick of a controller (XInput: Xbox pads, or others through Steam
   Input) now drives the reprojected camera, as the mouse does: XPAR learns from the game's own camera how
   fast the stick turns it and the game's response curve, and moves the camera with the held stick between

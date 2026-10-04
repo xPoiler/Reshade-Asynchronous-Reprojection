@@ -66,7 +66,11 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
     // the start or in the middle of a session), and it is out from the first frame an upscaler gives. It
     // starts after 600 frames without any, so that a game whose upscaler is on does not see it while it
     // loads or in a short pause; what was learned from the one source is dropped for the other (presenter).
-    const bool wanted = p->shared()->settings.enabled && !p->game_depth_seen();
+    // Not while the game's frame generation is in use either: its frames come from there (the generated images
+    // are taken for the game's own frames), and the feed - run per presented image, on frame generation's own
+    // present thread - would fill the frame slots with frames of its own, leaving the generated images nowhere
+    // to go (Cyberpunk 2077 with FSR frame generation and DLSS not running: nothing shown at all).
+    const bool wanted = p->shared()->settings.enabled && !p->game_depth_seen() && !p->generation_active();
     if (!g.scanned) scan(runtime);
     if (wanted) track_depth_buffers(); else release_depth_choice(runtime);
     if (!wanted || ++g.waited < 600) {

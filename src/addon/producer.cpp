@@ -472,7 +472,8 @@ void Producer::poll_markers() {
 }
 
 void Producer::on_generated(std::uint64_t frame, std::uint32_t index, std::uint32_t per_frame, ID3D12Resource* image, D3D12_RESOURCE_STATES image_state,
-                            ID3D12Resource* real, D3D12_RESOURCE_STATES real_state, ID3D12GraphicsCommandList* list) {
+                            ID3D12Resource* real, D3D12_RESOURCE_STATES real_state, ID3D12GraphicsCommandList* list,
+                            ID3D12Resource* hudless, D3D12_RESOURCE_STATES hudless_state) {
     std::lock_guard lock(mutex_);
     // (diagnostics: why an image is not taken)
     auto skip = [&](GenSkip reason) { push_event(shared_, kEvFrameGen, frame, 0x300 | (static_cast<std::uint64_t>(reason) << 16)); };
@@ -517,6 +518,7 @@ void Producer::on_generated(std::uint64_t frame, std::uint32_t index, std::uint3
     const bool compute = list->GetType() == D3D12_COMMAND_LIST_TYPE_COMPUTE;
     if (compute && (image_state & graphics_only)) { ++shared_->hooks.copies_failed; return skip(kGenSkipComputeState); }
     if (compute && (real_state & graphics_only)) real = nullptr;
+    if (compute && (hudless_state & graphics_only)) hudless = nullptr;
     collect_retired();
     auto set_info = [&](Tex k) {
         const auto& t = textures_[slot][k];
@@ -540,6 +542,14 @@ void Producer::on_generated(std::uint64_t frame, std::uint32_t index, std::uint3
             copy_into(list, real, real_state, textures_[slot][kBackbuffer].resource.Get());
             set_info(kBackbuffer);
             m.qpc_present = qpc_now();
+        }
+        if (hudless && !m.tex[kHudless].valid) {
+            const auto hd = hudless->GetDesc();
+            if (hd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && hd.SampleDesc.Count == 1 && hd.Width == rd.Width && hd.Height == rd.Height &&
+                ensure_texture(slot, kHudless, hd)) {
+                copy_into(list, hudless, hudless_state, textures_[slot][kHudless].resource.Get());
+                set_info(kHudless);
+            }
         }
     }
     if (take) m.gen_index[m.generated++] = index;

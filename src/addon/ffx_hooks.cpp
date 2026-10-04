@@ -2,8 +2,12 @@
 #include "addon/ngx_hooks.hpp"
 #include "addon/streamline_hooks.hpp"
 #include "common/inline_hook.hpp"
+#include <reshade.hpp>
 #include <d3d12.h>
+#include <wrl/client.h>
 #include <atomic>
+#include <mutex>
+#include <cstdio>
 #include <algorithm>
 #include <cstring>
 #include <string>
@@ -60,6 +64,30 @@ struct ffxDispatchDescFrameGeneration {
 static_assert(offsetof(ffxDispatchDescFrameGeneration, numGeneratedFrames) == 264 && offsetof(ffxDispatchDescFrameGeneration, frameID) == 304,
               "frame generation dispatch layout");
 constexpr ffxStructType_t kDispatchFrameGeneration = 0x00020003u;
+// Frame generation's setup (ffx_framegeneration.h): a game may hand over its picture without the HUD
+// (HUDLessColor, may be empty); and the frame generation swapchain's UI layer (ffx_api_framegeneration_dx12.h,
+// may be empty). Read for the log only, so far.
+struct ffxConfigureDescFrameGeneration {
+    ffxApiHeader header;
+    void* swapChain;
+    void* presentCallback;
+    void* presentCallbackUserContext;
+    void* frameGenerationCallback;
+    void* frameGenerationCallbackUserContext;
+    bool frameGenerationEnabled;
+    bool allowAsyncWorkloads;
+    FfxApiResource HUDLessColor;
+    std::uint32_t flags;
+};
+static_assert(offsetof(ffxConfigureDescFrameGeneration, HUDLessColor) == 64 && offsetof(ffxConfigureDescFrameGeneration, flags) == 112,
+              "frame generation configure layout");
+struct ffxConfigureDescFrameGenerationSwapChainRegisterUiResourceDX12 {
+    ffxApiHeader header;
+    FfxApiResource uiResource;
+    std::uint32_t flags;
+};
+static_assert(offsetof(ffxConfigureDescFrameGenerationSwapChainRegisterUiResourceDX12, flags) == 64, "UI resource registration layout");
+constexpr ffxStructType_t kConfigureFrameGeneration = 0x00020002u, kConfigureRegisterUi = 0x00030002u;
 constexpr std::uint32_t kDepthInverted = 1u << 3;  // the same bit in both APIs' upscaler creation flags
 
 // FidelityFX SDK 1.0 (FSR 3.0; ffx_types.h and ffx_fsr3upscaler.h of tags fsr3-v3.0.3 / fsr3-v3.0.4),
@@ -291,9 +319,54 @@ ffxReturnCode_t hk_create(ffxContext* context, ffxApiHeader* desc, const void* m
     return result;
 }
 
+// The HUD-less picture the game registered with frame generation's setup (the latest one), kept alive here: it is
+// copied where the generated images are (hk_dispatch), possibly on another thread than the setup's.
+std::mutex g_hudless_mutex;
+Microsoft::WRL::ComPtr<ID3D12Resource> g_hudless;
+std::uint32_t g_hudless_state = 0;
+
+// What the game hands to frame generation's setup: its HUD-less picture (kept for the capture), its UI layer
+// (both logged when they change).
+void log_frame_generation_setup(const ffxApiHeader* desc) {
+    static std::atomic<std::uint64_t> said_hudless{~0ull}, said_ui{~0ull};
+    auto key = [](const FfxApiResource& r) {
+        return r.resource ? (std::uint64_t(r.description.width) << 40) ^ (std::uint64_t(r.description.height) << 20) ^ r.description.format ^ 1ull : 0ull;
+    };
+    char text[220];
+    if (const auto* fg = find_desc<ffxConfigureDescFrameGeneration>(desc, kConfigureFrameGeneration)) {
+        {
+            std::lock_guard lock(g_hudless_mutex);
+            auto* r = static_cast<ID3D12Resource*>(fg->HUDLessColor.resource);
+            if (g_hudless.Get() != r) g_hudless = r;
+            g_hudless_state = fg->HUDLessColor.state;
+        }
+        const std::uint64_t k = key(fg->HUDLessColor);
+        if (said_hudless.exchange(k) != k) {
+            if (fg->HUDLessColor.resource)
+                std::snprintf(text, sizeof(text), "XPAR: FSR frame generation setup: the game hands over its HUD-less picture (%ux%u, format %u, state %u)",
+                              fg->HUDLessColor.description.width, fg->HUDLessColor.description.height, fg->HUDLessColor.description.format, fg->HUDLessColor.state);
+            else
+                std::snprintf(text, sizeof(text), "XPAR: FSR frame generation setup: no HUD-less picture (frame generation %s)", fg->frameGenerationEnabled ? "on" : "off");
+            reshade::log::message(reshade::log::level::info, text);
+        }
+    }
+    if (const auto* ui = find_desc<ffxConfigureDescFrameGenerationSwapChainRegisterUiResourceDX12>(desc, kConfigureRegisterUi)) {
+        const std::uint64_t k = key(ui->uiResource) ^ (std::uint64_t(ui->flags) << 60);
+        if (said_ui.exchange(k) != k) {
+            if (ui->uiResource.resource)
+                std::snprintf(text, sizeof(text), "XPAR: FSR frame generation setup: the game registers a UI layer (%ux%u, format %u, flags %u)",
+                              ui->uiResource.description.width, ui->uiResource.description.height, ui->uiResource.description.format, ui->flags);
+            else
+                std::snprintf(text, sizeof(text), "XPAR: FSR frame generation setup: UI layer registered empty");
+            reshade::log::message(reshade::log::level::info, text);
+        }
+    }
+}
+
 template <int I>
 ffxReturnCode_t hk_configure(ffxContext* context, const ffxApiHeader* desc) {
     if (t_depth == 0 && desc && frame_generation_type(desc->type)) note_frame_generation(2 | (desc->type << 8));
+    if (t_depth == 0 && desc) log_frame_generation_setup(desc);
     ++t_depth;
     const ffxReturnCode_t result = reinterpret_cast<ConfigureFn>(g_configure_hooks[I].original())(context, desc);
     --t_depth;
@@ -306,6 +379,7 @@ std::int32_t hk_fg(void* a, void* b) {
     // (FSR 3.0's frame generation is not taken, but counts: XPAR steps aside while it is on)
     if (kFgEntries[I].source == 3 && g_producer && g_producer->shared()) InterlockedIncrement(&g_producer->shared()->generation_calls);
     else if (t_depth == 0 && b) note_frame_generation(kFgEntries[I].source | (static_cast<const ffxApiHeader*>(b)->type << 8));
+    if (kFgEntries[I].source == 9 && t_depth == 0 && b) log_frame_generation_setup(static_cast<const ffxApiHeader*>(b));
     ++t_depth;
     const std::int32_t result = reinterpret_cast<PassFn>(g_fg_hooks[I].original())(a, b);
     --t_depth;
@@ -345,10 +419,19 @@ ffxReturnCode_t hk_dispatch(ffxContext* context, const ffxApiHeader* desc) {
         const auto* fg = reinterpret_cast<const ffxDispatchDescFrameGeneration*>(desc);
         auto* list = static_cast<ID3D12GraphicsCommandList*>(fg->commandList);
         const std::uint32_t n = std::min<std::uint32_t>(fg->numGeneratedFrames, 4);
+        // (the game's HUD-less picture from the setup, read by frame generation right here)
+        Microsoft::WRL::ComPtr<ID3D12Resource> hudless;
+        std::uint32_t hudless_state = 0;
+        {
+            std::lock_guard lock(g_hudless_mutex);
+            hudless = g_hudless;
+            hudless_state = g_hudless_state;
+        }
         for (std::uint32_t i = 0; i < n && list; ++i)
             if (fg->outputs[i].resource)
                 g_producer->on_generated(0, i + 1, n, static_cast<ID3D12Resource*>(fg->outputs[i].resource), d3d12_state(fg->outputs[i].state),
-                                         static_cast<ID3D12Resource*>(fg->presentColor.resource), d3d12_state(fg->presentColor.state), list);
+                                         static_cast<ID3D12Resource*>(fg->presentColor.resource), d3d12_state(fg->presentColor.state), list,
+                                         hudless.Get(), d3d12_state(hudless_state));
     }
     return result;
 }

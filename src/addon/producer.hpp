@@ -94,8 +94,11 @@ public:
     // evenly; `real` is the frame's own picture (taken with the first). `frame` 0 or unknown: the frame whose
     // present the game started last. Once its last image is seen, the frame is published as soon as the GPU
     // has run `list` that far (wherever it is submitted).
+    // `hudless`: the frame's picture without the HUD, when frame generation has one (FSR's setup) - taken with
+    // the frame's own picture, unless the frame has one already (Streamline's).
     void on_generated(std::uint64_t frame, std::uint32_t index, std::uint32_t per_frame, ID3D12Resource* image, D3D12_RESOURCE_STATES image_state,
-                      ID3D12Resource* real, D3D12_RESOURCE_STATES real_state, ID3D12GraphicsCommandList* list);
+                      ID3D12Resource* real, D3D12_RESOURCE_STATES real_state, ID3D12GraphicsCommandList* list,
+                      ID3D12Resource* hudless = nullptr, D3D12_RESOURCE_STATES hudless_state = D3D12_RESOURCE_STATE_COMMON);
     // The game's frame generation is used (its images taken) with XPAR's own warp engine, the one that shows
     // them; with NVIDIA Latewarp the presenter steps aside while frame generation is on.
     bool generation_wanted() const {
