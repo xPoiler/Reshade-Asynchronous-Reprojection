@@ -3406,7 +3406,7 @@ void Renderer::skip_frame() {
     signal();
 }
 
-void Renderer::finish_frame(bool warped, int marker) {
+void Renderer::finish_frame(bool warped, int marker, bool newest) {
     intake_slot_[frame_index_] = false;
     // With split queues the unwarped frame is the shown one, copied (the warp never changes the state of
     // the textures the intake queue may read at the same time).
@@ -3449,11 +3449,12 @@ void Renderer::finish_frame(bool warped, int marker) {
     {
         LARGE_INTEGER q; QueryPerformanceCounter(&q);
         submit_qpc_[frame_index_] = q.QuadPart;
+        last_submit_qpc_ = q.QuadPart;
     }
     {
         LARGE_INTEGER a, b, f;
         QueryPerformanceCounter(&a);
-        swapchain_->Present(1, 0);
+        swapchain_->Present(newest ? 0 : 1, 0);
         QueryPerformanceCounter(&b); QueryPerformanceFrequency(&f);
         last_present_call_ms_ = float(double(b.QuadPart - a.QuadPart) * 1000.0 / double(f.QuadPart));
     }

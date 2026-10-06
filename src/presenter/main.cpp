@@ -632,9 +632,26 @@ void render_thread() {
     double swap_wait_ms = 0, present_call_ms = 0, log_swap_wait_ms = 0, log_present_call_ms = 0, log_present_call_max = 0;
     // Latency breakdown: per present, the displayed camera's time and the present's time (by present count), matched
     // with the swapchain's statistics (the refresh that showed it); medians over 5 s.
-    struct ShownPresent { UINT count = 0; double present_t = 0, camera_t = 0; bool done = true; };
+    struct ShownPresent { UINT count = 0; double present_t = 0, camera_t = 0; bool done = true; std::int64_t target = 0; };
     ShownPresent shown_presents[64];
-    std::vector<double> lat_behind, lat_display, lat_age;
+    std::vector<double> lat_behind, lat_display, lat_age, lat_queued;
+    // Automatic present lead: as late as the warp still makes its refresh. Per warped frame, the time from the
+    // planned wake-up to its GPU work finished (ready, a window of them), and the refreshes from its target vblank
+    // to the screen: the usual count (the most common of a window) or more (late: missed its refresh).
+    // target = p99 of ready + margin; the margin grows with late frames and shrinks slowly while there are none.
+    // The lead in use glides towards the target a little each refresh (a jump would move the camera's time by
+    // as much in one refresh: a visible hitch).
+    struct AutoLead {
+        double lead_ms = 3.0, target_ms = 3.0, margin_ms = 0.75;
+        std::vector<double> ready;
+        int refreshes[8] = {}, matched = 0, late = 0, usual = -1;
+        int late_logged = 0, matched_logged = 0, prev_r = -1;
+        UINT prev_count = 0, stat_count = 0, stat_refresh = 0;
+    } auto_lead;
+    struct PlannedFrame { std::int64_t submit = 0, tick = 0; };
+    PlannedFrame planned[16];
+    int planned_at = 0;
+    std::int64_t frame_tick = 0, frame_vblank = 0, timing_seen = 0;
     std::uint32_t log_presents = 0, capped_windows = 0;
     double log_since = now_seconds();
 
@@ -976,7 +993,13 @@ void render_thread() {
         // frame latency of 1 the swapchain only frees us at that display vblank, leaving ~2.5 ms. With a
         // lead we allow one queued frame and wake `lead` ms before each composition instead, one frame
         // per refresh (a new target is always a later vblank than the previous one).
-        const bool paced = settings.present_lead_ms > 0 && vblank.valid();
+        if (settings.present_lead_auto && vblank.valid()) {
+            const double d = auto_lead.target_ms - auto_lead.lead_ms;
+            auto_lead.lead_ms += std::clamp(d, -0.01, 0.03);  // per refresh: at most 1.2 ms/s down, 3.6 ms/s up
+        }
+        const double lead_ms = settings.present_lead_auto ? auto_lead.lead_ms : double(settings.present_lead_ms);
+        const bool paced = lead_ms > 0 && vblank.valid();
+        frame_tick = frame_vblank = 0;
         paced_last = paced;
         // Split queues with XPAR's own engine when paced (Latewarp and the unpaced path record everything on
         // the realtime queue). Switched only while no frame is being taken in.
@@ -995,7 +1018,7 @@ void render_thread() {
         renderer.set_frame_latency(paced ? 2 : 1);
         if (paced) {
             const double f = double(g_qpc_frequency);
-            const std::int64_t lead = static_cast<std::int64_t>(settings.present_lead_ms * 1e-3 * f);
+            const std::int64_t lead = static_cast<std::int64_t>(lead_ms * 1e-3 * f);
             const std::int64_t compose = static_cast<std::int64_t>(2.5e-3 * f);  // composition deadline after a vblank
             const std::int64_t now_q = qpc_now();
             std::int64_t v = vblank.next_after(now_q - compose + lead);  // first vblank whose deadline - lead is ahead
@@ -1006,6 +1029,7 @@ void render_thread() {
             // the refresh itself only warps (taking a frame in costs several ms of GPU at 4K). One that
             // arrives too close to the refresh waits until just after it.
             const std::int64_t tick = v + compose - lead;
+            frame_tick = tick; frame_vblank = v;
             const std::int64_t budget = static_cast<std::int64_t>((intake_ms + 1.0) * 1e-3 * f);
             const bool can_take_in = g_app.visible && !generation_aside() && renderer.session_open(sh.session) &&
                                      sh.backbuffer_width == renderer.width() && sh.backbuffer_height == renderer.height();
@@ -1215,7 +1239,9 @@ void render_thread() {
         // FrameWarp's own warp engine when chosen, or when Latewarp is not available.
         const bool own_engine = settings.warp_engine == 1 || !latewarp.ready();
         if (source.valid && settings.enabled && !settings.show_original && !sh.overlay_open && source.has_depth) {
-            Prediction p = g_app.model.predict(now);
+            // (paced: the camera as of the planned wake-up, a fixed time before the refresh it is meant for - not
+            // the moment the loop got there, which varies by a fraction of a millisecond and would jitter the motion)
+            Prediction p = g_app.model.predict(frame_tick && seconds(frame_tick) <= now ? seconds(frame_tick) : now);
             if (settings.invert_warp) p.camera = apply_rotation(source_basis, g_app.model.world_up(), -p.yaw, -p.pitch, source_basis.pos);
             applied = p;
             const Vec3 origin = source_basis.pos;
@@ -1286,7 +1312,7 @@ void render_thread() {
         const bool as_is = !(warped && !unmoved) && !settings.overlay_debug && !settings.show_mask && g_app.has_frames;
         const bool same_picture = as_is && shown_frame && as_is_frame == shown_frame && as_is_w == renderer.width() && as_is_h == renderer.height();
         if (same_picture) renderer.skip_frame();
-        else renderer.finish_frame(warped && !unmoved, settings.overlay_debug ? (warped ? 1 : 2) : 0);
+        else renderer.finish_frame(warped && !unmoved, settings.overlay_debug ? (warped ? 1 : 2) : 0, paced_last);
         presented_last = !same_picture;
         as_is_frame = as_is ? shown_frame : 0;
         as_is_w = renderer.width(); as_is_h = renderer.height();
@@ -1401,14 +1427,38 @@ void render_thread() {
                          dc.pos.x, dc.pos.y, dc.pos.z, dc.fwd.x, dc.fwd.y, dc.fwd.z);
         }
         record_timeline(sh, settings);
-        ++stat_frames;
+        // (a refresh: a present, or with pacing a refresh that keeps the same picture - not the 1 ms polls of the
+        // unpaced loop while nothing changes)
+        if (!same_picture || paced_last) ++stat_frames;
         present_call_ms += renderer.last_present_call_ms();
         {
             const auto ps = renderer.present_stats();
             if (!same_picture && warped && ps.last_present_count) {
                 const double camera_t = g_app.model.source_time() + applied.horizon;
                 lat_behind.push_back((now - camera_t) * 1000.0);
-                shown_presents[ps.last_present_count % 64] = {ps.last_present_count, now_seconds(), camera_t, false};
+                shown_presents[ps.last_present_count % 64] = {ps.last_present_count, now_seconds(), camera_t, false, frame_vblank};
+                if (ps.hr == S_OK && ps.present_count && ps.last_present_count >= ps.present_count)
+                    lat_queued.push_back(double(ps.last_present_count - ps.present_count));
+            }
+            if (!same_picture && frame_tick) { planned[planned_at] = {renderer.last_submit_qpc(), frame_tick}; planned_at = (planned_at + 1) % 16; }
+            // GPU timing comes back a few frames later: matched with its frame's planned wake-up by submit time.
+            const auto tm = renderer.last_timing();
+            if (tm.valid && tm.submit != timing_seen) {
+                timing_seen = tm.submit;
+                for (const auto& pf : planned)
+                    if (pf.submit == tm.submit && tm.gpu_end > pf.tick) {
+                        auto_lead.ready.push_back(double(tm.gpu_end - pf.tick) * 1000.0 / double(g_qpc_frequency));
+                        break;
+                    }
+            }
+            // Presents replaced before they were shown (more presents than refreshes showing them between two
+            // statistics): with the newest frame shown at each refresh, a frame that missed its refresh.
+            if (ps.hr == S_OK && ps.present_count && ps.present_count != auto_lead.stat_count) {
+                if (auto_lead.stat_count && ps.present_count > auto_lead.stat_count && ps.present_refresh > auto_lead.stat_refresh) {
+                    const UINT presents = ps.present_count - auto_lead.stat_count, refreshes = ps.present_refresh - auto_lead.stat_refresh;
+                    if (presents > refreshes && presents - refreshes < 8) auto_lead.late += static_cast<int>(presents - refreshes);
+                }
+                auto_lead.stat_count = ps.present_count; auto_lead.stat_refresh = ps.present_refresh;
             }
             if (ps.hr == S_OK && ps.sync_qpc && ps.present_count) {
                 auto& e = shown_presents[ps.present_count % 64];
@@ -1419,7 +1469,36 @@ void render_thread() {
                         lat_display.push_back((screen_t - e.present_t) * 1000.0);
                         lat_age.push_back((screen_t - e.camera_t) * 1000.0);
                     }
+                    if (e.target && vblank.period > 0) {
+                        const long long r = std::llround(double(ps.sync_qpc - e.target) / vblank.period);
+                        if (r >= 0 && r < 8) {
+                            ++auto_lead.refreshes[r]; ++auto_lead.matched;
+                            // Late (a missed refresh): shown a refresh later than the present just before it.
+                            if (auto_lead.prev_count + 1 == ps.present_count && r > auto_lead.prev_r) ++auto_lead.late;
+                            auto_lead.prev_count = ps.present_count; auto_lead.prev_r = int(r);
+                        }
+                    }
                 }
+            }
+            // Once a second of matched presents: the usual refresh count, and the lead from the warp's measured time.
+            if (auto_lead.matched >= 120) {
+                int mode = 0;
+                for (int k = 1; k < 8; ++k) if (auto_lead.refreshes[k] > auto_lead.refreshes[mode]) mode = k;
+                if (auto_lead.usual >= 0)
+                    auto_lead.margin_ms = auto_lead.late ? std::min(auto_lead.margin_ms + (auto_lead.late > 2 ? 0.5 : 0.25), 4.0)
+                                                         : std::max(auto_lead.margin_ms - 0.05, 0.5);
+                // (the usual count only from a window that mostly agrees: one of mostly late frames would hide them)
+                if (auto_lead.usual < 0 || auto_lead.refreshes[mode] * 10 >= auto_lead.matched * 9) auto_lead.usual = mode;
+                if (auto_lead.ready.size() >= 60) {
+                    auto& v = auto_lead.ready;
+                    const std::size_t k = std::min(v.size() - 1, v.size() * 99 / 100);
+                    std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(k), v.end());
+                    auto_lead.target_ms = std::clamp(v[k] + auto_lead.margin_ms, 1.0, 8.0);
+                    v.clear();
+                }
+                auto_lead.late_logged += auto_lead.late; auto_lead.matched_logged += auto_lead.matched;
+                std::fill(std::begin(auto_lead.refreshes), std::end(auto_lead.refreshes), 0);
+                auto_lead.matched = auto_lead.late = 0;
             }
         }
         log_present_call_max = std::max(log_present_call_max, double(renderer.last_present_call_ms()));
@@ -1582,11 +1661,17 @@ void render_thread() {
                     };
                     st.lat_behind_ms = float(median(lat_behind)); st.lat_display_ms = float(median(lat_display));
                     st.lat_age_ms = float(median(lat_age));
+                    st.presents_queued = lat_queued.empty() ? 0.0f : float(median(lat_queued));
+                    st.present_lead_ms = paced_last ? float(settings.present_lead_auto ? auto_lead.lead_ms : settings.present_lead_ms) : 0.0f;
                     if (!lat_behind.empty())
                         logf("latency: game %.1f ms (input to frame, p90) | displayed camera %.1f ms behind when rendered | present to screen %.1f ms "
-                             "| camera age on screen %.1f ms (medians; %zu presents matched)", g_app.model.latency() * 1000.0, st.lat_behind_ms,
-                             st.lat_display_ms, st.lat_age_ms, lat_age.size());
-                    lat_behind.clear(); lat_display.clear(); lat_age.clear();
+                             "| camera age on screen %.1f ms (medians; %zu presents matched) | present lead %.2f ms (%s, margin %.2f) | "
+                             "presents queued %.1f | late %d of %d (usual: shown %d refreshes after the target vblank)",
+                             g_app.model.latency() * 1000.0, st.lat_behind_ms, st.lat_display_ms, st.lat_age_ms, lat_age.size(), st.present_lead_ms,
+                             settings.present_lead_auto ? "automatic" : "manual", auto_lead.margin_ms, st.presents_queued, auto_lead.late_logged,
+                             auto_lead.matched_logged, auto_lead.usual);
+                    lat_behind.clear(); lat_display.clear(); lat_age.clear(); lat_queued.clear();
+                    auto_lead.late_logged = auto_lead.matched_logged = 0;
                     const double span = now - log_since;
                     logf("refresh loop: %.1f presents/s | per present: Present call %.2f ms (max %.1f), swapchain wait %.2f ms | display %.1f Hz",
                          log_presents / span, log_presents ? log_present_call_ms / log_presents : 0.0, log_present_call_max,

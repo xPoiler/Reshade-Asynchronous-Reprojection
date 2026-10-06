@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 47;
+constexpr std::uint32_t kVersion = 48;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -103,6 +103,7 @@ struct Settings {
     std::uint32_t stretch_width;       // own warp: render px the scenery around the character/weapon stretches over, 0 off, default 1 (saved per game)
     std::uint32_t near_camera_rule;    // character/weapon detection: near-camera pixels moving against the camera count (default on, saved per game)
     std::uint32_t use_controller;      // the controller's right stick drives rotation too (option, on by default, saved per game)
+    std::uint32_t present_lead_auto;   // default on: the present lead follows the measured warp time (present_lead_ms unused)
 };
 
 // Presenter status, displayed by the add-on UI.
@@ -143,6 +144,10 @@ struct PresenterStatus {
     // The camera is estimated (no camera from the game) and explains its frames poorly lately: the camera model does
     // not learn from it meanwhile (share of the last 60 estimated frames unexplained, percent; 0: fine or not estimated).
     std::uint32_t estimate_unreliable_pct;
+    // The present lead in use (automatic or the slider's), ms; presents not yet shown right after ours (median of
+    // the last 5 s, ours included: 1 = nothing queued ahead of it; 0: not measured).
+    float present_lead_ms;
+    float presents_queued;
     char message[256];
 };
 

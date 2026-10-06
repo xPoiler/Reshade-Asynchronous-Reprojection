@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+* **Lower output latency, steadier timing.** The present lead is automatic (new default): XPAR measures how
+  long its warp takes and renders as late as it still makes the refresh, backing off when a frame misses
+  (Stalker 2: 2.5-3.5 ms instead of 6, present to screen 16 ms instead of 19.6). The camera is taken at the
+  planned moment before each refresh, so lead changes and wake-up jitter no longer move it. XPAR's frames no
+  longer queue behind a late one: the newest finished frame is shown at each refresh, so one missed refresh
+  costs that refresh only (before, every frame after it stayed a refresh later, up to 24.5 ms). The slider
+  remains as a manual setting.
+* The Output fps figure counts refreshes only (with Present lead 0 it counted idle checks: 373 fps shown).
 * The first-person weapon is held still while walking backwards too: its nearest part (behind where the
   camera was a frame earlier) went unrecognised and warped with the scenery (DOOM Eternal).
 * **Games that hand DLSS full-resolution motion vectors work properly** (DLSS without Streamline tags, no

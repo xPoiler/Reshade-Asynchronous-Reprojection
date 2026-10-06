@@ -104,6 +104,7 @@ constexpr Persisted kPersisted[] = {
     {"OrbitDistance", nullptr, &fw::Settings::orbit_distance},
     {"MaxExtrapolation", nullptr, &fw::Settings::max_horizon_ms},
     {"PresentLead", nullptr, &fw::Settings::present_lead_ms},
+    {"PresentLeadAuto", &fw::Settings::present_lead_auto, nullptr},
     {"WarpEngine", &fw::Settings::warp_engine, nullptr},
     {"KeepHudStill", &fw::Settings::use_ui_tags, nullptr},
     {"KeepStillHud", &fw::Settings::no_warp_mask, nullptr},
@@ -541,8 +542,14 @@ void draw_overlay(effect_runtime*) {
         ImGui::SliderFloat("Max extrapolation (ms)", &s.max_horizon_ms, 0.0f, 200.0f, "%.0f");
         bool strip = s.overlay_debug != 0;
         if (ImGui::Checkbox("Debug strip (top-left, shows every presented frame)", &strip)) s.overlay_debug = strip;
+        bool auto_lead = s.present_lead_auto != 0;
+        if (ImGui::Checkbox("Automatic present lead", &auto_lead)) s.present_lead_auto = auto_lead;
+        if (auto_lead && alive && p.present_lead_ms > 0.0f) { ImGui::SameLine(); ImGui::TextDisabled("(now %.1f ms)", p.present_lead_ms); }
+        if (auto_lead) ImGui::BeginDisabled();
         ImGui::SliderFloat("Present lead (ms)", &s.present_lead_ms, 0.0f, 7.0f, "%.1f");
-        ImGui::TextDisabled("  render this long before the next refresh; 0 = right after the previous one");
+        if (auto_lead) ImGui::EndDisabled();
+        ImGui::TextDisabled("  render this long before the next refresh; 0 = right after the previous one; automatic: as late as\n"
+                            "  the warp still makes its refresh (measured)");
         static const char* const kPriorities[] = {"Realtime (default)", "High", "Normal"};
         int priority = s.gpu_priority <= 2 ? static_cast<int>(s.gpu_priority) : 0;
         if (ImGui::Combo("Presenter GPU priority", &priority, kPriorities, 3)) {
@@ -652,8 +659,8 @@ void draw_overlay(effect_runtime*) {
                     p.calibrated_y ? "fitted" : "learning", p.gain_y * 1000.0f, p.tau_y_ms, p.fit_quality_y);
         ImGui::Text("Input delay %.0f ms | game latency %.1f ms | measured orbit %.0f cm", p.delay_ms, p.latency_ms, p.orbit_cm);
         if (p.lat_age_ms > 0.0f)
-            ImGui::Text("Latency: camera shown %.1f ms behind | present to screen %.1f ms | camera age on screen %.1f ms",
-                        p.lat_behind_ms, p.lat_display_ms, p.lat_age_ms);
+            ImGui::Text("Latency: camera shown %.1f ms behind | present to screen %.1f ms | camera age on screen %.1f ms | presents queued %.1f",
+                        p.lat_behind_ms, p.lat_display_ms, p.lat_age_ms, p.presents_queued);
         if (!p.controller)
             ImGui::TextDisabled("Controller: none connected (XInput)");
         else if (p.stick_gain_x == 0.0f && p.stick_gain_y == 0.0f)

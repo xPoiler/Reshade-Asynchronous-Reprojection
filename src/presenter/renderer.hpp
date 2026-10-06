@@ -97,7 +97,10 @@ public:
     LatewarpInputs latewarp_inputs(const IngestedSource& src, bool use_ui_tags);
     // Blits the warped output (or the unwarped private backbuffer) to the swapchain and presents.
     // marker: 0 none, 1 green (warped), 2 red (original).
-    void finish_frame(bool warped, int marker);
+    // newest: the swapchain shows the newest finished frame at each refresh and drops one still waiting (paced:
+    // the presenter itself presents once per refresh; a frame that misses its refresh is replaced by the next
+    // one instead of holding every frame after it a refresh back). Otherwise each frame waits for a refresh.
+    void finish_frame(bool warped, int marker, bool newest = false);
     // Nothing new to show this refresh (the picture presented last is still the right one): what the refresh
     // recorded so far (a frame taken in on the same queue, for one) is submitted, with no warp, no blit and no
     // present - the composition keeps showing the last picture.
@@ -215,6 +218,7 @@ public:
     bool read_motion_samples(std::vector<float>& out);
     float last_flush_ms() const { return last_flush_ms_; }  // how long sample_motion waited for the GPU
     float last_present_call_ms() const { return last_present_call_ms_; }  // how long the last Present call took (CPU)
+    std::int64_t last_submit_qpc() const { return last_submit_qpc_; }   // when the last presented frame's work was submitted (as in last_timing)
     ID3D12Resource* no_warp_mask() const {
         if (split_) return shown_mask_ ? front_[kPMask].texture.Get() : nullptr;
         return mask_ready_ ? private_[kPMask].texture.Get() : nullptr;
@@ -319,6 +323,7 @@ private:
     UINT samples_count_ = 0;
     float last_flush_ms_ = 0;
     float last_present_call_ms_ = 0;
+    std::int64_t last_submit_qpc_ = 0;
     ComPtr<ID3D12Resource> hud_counts_, hud_readback_, scene_fit_, scene_stamps_readback_;
     ComPtr<ID3D12QueryHeap> scene_stamps_;
     bool hud_pending_[kRing] = {}, hud_scene_pending_[kRing] = {}, hud_from_scene_ = false;

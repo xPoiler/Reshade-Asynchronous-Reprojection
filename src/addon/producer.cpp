@@ -48,7 +48,8 @@ Producer::Producer() {
     s.rotation_extrapolation = 1.0f; s.translation_extrapolation = 1.0f;
     s.orbit_distance = 0.0f; s.max_horizon_ms = 100.0f;
     s.prediction_ms = -16.0f;  // manual value, used when auto is off
-    s.present_lead_ms = 6.0f;
+    s.present_lead_ms = 6.0f;  // manual value, used when the automatic lead is off
+    s.present_lead_auto = 1;
     s.no_warp_mask = 1;   // HUD detection in games without HUD layers
     s.keep_attached = 1;  // character / first-person weapon detection, every game
     s.near_camera_rule = 1;
