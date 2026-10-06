@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+* The first-person weapon is held still while walking backwards too: its nearest part (behind where the
+  camera was a frame earlier) went unrecognised and warped with the scenery (DOOM Eternal).
 * **Games that hand DLSS full-resolution motion vectors work properly** (DLSS without Streamline tags, no
   "low-resolution motion vectors" flag - Stalker 2 without frame generation). XPAR read only a quarter of
   them: the camera estimate saw a narrower field of view, rejected most frames, and the mouse model learned

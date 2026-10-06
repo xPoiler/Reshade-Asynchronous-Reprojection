@@ -82,6 +82,12 @@ groupshared float4 gs_a[64], gs_b[64];
             const float4 prev = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, d, 1), clip_to_prev);
             const float2 cam = float2(prev.x / prev.w * 0.5 + 0.5, 0.5 - prev.y / prev.w * 0.5) - uv;
             const float2 g = motion_t.Load(int3(min(id.xy, mv_size - 1), 0));
+            // Behind where the camera was a frame ago (the camera moved back past it - only when moving backwards,
+            // only for what is very close: the back of a first-person gun): no point of the scene can be seen now
+            // and have been behind the camera then, so it moves with the camera - attached. (It had no camera motion
+            // at all to compare with and was left unclassified: warped with the scenery, DOOM Eternal walking back.)
+            if (prev.w <= 0 && all(abs(g) < 1e4))
+                o = float4(0, 0, d, ((flags & 1) && (flags & 16) && d > 1.0 / 4096.0) ? 2 : 0);
             if (prev.w > 0 && all(abs(g) < 1e4)) {
                 const float2 own = (g * mv_scale - cam) * float2(rect.zw);
                 const float2 cam_px = cam * float2(rect.zw);
