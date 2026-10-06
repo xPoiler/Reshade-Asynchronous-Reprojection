@@ -10,6 +10,7 @@
 #include "addon/ffx_hooks.hpp"
 #include "addon/depth_choice.hpp"
 #include "addon/reshade_feed.hpp"
+#include "addon/frame_cap.hpp"
 #include <d3d12.h>
 #include <dxgi1_2.h>
 #include <algorithm>
@@ -105,6 +106,7 @@ constexpr Persisted kPersisted[] = {
     {"MaxExtrapolation", nullptr, &fw::Settings::max_horizon_ms},
     {"PresentLead", nullptr, &fw::Settings::present_lead_ms},
     {"PresentLeadAuto", &fw::Settings::present_lead_auto, nullptr},
+    {"FrameCap", &fw::Settings::frame_cap, nullptr},
     {"WarpEngine", &fw::Settings::warp_engine, nullptr},
     {"KeepHudStill", &fw::Settings::use_ui_tags, nullptr},
     {"KeepStillHud", &fw::Settings::no_warp_mask, nullptr},
@@ -382,6 +384,15 @@ void on_present(command_queue*, swapchain* chain, const rect*, const rect*, uint
 }
 
 void on_finish_present(command_queue* queue, swapchain*) {
+    if (queue && g_producer && g_producer->shared()) {
+        auto* sh = g_producer->shared();
+        fw::frame_cap_after_present(queue, sh->settings.frame_cap != 0 && sh->settings.enabled != 0, g_producer->generation_active());
+        const fw::FrameCapStatus cap = fw::frame_cap_status();
+        sh->hooks.cap_active = cap.active; sh->hooks.cap_reflex = cap.reflex;
+        sh->hooks.cap_fps = cap.cap_fps; sh->hooks.cap_game_fps = cap.game_fps;
+        sh->hooks.cap_present_to_done_ms = cap.present_to_done_ms; sh->hooks.cap_start_to_done_ms = cap.start_to_done_ms;
+        sh->hooks.cap_wait_ms = cap.wait_ms; sh->hooks.cap_queued_pct = cap.queued_pct;
+    }
     if (!queue || queue->get_device()->get_api() != device_api::vulkan) return;
     g_finish_present_seen = true;
     const PendingVk pending = g_pending_vk;
@@ -452,6 +463,16 @@ const char* format_name(std::uint32_t f) {
         case DXGI_FORMAT_R11G11B10_FLOAT: return "R11G11B10F";
         default: return nullptr;
     }
+}
+
+// An option's explanation, shown while the mouse rests on it (keeps the panel compact).
+void hint(const char* text) {
+    if (!ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) return;
+    ImGui::BeginTooltip();
+    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 36.0f);
+    ImGui::TextUnformatted(text);
+    ImGui::PopTextWrapPos();
+    ImGui::EndTooltip();
 }
 
 void draw_overlay(effect_runtime*) {
@@ -537,130 +558,15 @@ void draw_overlay(effect_runtime*) {
         }
         ImGui::SliderFloat("Latency <-> smoothness (ms)", &s.prediction_ms, -40.0f, 30.0f, "%.0f");
         if (auto_latency) ImGui::EndDisabled();
-        ImGui::TextDisabled("  negative: smoother, adds that much delay | positive: predicts further ahead");
+        hint("Negative: smoother, adds that much delay | positive: predicts further ahead.");
         ImGui::SliderFloat("Orbit distance (0 = off)", &s.orbit_distance, 0.0f, 1000.0f, "%.0f");
         ImGui::SliderFloat("Max extrapolation (ms)", &s.max_horizon_ms, 0.0f, 200.0f, "%.0f");
-        bool strip = s.overlay_debug != 0;
-        if (ImGui::Checkbox("Debug strip (top-left, shows every presented frame)", &strip)) s.overlay_debug = strip;
-        bool auto_lead = s.present_lead_auto != 0;
-        if (ImGui::Checkbox("Automatic present lead", &auto_lead)) s.present_lead_auto = auto_lead;
-        if (auto_lead && alive && p.present_lead_ms > 0.0f) { ImGui::SameLine(); ImGui::TextDisabled("(now %.1f ms)", p.present_lead_ms); }
-        if (auto_lead) ImGui::BeginDisabled();
-        ImGui::SliderFloat("Present lead (ms)", &s.present_lead_ms, 0.0f, 7.0f, "%.1f");
-        if (auto_lead) ImGui::EndDisabled();
-        ImGui::TextDisabled("  render this long before the next refresh; 0 = right after the previous one; automatic: as late as\n"
-                            "  the warp still makes its refresh (measured)");
-        static const char* const kPriorities[] = {"Realtime (default)", "High", "Normal"};
-        int priority = s.gpu_priority <= 2 ? static_cast<int>(s.gpu_priority) : 0;
-        if (ImGui::Combo("Presenter GPU priority", &priority, kPriorities, 3)) {
-            s.gpu_priority = static_cast<std::uint32_t>(priority);
-            reshade::set_config_value(nullptr, "FrameWarp", "GpuPriority", priority);
-        }
-        static const char* const kEngines[] = {"NVIDIA Latewarp", "XPAR (default)"};
-        // NVIDIA Latewarp is optional: only selectable once the presenter reports it ready.
-        const bool latewarp = sh.presenter.latewarp == 2;
-        int engine = latewarp && s.warp_engine != 1 ? 0 : 1;
-        ImGui::BeginDisabled(!latewarp);
-        if (ImGui::Combo("Warp engine", &engine, kEngines, 2)) s.warp_engine = static_cast<std::uint32_t>(engine);
-        ImGui::EndDisabled();
-        bool memory = s.background_memory != 0;
-        if (ImGui::Checkbox("Background memory for uncovered areas (XPAR engine)", &memory)) {
-            s.background_memory = memory;
-            reshade::set_config_value(nullptr, "FrameWarp", "BackgroundMemory", memory ? "1" : "0");
-        }
-        ImGui::TextDisabled("  beside the character/weapon and at the screen edges: the scenery as last seen there, when recent");
-        bool moving = s.moving_objects != 0;
-        if (ImGui::Checkbox("Move objects at the display rate even without frame generation (XPAR engine, experimental)", &moving)) {
-            s.moving_objects = moving;
-            reshade::set_config_value(nullptr, "FrameWarp", "MovingObjects", moving ? "1" : "0");
-        }
-        ImGui::TextDisabled("  the game's own DLSS or FSR frame generation is used by itself when it is on; this moves cars, people and your");
-        ImGui::TextDisabled("  character/weapon at the display rate without it, one game frame late (the camera is not delayed); games with DLSS or FSR");
-        if (!latewarp)
-            ImGui::TextDisabled("  NVIDIA Latewarp is not installed (optional: nvngx_latewarp.dll, NVIDIA GPUs only)");
-        bool borderless = force_borderless();
-        if (ImGui::Checkbox("Force a borderless window (for games that only run in exclusive fullscreen)", &borderless))
-            reshade::set_config_value(nullptr, "FrameWarp", "ForceBorderless", borderless ? "1" : "0");
-        ImGui::TextDisabled("  XPAR can't show over exclusive fullscreen; applies when the game is restarted; remembered for this game");
-        bool invert = s.invert_warp != 0;
-        if (ImGui::Checkbox("Invert warp (debug)", &invert)) s.invert_warp = invert;
-        bool record = s.record_diagnostics != 0;
-        if (ImGui::Checkbox("Record detailed diagnostics (for troubleshooting)", &record)) {
-            s.record_diagnostics = record;
-            reshade::set_config_value(nullptr, "FrameWarp", "RecordDiagnostics", record ? "1" : "0");
-        }
-        ImGui::TextDisabled("  frame-by-frame recordings in the FrameWarp\\logs folder; remembered for this game");
-        bool ui = s.use_ui_tags != 0;
-        if (ImGui::Checkbox("Keep HUD still (HUD-less + UI tags)", &ui)) s.use_ui_tags = ui;
-        // What is kept unwarped: the HUD (detected in games without HUD layers) and what moves with the
-        // camera (third-person character, first-person weapon).
-        static const char* const kKeepStill[] = {"HUD + character/weapon (default)", "HUD only", "Character/weapon only", "Off"};
-        int keep = s.no_warp_mask ? (s.keep_attached ? 0 : 1) : (s.keep_attached ? 2 : 3);
-        if (ImGui::Combo("Keep still", &keep, kKeepStill, 4)) {
-            s.no_warp_mask = keep == 0 || keep == 1;
-            s.keep_attached = keep == 0 || keep == 2;
-        }
-        const bool mask = s.no_warp_mask != 0, attached = s.keep_attached != 0;
-        if (attached) {
-            ImGui::TextDisabled("  what moves with the camera is not warped and moves at the game's frame rate%s",
-                                p.mv_scale_x == 0.0f ? "; starts after a few seconds of turning the camera" : "");
-            bool near_rule = s.near_camera_rule != 0;
-            if (ImGui::Checkbox("Keep near-camera motion still (weapon animations, hands)", &near_rule)) {
-                s.near_camera_rule = near_rule;
-                reshade::set_config_value(nullptr, "FrameWarp", "NearCameraRule", near_rule ? "1" : "0");
-            }
-            ImGui::TextDisabled("  turn off if the floor near the camera is kept still while strafing");
-            int stretch = static_cast<int>(std::min(s.stretch_width, 32u));
-            if (ImGui::SliderInt("Stretch around character/weapon (render px, XPAR engine)", &stretch, 0, 32, stretch ? "%d" : "off")) {
-                s.stretch_width = static_cast<std::uint32_t>(stretch);
-                const std::string value = std::to_string(stretch);
-                reshade::set_config_value(nullptr, "FrameWarp", "StretchWidth", value.c_str());
-            }
-            ImGui::TextDisabled("  the scenery beside it stretches instead of tearing into streaks when strafing or turning");
-            bool orbited = s.turn_rule != 0;
-            if (ImGui::Checkbox("Keep still what the camera turns around (third-person)", &orbited)) {
-                s.turn_rule = orbited;
-                reshade::set_config_value(nullptr, "FrameWarp", "HoldOrbitedCharacter", orbited ? "1" : "0");
-            }
-            ImGui::TextDisabled("  for over-the-shoulder cameras that circle the character: what barely moves on screen while turning is held");
-        }
-        if (mask) {
-            static const char* const kHudFind[] = {"Learned from camera motion", "From the upscaler output (DLSS or FSR)",
-                                                   "Upscaler output + camera motion check (default)"};
-            int find = s.hud_from_scene > 2 ? 2 : int(s.hud_from_scene);
-            if (ImGui::Combo("Find the HUD", &find, kHudFind, 3)) {
-                s.hud_from_scene = find;
-                static const char* const kValues[] = {"0", "1", "2"};
-                reshade::set_config_value(nullptr, "FrameWarp", "HudFromDlssOutput", kValues[find]);
-            }
-            if (find == 0)
-                ImGui::TextDisabled("  learns what stays put while the camera moves; the only choice without an upscaler output");
-            else if (find == 1)
-                ImGui::TextDisabled("  sharper and instant, but in some games it may keep parts of the scenery still; check with the mask view");
-            else if (find == 2)
-                ImGui::TextDisabled("  from the upscaler output, minus what is seen moving with the world when the camera turns; check with the mask view");
-            if (find != 0) {
-                bool fill = s.hud_fill != 0;
-                if (ImGui::Checkbox("Fill behind the HUD from the upscaler output (XPAR engine)", &fill)) {
-                    s.hud_fill = fill;
-                    reshade::set_config_value(nullptr, "FrameWarp", "FillBehindHud", fill ? "1" : "0");
-                }
-                ImGui::TextDisabled("  shows the scenery the HUD covers when the camera turns, instead of a smeared trail");
-            }
-        }
-        if (mask || attached) {
-            bool show = s.show_mask != 0;
-            if (ImGui::Checkbox("Show the mask (debug: magenta = kept still; learned HUD: green = being learned)", &show)) s.show_mask = show;
-        }
         ImGui::Separator();
         ImGui::Text("Camera model  yaw: %s gain %.3g mrad/count, smoothing %.0f ms, quality %.2f",
                     p.calibrated_x ? "fitted" : "learning", p.gain_x * 1000.0f, p.tau_x_ms, p.fit_quality_x);
         ImGui::Text("            pitch: %s gain %.3g mrad/count, smoothing %.0f ms, quality %.2f",
                     p.calibrated_y ? "fitted" : "learning", p.gain_y * 1000.0f, p.tau_y_ms, p.fit_quality_y);
         ImGui::Text("Input delay %.0f ms | game latency %.1f ms | measured orbit %.0f cm", p.delay_ms, p.latency_ms, p.orbit_cm);
-        if (p.lat_age_ms > 0.0f)
-            ImGui::Text("Latency: camera shown %.1f ms behind | present to screen %.1f ms | camera age on screen %.1f ms | presents queued %.1f",
-                        p.lat_behind_ms, p.lat_display_ms, p.lat_age_ms, p.presents_queued);
         if (!p.controller)
             ImGui::TextDisabled("Controller: none connected (XInput)");
         else if (p.stick_gain_x == 0.0f && p.stick_gain_y == 0.0f)
@@ -677,6 +583,146 @@ void draw_overlay(effect_runtime*) {
             if (ImGui::SliderFloat("Pitch mrad/count", &gy, -5.0f, 5.0f, "%.4f")) s.manual_gain_y = gy / 1000.0f;
             ImGui::SliderFloat("Input delay (ms)", &s.manual_delay_ms, -20.0f, 60.0f, "%.1f");
         }
+    }
+
+    if (ImGui::CollapsingHeader("Latency", ImGuiTreeNodeFlags_DefaultOpen)) {
+        bool auto_lead = s.present_lead_auto != 0;
+        if (ImGui::Checkbox("Automatic present lead", &auto_lead)) s.present_lead_auto = auto_lead;
+        hint("Renders each refresh as late as the warp still makes it in time (measured), for the freshest camera.");
+        if (auto_lead && alive && p.present_lead_ms > 0.0f) { ImGui::SameLine(); ImGui::TextDisabled("(now %.1f ms)", p.present_lead_ms); }
+        if (auto_lead) ImGui::BeginDisabled();
+        ImGui::SliderFloat("Present lead (ms)", &s.present_lead_ms, 0.0f, 7.0f, "%.1f");
+        if (auto_lead) ImGui::EndDisabled();
+        hint("Manual: render this long before the next refresh; 0 = right after the previous one.");
+        bool cap = s.frame_cap != 0;
+        if (ImGui::Checkbox("Latency-aware frame cap", &cap)) s.frame_cap = cap;
+        hint("Holds the game just below the rate its GPU sustains, so no frame waits in the GPU's queue and the game reads "
+             "input later (what NVIDIA Reflex does). Stands aside by itself while the game's Reflex is on. Remembered per game.");
+        if (cap) {
+            const fw::FrameCapStatus st = fw::frame_cap_status();
+            ImGui::SameLine();
+            if (st.reflex)
+                ImGui::TextDisabled("(off: the game's Reflex is on)");
+            else if (st.active)
+                ImGui::TextDisabled("(%.1f fps, game %.1f | GPU done %.1f ms after present | held %.1f ms)", st.cap_fps, st.game_fps,
+                                    st.present_to_done_ms, st.wait_ms);
+            else
+                ImGui::TextDisabled("(measuring; off during frame generation, not for Vulkan yet)");
+        }
+        if (p.lat_age_ms > 0.0f)
+            ImGui::Text("Latency: camera shown %.1f ms behind | present to screen %.1f ms | camera age on screen %.1f ms | presents queued %.1f",
+                        p.lat_behind_ms, p.lat_display_ms, p.lat_age_ms, p.presents_queued);
+        static const char* const kPriorities[] = {"Realtime (default)", "High", "Normal"};
+        int priority = s.gpu_priority <= 2 ? static_cast<int>(s.gpu_priority) : 0;
+        if (ImGui::Combo("Presenter GPU priority", &priority, kPriorities, 3)) {
+            s.gpu_priority = static_cast<std::uint32_t>(priority);
+            reshade::set_config_value(nullptr, "FrameWarp", "GpuPriority", priority);
+        }
+    }
+
+    if (ImGui::CollapsingHeader("Warp", ImGuiTreeNodeFlags_DefaultOpen)) {
+        static const char* const kEngines[] = {"NVIDIA Latewarp", "XPAR (default)"};
+        // NVIDIA Latewarp is optional: only selectable once the presenter reports it ready.
+        const bool latewarp = sh.presenter.latewarp == 2;
+        int engine = latewarp && s.warp_engine != 1 ? 0 : 1;
+        ImGui::BeginDisabled(!latewarp);
+        if (ImGui::Combo("Warp engine", &engine, kEngines, 2)) s.warp_engine = static_cast<std::uint32_t>(engine);
+        ImGui::EndDisabled();
+        bool memory = s.background_memory != 0;
+        if (ImGui::Checkbox("Background memory for uncovered areas (XPAR engine)", &memory)) {
+            s.background_memory = memory;
+            reshade::set_config_value(nullptr, "FrameWarp", "BackgroundMemory", memory ? "1" : "0");
+        }
+        hint("Beside the character/weapon and at the screen edges: the scenery as last seen there, when recent.");
+        bool moving = s.moving_objects != 0;
+        if (ImGui::Checkbox("Move objects at the display rate even without frame generation (XPAR engine, experimental)", &moving)) {
+            s.moving_objects = moving;
+            reshade::set_config_value(nullptr, "FrameWarp", "MovingObjects", moving ? "1" : "0");
+        }
+        hint("The game's own DLSS or FSR frame generation is used by itself when it is on; this moves cars, people and your "
+             "character/weapon at the display rate without it, one game frame late (the camera is not delayed). Games with DLSS or FSR.");
+        if (!latewarp)
+            ImGui::TextDisabled("NVIDIA Latewarp is not installed (optional: nvngx_latewarp.dll, NVIDIA GPUs only)");
+        bool ui = s.use_ui_tags != 0;
+        if (ImGui::Checkbox("Keep HUD still (HUD-less + UI tags)", &ui)) s.use_ui_tags = ui;
+        // What is kept unwarped: the HUD (detected in games without HUD layers) and what moves with the
+        // camera (third-person character, first-person weapon).
+        static const char* const kKeepStill[] = {"HUD + character/weapon (default)", "HUD only", "Character/weapon only", "Off"};
+        int keep = s.no_warp_mask ? (s.keep_attached ? 0 : 1) : (s.keep_attached ? 2 : 3);
+        if (ImGui::Combo("Keep still", &keep, kKeepStill, 4)) {
+            s.no_warp_mask = keep == 0 || keep == 1;
+            s.keep_attached = keep == 0 || keep == 2;
+        }
+        hint("What moves with the camera (third-person character, first-person weapon) is not warped and moves at the game's "
+             "frame rate; the HUD is detected in games without HUD layers.");
+        const bool mask = s.no_warp_mask != 0, attached = s.keep_attached != 0;
+        if (attached) {
+            if (p.mv_scale_x == 0.0f) ImGui::TextDisabled("Character/weapon: starts after a few seconds of turning the camera");
+            bool near_rule = s.near_camera_rule != 0;
+            if (ImGui::Checkbox("Keep near-camera motion still (weapon animations, hands)", &near_rule)) {
+                s.near_camera_rule = near_rule;
+                reshade::set_config_value(nullptr, "FrameWarp", "NearCameraRule", near_rule ? "1" : "0");
+            }
+            hint("Turn off if the floor near the camera is kept still while strafing.");
+            int stretch = static_cast<int>(std::min(s.stretch_width, 32u));
+            if (ImGui::SliderInt("Stretch around character/weapon (render px, XPAR engine)", &stretch, 0, 32, stretch ? "%d" : "off")) {
+                s.stretch_width = static_cast<std::uint32_t>(stretch);
+                const std::string value = std::to_string(stretch);
+                reshade::set_config_value(nullptr, "FrameWarp", "StretchWidth", value.c_str());
+            }
+            hint("The scenery beside it stretches instead of tearing into streaks when strafing or turning.");
+            bool orbited = s.turn_rule != 0;
+            if (ImGui::Checkbox("Keep still what the camera turns around (third-person)", &orbited)) {
+                s.turn_rule = orbited;
+                reshade::set_config_value(nullptr, "FrameWarp", "HoldOrbitedCharacter", orbited ? "1" : "0");
+            }
+            hint("For over-the-shoulder cameras that circle the character: what barely moves on screen while turning is held.");
+        }
+        if (mask) {
+            static const char* const kHudFind[] = {"Learned from camera motion", "From the upscaler output (DLSS or FSR)",
+                                                   "Upscaler output + camera motion check (default)"};
+            int find = s.hud_from_scene > 2 ? 2 : int(s.hud_from_scene);
+            if (ImGui::Combo("Find the HUD", &find, kHudFind, 3)) {
+                s.hud_from_scene = find;
+                static const char* const kValues[] = {"0", "1", "2"};
+                reshade::set_config_value(nullptr, "FrameWarp", "HudFromDlssOutput", kValues[find]);
+            }
+            if (find == 0)
+                hint("Learns what stays put while the camera moves; the only choice without an upscaler output.");
+            else if (find == 1)
+                hint("Sharper and instant, but in some games it may keep parts of the scenery still; check with the mask view.");
+            else if (find == 2)
+                hint("From the upscaler output, minus what is seen moving with the world when the camera turns; check with the mask view.");
+            if (find != 0) {
+                bool fill = s.hud_fill != 0;
+                if (ImGui::Checkbox("Fill behind the HUD from the upscaler output (XPAR engine)", &fill)) {
+                    s.hud_fill = fill;
+                    reshade::set_config_value(nullptr, "FrameWarp", "FillBehindHud", fill ? "1" : "0");
+                }
+                hint("Shows the scenery the HUD covers when the camera turns, instead of a smeared trail.");
+            }
+        }
+        bool borderless = force_borderless();
+        if (ImGui::Checkbox("Force a borderless window (for games that only run in exclusive fullscreen)", &borderless))
+            reshade::set_config_value(nullptr, "FrameWarp", "ForceBorderless", borderless ? "1" : "0");
+        hint("XPAR can't show over exclusive fullscreen; applies when the game is restarted; remembered for this game.");
+    }
+
+    if (ImGui::CollapsingHeader("Debug")) {
+        bool strip = s.overlay_debug != 0;
+        if (ImGui::Checkbox("Debug strip (top-left, shows every presented frame)", &strip)) s.overlay_debug = strip;
+        bool invert = s.invert_warp != 0;
+        if (ImGui::Checkbox("Invert warp (debug)", &invert)) s.invert_warp = invert;
+        if (s.no_warp_mask || s.keep_attached) {
+            bool show = s.show_mask != 0;
+            if (ImGui::Checkbox("Show the mask (debug: magenta = kept still; learned HUD: green = being learned)", &show)) s.show_mask = show;
+        }
+        bool record = s.record_diagnostics != 0;
+        if (ImGui::Checkbox("Record detailed diagnostics (for troubleshooting)", &record)) {
+            s.record_diagnostics = record;
+            reshade::set_config_value(nullptr, "FrameWarp", "RecordDiagnostics", record ? "1" : "0");
+        }
+        hint("Frame-by-frame recordings in the FrameWarp\\logs folder; remembered for this game.");
     }
 
     if (ImGui::CollapsingHeader("FSR diagnostics (AMD FidelityFX 2 / 3.0 / 3.1 / 4)")) {
@@ -773,6 +819,7 @@ void unregister_callbacks() {
     reshade::unregister_event<reshade::addon_event::create_resource>(on_create_resource);
     reshade::unregister_event<reshade::addon_event::present>(on_present);
     reshade::unregister_event<reshade::addon_event::finish_present>(on_finish_present);
+    fw::frame_cap_shutdown();
     fw::unregister_depth_choice_events();
     reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(fw::on_reshade_reloaded_effects);
     reshade::unregister_event<reshade::addon_event::reshade_finish_effects>(fw::on_reshade_finish_effects);

@@ -1670,6 +1670,13 @@ void render_thread() {
                              g_app.model.latency() * 1000.0, st.lat_behind_ms, st.lat_display_ms, st.lat_age_ms, lat_age.size(), st.present_lead_ms,
                              settings.present_lead_auto ? "automatic" : "manual", auto_lead.margin_ms, st.presents_queued, auto_lead.late_logged,
                              auto_lead.matched_logged, auto_lead.usual);
+                    {
+                        const auto& hk = sh.hooks;
+                        if (sh.settings.frame_cap && hk.cap_reflex) logf("frame cap: standing aside, the game's NVIDIA Reflex is on");
+                        else if (hk.cap_active)
+                            logf("frame cap: %.1f fps (game %.1f fps) | GPU done %.1f ms after the game's present, %.1f ms after its frame start | held %.1f ms per frame | queued %.0f%%",
+                                 hk.cap_fps, hk.cap_game_fps, hk.cap_present_to_done_ms, hk.cap_start_to_done_ms, hk.cap_wait_ms, hk.cap_queued_pct);
+                    }
                     lat_behind.clear(); lat_display.clear(); lat_age.clear(); lat_queued.clear();
                     auto_lead.late_logged = auto_lead.matched_logged = 0;
                     const double span = now - log_since;

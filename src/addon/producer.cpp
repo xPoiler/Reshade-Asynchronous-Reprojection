@@ -50,6 +50,7 @@ Producer::Producer() {
     s.prediction_ms = -16.0f;  // manual value, used when auto is off
     s.present_lead_ms = 6.0f;  // manual value, used when the automatic lead is off
     s.present_lead_auto = 1;
+    s.frame_cap = 1;  // latency-aware frame cap, standing aside while the game's Reflex is on
     s.no_warp_mask = 1;   // HUD detection in games without HUD layers
     s.keep_attached = 1;  // character / first-person weapon detection, every game
     s.near_camera_rule = 1;

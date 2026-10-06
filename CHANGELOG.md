@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+* **Latency-aware frame cap** (on by default, remembered per game): XPAR holds the game just below the rate its
+  GPU sustains, so no frame waits in the GPU's queue and the game reads input later - what NVIDIA Reflex does,
+  for games without it and for AMD and Intel GPUs. It finds the rate by itself (slower when frames queue,
+  faster while the GPU idles) and stands aside while the game's own Reflex is on (asked from the driver) and
+  during the game's frame generation. Direct3D 12 and 11; not Vulkan yet.
+* The XPAR panel is reorganised: Camera motion, Latency, Warp and Debug sections; the explanations of the
+  options are shown when the mouse rests on them.
 * **Lower output latency, steadier timing.** The present lead is automatic (new default): XPAR measures how
   long its warp takes and renders as late as it still makes the refresh, backing off when a frame misses
   (Stalker 2: 2.5-3.5 ms instead of 6, present to screen 16 ms instead of 19.6). The camera is taken at the

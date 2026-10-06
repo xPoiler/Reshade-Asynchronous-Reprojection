@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 48;
+constexpr std::uint32_t kVersion = 49;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -104,6 +104,7 @@ struct Settings {
     std::uint32_t near_camera_rule;    // character/weapon detection: near-camera pixels moving against the camera count (default on, saved per game)
     std::uint32_t use_controller;      // the controller's right stick drives rotation too (option, on by default, saved per game)
     std::uint32_t present_lead_auto;   // default on: the present lead follows the measured warp time (present_lead_ms unused)
+    std::uint32_t frame_cap;           // default on: latency-aware frame cap for the game while its NVIDIA Reflex is off (add-on; saved per game)
 };
 
 // Presenter status, displayed by the add-on UI.
@@ -168,6 +169,10 @@ struct HookStats {
     std::int32_t pcl_lookup_result, reflex_lookup_result;
     std::uint32_t probe_calls[8];  // game-specific plugin probes (game_probe.cpp)
     std::uint32_t probe_installed;
+    // Latency-aware frame cap (frame_cap.hpp), for the presenter's log: 1 capping; the cap and the game's rate
+    // (fps); the GPU done after the present / after the frame's start (medians, ms); held back per frame (ms).
+    std::uint32_t cap_active, cap_reflex;  // (cap_reflex: the game's Reflex is on, the cap stands aside)
+    float cap_fps, cap_game_fps, cap_present_to_done_ms, cap_start_to_done_ms, cap_wait_ms, cap_queued_pct;
 };
 
 // Game-side event log (lock-free ring) written by the add-on, dumped to CSV by the presenter.
