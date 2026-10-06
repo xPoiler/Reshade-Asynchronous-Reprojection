@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+* **Reset all settings to defaults**: a button at the top of the XPAR panel puts every setting back to its default
+  for the game (Enable reprojection and the learned camera model stay).
 * **New default Auto latency: "Lowest latency without edge fill".** Every refresh XPAR shows the camera as late as
   it can without revealing anything the game has not rendered: the camera as of now (your mouse up to this
   moment) while you aim or turn slowly, falling back as far as one game frame during fast turns, where what the

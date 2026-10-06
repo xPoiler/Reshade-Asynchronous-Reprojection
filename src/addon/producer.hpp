@@ -16,6 +16,9 @@ namespace reshade::api { struct device; struct command_queue; }
 namespace fw {
 class VkTransport;
 
+// Every setting at its default (producer.cpp).
+void default_settings(Settings& s);
+
 class Producer {
 public:
     Producer();

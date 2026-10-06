@@ -26,23 +26,10 @@ DXGI_FORMAT copy_format(DXGI_FORMAT f) {
 }
 }  // namespace
 
-Producer::Producer() {
-    const DWORD pid = GetCurrentProcessId();
-    marker_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    mapping_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(Shared), map_name(pid).c_str());
-    if (!mapping_) return;
-    shared_ = static_cast<Shared*>(MapViewOfFile(mapping_, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Shared)));
-    if (!shared_) return;
-    std::memset(shared_, 0, sizeof(Shared));
-    shared_->magic = kMagic;
-    shared_->version = kVersion;
-    shared_->producer_pid = pid;
-    shared_->session = static_cast<std::uint64_t>(qpc_now());
-    LARGE_INTEGER f; QueryPerformanceFrequency(&f); shared_->qpc_frequency = f.QuadPart;
-    shared_->hooks.constants_base = shared_->hooks.tag_base = -1;
-    for (auto& r : shared_->hooks.feature_result) r = -1;
-    shared_->hooks.pcl_lookup_result = shared_->hooks.reflex_lookup_result = -1;
-    auto& s = shared_->settings;
+// Every setting at its default (the add-on starting, the panel's "Reset all settings to defaults"; the remembered
+// ones read from ReShade.ini afterwards).
+void default_settings(Settings& s) {
+    s = Settings{};
     s.enabled = 1; s.use_mouse = 1; s.use_ui_tags = 1;
     s.warp_engine = 1;  // XPAR's own engine (NVIDIA Latewarp is the alternative)
     s.rotation_extrapolation = 1.0f; s.translation_extrapolation = 1.0f;
@@ -64,6 +51,26 @@ Producer::Producer() {
     s.auto_prediction = 6;     // default: the lowest latency without edge fill (now .. one game frame back); 3: Auto - 1/2 game frame, 1/4 in games
                                // without HUD layers (shorter warps hide mask misses), 1 without DLSS/FSR (XPAR's own motion); 1: full, 2: half, 4: quarter
     s.manual_gain_x = s.manual_gain_y = 0.0f; s.manual_delay_ms = 0.0f;
+    s.use_controller = 1;  // the right stick drives rotation too
+}
+
+Producer::Producer() {
+    const DWORD pid = GetCurrentProcessId();
+    marker_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    mapping_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(Shared), map_name(pid).c_str());
+    if (!mapping_) return;
+    shared_ = static_cast<Shared*>(MapViewOfFile(mapping_, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Shared)));
+    if (!shared_) return;
+    std::memset(shared_, 0, sizeof(Shared));
+    shared_->magic = kMagic;
+    shared_->version = kVersion;
+    shared_->producer_pid = pid;
+    shared_->session = static_cast<std::uint64_t>(qpc_now());
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f); shared_->qpc_frequency = f.QuadPart;
+    shared_->hooks.constants_base = shared_->hooks.tag_base = -1;
+    for (auto& r : shared_->hooks.feature_result) r = -1;
+    shared_->hooks.pcl_lookup_result = shared_->hooks.reflex_lookup_result = -1;
+    default_settings(shared_->settings);
 }
 
 Producer::~Producer() {

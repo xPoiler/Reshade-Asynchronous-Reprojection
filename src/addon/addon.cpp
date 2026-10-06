@@ -129,6 +129,13 @@ void write_persisted(const Persisted& p, double v) {
     else std::snprintf(text, sizeof(text), "%.9g", v);
     reshade::set_config_value(nullptr, "FrameWarp", p.key, static_cast<const char*>(text));
 }
+// The settings with keys of their own in ReShade.ini (read where the add-on starts, written by the panel), and their
+// defaults. GameCameraCheck is no setting: what the presenter found out about the game's own camera.
+struct Saved { const char* key; int default_value; };
+constexpr Saved kSaved[] = {{"HudFromDlssOutput", 2}, {"FillBehindHud", 1}, {"HoldOrbitedCharacter", 1},
+                            {"NearCameraRule", 1}, {"RecordDiagnostics", 0}, {"BackgroundMemory", 1},
+                            {"StretchWidth", 1}, {"GameCameraCheck", 0}, {"MovingObjects", 0},
+                            {"GpuPriority", 0}, {"ForceBorderless", 0}, {"Controller", 1}};
 // At start: the remembered values (none yet, or after an update: the defaults are written instead).
 void load_persisted(fw::Settings& s, bool reset) {
     for (std::size_t i = 0; i < kPersistedCount; ++i) {
@@ -147,6 +154,23 @@ void load_persisted(fw::Settings& s, bool reset) {
         }
         g_persisted[i] = persisted_value(s, p);
     }
+}
+// The panel's "Reset all settings to defaults": every setting, the remembered ones in ReShade.ini too (written on
+// the next panel frame, as any change). Enable reprojection, the learned camera model and what was found out about
+// the game stay.
+void reset_all_settings(fw::Settings& s) {
+    fw::Settings d;
+    fw::default_settings(d);
+    d.enabled = s.enabled;
+    d.reset_calibration = s.reset_calibration;
+    s = d;
+    for (const auto& k : kSaved) {
+        if (std::strcmp(k.key, "GameCameraCheck") == 0) continue;
+        char value[8];
+        std::snprintf(value, sizeof(value), "%d", k.default_value);
+        reshade::set_config_value(nullptr, "FrameWarp", k.key, static_cast<const char*>(value));
+    }
+    reshade::log::message(reshade::log::level::info, "XPAR: all settings reset to the defaults (panel)");
 }
 // Every panel frame: what changed since the last write is written.
 void save_persisted(const fw::Settings& s) {
@@ -271,29 +295,37 @@ void on_init_swapchain(swapchain* sc, bool) {
         fw::install_ffx_hooks(g_producer.get());
     }
     if (dev->get_api() == device_api::d3d12 || dev->get_api() == device_api::d3d11) fw::install_reshade_feed(g_producer.get());
-    // The settings remembered per game (ReShade.ini, [FrameWarp]). They belong to the version that saved
-    // them: after an update (any version change) they go back to the defaults, so the improved defaults of
-    // a new version apply right after installing it.
-    struct Saved { const char* key; int default_value; };
-    static constexpr Saved kSaved[] = {{"HudFromDlssOutput", 2}, {"FillBehindHud", 1}, {"HoldOrbitedCharacter", 1},
-                                       {"NearCameraRule", 1}, {"RecordDiagnostics", 0}, {"BackgroundMemory", 1},
-                                       {"StretchWidth", 1}, {"GameCameraCheck", 0}, {"MovingObjects", 0},
-                                       {"GpuPriority", 0}, {"ForceBorderless", 0}, {"Controller", 1}};
-    char saved_version[32] = "";
+    // The settings remembered per game (ReShade.ini, [FrameWarp]). They belong to the build that saved them:
+    // after an update - any new build, a test build of the same version too - they go back to the defaults,
+    // so the improved defaults apply right after installing it. The build: the version and the add-on's own
+    // link time stamp (PE header).
+    char build[48];
+    {
+        HMODULE self = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&load_persisted), &self);
+        unsigned stamp = 0;
+        if (self) {
+            const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(self);
+            stamp = reinterpret_cast<const IMAGE_NT_HEADERS*>(reinterpret_cast<const char*>(self) + dos->e_lfanew)->FileHeader.TimeDateStamp;
+        }
+        std::snprintf(build, sizeof(build), "%s+%08x", FW_VERSION, stamp);
+    }
+    char saved_version[48] = "";
     size_t size = sizeof(saved_version);
     bool settings_reset = false;
     if (!reshade::get_config_value(nullptr, "FrameWarp", "SettingsVersion", saved_version, &size) ||
-        std::strcmp(saved_version, FW_VERSION) != 0) {
+        std::strcmp(saved_version, build) != 0) {
         settings_reset = true;
         for (const auto& k : kSaved) {
             char value[8];
             std::snprintf(value, sizeof(value), "%d", k.default_value);
             reshade::set_config_value(nullptr, "FrameWarp", k.key, static_cast<const char*>(value));
         }
-        reshade::set_config_value(nullptr, "FrameWarp", "SettingsVersion", static_cast<const char*>(FW_VERSION));
+        reshade::set_config_value(nullptr, "FrameWarp", "SettingsVersion", static_cast<const char*>(build));
         if (saved_version[0]) {
-            char text[128];
-            std::snprintf(text, sizeof(text), "XPAR updated from %s to " FW_VERSION ": settings reset to the defaults", saved_version);
+            char text[160];
+            std::snprintf(text, sizeof(text), "XPAR updated from %s to %s: settings reset to the defaults", saved_version, build);
             reshade::log::message(reshade::log::level::info, text);
         }
     }
@@ -538,6 +570,9 @@ void draw_overlay(effect_runtime*) {
         ImGui::TextWrapped("%s", p.message);
     }
 
+    if (ImGui::Button("Reset all settings to defaults")) reset_all_settings(s);
+    hint("Every XPAR setting back to its default, for this game too (remembered). Enable reprojection and the learned "
+         "camera model stay (Reset camera model is below).");
     if (ImGui::CollapsingHeader("Camera motion", ImGuiTreeNodeFlags_DefaultOpen)) {
         bool mouse = s.use_mouse != 0;
         if (ImGui::Checkbox("Raw mouse drives rotation", &mouse)) s.use_mouse = mouse;
