@@ -652,6 +652,8 @@ void render_thread() {
     PlannedFrame planned[16];
     int planned_at = 0;
     std::int64_t frame_tick = 0, frame_vblank = 0, timing_seen = 0;
+    // Auto latency "camera as of now": the time ahead of Auto's camera in use (s).
+    double now_ahead = 0;
     std::uint32_t log_presents = 0, capped_windows = 0;
     double log_since = now_seconds();
 
@@ -1130,7 +1132,9 @@ void render_thread() {
         // carried ahead of the newest frame as well (RE2: raw mouse input, ~100 mouse events a second to go
         // by), and showing the moment between the last two frames instead held the view on the camera
         // (slow wander in a replay: 11 px with a quarter, 3 px with a whole frame).
-        const std::uint32_t fraction = settings.auto_prediction == 3 ? (source_motion_estimated ? 1u : game_has_hud_layers ? 2u : 4u)
+        // (camera as of now, 5: starts from Auto's choice, see the prediction below)
+        const std::uint32_t fraction = settings.auto_prediction == 3 || settings.auto_prediction == 5 || settings.auto_prediction == 6
+                                           ? (source_motion_estimated ? 1u : game_has_hud_layers ? 2u : 4u)
                                                                      : settings.auto_prediction;
         ps.auto_fraction = (fraction == 1 || fraction == 2 || fraction == 4) ? 1.0 / fraction : 0.0;
         ps.orbit_distance = settings.orbit_distance;
@@ -1241,7 +1245,70 @@ void render_thread() {
         if (source.valid && settings.enabled && !settings.show_original && !sh.overlay_open && source.has_depth) {
             // (paced: the camera as of the planned wake-up, a fixed time before the refresh it is meant for - not
             // the moment the loop got there, which varies by a fraction of a millisecond and would jitter the motion)
-            Prediction p = g_app.model.predict(frame_tick && seconds(frame_tick) <= now ? seconds(frame_tick) : now);
+            const double t_camera = frame_tick && seconds(frame_tick) <= now ? seconds(frame_tick) : now;
+            Prediction p = g_app.model.predict(t_camera);
+            // Camera as of now (Auto latency 5): Auto's camera moved forward to this moment, the mouse up to now
+            // through the learned model - as far as the uncovered edge allows: no more of the screen than
+            // edge_limit_pct of its width beyond what Auto's own camera uncovers (bisection on the time; the
+            // edge grows with it during a turn).
+            // The limit is Auto's own turn away from the game's frame right now, per axis (left/right, up/down): the
+            // warp may not uncover more at either edge - nor warp the scenery behind a held weapon further - than
+            // Auto does, plus the extra allowed. (Against Auto's largest turn of the last 100 ms, quick back-and-forth
+            // kept the limit high: "now" stayed turned that far all the time, and the weapon showed artifacts.) The
+            // time ahead follows the allowed one gradually (at most 0.6 ms back / 0.25 ms forward per refresh):
+            // jumping to it every refresh made the camera tremble.
+            if (settings.auto_prediction == 5) {
+                const double ahead = std::max(0.0, g_app.model.latency() - g_app.model.effective_prediction());
+                const double sx = std::fabs(source_camera.view_to_clip[0]), sy = std::fabs(source_camera.view_to_clip[5]);
+                auto edge_x = [&](const Prediction& q) { return 0.5 * std::tan(std::min(std::fabs(q.yaw), 1.4)) * sx; };
+                auto edge_y = [&](const Prediction& q) { return 0.5 * std::tan(std::min(std::fabs(q.pitch), 1.4)) * sy; };
+                const double extra = std::max(0.0f, settings.edge_limit_pct) / 100.0;
+                const double limit_x = edge_x(p) + extra, limit_y = edge_y(p) + extra;
+                auto within = [&](const Prediction& q) { return edge_x(q) <= limit_x && edge_y(q) <= limit_y; };
+                double allowed = ahead;
+                if (!settings.edge_unlimited && !within(g_app.model.predict(t_camera + ahead))) {
+                    double lo = 0, hi = ahead;
+                    for (int it = 0; it < 7; ++it) {
+                        const double mid = 0.5 * (lo + hi);
+                        if (within(g_app.model.predict(t_camera + mid))) lo = mid; else hi = mid;
+                    }
+                    allowed = lo;
+                }
+                now_ahead = std::clamp(now_ahead + std::clamp(allowed - now_ahead, -0.6e-3, 0.25e-3), 0.0, ahead);
+                if (now_ahead > 0) p = g_app.model.predict(t_camera + now_ahead);
+            } else if (settings.auto_prediction == 6) {
+                // Lowest latency without edge fill: the latest camera time whose view stays between the game's last two
+                // frames' cameras (per axis) - everything the warp reveals then was rendered by one of them (the older
+                // one through background memory). From now back to one game frame before the newest. The time follows
+                // gradually: back faster (1.5 ms per refresh, a flick's edge), forward slowly (0.25 ms).
+                const double ahead = std::max(0.0, g_app.model.latency() - g_app.model.effective_prediction());
+                const double frame = g_app.model.frame_interval();
+                double previous[2] = {0, 0};
+                g_app.model.previous_source_delta(previous);
+                constexpr double kTolerance = 1e-3;  // radians (~0.06 degrees)
+                auto covered = [&](const Prediction& q) {
+                    const double d[2] = {q.yaw, q.pitch};
+                    for (int k = 0; k < 2; ++k)
+                        if (d[k] < std::min(0.0, previous[k]) - kTolerance || d[k] > std::max(0.0, previous[k]) + kTolerance) return false;
+                    return true;
+                };
+                // (predict(t) shows the camera as of t - ahead: the oldest allowed is one frame before the newest frame)
+                const double oldest = std::min(0.0, g_app.model.source_time() - (frame > 0 ? frame : 0.0) + ahead - t_camera);
+                double allowed = ahead;
+                if (!covered(g_app.model.predict(t_camera + ahead))) {
+                    double lo = oldest, hi = ahead;
+                    for (int it = 0; it < 8; ++it) {
+                        const double mid = 0.5 * (lo + hi);
+                        if (covered(g_app.model.predict(t_camera + mid))) lo = mid; else hi = mid;
+                    }
+                    allowed = lo;
+                }
+                now_ahead = std::clamp(now_ahead + std::clamp(allowed - now_ahead, -1.5e-3, 0.25e-3), oldest, ahead);
+                if (now_ahead != 0) p = g_app.model.predict(t_camera + now_ahead);
+            } else {
+                now_ahead = 0;
+            }
+            g_app.model.set_display_ahead(now_ahead);
             if (settings.invert_warp) p.camera = apply_rotation(source_basis, g_app.model.world_up(), -p.yaw, -p.pitch, source_basis.pos);
             applied = p;
             const Vec3 origin = source_basis.pos;
@@ -1293,7 +1360,8 @@ void render_thread() {
                 unmoved = !settings.show_mask && !with_objects && generated < 0;
                 for (int i = 0; i < 16 && unmoved; ++i) unmoved = std::fabs(m.data()[i] - (i % 5 == 0 ? 1.0f : 0.0f)) < 2e-6f;
                 warped = unmoved || renderer.own_warp(source, settings.use_ui_tags != 0, inputs.no_warp_mask != nullptr, m.data(), inputs.depth_inverted,
-                                                     settings.background_memory != 0, with_objects ? &objects : nullptr, generated);
+                                                     settings.background_memory != 0, with_objects ? &objects : nullptr, generated,
+                                                     settings.edge_fill != 0);
             } else {
                 warped = latewarp.evaluate(list, inputs, first_eval, view_matrix(p.camera, origin, z_sign),
                                            view_matrix(source_basis, origin, z_sign), projection);

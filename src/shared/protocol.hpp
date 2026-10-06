@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 49;
+constexpr std::uint32_t kVersion = 50;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -85,7 +85,9 @@ struct Settings {
     std::uint32_t overlay_debug;   // presenter draws a debug indicator
     std::uint32_t invert_warp;     // debug: flip the applied rotation
     float prediction_ms;           // show the camera this far ahead of the game's own latency
-    std::uint32_t auto_prediction; // 0: manual slider; 1, 2, 4: -(1/n of the measured game frame); 3: 1/2 with HUD layers, 1/4 without, 1 with XPAR's own motion vectors
+    std::uint32_t auto_prediction; // 0: manual slider; 1, 2, 4: -(1/n of the measured game frame); 3: 1/2 with HUD layers, 1/4 without, 1 with XPAR's own motion vectors;
+                                   // 5: the camera as of now, held back only as far as the uncovered edge needs (edge_limit_pct, edge_unlimited);
+                                   // 6: the lowest latency that uncovers nothing the game has not rendered (now .. one game frame back)
     float present_lead_ms;         // render this long before the next vblank (0: right after the previous one)
     std::uint32_t gpu_priority;    // presenter GPU scheduling class: 0 realtime (default), 1 high, 2 normal
     std::uint32_t moving_objects;  // XPAR engine: objects move at the display rate, between the game's frames (option, off by default)
@@ -104,6 +106,10 @@ struct Settings {
     std::uint32_t near_camera_rule;    // character/weapon detection: near-camera pixels moving against the camera count (default on, saved per game)
     std::uint32_t use_controller;      // the controller's right stick drives rotation too (option, on by default, saved per game)
     std::uint32_t present_lead_auto;   // default on: the present lead follows the measured warp time (present_lead_ms unused)
+    std::uint32_t edge_fill;           // own warp, what a turn uncovers past the frame's edge: 0 extended edge pixels, 1 soft (default; saved per game)
+    float edge_limit_pct;              // Auto latency "camera as of now": the most of the screen's width (percent) the warp may uncover
+                                       // beyond what the regular Auto latency uncovers lately (0: no more than it; saved per game)
+    std::uint32_t edge_unlimited;      // ...or no limit at all (saved per game)
     std::uint32_t frame_cap;           // default on: latency-aware frame cap for the game while its NVIDIA Reflex is off (add-on; saved per game)
 };
 

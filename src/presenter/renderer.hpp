@@ -140,7 +140,7 @@ public:
     // generated: show the game's generated image of that index (frame generation, see prepare_generated)
     // instead of the frame; source_to_target is then that image's camera's.
     bool own_warp(const IngestedSource& src, bool use_ui_tags, bool use_mask, const float source_to_target[16], bool depth_inverted,
-                  bool memory = false, const ObjectWarp* objects = nullptr, int generated = -1);
+                  bool memory = false, const ObjectWarp* objects = nullptr, int generated = -1, bool soft_edge = false);
     // Frame generation, once per game frame (after the motion analysis): the generated images taken in with
     // the frame made ready for the warp - each one's depth (this frame's, moved back along the motion vectors
     // to the image's moment) and, with the HUD-less picture and UI layer, the UI they show taken back out

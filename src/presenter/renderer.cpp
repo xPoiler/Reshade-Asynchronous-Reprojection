@@ -1009,7 +1009,7 @@ bool hud_near(Texture2D<float> score, int2 p) {
 // camera's); where the previous frame shows the object there too, the still scenery next to it is stretched.
 // rect: the valid depth region; grid: depth texture size. flags: 1 UI layer, 2 mask, 4 fill behind the
 // HUD, 16 depth inverted, 32 depth-independent (rotation only), 64 background memory (t4), 128 stretch,
-// 256 moving objects (t6-t9; alpha: game frames back towards the previous frame).
+// 256 moving objects (t6-t9; alpha: game frames back towards the previous frame), 512 soft edge (ow_soft_edge).
 // t2: the XPAR warp's mask (cs_mask u1): held above 0.95.
 Texture2D<float4> ow_color_t : register(t0);
 Texture2D<float4> ow_ui_t : register(t1);
@@ -1095,6 +1095,28 @@ float4 ow_carried(int2 p, float4 c) {
     if (b.w <= 1e-6) return c;
     return ow_bilinear(u - float2(b.x / b.w - a.x, a.y - b.y / b.w) * 0.5);
 }
+// Soft edge (flag 512): beyond the rendered frame, a blur of the pixels along the edge that widens with the
+// distance past it (no streaks: neighbouring rows mix). Neither darkened nor desaturated: either made the band
+// stand out more.
+float4 ow_soft_edge(float2 src, float2 inside) {
+    const float2 px = float2(out_size);
+    const float2 beyond = (src - inside) * px;  // from the edge to this pixel, in output pixels
+    const float d = length(beyond);
+    const float2 inward = -beyond / max(d, 1e-3);
+    const float2 along = float2(-inward.y, inward.x);
+    const float spread = min(4.0 + 0.6 * d, 192.0);
+    const float2 lo = 0.5 / px, hi = 1.0 - lo;
+    float4 c = 0;
+    float total = 0;
+    [unroll] for (int i = -3; i <= 3; ++i)
+        [unroll] for (int j = 0; j < 3; ++j) {
+            const float2 q = inside + (along * (float(i) * spread / 3.0) + inward * (float(j) * spread * 0.5 + 0.5)) / px;
+            const float w = 1.0 / (1.0 + 0.25 * float(i * i) + float(j));
+            c += ow_bilinear(clamp(q, lo, hi)) * w;
+            total += w;
+        }
+    return c / total;
+}
 // The rendered pixel that lands on uv; false: none (behind the displayed camera).
 bool ow_find(float2 uv, out float2 src) {
     src = uv;
@@ -1157,11 +1179,15 @@ float4 ow_scene(uint2 id, float2 uv, out float2 src, out bool valid) {
         } else {
             // Revealed edge: the nearest edge pixels, blended with a few taps further in along the same
             // direction, so the band reads as a soft continuation rather than streaks.
-            const float2 inward = normalize(inside - src + 1e-9) / float2(out_size);
-            const float reach = min(length((src - inside) * float2(out_size)), 24.0);
-            c = 0;
-            [unroll] for (int k = 0; k < 4; ++k) c += ow_bilinear(inside + inward * (reach * 0.25 * k));
-            c *= 0.25;
+            if (flags & 512) {
+                c = ow_soft_edge(src, inside);
+            } else {
+                const float2 inward = normalize(inside - src + 1e-9) / float2(out_size);
+                const float reach = min(length((src - inside) * float2(out_size)), 24.0);
+                c = 0;
+                [unroll] for (int k = 0; k < 4; ++k) c += ow_bilinear(inside + inward * (reach * 0.25 * k));
+                c *= 0.25;
+            }
             if (flags & 64) {
                 float4 remembered;
                 if (ow_from_memory(src, remembered)) c = remembered;
@@ -2515,7 +2541,7 @@ void Renderer::detect_hud_from_scene(const XConstants& base, bool fill) {
 }
 
 bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_mask, const float source_to_target[16], bool depth_inverted,
-                        bool memory, const ObjectWarp* objects, int generated) {
+                        bool memory, const ObjectWarp* objects, int generated, bool soft_edge) {
     // (the shown set with split queues)
     if (!src.valid || !src.has_depth || !private_[kPOutput].texture || !shown(kPDepth).texture) return false;
     const bool split = use_ui_tags && src.has_hudless && src.has_ui && shown(kPHudless).texture && shown(kPUi).texture;
@@ -2544,7 +2570,7 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
     const bool remembered = memory && mask && mem_shown_ >= 0 && private_[kPMem0 + mem_shown_].texture;
     const bool stretched = mask && (split_ ? shown_stretch_ : stretch_built_);
     c.flags = (split ? 1u : 0u) | (mask ? 2u : 0u) | (fill ? 4u : 0u) | (depth_inverted ? 16u : 0u) | (no_depth ? 32u : 0u) |
-              (remembered ? 64u : 0u) | (stretched ? 128u : 0u) | (moving ? 256u : 0u);
+              (remembered ? 64u : 0u) | (stretched ? 128u : 0u) | (moving ? 256u : 0u) | (soft_edge ? 512u : 0u);
     float wc[20] = {};
     const UINT t = kWSrv(kWWarp);
     // Frame generation: one of the game's generated images, with its own depth (prepare_generated).

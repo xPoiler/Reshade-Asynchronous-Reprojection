@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+* **New default Auto latency: "Lowest latency without edge fill".** Every refresh XPAR shows the camera as late as
+  it can without revealing anything the game has not rendered: the camera as of now (your mouse up to this
+  moment) while you aim or turn slowly, falling back as far as one game frame during fast turns, where what the
+  warp reveals comes from the game's last two frames (keep Background memory on). The earlier Auto is still
+  there, and so is "Camera as of now (edge-limited)" with its "Extra uncovered edge" slider (0: no more edge than
+  Auto) or no limit at all.
+* **Softer screen edges** (new default, "Uncovered screen edges" in the Warp section): what a fast turn uncovers
+  past the frame's edge is a blur of the scenery along it, wider further out, instead of repeated edge pixels
+  that streak. The old fill remains as an option.
 * **Latency-aware frame cap** (on by default, remembered per game): XPAR holds the game just below the rate its
   GPU sustains, so no frame waits in the GPU's queue and the game reads input later - what NVIDIA Reflex does,
   for games without it and for AMD and Intel GPUs. It finds the rate by itself (slower when frames queue,

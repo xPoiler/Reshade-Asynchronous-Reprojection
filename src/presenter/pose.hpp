@@ -406,6 +406,10 @@ public:
     bool camera_follows_mouse() const { return follows_; }
     const AxisParams& params(int axis) const { return params_[axis]; }
     double latency() const { return latency_; }
+    // The camera is displayed this far (s) past the time predict(now) is asked for by default (Auto latency's
+    // "camera as of now"): a new frame's correction is then measured and faded in at the displayed time - at
+    // Auto's time it left a small jump at every game frame (a gritty camera on small mouse movements).
+    void set_display_ahead(double ahead) { display_ahead_ = ahead; }
     // Median of the recent game frame intervals (0 until measured).
     double frame_interval() const { return frame_interval_; }
     // The latency setting actually in use (auto: exactly one game frame behind).
@@ -437,7 +441,7 @@ public:
         const bool had = have_source_;
         Vec3 old_pos{};
         if (had) {
-            const Prediction p = predict(now);
+            const Prediction p = predict(now + display_ahead_);
             old_abs[0] = src_.theta[0] + p.yaw; old_abs[1] = src_.theta[1] + p.pitch; old_pos = p.camera.pos;
         }
 
@@ -506,13 +510,14 @@ public:
         blend_pos_ = {};
         if (!f.consecutive) velocity_ = {};
         if (had && f.consecutive) {
-            const Prediction p = predict(now);
+            const Prediction p = predict(now + display_ahead_);
             const double off[2] = {old_abs[0] - (src_.theta[0] + p.yaw), old_abs[1] - (src_.theta[1] + p.pitch)};
             if (std::fabs(off[0]) < 0.15 && std::fabs(off[1]) < 0.15) { blend_[0] = off[0]; blend_[1] = off[1]; }
             const Vec3 dp = old_pos - p.camera.pos;
             if (length(dp) < 100.0 && settings_.blend_positions) blend_pos_ = dp;
         }
-        blend_t_ = now;
+        // (on the displayed camera's clock: with the camera shown ahead of Auto's time, the fade starts there too)
+        blend_t_ = now + display_ahead_;
     }
 
     // Camera for display at wall time `now`, relative to the newest source.
@@ -618,6 +623,14 @@ public:
     }
     const CameraBasis& source_basis() const { return src_.basis; }
     double source_theta(int axis) const { return src_.theta[axis]; }
+    // The game frame before the newest one, relative to it (yaw, pitch deltas as in Prediction): false when there is
+    // none right before it.
+    bool previous_source_delta(double delta[2]) const {
+        if (frames_.size() < 2 || !frames_.back().consecutive) return false;
+        const Frame& b = frames_[frames_.size() - 2];
+        delta[0] = b.theta[0] - src_.theta[0]; delta[1] = b.theta[1] - src_.theta[1];
+        return true;
+    }
     double source_time() const { return src_.t; }
     Vec3 world_up() const { return up_.get(); }
 
@@ -896,6 +909,7 @@ private:
     double latency_ = 0;
     std::deque<double> latencies_;
     double blend_[2] = {0, 0}, blend_t_ = 0;
+    double display_ahead_ = 0;  // set_display_ahead
     Vec3 blend_pos_{}, velocity_{};
     double orbit_num_ = 0, orbit_den_ = 0, orbit_fit_ = 0;
     int since_fit_ = 0;

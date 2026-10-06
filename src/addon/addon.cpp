@@ -107,6 +107,9 @@ constexpr Persisted kPersisted[] = {
     {"PresentLead", nullptr, &fw::Settings::present_lead_ms},
     {"PresentLeadAuto", &fw::Settings::present_lead_auto, nullptr},
     {"FrameCap", &fw::Settings::frame_cap, nullptr},
+    {"EdgeFill", &fw::Settings::edge_fill, nullptr},
+    {"EdgeLimit", nullptr, &fw::Settings::edge_limit_pct},
+    {"EdgeUnlimited", &fw::Settings::edge_unlimited, nullptr},
     {"WarpEngine", &fw::Settings::warp_engine, nullptr},
     {"KeepHudStill", &fw::Settings::use_ui_tags, nullptr},
     {"KeepStillHud", &fw::Settings::no_warp_mask, nullptr},
@@ -545,11 +548,26 @@ void draw_overlay(effect_runtime*) {
         }
         ImGui::SliderFloat("Rotation extrapolation", &s.rotation_extrapolation, 0.0f, 1.0f);
         static const char* const kAutoModes[] = {"Off (manual slider)", "Auto (1/2, 1/4 without HUD layers, 1 without DLSS/FSR)", "1 game frame", "1/2 game frame",
-                                                 "1/4 game frame"};
-        static const std::uint32_t kAutoValues[] = {0, 3, 1, 2, 4};
+                                                 "1/4 game frame", "Camera as of now (edge-limited)", "Lowest latency without edge fill (default)"};
+        static const std::uint32_t kAutoValues[] = {0, 3, 1, 2, 4, 5, 6};
         int auto_index = 0;
-        for (int i = 0; i < 5; ++i) if (kAutoValues[i] == s.auto_prediction) auto_index = i;
-        if (ImGui::Combo("Auto latency", &auto_index, kAutoModes, 5)) s.auto_prediction = kAutoValues[auto_index];
+        for (int i = 0; i < 7; ++i) if (kAutoValues[i] == s.auto_prediction) auto_index = i;
+        if (ImGui::Combo("Auto latency", &auto_index, kAutoModes, 7)) s.auto_prediction = kAutoValues[auto_index];
+        hint("How far behind the newest camera the view is shown. Auto: between the game's last frames (smoothest). "
+             "Camera as of now: the lowest latency - the mouse up to this moment - held back only as far as needed to keep "
+             "what a fast turn uncovers at the screen's edge under the limit below. Lowest latency without edge fill: the "
+             "camera as of now whenever that shows nothing the game has not rendered, down to one game frame back during "
+             "fast turns (what the warp reveals then comes from the game's last frames: keep Background memory on).");
+        if (s.auto_prediction == 5) {
+            bool unlimited = s.edge_unlimited != 0;
+            if (ImGui::Checkbox("No edge limit", &unlimited)) s.edge_unlimited = unlimited;
+            hint("Always the camera as of now, however much a fast turn uncovers at the screen's edge.");
+            if (unlimited) ImGui::BeginDisabled();
+            ImGui::SliderFloat("Extra uncovered edge (% of width)", &s.edge_limit_pct, 0.0f, 25.0f, "%.1f");
+            if (unlimited) ImGui::EndDisabled();
+            hint("How much more of the screen's edge a fast turn may uncover than with Auto latency. 0: no more than Auto - "
+                 "the camera as of now whenever that adds no edge, held back during fast turns.");
+        }
         const bool auto_latency = s.auto_prediction != 0;
         if (auto_latency) {
             ImGui::SameLine();
@@ -634,6 +652,12 @@ void draw_overlay(effect_runtime*) {
             reshade::set_config_value(nullptr, "FrameWarp", "BackgroundMemory", memory ? "1" : "0");
         }
         hint("Beside the character/weapon and at the screen edges: the scenery as last seen there, when recent.");
+        static const char* const kEdgeFills[] = {"Extended edge pixels", "Soft (default)"};
+        int edge_fill = s.edge_fill ? 1 : 0;
+        if (ImGui::Combo("Uncovered screen edges (XPAR engine)", &edge_fill, kEdgeFills, 2)) s.edge_fill = static_cast<std::uint32_t>(edge_fill);
+        hint("What a fast turn uncovers past the edge of the game's frame, where background memory has nothing: soft blurs "
+             "the scenery along the edge more the further out, slightly less saturated; extended edge pixels repeat the "
+             "edge (sharper close to it, streaks further out). Remembered per game.");
         bool moving = s.moving_objects != 0;
         if (ImGui::Checkbox("Move objects at the display rate even without frame generation (XPAR engine, experimental)", &moving)) {
             s.moving_objects = moving;
