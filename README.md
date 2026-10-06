@@ -109,6 +109,10 @@ Advanced: both files also accept a game name or folder directly (`install.bat "E
 2. Open the ReShade overlay (Home key) and go to **Add-ons > XPAR**. The presenter starts
    automatically with the game.
 
+The settings are remembered per game (in the game's `ReShade.ini`), except **Enable reprojection** and the
+comparison and debug switches (Show original, Debug strip, Invert warp, Show the mask). Updating FrameWarp
+resets them to the defaults.
+
 | Setting | What it does |
 |---|---|
 | **Enable reprojection (N Hz)** | Turns reprojection on or off. N is the refresh rate of the display the game is on, from its current display mode. |

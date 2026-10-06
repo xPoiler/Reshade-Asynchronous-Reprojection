@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+* **Games that hand DLSS full-resolution motion vectors work properly** (DLSS without Streamline tags, no
+  "low-resolution motion vectors" flag - Stalker 2 without frame generation). XPAR read only a quarter of
+  them: the camera estimate saw a narrower field of view, rejected most frames, and the mouse model learned
+  from a camera that barely moved. They are now taken whole and scaled to render pixels.
+* **The mouse model no longer unlearns the mouse.** Stretches where the camera clearly does not follow the
+  mouse (inventories, maps, dialogues with the game's own cursor) are left out of its fit, a learned model is
+  only refitted with enough usable data, and frames a camera estimate cannot explain are not learned from (the
+  XPAR panel says when the estimate is unreliable). A poor model is no longer saved.
+* A locked field of view of an estimated camera is learned again when it keeps failing, for the upscaler's
+  motion vectors too.
+* **Latency breakdown** in the XPAR panel and the log: how far behind the displayed camera is, the time from
+  XPAR's present to the screen, and the age of the camera when it reaches the screen.
+* Record detailed diagnostics also saves what the game hands its upscaler (`upscaler.csv`), and the DLSS
+  inputs are logged whenever they change. Captures continue numbering instead of overwriting earlier ones.
+* **More settings are remembered per game:** Keep still, Keep HUD still, Warp engine, Raw mouse drives
+  rotation, Auto latency and Latency <-> smoothness, Rotation extrapolation, Orbit distance, Max
+  extrapolation, Present lead, and Manual mouse gain with its values. Enable reprojection and the
+  comparison and debug switches (Show original, Debug strip, Invert warp, Show the mask) are not
+  remembered. As before, an update resets the remembered settings to the defaults.
+
 ## 1.8.5
 
 * **The HUD stays still with FSR frame generation too.** Games that hand FSR frame generation a picture

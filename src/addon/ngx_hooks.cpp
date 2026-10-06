@@ -57,6 +57,19 @@ std::uint32_t feature_of(const void* handle) {
 }
 
 // DLSS Super Resolution, or DLSS Ray Reconstruction (which upscales too, from the same inputs).
+// The motion vectors' own resolution. With DLSS's MVLowRes flag they are at render resolution (as the depth, a
+// sub-rectangle of it included); without it they are at output resolution (Stalker 2 without frame generation:
+// 3840x2160 against a 1920x1080 depth) - taken whole then, their values (pixels of that texture) scaled to render
+// pixels. (Reading only the depth-sized corner of them gave a quarter of the picture: a camera estimate with half
+// the field of view, frames rejected, the mouse model learning from a still camera.)
+struct MotionSize { std::uint32_t w, h; float sx, sy; };
+MotionSize motion_size(const NgxStats* s, std::uint32_t w, std::uint32_t h) {
+    const bool full_resolution = s->create_flags != 0 && !(s->create_flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes);
+    if (!full_resolution || !s->mv_w || !s->mv_h || (s->mv_w <= w && s->mv_h <= h)) return {w, h, 1.0f, 1.0f};
+    const std::uint32_t mw = s->out_w ? std::min(s->mv_w, s->out_w) : s->mv_w, mh = s->out_h ? std::min(s->mv_h, s->out_h) : s->mv_h;
+    return {mw, mh, float(w) / float(mw), float(h) / float(mh)};
+}
+
 bool is_dlss(std::uint32_t feature) { return feature == NVSDK_NGX_Feature_SuperSampling || feature == NVSDK_NGX_Feature_RayReconstruction; }
 constexpr std::uint32_t kFrameGeneration = 11;  // DLSS Frame Generation (NVSDK_NGX_Feature_FrameGeneration)
 
@@ -191,8 +204,9 @@ NVSDK_NGX_Result NVSDK_CONV hk_evaluate(ID3D12GraphicsCommandList* list, const N
                     g_last_dlss_publish = qpc_now();
                     const std::uint32_t w = s->subrect_w ? s->subrect_w : s->depth_w, h = s->subrect_h ? s->subrect_h : s->depth_h;
                     const auto state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                    const MotionSize ms = motion_size(s, w, h);
                     g_producer->on_tag(frame, kDepth, depth, state, 0, 0, w, h, list);
-                    g_producer->on_tag(frame, kMotion, motion, state, 0, 0, w, h, list);
+                    g_producer->on_tag(frame, kMotion, motion, state, 0, 0, ms.w, ms.h, list);
                     ++s->frames_joined;
                     if (shared->settings.hud_from_scene && params->Get(NVSDK_NGX_Parameter_Output, &output) == NVSDK_NGX_Result_Success && output) {
                         published = frame; output_w = s->out_w; output_h = s->out_h;
@@ -213,12 +227,14 @@ NVSDK_NGX_Result NVSDK_CONV hk_evaluate(ID3D12GraphicsCommandList* list, const N
                 cam.jitter[0] = s->jitter[0]; cam.jitter[1] = s->jitter[1];
                 cam.mvec_scale[0] = s->mv_scale[0] != 0 ? s->mv_scale[0] : 1.0f;  // motion vector * scale = render pixels
                 cam.mvec_scale[1] = s->mv_scale[1] != 0 ? s->mv_scale[1] : 1.0f;
-                g_producer->on_constants(frame, cam);
                 const std::uint32_t w = s->subrect_w ? s->subrect_w : s->depth_w, h = s->subrect_h ? s->subrect_h : s->depth_h;
+                const MotionSize ms = motion_size(s, w, h);
+                cam.mvec_scale[0] *= ms.sx; cam.mvec_scale[1] *= ms.sy;
+                g_producer->on_constants(frame, cam);
                 // DLSS inputs are in a shader-resource state when evaluated.
                 const auto state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
                 g_producer->on_tag(frame, kDepth, depth, state, 0, 0, w, h, list);
-                g_producer->on_tag(frame, kMotion, motion, state, 0, 0, w, h, list);
+                g_producer->on_tag(frame, kMotion, motion, state, 0, 0, ms.w, ms.h, list);
                 ++s->frames_published;
                 if (shared->settings.hud_from_scene && params->Get(NVSDK_NGX_Parameter_Output, &output) == NVSDK_NGX_Result_Success && output) {
                     published = frame; output_w = s->out_w; output_h = s->out_h;
@@ -307,10 +323,12 @@ NVSDK_NGX_Result NVSDK_CONV hk_vk_evaluate(VkCommandBuffer cb, const NVSDK_NGX_H
                 cam.jitter[0] = s->jitter[0]; cam.jitter[1] = s->jitter[1];
                 cam.mvec_scale[0] = s->mv_scale[0] != 0 ? s->mv_scale[0] : 1.0f;  // motion vector * scale = render pixels
                 cam.mvec_scale[1] = s->mv_scale[1] != 0 ? s->mv_scale[1] : 1.0f;
-                g_producer->on_constants(frame, cam);
                 const std::uint32_t w = s->subrect_w ? s->subrect_w : s->depth_w, h = s->subrect_h ? s->subrect_h : s->depth_h;
+                const MotionSize ms = motion_size(s, w, h);
+                cam.mvec_scale[0] *= ms.sx; cam.mvec_scale[1] *= ms.sy;
+                g_producer->on_constants(frame, cam);
                 tag_vk(frame, kDepth, depth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, w, h, cb);
-                tag_vk(frame, kMotion, motion, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, w, h, cb);
+                tag_vk(frame, kMotion, motion, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, ms.w, ms.h, cb);
                 ++s->frames_published;
                 if (g_producer->shared()->settings.hud_from_scene && (output = vk_image(params, NVSDK_NGX_Parameter_Output)) != nullptr) {
                     published = frame; output_w = s->out_w; output_h = s->out_h;

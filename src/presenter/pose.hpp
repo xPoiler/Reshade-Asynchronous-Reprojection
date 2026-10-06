@@ -333,6 +333,12 @@ private:
     Vec3 up_{0, 0, 1};
 };
 
+// A fit that explains less of the camera's motion than this (1 - rms(model)/rms(hold)) does not replace one that
+// explained it at least this well, and is not saved: stretches where the mouse moves and the camera does not
+// (inventories, maps, dialogues with a cursor the game draws) fit a gain near zero with a quality near zero
+// (Stalker 2: the yaw gain fell 30x within a session, then was saved and loaded again).
+constexpr double kMinFitQuality = 0.2;
+
 // Parameters of one axis of the camera model.
 struct AxisParams {
     double gain = 0;   // radians per count (0: mouse unused)
@@ -392,6 +398,9 @@ public:
 
     void configure(const PoseSettings& s) { settings_ = s; }
     void set_mouse_gate(bool open) { gate_ = open; }
+    // The camera of the frames that follow can be learned from (an estimated camera explaining its frames poorly
+    // cannot: fitted on it, the mouse model learns a camera that is not there).
+    void set_camera_trusted(bool trusted) { camera_trusted_ = trusted; }
     bool mouse_gate() const { return gate_; }
     // false while the game's camera does not follow the mouse (see update_follows).
     bool camera_follows_mouse() const { return follows_; }
@@ -433,7 +442,7 @@ public:
         }
 
         // Yaw is unwrapped against the previous frame; only consecutive, cut-free frames feed the fit.
-        Frame f{id, t, {0, elevation(camera.fwd, world_up)}, gate_, camera.fwd, false, camera.pos, epoch};
+        Frame f{id, t, {0, elevation(camera.fwd, world_up)}, gate_ && camera_trusted_, camera.fwd, false, camera.pos, epoch};
         if (!frames_.empty()) {
             const Frame& prev = frames_.back();
             const double dyaw = yaw_between(prev.fwd, camera.fwd, world_up);
@@ -693,7 +702,36 @@ private:
         static constexpr double kTaus[] = {0.0, 0.03, 0.05, 0.07, 0.09, 0.12, 0.15, 0.2, 0.3};
         static constexpr double kDelays[] = {-0.01, 0.0, 0.01, 0.02, 0.03};
         static constexpr double kPowers[] = {1.0, 2.0, 3.0};
-        const auto& frames = job.frames;
+        auto& frames = job.frames;
+        // Half-second stretches where the camera clearly did not follow the mouse are left out: the model as it
+        // stands expects a turn of a quarter degree or more from the mouse there, and the camera moved less than a quarter
+        // of it (an inventory, a map, a dialogue with a cursor the game draws - movements too small or too slow for
+        // the moment-to-moment check, update_follows). Fitted on, they pull the gain to zero: the camera's own
+        // momentum explains its motion there just as well without the mouse (Stalker 2: the yaw gain fell 30x).
+        // (Nothing to judge with before a gain is learned.)
+        const double g0 = job.params[0].fitted ? job.params[0].gain : 0.0, g1 = job.params[1].fitted ? job.params[1].gain : 0.0;
+        if ((g0 != 0.0 || g1 != 0.0) && !frames.empty()) {
+            MouseCursor m0{job.mouse_t, job.mouse_v[0]}, m1{job.mouse_t, job.mouse_v[1]};
+            std::size_t s = 0;
+            while (s < frames.size()) {
+                std::size_t e = s;
+                while (e + 1 < frames.size() && frames[e + 1].consecutive && frames[e + 1].t - frames[s].t <= 0.5) ++e;
+                if (e > s) {
+                    const double x = g0 * m0.sum(frames[s].t, frames[e].t, frames[e].t, 0.0), y = g1 * m1.sum(frames[s].t, frames[e].t, frames[e].t, 0.0);
+                    const double expected = std::sqrt(x * x + y * y);
+                    const double dx = frames[e].theta[0] - frames[s].theta[0], dy = frames[e].theta[1] - frames[s].theta[1];
+                    if (expected >= 0.25 * 3.14159265358979 / 180.0 && std::sqrt(dx * dx + dy * dy) < 0.25 * expected)
+                        for (std::size_t i = s; i <= e; ++i) frames[i].gate = false;
+                }
+                s = e + 1;
+            }
+        }
+        // Too little left to fit on (most of the history left out): a model already learned stays as it is.
+        if (job.params[0].fitted || job.params[1].fitted) {
+            std::size_t usable = 0;
+            for (std::size_t i = 1; i < frames.size(); ++i) usable += frames[i].consecutive && frames[i].gate && frames[i - 1].gate;
+            if (usable < std::max<std::size_t>(300, frames.size() / 4)) return;
+        }
         for (int k = 0; k < 2; ++k) {
             AxisParams& out = job.params[k];
             // Any stick movement worth fitting (deflection x seconds: half a second at full tilt)?
@@ -773,6 +811,8 @@ private:
             // instead of dropping to no mouse at all until the next movement is learned again. Each input keeps
             // its own gain while only the other one moves (switching between mouse and controller).
             if (!informative && !stick_informative && out.fitted) continue;
+            const double quality = hold_rms > 0 ? 1.0 - best_rms / hold_rms : 0;
+            if (out.fitted && out.quality >= kMinFitQuality && quality < kMinFitQuality) continue;  // (see kMinFitQuality)
             if (best_rms < 1e29) {
                 out.tau = best_tau; out.delay = best_delay;
                 if (informative || !stick_informative) out.gain = best_gain;
@@ -852,6 +892,7 @@ private:
     bool have_source_ = false;
     bool gate_ = true;
     bool follows_ = true;  // the game's camera follows the mouse (update_follows)
+    bool camera_trusted_ = true;  // set_camera_trusted
     double latency_ = 0;
     std::deque<double> latencies_;
     double blend_[2] = {0, 0}, blend_t_ = 0;

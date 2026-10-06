@@ -262,7 +262,8 @@ private:
     ID3D12Resource* shared_texture(int slot, int kind, std::uint32_t generation);
     D3D12_CPU_DESCRIPTOR_HANDLE cpu(UINT index) const;
     D3D12_GPU_DESCRIPTOR_HANDLE gpu(UINT index) const;
-    void convert(ID3D12Resource* source, DXGI_FORMAT source_format, int slot, int kind, PrivateId target, std::uint32_t w, std::uint32_t h);
+    void convert(ID3D12Resource* source, DXGI_FORMAT source_format, int slot, int kind, PrivateId target, std::uint32_t w, std::uint32_t h,
+                 std::uint32_t source_w = 0, std::uint32_t source_h = 0);
     void create_swapchain_views();
     // HUD in this frame from the upscaler's output (into the HUD score texture, 1 = HUD).
     void detect_hud_from_scene(const struct XConstants& base, bool fill);

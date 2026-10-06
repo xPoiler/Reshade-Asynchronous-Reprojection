@@ -335,9 +335,9 @@ public:
             if (inliers.size() >= 32) e = fit_motion(inliers, w, h, f, o, t, fp, prior, move_prior);
             if (std::isfinite(e) && std::sqrt(e) < acceptable(valid)) { omega = o; T = t; last_residual_ = std::sqrt(e); }
         }
-        // A field of view learned from estimated vectors and then locked has to keep explaining the frames:
-        // when it fails a third of 300, it is learned again.
-        if (noisy && learned_locked_) {
+        // A field of view learned and then locked has to keep explaining the frames: when it fails a third of 300,
+        // it is learned again (estimated vectors and the upscaler's alike).
+        if (learned_locked_) {
             ++locked_frames_;
             if (!ok) ++locked_rejected_;
             if (locked_frames_ >= 300) {

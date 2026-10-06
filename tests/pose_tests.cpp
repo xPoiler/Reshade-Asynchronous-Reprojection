@@ -247,6 +247,23 @@ static void mouse_ignored_in_menus() {
     EXPECT(yaw_in_menu < 1e-3, "no predicted turn in the menu (%.4f rad)", yaw_in_menu);
 }
 
+// A long stretch where the mouse moves slowly and the camera does not (an inventory with a cursor the game draws,
+// movements too small for the "camera follows the mouse" check to judge): the learned gain survives it.
+static void gain_survives_menus() {
+    PoseModel model;
+    Game g; g.model = &model;
+    for (int i = 0; i < 20000; ++i) g.step(pattern_x(g.t), pattern_y(g.t));  // learn
+    const double before_x = model.params(0).gain, before_y = model.params(1).gain;
+    g.menu = true;
+    for (int i = 0; i < 45000; ++i) {  // 45 s: the whole fit window
+        const bool tick = (static_cast<long>(std::lround(g.t * 1000.0)) % 40) == 0;  // 25 small moves a second
+        g.step(tick ? (std::sin(g.t) > 0 ? 1 : -1) : 0, tick ? 1 : 0);
+    }
+    const double after_x = model.params(0).gain, after_y = model.params(1).gain;
+    std::printf("gain through a long menu: yaw %.6g -> %.6g, pitch %.6g -> %.6g\n", before_x, after_x, before_y, after_y);
+    EXPECT(std::fabs(after_x / before_x - 1.0) < 0.05 && std::fabs(after_y / before_y - 1.0) < 0.05, "the learned gains survive a long menu");
+}
+
 static void world_up_detection() {
     WorldUp up;
     for (int i = 0; i < 20; ++i) up.add(camera_at(i * 0.3, 0.1 * std::sin(i)));
@@ -373,6 +390,7 @@ int main() {
     auto_latency_tracks_frame_interval();
     world_up_detection();
     mouse_ignored_in_menus();
+    gain_survives_menus();
     controller_stick();
     worker_fit_matches();
     if (failures) { std::printf("%d failure(s)\n", failures); return 1; }

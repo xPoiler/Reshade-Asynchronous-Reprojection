@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 45;
+constexpr std::uint32_t kVersion = 47;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -135,6 +135,14 @@ struct PresenterStatus {
     // (rad/s, 0: not learned yet) and the response curve (|s|^power) per axis.
     std::uint32_t controller;
     float stick_gain_x, stick_gain_y, stick_power_x, stick_power_y;
+    // Latency breakdown (medians of the last 5 s, ms; 0: not measured): how far behind the moment of rendering the
+    // displayed camera is (Auto latency's choice: game latency + a fraction of a frame), from the present to the
+    // screen (the swapchain's frame statistics), and the age of the displayed camera when it reaches the screen
+    // (the two together: what camera rotation costs, mouse included). Game latency: latency_ms.
+    float lat_behind_ms, lat_display_ms, lat_age_ms;
+    // The camera is estimated (no camera from the game) and explains its frames poorly lately: the camera model does
+    // not learn from it meanwhile (share of the last 60 estimated frames unexplained, percent; 0: fine or not estimated).
+    std::uint32_t estimate_unreliable_pct;
     char message[256];
 };
 

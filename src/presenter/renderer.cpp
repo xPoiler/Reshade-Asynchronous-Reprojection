@@ -18,7 +18,11 @@ cbuffer C : register(b0) { uint2 size; uint marker; uint counter; };
 
 [numthreads(8, 8, 1)] void cs_color(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= size)) return;
-    dst4[id.xy] = src.Load(int3(id.xy, 0));
+    // (marker, counter: the source's size when it differs - motion vectors at output resolution over the render
+    // grid: the matching position; 0: the same pixel)
+    const uint2 source = uint2(marker, counter);
+    const uint2 at = all(source > 0) ? min(uint2((float2(id.xy) + 0.5) * float2(source) / float2(size)), source - 1) : id.xy;
+    dst4[id.xy] = src.Load(int3(at, 0));
 }
 [numthreads(8, 8, 1)] void cs_depth(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= size)) return;
@@ -3101,7 +3105,7 @@ ID3D12GraphicsCommandList* Renderer::begin(int context) {
 }
 
 void Renderer::convert(ID3D12Resource* source, DXGI_FORMAT source_format, int slot, int kind, PrivateId target,
-                       std::uint32_t w, std::uint32_t h) {
+                       std::uint32_t w, std::uint32_t h, std::uint32_t source_w, std::uint32_t source_h) {
     D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
     sv.Format = srv_format(source_format);
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -3118,7 +3122,8 @@ void Renderer::convert(ID3D12Resource* source, DXGI_FORMAT source_format, int sl
     transition(p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     list_->SetPipelineState(target == kPDepth ? cs_depth_.Get() : cs_color_.Get());
     list_->SetComputeRootSignature(root_.Get());
-    const std::uint32_t constants[4] = {w, h, 0, 0};
+    const bool resample = target != kPDepth && source_w && source_h && (source_w != w || source_h != h);
+    const std::uint32_t constants[4] = {w, h, resample ? source_w : 0u, resample ? source_h : 0u};
     list_->SetComputeRoot32BitConstants(0, 4, constants, 0);
     list_->SetComputeRootDescriptorTable(1, gpu(index));
     list_->SetComputeRootDescriptorTable(2, gpu(kPrivUav + target));
@@ -3288,8 +3293,13 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
         convert(sources[kDepth], static_cast<DXGI_FORMAT>(dp.format), slot, kDepth, kPDepth, dp.width, dp.height);
         const auto& mv = m.tex[kMotion];
         if (sources[kMotion]) {
-            convert(sources[kMotion], static_cast<DXGI_FORMAT>(mv.format), slot, kMotion, kPMotion,
-                    std::min(mv.width, dp.width), std::min(mv.height, dp.height));
+            // (motion vectors at another resolution than the depth - output resolution: sampled at the matching
+            // positions over the depth's grid, not cropped to its corner)
+            if (mv.width > dp.width || mv.height > dp.height)
+                convert(sources[kMotion], static_cast<DXGI_FORMAT>(mv.format), slot, kMotion, kPMotion, dp.width, dp.height, mv.width, mv.height);
+            else
+                convert(sources[kMotion], static_cast<DXGI_FORMAT>(mv.format), slot, kMotion, kPMotion,
+                        std::min(mv.width, dp.width), std::min(mv.height, dp.height));
             out.has_motion = true;
         } else if (estimate) {
             take_colour();

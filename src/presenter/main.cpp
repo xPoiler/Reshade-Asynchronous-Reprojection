@@ -60,6 +60,7 @@ struct App {
     FILE* csv_mouse = nullptr;    // raw input
     FILE* csv_stick = nullptr;    // controller right stick (on change)
     FILE* csv_hooks = nullptr;    // the add-on's call counters (Streamline, NGX, FSR, frame generation), cumulative, once a second
+    FILE* csv_upscaler = nullptr; // what the game hands its upscaler (DLSS / FSR inputs: sizes, formats, motion vector scale, jitter), once a second
     std::atomic<bool> controller{false};  // an XInput controller is connected and read
     FILE* csv_motion = nullptr;   // per game frame: agreement of the motion vectors with depth + camera
     FILE* csv_sources = nullptr;  // ingested frames + camera
@@ -158,6 +159,10 @@ void open_recordings() {
         g_app.csv_events = open_csv(L"events.csv", "qpc,kind,tid,frame,extra");
         g_app.csv_mouse = open_csv(L"mouse.csv", "qpc,dx,dy");
         g_app.csv_stick = open_csv(L"stick.csv", "qpc,x,y");
+        g_app.csv_upscaler = open_csv(L"upscaler.csv",
+            "qpc,ngx_feature,ngx_create_flags,ngx_render_w,ngx_render_h,ngx_out_w,ngx_out_h,ngx_subrect_w,ngx_subrect_h,ngx_depth_w,ngx_depth_h,ngx_depth_format,"
+            "ngx_mv_w,ngx_mv_h,ngx_mv_format,ngx_mv_scale_x,ngx_mv_scale_y,ngx_jitter_x,ngx_jitter_y,"
+            "fsr_create_flags,fsr_render_w,fsr_render_h,fsr_out_w,fsr_out_h,fsr_mv_scale_x,fsr_mv_scale_y,fsr_jitter_x,fsr_jitter_y,fsr_near,fsr_far,fsr_fov");
         g_app.csv_hooks = open_csv(L"hooks.csv",
             "qpc,sl_constants,sl_tags,sl_tags_for_frame,sl_markers,sl_evaluate,sl_new_frame_token,sl_set_feature_loaded,sl_allocate,sl_free,"
             "sl_get_feature_function,ngx_creates,ngx_dlss_creates,ngx_evaluates,ngx_dlss_evaluates,ngx_feature1,ngx_feature11,ngx_feature13,"
@@ -190,8 +195,28 @@ void logf(const char* format, ...) {
 // stop; also while paused.
 void record_hooks(const Shared& sh, double now) {
     static double last = 0;
-    if (now - last < 1.0 || !rec(g_app.csv_hooks)) return;
+    // (what the game hands its upscaler, also in presenter.log whenever it changes - recording or not)
+    {
+        const auto& n = sh.ngx;
+        static char logged[320] = "";
+        char line[320];
+        if (n.dlss_feature) {
+            std::snprintf(line, sizeof(line), "DLSS inputs: feature %u, flags 0x%x, render %ux%u -> %ux%u, subrect %ux%u, depth %ux%u fmt %u, motion vectors %ux%u fmt %u, "
+                          "scale %.6g x %.6g", n.dlss_feature, n.create_flags, n.render_w, n.render_h, n.out_w, n.out_h, n.subrect_w, n.subrect_h, n.depth_w,
+                          n.depth_h, n.depth_format, n.mv_w, n.mv_h, n.mv_format, n.mv_scale[0], n.mv_scale[1]);
+            if (std::strcmp(line, logged) != 0) { logf("%s", line); std::snprintf(logged, sizeof(logged), "%s", line); }
+        }
+    }
+    if (now - last < 1.0 || (!rec(g_app.csv_hooks) && !rec(g_app.csv_upscaler))) return;
     last = now;
+    if (rec(g_app.csv_upscaler)) {
+        const auto &n = sh.ngx; const auto &f = sh.fsr;
+        wr(g_app.csv_upscaler, "%lld,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%.6g,%.6g,%.4f,%.4f,%u,%u,%u,%u,%u,%.6g,%.6g,%.4f,%.4f,%.6g,%.6g,%.6g\n",
+           static_cast<long long>(qpc_now()), n.dlss_feature, n.create_flags, n.render_w, n.render_h, n.out_w, n.out_h, n.subrect_w, n.subrect_h,
+           n.depth_w, n.depth_h, n.depth_format, n.mv_w, n.mv_h, n.mv_format, n.mv_scale[0], n.mv_scale[1], n.jitter[0], n.jitter[1],
+           f.create_flags, f.render_w, f.render_h, f.out_w, f.out_h, f.mv_scale[0], f.mv_scale[1], f.jitter[0], f.jitter[1], f.near_plane, f.far_plane, f.fov);
+    }
+    if (!rec(g_app.csv_hooks)) return;
     const auto &h = sh.hooks; const auto &n = sh.ngx; const auto &f = sh.fsr;
     wr(g_app.csv_hooks, "%lld,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%ld,%ld,%ld,%u,%u\n",
        static_cast<long long>(qpc_now()), h.constants_calls, h.tag_calls, h.tag_for_frame_calls, h.marker_calls, h.export_calls[3],
@@ -347,10 +372,12 @@ void load_profile() {
     std::ifstream in(g_app.profile_path);
     AxisParams p[2];
     int version = 0;
-    if (in >> version && (version == 2 || version == 3) &&
+    if (in >> version && version >= 2 && version <= 4 &&
         in >> p[0].gain >> p[0].tau >> p[0].delay >> p[1].gain >> p[1].tau >> p[1].delay) {
-        if (version == 3 && !(in >> p[0].stick_gain >> p[0].stick_power >> p[1].stick_gain >> p[1].stick_power))
+        if (version >= 3 && !(in >> p[0].stick_gain >> p[0].stick_power >> p[1].stick_gain >> p[1].stick_power))
             p[0].stick_gain = p[1].stick_gain = 0, p[0].stick_power = p[1].stick_power = 1;
+        // (the fit's quality: older profiles have none and count as unproven - any good fit replaces them)
+        if (version >= 4 && !(in >> p[0].quality >> p[1].quality)) p[0].quality = p[1].quality = 0;
         p[0].fitted = p[1].fitted = true;
         g_app.model.seed(p[0], p[1]);
         logf("profile loaded: yaw gain %.4g tau %.0f ms, pitch gain %.4g tau %.0f ms", p[0].gain, p[0].tau * 1000, p[1].gain, p[1].tau * 1000);
@@ -359,9 +386,11 @@ void load_profile() {
 void save_profile() {
     const auto &x = g_app.model.params(0), &y = g_app.model.params(1);
     if (!x.fitted && !y.fitted) return;
+    // (a model that explains the camera poorly is not saved: the last good one stays - see kMinFitQuality)
+    if (x.quality < kMinFitQuality || y.quality < kMinFitQuality) return;
     std::ostringstream out;
-    out << 3 << ' ' << x.gain << ' ' << x.tau << ' ' << x.delay << ' ' << y.gain << ' ' << y.tau << ' ' << y.delay << ' '
-        << x.stick_gain << ' ' << x.stick_power << ' ' << y.stick_gain << ' ' << y.stick_power << '\n';
+    out << 4 << ' ' << x.gain << ' ' << x.tau << ' ' << x.delay << ' ' << y.gain << ' ' << y.tau << ' ' << y.delay << ' '
+        << x.stick_gain << ' ' << x.stick_power << ' ' << y.stick_gain << ' ' << y.stick_power << ' ' << x.quality << ' ' << y.quality << '\n';
     g_files.replace(g_app.profile_path, out.str());  // (written by the file thread: see FileWriter)
 }
 
@@ -572,6 +601,9 @@ void render_thread() {
     double last_mv_log = 0, last_usage_log = 0;
     bool game_has_hud_layers = false, mask_logged = false, source_masked = false, hudless_hud_logged = false;
     CameraEstimator estimator;
+    // Whether the estimated camera can be learned from: the frame itself was explained, and so were most of the last 60.
+    std::deque<bool> estimate_rejects;
+    bool estimate_trusted = true, estimate_was_trusted = true;
     bool estimator_logged = false, fov_logged = false;
     bool fsr_logged = false;
     int logged_fov_mode = 0;
@@ -598,6 +630,11 @@ void render_thread() {
     // still busy with earlier refreshes) and the Present call (a frame rate cap of the graphics driver holds
     // the presents there). Output well below the refresh rate with the presents held: a cap from outside.
     double swap_wait_ms = 0, present_call_ms = 0, log_swap_wait_ms = 0, log_present_call_ms = 0, log_present_call_max = 0;
+    // Latency breakdown: per present, the displayed camera's time and the present's time (by present count), matched
+    // with the swapchain's statistics (the refresh that showed it); medians over 5 s.
+    struct ShownPresent { UINT count = 0; double present_t = 0, camera_t = 0; bool done = true; };
+    ShownPresent shown_presents[64];
+    std::vector<double> lat_behind, lat_display, lat_age;
     std::uint32_t log_presents = 0, capped_windows = 0;
     double log_since = now_seconds();
 
@@ -732,6 +769,22 @@ void render_thread() {
                         const double t0 = now_seconds();
                         cam = estimator.update(motion_samples, rw, rh, m.camera, s.motion_estimated);
                         estimator_ms_sum += (now_seconds() - t0) * 1000.0; ++estimator_runs;
+                        {
+                            estimate_rejects.push_back(estimator.last_rejected());
+                            if (estimate_rejects.size() > 60) estimate_rejects.pop_front();
+                            int rejected = 0;
+                            for (const bool r : estimate_rejects) rejected += r;
+                            const double share = double(rejected) / double(estimate_rejects.size());
+                            const bool reliable = estimate_rejects.size() < 30 || share <= 0.3;
+                            estimate_trusted = reliable && !estimator.last_rejected();
+                            sh.presenter.estimate_unreliable_pct = reliable ? 0u : static_cast<std::uint32_t>(share * 100.0 + 0.5);
+                            if (reliable != estimate_was_trusted) {
+                                logf(reliable ? "camera estimate reliable again: the camera model learns from it"
+                                              : "camera estimate unreliable (%.0f%% of the last frames unexplained): the camera model does not learn from it meanwhile",
+                                     share * 100.0);
+                                estimate_was_trusted = reliable;
+                            }
+                        }
                         flush_ms_sum += renderer.last_flush_ms() + intake_wait_ms;
                         intake_wait_ms = 0;
                         if (estimator_runs >= 300) {
@@ -805,6 +858,8 @@ void render_thread() {
                 source_frame = m.frame_id;
                 frame_times.emplace_back(m.frame_id, source_time);
                 if (frame_times.size() > 8) frame_times.pop_front();
+                g_app.model.set_camera_trusted(!cam.estimated || estimate_trusted);
+                if (!cam.estimated) sh.presenter.estimate_unreliable_pct = 0;
                 g_app.model.add_source(m.frame_id, source_time, seconds(qpc_now()), incoming.basis, cam.reset != 0, now_seconds(),
                                        cam.position_epoch);
                 if (rec(g_app.csv_sources)) {
@@ -1274,10 +1329,17 @@ void render_thread() {
         } else if (dump_stage == 2 && dump_now && shown_frame != dump_after) {
             dump_stage = 0;
             dump_frames[2] = dump_frame();
-            static int captures = 0;
+            static int captures = -1;
             const auto dir = g_app.data_dir / L"captures";
             std::error_code ec;
             std::filesystem::create_directories(dir, ec);
+            if (captures < 0) {  // (continue after the captures already there: a new session used to overwrite them)
+                captures = 0;
+                for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+                    const std::wstring name = entry.path().filename().wstring();
+                    if (name.rfind(L"capture_", 0) == 0) captures = std::max(captures, _wtoi(name.c_str() + 8));
+                }
+            }
             const int n = ++captures;
             for (const auto& [which, name] : {std::pair{0, L"frame"}, std::pair{1, L"output"}, std::pair{2, L"scene"}, std::pair{3, L"depth"},
                                               std::pair{4, L"motion"}, std::pair{5, L"object"}, std::pair{6, L"mask"}, std::pair{7, L"hudscore"},
@@ -1341,6 +1403,25 @@ void render_thread() {
         record_timeline(sh, settings);
         ++stat_frames;
         present_call_ms += renderer.last_present_call_ms();
+        {
+            const auto ps = renderer.present_stats();
+            if (!same_picture && warped && ps.last_present_count) {
+                const double camera_t = g_app.model.source_time() + applied.horizon;
+                lat_behind.push_back((now - camera_t) * 1000.0);
+                shown_presents[ps.last_present_count % 64] = {ps.last_present_count, now_seconds(), camera_t, false};
+            }
+            if (ps.hr == S_OK && ps.sync_qpc && ps.present_count) {
+                auto& e = shown_presents[ps.present_count % 64];
+                if (e.count == ps.present_count && !e.done) {
+                    e.done = true;
+                    const double screen_t = seconds(ps.sync_qpc);
+                    if (screen_t >= e.present_t && screen_t - e.present_t < 0.25) {
+                        lat_display.push_back((screen_t - e.present_t) * 1000.0);
+                        lat_age.push_back((screen_t - e.camera_t) * 1000.0);
+                    }
+                }
+            }
+        }
         log_present_call_max = std::max(log_present_call_max, double(renderer.last_present_call_ms()));
 
         {
@@ -1455,6 +1536,17 @@ void render_thread() {
                 st.display_hz = vblank.period > 0 ? float(double(qf.QuadPart) / vblank.period) : 0.0f;
             }
             st.fit_quality_x = float(px.quality); st.fit_quality_y = float(py.quality);
+            {
+                // (the camera model, when it changes notably: gain by a fifth, quality by 0.1)
+                static double logged[4] = {0, 0, -1, -1};
+                auto changed = [](double a, double b) { return (a == 0) != (b == 0) || (a != 0 && std::fabs(b / a - 1.0) > 0.2); };
+                if (changed(logged[0], px.gain) || changed(logged[1], py.gain) || std::fabs(logged[2] - px.quality) > 0.1 ||
+                    std::fabs(logged[3] - py.quality) > 0.1) {
+                    logf("camera model: yaw gain %.4g (quality %.2f, smoothing %.0f ms, delay %.0f ms), pitch gain %.4g (quality %.2f, smoothing %.0f ms, delay %.0f ms)",
+                         px.gain, px.quality, px.tau * 1000.0, px.delay * 1000.0, py.gain, py.quality, py.tau * 1000.0, py.delay * 1000.0);
+                    logged[0] = px.gain; logged[1] = py.gain; logged[2] = px.quality; logged[3] = py.quality;
+                }
+            }
             st.controller = g_app.controller ? 1u : 0u;
             st.stick_gain_x = float(px.stick_gain); st.stick_gain_y = float(py.stick_gain);
             st.stick_power_x = float(px.stick_power); st.stick_power_y = float(py.stick_power);
@@ -1483,6 +1575,18 @@ void render_thread() {
                 log_swap_wait_ms += swap_wait_ms; log_present_call_ms += present_call_ms; log_presents += stat_frames;
                 swap_wait_ms = present_call_ms = 0;
                 if (now - log_since >= 5.0) {
+                    auto median = [](std::vector<double>& v) {
+                        if (v.empty()) return 0.0;
+                        std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+                        return v[v.size() / 2];
+                    };
+                    st.lat_behind_ms = float(median(lat_behind)); st.lat_display_ms = float(median(lat_display));
+                    st.lat_age_ms = float(median(lat_age));
+                    if (!lat_behind.empty())
+                        logf("latency: game %.1f ms (input to frame, p90) | displayed camera %.1f ms behind when rendered | present to screen %.1f ms "
+                             "| camera age on screen %.1f ms (medians; %zu presents matched)", g_app.model.latency() * 1000.0, st.lat_behind_ms,
+                             st.lat_display_ms, st.lat_age_ms, lat_age.size());
+                    lat_behind.clear(); lat_display.clear(); lat_age.clear();
                     const double span = now - log_since;
                     logf("refresh loop: %.1f presents/s | per present: Present call %.2f ms (max %.1f), swapchain wait %.2f ms | display %.1f Hz",
                          log_presents / span, log_presents ? log_present_call_ms / log_presents : 0.0, log_present_call_max,
@@ -1710,7 +1814,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (g_app.shared) g_app.shared->presenter.pid = 0;
     logf("exit");
     g_files.stop();
-    for (FILE* csv : {g_app.csv_events, g_app.csv_mouse, g_app.csv_sources, g_app.csv_outputs, g_app.csv_motion, g_app.csv_stick, g_app.csv_hooks}) if (csv) std::fclose(csv);
+    for (FILE* csv : {g_app.csv_events, g_app.csv_mouse, g_app.csv_sources, g_app.csv_outputs, g_app.csv_motion, g_app.csv_stick, g_app.csv_hooks, g_app.csv_upscaler}) if (csv) std::fclose(csv);
     if (g_app.log) std::fclose(g_app.log);
     if (single) CloseHandle(single);
     return 0;

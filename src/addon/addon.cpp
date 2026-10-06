@@ -13,6 +13,7 @@
 #include <d3d12.h>
 #include <dxgi1_2.h>
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <cstdio>
 #include <string>
@@ -88,6 +89,65 @@ bool presenter_running() {
         CloseHandle(h);
     }
     return false;
+}
+
+// More settings remembered per game (ReShade.ini, [FrameWarp]), as they are set in the panel: written when they
+// change, read when the game starts, back to the defaults after an update (as the options above). Not
+// remembered: Enable reprojection and the comparison/debug switches (Show original, Debug strip, Invert warp,
+// Show the mask) - those never stick.
+struct Persisted { const char* key; std::uint32_t fw::Settings::*u; float fw::Settings::*f; };
+constexpr Persisted kPersisted[] = {
+    {"UseMouse", &fw::Settings::use_mouse, nullptr},
+    {"RotationExtrapolation", nullptr, &fw::Settings::rotation_extrapolation},
+    {"AutoLatency", &fw::Settings::auto_prediction, nullptr},
+    {"LatencySmoothness", nullptr, &fw::Settings::prediction_ms},
+    {"OrbitDistance", nullptr, &fw::Settings::orbit_distance},
+    {"MaxExtrapolation", nullptr, &fw::Settings::max_horizon_ms},
+    {"PresentLead", nullptr, &fw::Settings::present_lead_ms},
+    {"WarpEngine", &fw::Settings::warp_engine, nullptr},
+    {"KeepHudStill", &fw::Settings::use_ui_tags, nullptr},
+    {"KeepStillHud", &fw::Settings::no_warp_mask, nullptr},
+    {"KeepStillCharacter", &fw::Settings::keep_attached, nullptr},
+    {"ManualMouseGain", &fw::Settings::manual_gain, nullptr},
+    {"ManualGainYaw", nullptr, &fw::Settings::manual_gain_x},
+    {"ManualGainPitch", nullptr, &fw::Settings::manual_gain_y},
+    {"ManualInputDelay", nullptr, &fw::Settings::manual_delay_ms},
+};
+constexpr std::size_t kPersistedCount = sizeof(kPersisted) / sizeof(kPersisted[0]);
+double g_persisted[kPersistedCount];  // the values as last written or read
+
+double persisted_value(const fw::Settings& s, const Persisted& p) { return p.u ? double(s.*(p.u)) : double(s.*(p.f)); }
+void write_persisted(const Persisted& p, double v) {
+    char text[32];
+    if (p.u) std::snprintf(text, sizeof(text), "%u", static_cast<unsigned>(v));
+    else std::snprintf(text, sizeof(text), "%.9g", v);
+    reshade::set_config_value(nullptr, "FrameWarp", p.key, static_cast<const char*>(text));
+}
+// At start: the remembered values (none yet, or after an update: the defaults are written instead).
+void load_persisted(fw::Settings& s, bool reset) {
+    for (std::size_t i = 0; i < kPersistedCount; ++i) {
+        const Persisted& p = kPersisted[i];
+        char text[32] = "";
+        size_t size = sizeof(text);
+        if (!reset && reshade::get_config_value(nullptr, "FrameWarp", p.key, text, &size) && text[0]) {
+            char* end = nullptr;
+            const double v = std::strtod(text, &end);
+            if (end != text && std::isfinite(v)) {
+                if (p.u) s.*(p.u) = static_cast<std::uint32_t>(std::max(0.0, v));
+                else s.*(p.f) = static_cast<float>(v);
+            }
+        } else if (reset) {
+            write_persisted(p, persisted_value(s, p));
+        }
+        g_persisted[i] = persisted_value(s, p);
+    }
+}
+// Every panel frame: what changed since the last write is written.
+void save_persisted(const fw::Settings& s) {
+    for (std::size_t i = 0; i < kPersistedCount; ++i) {
+        const double v = persisted_value(s, kPersisted[i]);
+        if (v != g_persisted[i]) { write_persisted(kPersisted[i], v); g_persisted[i] = v; }
+    }
 }
 
 // Games that only run in exclusive fullscreen (option, saved per game, read when the game sets up its picture):
@@ -215,8 +275,10 @@ void on_init_swapchain(swapchain* sc, bool) {
                                        {"GpuPriority", 0}, {"ForceBorderless", 0}, {"Controller", 1}};
     char saved_version[32] = "";
     size_t size = sizeof(saved_version);
+    bool settings_reset = false;
     if (!reshade::get_config_value(nullptr, "FrameWarp", "SettingsVersion", saved_version, &size) ||
         std::strcmp(saved_version, FW_VERSION) != 0) {
+        settings_reset = true;
         for (const auto& k : kSaved) {
             char value[8];
             std::snprintf(value, sizeof(value), "%d", k.default_value);
@@ -247,6 +309,7 @@ void on_init_swapchain(swapchain* sc, bool) {
         shared->settings.stretch_width = static_cast<std::uint32_t>(std::clamp(saved("StretchWidth"), 0, 32));
         shared->settings.gpu_priority = static_cast<std::uint32_t>(std::clamp(saved("GpuPriority"), 0, 2));
         shared->settings.use_controller = saved("Controller") != 0;
+        load_persisted(shared->settings, settings_reset);
         // What the presenter found out about the game's own camera in an earlier run (Shared::game_camera_check).
         InterlockedExchange(&shared->game_camera_check, std::clamp(saved("GameCameraCheck"), 0, 2));
     }
@@ -391,6 +454,9 @@ const char* format_name(std::uint32_t f) {
 }
 
 void draw_overlay(effect_runtime*) {
+    struct SaveAfter {  // (when the panel is drawn: what was changed in it is remembered)
+        ~SaveAfter() { if (g_producer && g_producer->shared()) save_persisted(g_producer->shared()->settings); }
+    } save_after;
     if (!g_producer || !g_producer->shared()) { ImGui::TextUnformatted("Shared memory unavailable."); return; }
     auto& sh = *g_producer->shared();
     auto& s = sh.settings;
@@ -437,6 +503,9 @@ void draw_overlay(effect_runtime*) {
     if (fw::reshade_feed_status()[0]) ImGui::TextWrapped("%s", fw::reshade_feed_status());
     if (sh.game_camera_check == 1)
         ImGui::TextDisabled("Camera: estimated from the motion vectors (the game's own camera data does not match them)");
+    if (alive && p.estimate_unreliable_pct)
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "Camera estimate unreliable lately (%u%% of frames unexplained): the camera model does not learn from it meanwhile",
+                           p.estimate_unreliable_pct);
     if (!alive && ImGui::Button("Start presenter")) { g_presenter_launched = false; launch_presenter(); }
     if (alive) {
         ImGui::Text("Output %.1f fps | game %.1f fps | warp GPU %.2f ms | source age %.1f ms",
@@ -582,6 +651,9 @@ void draw_overlay(effect_runtime*) {
         ImGui::Text("            pitch: %s gain %.3g mrad/count, smoothing %.0f ms, quality %.2f",
                     p.calibrated_y ? "fitted" : "learning", p.gain_y * 1000.0f, p.tau_y_ms, p.fit_quality_y);
         ImGui::Text("Input delay %.0f ms | game latency %.1f ms | measured orbit %.0f cm", p.delay_ms, p.latency_ms, p.orbit_cm);
+        if (p.lat_age_ms > 0.0f)
+            ImGui::Text("Latency: camera shown %.1f ms behind | present to screen %.1f ms | camera age on screen %.1f ms",
+                        p.lat_behind_ms, p.lat_display_ms, p.lat_age_ms);
         if (!p.controller)
             ImGui::TextDisabled("Controller: none connected (XInput)");
         else if (p.stick_gain_x == 0.0f && p.stick_gain_y == 0.0f)
