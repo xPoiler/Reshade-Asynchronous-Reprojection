@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+* **Third-person cameras that circle the character, in games that give DLSS or FSR their motion vectors but no
+  camera** (Assassin's Creed Black Flag Resynced): XPAR measures the point the camera turns around and predicts
+  turns around it instead of on the spot ("Orbit pivot" in Camera motion: Measured by default, Off, or Manual
+  with the Orbit distance slider). It is used only while the turns agree on one point (a first-person camera
+  never does), and not where XPAR works out the motion from the picture itself, which is too rough to measure
+  it. Games that send their own camera are unchanged.
+* New option where a measured orbit is in use, off by default: "Let the ground around the character move with
+  the orbit" - the ground at the character's feet is no longer held still while turning.
+* Record detailed diagnostics stays as it was when a new version resets the settings.
 * **Reset all settings to defaults**: a button at the top of the XPAR panel puts every setting back to its default
   for the game (Enable reprojection and the learned camera model stay).
 * **New default Auto latency: "Lowest latency without edge fill".** Every refresh XPAR shows the camera as late as

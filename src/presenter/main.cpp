@@ -906,9 +906,18 @@ void render_thread() {
                 // vector scale and checks the game's camera (camera_check.hpp), which every game needs. (It does
                 // nothing without depth or motion vectors.)
                 renderer.pass_stamp(Renderer::kPassStart);
+                // Floor release (debug test): only while turns are predicted around a measured orbit pivot - its depth
+                // value through the frame's projection (row vector: clip = (0, 0, z, 1) * view_to_clip).
+                float floor_pivot_depth = 0.0f;
+                if (settings.floor_release && settings.orbit_mode == 0 && source_was_estimated && !source_motion_estimated && g_app.model.orbit() > 0) {
+                    const float* p = cam.view_to_clip;
+                    const double z = g_app.model.orbit() * view_z_sign(p);
+                    const double cz = z * p[10] + p[14], cw = z * p[11] + p[15];
+                    if (std::fabs(cw) > 1e-9 && cz / cw > 0) floor_pivot_depth = float(cz / cw);
+                }
                 renderer.analyze_motion(s, cam.clip_to_prev_clip, float(mv_scale.scale(0, s.depth_rect.w)),
                                         float(mv_scale.scale(1, s.depth_rect.h)), mv_scale.valid, cam.depth_inverted != 0,
-                                        settings.near_camera_rule != 0, settings.turn_rule != 0, m.frame_id);
+                                        settings.near_camera_rule != 0, settings.turn_rule != 0, m.frame_id, floor_pivot_depth);
                 // Moving objects (option): what moves on its own, as a straight line back to the previous frame.
                 // Only with the game's own motion vectors (an upscaler's): those estimated from the picture are
                 // too rough at the edges of things.
@@ -1137,7 +1146,11 @@ void render_thread() {
                                            ? (source_motion_estimated ? 1u : game_has_hud_layers ? 2u : 4u)
                                                                      : settings.auto_prediction;
         ps.auto_fraction = (fraction == 1 || fraction == 2 || fraction == 4) ? 1.0 / fraction : 0.0;
-        ps.orbit_distance = settings.orbit_distance;
+        ps.orbit_distance = settings.orbit_mode == 2 ? settings.orbit_distance : 0.0;
+        // (measured orbit: only for a camera estimated from the game's own motion vectors - an upscaler's. Estimated
+        // from the picture (no DLSS or FSR) the pivot wanders: RE2, spread 12-35% against Black Flag's 4%, switched
+        // on and off, and turning on the spot looked steadier there)
+        ps.use_measured_orbit = settings.orbit_mode == 0 && source_was_estimated && !source_motion_estimated;
         ps.max_horizon = settings.max_horizon_ms / 1000.0;
         ps.manual_gain = settings.manual_gain != 0;
         ps.manual_gain_x = settings.manual_gain_x; ps.manual_gain_y = settings.manual_gain_y;
@@ -1643,7 +1656,8 @@ void render_thread() {
             st.delay_ms = float(px.delay * 1000.0);
             st.tau_x_ms = float(px.tau * 1000.0); st.tau_y_ms = float(py.tau * 1000.0);
             st.latency_ms = float(g_app.model.latency() * 1000.0);
-            st.orbit_cm = float(g_app.model.learned_orbit());
+            st.orbit_cm = float(g_app.model.consistent_orbit());
+            st.orbit_in_use = settings.orbit_mode == 0 && source_was_estimated && !source_motion_estimated && g_app.model.orbit() > 0;
             st.frame_interval_ms = float(g_app.model.frame_interval() * 1000.0);
             st.effective_prediction_ms = float(g_app.model.effective_prediction() * 1000.0);
             st.mv_scale_x = mv_scale.valid ? float(mv_scale.scale(0, source.depth_rect.w)) : 0.0f;

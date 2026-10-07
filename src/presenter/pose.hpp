@@ -358,7 +358,8 @@ inline double velocity_term(double tau, double w, double h) {
 struct PoseSettings {
     bool use_mouse = true;
     double rotation_extrapolation = 1.0;  // scales the camera-velocity term
-    double orbit_distance = 0.0;          // > 0: manual orbit pivot distance; 0: learned
+    double orbit_distance = 0.0;          // > 0: manual orbit pivot distance; 0: the measured one when use_measured_orbit, else none
+    bool use_measured_orbit = false;      // turn around the measured pivot (orbit_fit_; games whose camera XPAR estimates)
     double translation_extrapolation = 1.0;
     bool blend_positions = false;
     double blend_tau = 0.05;              // seconds over which a new frame's correction of the prediction fades in
@@ -416,10 +417,19 @@ public:
     double effective_prediction() const {
         return settings_.auto_fraction > 0 && frame_interval_ > 0 ? -settings_.auto_fraction * frame_interval_ : settings_.prediction;
     }
-    // Orbit pivot distance used for rotations (manual only: on E33 the camera's measured velocity
-    // already contains the orbit motion and predicts position better, measured on recorded play sessions).
-    double orbit() const { return settings_.orbit_distance; }
+    // Orbit pivot distance used for rotations: the manual one, or the measured one where asked for (games without a
+    // camera of their own: Black Flag's camera circles the character ~40 units ahead, and turning on the spot held
+    // the ground at his feet and swung the foreground). Not for games' own cameras: on E33 the camera's measured
+    // velocity already contains the orbit motion and predicts position better (recorded sessions), and a fixed
+    // orbit in RE9 shook everything.
+    // The measured pivot is used only while it is consistent (orbit_consistent_, see add_source), gliding in and out.
+    double orbit() const {
+        if (settings_.orbit_distance > 0) return settings_.orbit_distance;
+        return settings_.use_measured_orbit ? orbit_used_ : 0.0;
+    }
     double learned_orbit() const { return orbit_fit_; }
+    // The measured pivot when the recent turns agree on one (0: they do not - a first-person camera).
+    double consistent_orbit() const { return orbit_consistent_; }
     void seed(const AxisParams& yaw, const AxisParams& pitch) { params_[0] = yaw; params_[1] = pitch; ++generation_; }
     void reset_fit() { params_[0] = params_[1] = AxisParams{}; frames_.clear(); since_fit_ = 0; ++generation_; }
     // The camera source changed (the game's own camera <-> one estimated from motion vectors): their
@@ -427,7 +437,8 @@ public:
     void reset_history() {
         frames_.clear(); since_fit_ = 0; up_ = WorldUp{}; have_source_ = false; follows_ = true;
         blend_[0] = blend_[1] = 0; blend_pos_ = {}; velocity_ = {};
-        orbit_num_ = orbit_den_ = orbit_fit_ = 0; intervals_.clear(); frame_interval_ = 0; latencies_.clear();
+        orbit_num_ = orbit_den_ = orbit_fit_ = 0; orbit_samples_.clear(); orbit_consistent_ = orbit_used_ = 0; orbit_active_ = false;
+        intervals_.clear(); frame_interval_ = 0; latencies_.clear();
     }
 
     // A new rendered frame: t is the game's simulation (input) time, ingest_t when we received it.
@@ -477,6 +488,32 @@ public:
             orbit_num_ = orbit_num_ * decay + dot(moved, u);
             orbit_den_ = orbit_den_ * decay + dot(u, u);
             if (orbit_den_ > 1e-3) orbit_fit_ = std::clamp(orbit_num_ / orbit_den_, 0.0, 2000.0);
+            // Is there an orbit at all? Each frame that clearly turns (0.3 degrees or more) implies a pivot distance;
+            // only frames whose move that pivot explains (90% or more of it: not walking or strafing) count. Over
+            // the last 60 of them the pivot is taken as real when they agree - spread (interquartile range) under
+            // 15% of their median to start, under 25% to stay. Black Flag (a camera circling the character): 40.5
+            // to 43.7, used 93% of the time; DOOM Eternal (first person): scattered from 9 to 166, never used (its
+            // running fit wandered 0..7). Then the median, glided towards over ~0.3 s.
+            {
+                const double turned = std::acos(std::clamp(dot(a.fwd, f.fwd), -1.0, 1.0));
+                const double uu = dot(u, u), mm = dot(moved, moved);
+                if (turned >= 0.3 * 3.14159265358979 / 180.0 && uu > 0 && mm > 0) {
+                    const double r = dot(moved, u) / uu;
+                    const Vec3 rest = moved - u * r;
+                    if (1.0 - dot(rest, rest) / mm >= 0.9) {
+                        orbit_samples_.push_back(r);
+                        if (orbit_samples_.size() > 60) orbit_samples_.pop_front();
+                    }
+                }
+                if (orbit_samples_.size() >= 60) {
+                    std::vector<double> v(orbit_samples_.begin(), orbit_samples_.end());
+                    std::sort(v.begin(), v.end());
+                    const double median = v[v.size() / 2], spread = (v[v.size() * 3 / 4] - v[v.size() / 4]) / std::max(std::fabs(median), 1e-9);
+                    orbit_active_ = median > 0 && spread < (orbit_active_ ? 0.25 : 0.15);
+                    orbit_consistent_ = orbit_active_ ? median : 0.0;
+                }
+                orbit_used_ += (orbit_consistent_ - orbit_used_) * std::clamp(src_.dt / 0.3, 0.0, 1.0);
+            }
             // Translation the orbit does not explain (walking, camera lag) becomes a velocity.
             const Vec3 residual = (moved - u * orbit()) * (1.0 / src_.dt);
             const double a_v = std::clamp(src_.dt / 0.05, 0.0, 1.0);
@@ -912,6 +949,9 @@ private:
     double display_ahead_ = 0;  // set_display_ahead
     Vec3 blend_pos_{}, velocity_{};
     double orbit_num_ = 0, orbit_den_ = 0, orbit_fit_ = 0;
+    std::deque<double> orbit_samples_;            // per-frame pivot distances of clear turns the pivot explains
+    double orbit_consistent_ = 0, orbit_used_ = 0;  // the agreed pivot (0: none), and the one in use (glides to it)
+    bool orbit_active_ = false;
     int since_fit_ = 0;
     std::deque<double> intervals_;
     double frame_interval_ = 0;

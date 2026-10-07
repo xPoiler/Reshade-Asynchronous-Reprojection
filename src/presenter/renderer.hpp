@@ -177,7 +177,8 @@ public:
     // near_rule: pixels near the camera that move against the camera model count as attached; turn_rule:
     // so do pixels nearly still on screen while the camera turns (third-person orbit cameras). See cs_analyze.
     void analyze_motion(const IngestedSource& src, const float clip_to_prev_clip[16], float scale_x, float scale_y, bool scale_valid,
-                        bool depth_inverted = true, bool near_rule = true, bool turn_rule = false, std::uint64_t frame = 0);
+                        bool depth_inverted = true, bool near_rule = true, bool turn_rule = false, std::uint64_t frame = 0,
+                        float floor_pivot_depth = 0.0f);
     // Moving objects (option, XPAR engine). set_object_history: each game frame taken in keeps the previous
     // one's picture and depth (what objects uncover, and where they were). object_motion: once per game
     // frame, after analyze_motion: for each pixel the analysis found moving on its own, its straight-line

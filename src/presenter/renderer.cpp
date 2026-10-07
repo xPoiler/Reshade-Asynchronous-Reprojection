@@ -72,6 +72,17 @@ Texture2D<float4> analyze_flow_t : register(t2);  // (flag 2: XPAR's own motion,
 RWTexture2D<float4> object_u : register(u0);        // xy: own motion (render px, to previous frame), z: depth, w: 1 moving, 2 attached to camera
 RWStructuredBuffer<float4> partial_u : register(u1);
 groupshared float4 gs_a[64], gs_b[64];
+// A floor at p (reversed-Z depth): getting closer down the screen, evenly (a plane, not a bump or an edge), by at
+// least 60% of its own depth value per screen height - the ground under a third-person camera looking down at it.
+// An upright body facing the camera (a character) barely changes down the screen. k: render rows (~1/190 height).
+bool floor_at(int2 p, int k) {
+    const int2 lo = int2(rect.xy), hi = int2(rect.xy + rect.zw) - 1;
+    const float a = depth_t.Load(int3(clamp(p - int2(0, k), lo, hi), 0));
+    const float c = depth_t.Load(int3(clamp(p, lo, hi), 0));
+    const float b = depth_t.Load(int3(clamp(p + int2(0, k), lo, hi), 0));
+    const float slope = (b - a) / float(2 * k) * float(rect.w);
+    return slope > 0 && slope > 0.6 * max(c, 1e-6) && abs(b - 2 * c + a) < 0.25 * abs(b - a);
+}
 [numthreads(8, 8, 1)] void cs_analyze(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex, uint3 gid : SV_GroupID) {
     float4 a = 0, b = 0;
     if (all(id.xy < grid)) {
@@ -123,6 +134,16 @@ groupshared float4 gs_a[64], gs_b[64];
                     const float2 turn_px = far.w > 0 ? (float2(far.x / far.w * 0.5 + 0.5, 0.5 - far.y / far.w * 0.5) - uv) * float2(rect.zw)
                                                      : float2(0, 0);
                     turn_still = d > 1.0 / 4096.0 && length(turn_px) >= 2.0 && length(screen_px) < 0.2 * length(turn_px);
+                    // Floor release (flag 512, debug test; alpha: the depth value of the orbit pivot, only set while turns
+                    // are predicted around a measured pivot): the ground around the orbited character barely moves on
+                    // screen either, but the warp moves it right now - not held when it is floor (two of three spots
+                    // across agree) within half the pivot's distance.
+                    if (turn_still && (flags & 512) && (flags & 16) && alpha > 0 && abs(1.0 / d - 1.0 / alpha) < 0.5 / alpha) {
+                        const int k = max(2, int(round(float(rect.w) / 190.0)));
+                        const int2 p = int2(id.xy);
+                        const int votes = (floor_at(p, k) ? 1 : 0) + (floor_at(p - int2(k, 0), k) ? 1 : 0) + (floor_at(p + int2(k, 0), k) ? 1 : 0);
+                        if (votes >= 2) turn_still = false;
+                    }
                 }
                 const bool attached = (flags & 1) && (flags & 16) &&
                                       ((!(flags & 64) && d > 1.0 / 64.0 && moving) ||
@@ -2039,7 +2060,7 @@ struct XConstants {
 static_assert(sizeof(XConstants) == 32 * 4, "root constants");
 
 void Renderer::analyze_motion(const IngestedSource& src, const float clip_to_prev_clip[16], float scale_x, float scale_y, bool scale_valid,
-                              bool depth_inverted, bool near_rule, bool turn_rule, std::uint64_t frame) {
+                              bool depth_inverted, bool near_rule, bool turn_rule, std::uint64_t frame, float floor_pivot_depth) {
     if (!src.has_depth || !src.has_motion) return;
     const auto& depth = private_[kPDepth];
     const UINT w = depth.width, h = depth.height, gx = (w + 7) / 8, gy = (h + 7) / 8;
@@ -2079,7 +2100,9 @@ void Renderer::analyze_motion(const IngestedSource& src, const float clip_to_pre
     c.mv_scale[0] = scale_x; c.mv_scale[1] = scale_y;
     c.threshold = 1.0f;
     c.groups_x = gx;
-    c.flags = (scale_valid ? 1u : 0u) | (depth_inverted ? 16u : 0u) | (near_rule ? 0u : 64u) | (turn_rule ? 128u : 0u);
+    c.flags = (scale_valid ? 1u : 0u) | (depth_inverted ? 16u : 0u) | (near_rule ? 0u : 64u) | (turn_rule ? 128u : 0u) |
+              (floor_pivot_depth > 0 ? 512u : 0u);
+    c.alpha = floor_pivot_depth;  // (the floor release's pivot depth; alpha is unused by this pass otherwise)
     if (own_motion_) { c.flags |= 2u; c.out_size[0] = std::max(1u, w / 2); c.out_size[1] = std::max(1u, h / 2); }  // (level 0 of the displacements)
     transition(private_[kPObject], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     x_dispatch(cs_analyze_.Get(), &c, kXAnalyzeSrv, kXAnalyzeUav, gx, gy);

@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 50;
+constexpr std::uint32_t kVersion = 51;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -93,6 +93,8 @@ struct Settings {
     std::uint32_t moving_objects;  // XPAR engine: objects move at the display rate, between the game's frames (option, off by default)
     std::uint32_t no_warp_mask;    // games without HUD layers: detect the HUD and keep it unwarped
     std::uint32_t show_mask;       // debug: tint the no-warp mask (magenta) and the HUD score still learning (green)
+    std::uint32_t floor_release;   // option, off by default (saved per game): while turns are predicted around a measured orbit pivot, the
+                                   // turn rule does not hold the ground around the character (near the pivot's distance)
     std::uint32_t hud_from_scene;  // HUD detection, saved per game in ReShade.ini: 0 learned, 1 from the upscaler's output,
                                    // 2 (default) from the upscaler's output where the pixels do not follow the world (combined);
                                    // without an upscaler output the learned detection is used
@@ -107,6 +109,8 @@ struct Settings {
     std::uint32_t use_controller;      // the controller's right stick drives rotation too (option, on by default, saved per game)
     std::uint32_t present_lead_auto;   // default on: the present lead follows the measured warp time (present_lead_ms unused)
     std::uint32_t edge_fill;           // own warp, what a turn uncovers past the frame's edge: 0 extended edge pixels, 1 soft (default; saved per game)
+    std::uint32_t orbit_mode;          // turning around a pivot: 0 measured (default; camera estimated from the game's own motion vectors), 1 off,
+                                       // 2 manual (orbit_distance); saved per game
     float edge_limit_pct;              // Auto latency "camera as of now": the most of the screen's width (percent) the warp may uncover
                                        // beyond what the regular Auto latency uncovers lately (0: no more than it; saved per game)
     std::uint32_t edge_unlimited;      // ...or no limit at all (saved per game)
@@ -155,6 +159,7 @@ struct PresenterStatus {
     // the last 5 s, ours included: 1 = nothing queued ahead of it; 0: not measured).
     float present_lead_ms;
     float presents_queued;
+    std::uint32_t orbit_in_use;  // turns are predicted around the measured orbit pivot right now (Orbit pivot: Measured, consistent)
     char message[256];
 };
 

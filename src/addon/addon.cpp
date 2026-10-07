@@ -103,6 +103,8 @@ constexpr Persisted kPersisted[] = {
     {"AutoLatency", &fw::Settings::auto_prediction, nullptr},
     {"LatencySmoothness", nullptr, &fw::Settings::prediction_ms},
     {"OrbitDistance", nullptr, &fw::Settings::orbit_distance},
+    {"OrbitMode", &fw::Settings::orbit_mode, nullptr},
+    {"FloorRelease", &fw::Settings::floor_release, nullptr},
     {"MaxExtrapolation", nullptr, &fw::Settings::max_horizon_ms},
     {"PresentLead", nullptr, &fw::Settings::present_lead_ms},
     {"PresentLeadAuto", &fw::Settings::present_lead_auto, nullptr},
@@ -318,6 +320,8 @@ void on_init_swapchain(swapchain* sc, bool) {
         std::strcmp(saved_version, build) != 0) {
         settings_reset = true;
         for (const auto& k : kSaved) {
+            // (Record detailed diagnostics stays as it was: a test round with a new build is when it is wanted)
+            if (std::strcmp(k.key, "RecordDiagnostics") == 0) continue;
             char value[8];
             std::snprintf(value, sizeof(value), "%d", k.default_value);
             reshade::set_config_value(nullptr, "FrameWarp", k.key, static_cast<const char*>(value));
@@ -612,14 +616,30 @@ void draw_overlay(effect_runtime*) {
         ImGui::SliderFloat("Latency <-> smoothness (ms)", &s.prediction_ms, -40.0f, 30.0f, "%.0f");
         if (auto_latency) ImGui::EndDisabled();
         hint("Negative: smoother, adds that much delay | positive: predicts further ahead.");
-        ImGui::SliderFloat("Orbit distance (0 = off)", &s.orbit_distance, 0.0f, 1000.0f, "%.0f");
+        static const char* const kOrbitModes[] = {"Measured (default)", "Off", "Manual"};
+        int orbit_mode = s.orbit_mode <= 2 ? static_cast<int>(s.orbit_mode) : 0;
+        if (ImGui::Combo("Orbit pivot", &orbit_mode, kOrbitModes, 3)) s.orbit_mode = static_cast<std::uint32_t>(orbit_mode);
+        hint("Third-person cameras circle the character: turns are predicted around that point instead of on the spot. "
+             "Measured: in games that give the upscaler (DLSS, FSR) their motion vectors but no camera, the pivot XPAR "
+             "measures, while the turns agree on one; games that send their camera already include the orbit in its "
+             "motion, and motion worked out from the picture is too rough to measure it. Manual: the distance below, in any game.");
+        if (orbit_mode == 2) ImGui::SliderFloat("Orbit distance", &s.orbit_distance, 0.0f, 1000.0f, "%.0f");
+        // (only where a measured orbit is in use: the only place it acts)
+        if (alive && p.orbit_in_use) {
+            bool floor_release = s.floor_release != 0;
+            if (ImGui::Checkbox("Let the ground around the character move with the orbit", &floor_release)) s.floor_release = floor_release;
+            hint("\"Keep still what the camera turns around\" no longer holds the ground around the character - it barely "
+                 "moves on screen in an orbit too, but the warp around the measured pivot moves it right. Only shown, and only "
+                 "acting, while turns are predicted around a measured orbit pivot; near the pivot's distance. Remembered per game.");
+        }
         ImGui::SliderFloat("Max extrapolation (ms)", &s.max_horizon_ms, 0.0f, 200.0f, "%.0f");
         ImGui::Separator();
         ImGui::Text("Camera model  yaw: %s gain %.3g mrad/count, smoothing %.0f ms, quality %.2f",
                     p.calibrated_x ? "fitted" : "learning", p.gain_x * 1000.0f, p.tau_x_ms, p.fit_quality_x);
         ImGui::Text("            pitch: %s gain %.3g mrad/count, smoothing %.0f ms, quality %.2f",
                     p.calibrated_y ? "fitted" : "learning", p.gain_y * 1000.0f, p.tau_y_ms, p.fit_quality_y);
-        ImGui::Text("Input delay %.0f ms | game latency %.1f ms | measured orbit %.0f cm", p.delay_ms, p.latency_ms, p.orbit_cm);
+        ImGui::Text("Input delay %.0f ms | game latency %.1f ms | measured orbit %s", p.delay_ms, p.latency_ms,
+                    p.orbit_cm > 0.0f ? std::to_string(static_cast<int>(p.orbit_cm + 0.5f)).c_str() : "none (no consistent orbit)");
         if (!p.controller)
             ImGui::TextDisabled("Controller: none connected (XInput)");
         else if (p.stick_gain_x == 0.0f && p.stick_gain_y == 0.0f)
