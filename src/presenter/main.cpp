@@ -294,11 +294,16 @@ struct VramMonitor {
         if (adapter) adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &own);
         total_mb = total; own_mb = own.CurrentUsage / 1048576.0; budget_mb = own.Budget / 1048576.0;
         // Windows shrinks a process's budget when the GPU's memory runs out: less than a quarter of headroom
-        // left means the game and XPAR together no longer fit (they start to stutter and drop frames).
-        if (own.Budget && double(own.Budget) < double(own.CurrentUsage) * 1.25) {
+        // left means the game and XPAR together no longer fit (they start to stutter and drop frames). So does
+        // the card itself being 95% full, whatever XPAR's own budget says (DOOM Eternal at 4K on an 8 GB card:
+        // 7.7 of 8 GB in use, XPAR's budget briefly tight and then roomier again - the warning came and went
+        // within 10 s while both kept stuttering, at 10 game fps).
+        const bool own_tight = own.Budget && double(own.Budget) < double(own.CurrentUsage) * 1.25;
+        const bool card_full = size_mb > 0 && total > 0 && total >= 0.95 * size_mb;
+        if (own_tight || card_full) {
             if (pressure_until < now) logf("vram nearly full: presenter %.0f MB of a %.0f MB budget, adapter %.0f of %.0f MB in use", own_mb, budget_mb, total,
                                            size_mb);
-            pressure_until = now + 10.0;
+            pressure_until = now + 30.0;
         }
         if (!reason && std::abs(total - logged_total) < 100 && now - last_log < 30.0) return;
         logf("vram%s%s: adapter %.0f MB used (all processes) | presenter %.0f MB, budget %.0f MB", reason ? " at " : "", reason ? reason : "",
@@ -1117,6 +1122,8 @@ void render_thread() {
         }
         if (sh.backbuffer_width != renderer.width() || sh.backbuffer_height != renderer.height())
             renderer.resize(sh.backbuffer_width, sh.backbuffer_height);
+        // (HDR switched on or off in the game, or its colour space set after its swap chain was made)
+        renderer.set_output(static_cast<DXGI_FORMAT>(sh.backbuffer_format), sh.color_space);
         {
             // The overlay window should cover exactly the game's frame; a mismatch (display scaling,
             // windowed modes) would crop or offset the picture, so it is logged when it changes.

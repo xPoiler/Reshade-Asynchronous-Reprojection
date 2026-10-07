@@ -20,6 +20,7 @@
 #include <string>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
 
 using namespace reshade::api;
@@ -202,12 +203,28 @@ std::atomic<int> g_refusals{0};
 using GetFullscreenStateFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, BOOL*, IDXGIOutput**);
 using GetDescFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, DXGI_SWAP_CHAIN_DESC*);
 using GetFullscreenDescFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, DXGI_SWAP_CHAIN_FULLSCREEN_DESC*);
-GetFullscreenStateFn g_get_fullscreen_state = nullptr;
-GetDescFn g_get_desc = nullptr;
-GetFullscreenDescFn g_get_fullscreen_desc = nullptr;
+
+// Patched function table slots and their originals, per table: a process can have swap chains of more than one
+// implementation (a frame generation's own swap chain around the game's, Requiem), each with its own table - one
+// "original" for all of them called the wrong implementation's function with the object (Requiem crashed as it set
+// HDR10). Hooks look up the original of the table of the object they are called on. Entries are only added (a few),
+// published by the count, read without a lock.
+struct SlotPatch { void** table; int index; void* original; };
+SlotPatch g_patches[64];
+std::atomic<int> g_patch_count{0};
+std::mutex g_patch_mutex;
+void* original_of(void* object, int index) {
+    void** const table = *reinterpret_cast<void***>(object);
+    const int n = g_patch_count.load(std::memory_order_acquire);
+    for (int i = 0; i < n; ++i)
+        if (g_patches[i].table == table && g_patches[i].index == index) return g_patches[i].original;
+    return nullptr;
+}
 
 HRESULT STDMETHODCALLTYPE reported_fullscreen_state(IDXGISwapChain* sc, BOOL* fullscreen, IDXGIOutput** target) {
-    const HRESULT hr = g_get_fullscreen_state(sc, fullscreen, target);
+    const auto original = reinterpret_cast<GetFullscreenStateFn>(original_of(sc, 11));
+    if (!original) return E_FAIL;
+    const HRESULT hr = original(sc, fullscreen, target);
     if (SUCCEEDED(hr) && g_report_fullscreen) {
         if (fullscreen) *fullscreen = TRUE;
         if (target && !*target) sc->GetContainingOutput(target);
@@ -215,22 +232,30 @@ HRESULT STDMETHODCALLTYPE reported_fullscreen_state(IDXGISwapChain* sc, BOOL* fu
     return hr;
 }
 HRESULT STDMETHODCALLTYPE reported_desc(IDXGISwapChain* sc, DXGI_SWAP_CHAIN_DESC* desc) {
-    const HRESULT hr = g_get_desc(sc, desc);
+    const auto original = reinterpret_cast<GetDescFn>(original_of(sc, 12));
+    if (!original) return E_FAIL;
+    const HRESULT hr = original(sc, desc);
     if (SUCCEEDED(hr) && desc && g_report_fullscreen) desc->Windowed = FALSE;
     return hr;
 }
 HRESULT STDMETHODCALLTYPE reported_fullscreen_desc(IDXGISwapChain1* sc, DXGI_SWAP_CHAIN_FULLSCREEN_DESC* desc) {
-    const HRESULT hr = g_get_fullscreen_desc(sc, desc);
+    const auto original = reinterpret_cast<GetFullscreenDescFn>(original_of(sc, 19));
+    if (!original) return E_FAIL;
+    const HRESULT hr = original(sc, desc);
     if (SUCCEEDED(hr) && desc && g_report_fullscreen) desc->Windowed = FALSE;
     return hr;
 }
 
 template <typename Fn>
-void patch_slot(void** table, int index, Fn hook, Fn& original) {
+void patch_slot(void** table, int index, Fn hook) {
+    std::lock_guard<std::mutex> lock(g_patch_mutex);
     if (table[index] == reinterpret_cast<void*>(hook)) return;
+    const int n = g_patch_count.load();
+    if (n >= 64) return;
     DWORD protect = 0;
     if (!VirtualProtect(&table[index], sizeof(void*), PAGE_EXECUTE_READWRITE, &protect)) return;
-    original = reinterpret_cast<Fn>(table[index]);
+    g_patches[n] = {table, index, table[index]};
+    g_patch_count.store(n + 1, std::memory_order_release);  // (published before the hook can be reached)
     table[index] = reinterpret_cast<void*>(hook);
     VirtualProtect(&table[index], sizeof(void*), protect, &protect);
     FlushInstructionCache(GetCurrentProcess(), &table[index], sizeof(void*));
@@ -243,13 +268,44 @@ void report_fullscreen_for(swapchain* sc) {
     auto* dxgi = reinterpret_cast<IDXGISwapChain*>(sc->get_native());
     if (!dxgi) return;
     void** table = *reinterpret_cast<void***>(dxgi);
-    patch_slot(table, 11, &reported_fullscreen_state, g_get_fullscreen_state);
-    patch_slot(table, 12, &reported_desc, g_get_desc);
+    patch_slot(table, 11, &reported_fullscreen_state);
+    patch_slot(table, 12, &reported_desc);
     IDXGISwapChain1* dxgi1 = nullptr;
     if (SUCCEEDED(dxgi->QueryInterface(IID_PPV_ARGS(&dxgi1))) && dxgi1) {
-        patch_slot(*reinterpret_cast<void***>(dxgi1), 19, &reported_fullscreen_desc, g_get_fullscreen_desc);
+        patch_slot(*reinterpret_cast<void***>(dxgi1), 19, &reported_fullscreen_desc);
         dxgi1->Release();
     }
+}
+
+// The game's colour space (HDR): games set HDR10 or scRGB with SetColorSpace1 after creating their swap chain, and
+// again when HDR is switched in their menus (Stalker 2: 12 after the swap chain, 0 / 12 from the menu), which
+// init_swapchain does not see. DXGI keeps it where it can be read: its swap chains answer IDXGISwapChainTest, whose
+// GetColorSpace1 returns it, and ReShade (like Special K) also stores it as private data on the swap chain each time
+// the game sets it. Read at every present of the game's swap chain - no hook: patching SetColorSpace1 in the swap
+// chain's function table looped with the Steam overlay's own hook of it until the stack ran out (Requiem, HDR).
+MIDL_INTERFACE("8C803E30-9E41-4DDF-B206-46F28E90E405") IDXGISwapChainTest : IUnknown {
+    virtual bool STDMETHODCALLTYPE HasProxyFrontBufferSurface() = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetFrameStatisticsTest(void*) = 0;
+    virtual void STDMETHODCALLTYPE EmulateXBOXBehavior(BOOL) = 0;
+    virtual DXGI_COLOR_SPACE_TYPE STDMETHODCALLTYPE GetColorSpace1() = 0;
+};
+constexpr GUID kSwapChainColorSpaceData = {0x18b57e4, 0x1493, 0x4953, {0xad, 0xf2, 0xde, 0x6d, 0x99, 0xcc, 0x5, 0xe5}};
+bool read_color_space(swapchain* sc, std::uint32_t& color_space) {
+    const auto api = sc->get_device()->get_api();
+    if (api != device_api::d3d10 && api != device_api::d3d11 && api != device_api::d3d12) return false;
+    auto* dxgi = reinterpret_cast<IDXGISwapChain*>(sc->get_native());
+    if (!dxgi) return false;
+    IDXGISwapChainTest* test = nullptr;
+    if (SUCCEEDED(dxgi->QueryInterface(__uuidof(IDXGISwapChainTest), reinterpret_cast<void**>(&test))) && test) {
+        color_space = static_cast<std::uint32_t>(test->GetColorSpace1());
+        test->Release();
+        return true;
+    }
+    DXGI_COLOR_SPACE_TYPE cs = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    UINT size = sizeof(cs);
+    if (FAILED(dxgi->GetPrivateData(kSwapChainColorSpaceData, &size, &cs)) || size != sizeof(cs)) return false;
+    color_space = static_cast<std::uint32_t>(cs);
+    return true;
 }
 
 void log_refusal() {
@@ -418,6 +474,17 @@ void present_vulkan(effect_runtime* runtime, command_queue* queue) {
 
 // Every present ReShade sees (frame generation diagnostics: which swapchains get which images).
 void on_present(command_queue*, swapchain* chain, const rect*, const rect*, uint32_t, const rect*) {
+    // (the game's colour space, see read_color_space: the presenter's output follows it)
+    if (g_producer && g_producer->shared() && chain &&
+        reinterpret_cast<std::uint64_t>(chain->get_hwnd()) == g_producer->shared()->game_hwnd) {
+        std::uint32_t cs = 0;
+        if (read_color_space(chain, cs) && g_producer->shared()->color_space != cs) {
+            g_producer->shared()->color_space = cs;
+            char text[96];
+            std::snprintf(text, sizeof(text), "XPAR: the game's colour space is now %u", cs);
+            reshade::log::message(reshade::log::level::info, text);
+        }
+    }
     if (g_producer && g_producer->ready() && chain)
         fw::push_event(g_producer->shared(), fw::kEvSwapPresent, reinterpret_cast<std::uintptr_t>(chain), chain->get_current_back_buffer_index());
 }

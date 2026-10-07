@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+* **HDR fixed** (#7): XPAR now follows the game's picture format and colour space while it runs - HDR switched
+  on after the game started or from its menus, HDR10 (PQ) and scRGB alike. Before, it kept what the game had
+  when it started: HDR shown as SDR (grey, washed out) or scRGB written into an HDR10 output (garish). The colour
+  space is read from the swap chain at every present, with no hook (a hook clashed with the Steam overlay's).
+  HUD detection works in scRGB too (it read bright sky as HUD).
+* The video memory warning also appears when the graphics card itself is almost full, and stays up for 30 s
+  (it came and went within seconds while the game and XPAR kept stuttering).
 * **Third-person cameras that circle the character, in games that give DLSS or FSR their motion vectors but no
   camera** (Assassin's Creed Black Flag Resynced): XPAR measures the point the camera turns around and predicts
   turns around it instead of on the spot ("Orbit pivot" in Camera motion: Measured by default, Off, or Manual

@@ -64,6 +64,15 @@ cbuffer X : register(b0) {
     uint groups_x;                    // analyze: groups per row; reduce: total groups
     uint flags;                       // bit 0: mv_scale valid
 };
+// The game's picture for the HUD detections, on the scale their thresholds assume: values 0..1 roughly as bright as they
+// look (SDR, HDR10 PQ). A linear scRGB picture (flag 32768, set for every pass while the game outputs scRGB: values up to
+// 10-25, 1.0 = 80 nits) is encoded with the HDR10 curve (PQ) first - without it bright sky passed for HUD everywhere
+// (Cyberpunk in scRGB: 40-58% of the screen "HUD", 2-13% in HDR10).
+float3 seen(float3 c) {
+    if (!(flags & 32768)) return c;
+    const float3 l = pow(max(c, 0) * (80.0 / 10000.0), 0.1593017578125);
+    return pow((0.8359375 + 18.8515625 * l) / (1.0 + 18.6875 * l), 78.84375);
+}
 
 
 Texture2D<float> depth_t : register(t0);
@@ -429,7 +438,7 @@ Texture2D<float> hud_depth_t : register(t2);
 Texture2D<float4> hud_object_t : register(t3);  // per-pixel analysis: w > 1.5 = attached to the camera
 RWTexture2D<float> hud_score_u : register(u0);
 float luma(Texture2D<float4> t, int2 p) {
-    return dot(t.Load(int3(clamp(p, int2(0, 0), int2(out_size) - 1), 0)).rgb, float3(0.299, 0.587, 0.114));
+    return dot(seen(t.Load(int3(clamp(p, int2(0, 0), int2(out_size) - 1), 0)).rgb), float3(0.299, 0.587, 0.114));
 }
 float2 edge(Texture2D<float4> t, int2 p) {  // Sobel luminance gradient
     const float a = luma(t, p + int2(-1, -1)), b = luma(t, p + int2(0, -1)), c = luma(t, p + int2(1, -1));
@@ -452,7 +461,7 @@ uint hud_classify(uint2 id, out float weight) {
     if (flags & 32) { if (hud_object_t.Load(int3(pr, 0)).w > 1.5) return 3; }
     else if ((flags & 16) && depth > 1.0 / 64.0) return 3;
     const int2 p = int2(id);
-    const float3 delta = abs(hud_current_t.Load(int3(p, 0)).rgb - hud_previous_t.Load(int3(p, 0)).rgb);
+    const float3 delta = abs(seen(hud_current_t.Load(int3(p, 0)).rgb) - seen(hud_previous_t.Load(int3(p, 0)).rgb));
     const float change = max(delta.r, max(delta.g, delta.b));
     const float2 ec = edge(hud_current_t, p), ep = edge(hud_previous_t, p);
     const float lc = length(ec), lp = length(ep);
@@ -469,7 +478,7 @@ uint hud_classify(uint2 id, out float weight) {
     // If moving scenery explains the pixel just as well (it matches where the scene came from), it is no
     // evidence: repeating detail (windows, railings, tiles) can land on an identical copy of itself.
     const int2 q = clamp(int2(round(float2(p) + cam_px)), int2(0, 0), int2(out_size) - 1);
-    const float3 scenery = abs(hud_current_t.Load(int3(p, 0)).rgb - hud_previous_t.Load(int3(q, 0)).rgb);
+    const float3 scenery = abs(seen(hud_current_t.Load(int3(p, 0)).rgb) - seen(hud_previous_t.Load(int3(q, 0)).rgb));
     if (max(scenery.r, max(scenery.g, scenery.b)) < 0.03) return 0;
     const float2 eq = edge(hud_previous_t, q);
     const float lq = length(eq);
@@ -540,12 +549,12 @@ bool hud_follows_world(uint2 id) {
     const float2 from = came.xy;
     if (length(from - float2(id)) < 3.0) return false;
     // The camera rarely moves whole pixels: the best of the 4 pixels around where the scenery came from.
-    const float3 c = hud_current_t.Load(int3(id, 0)).rgb;
+    const float3 c = seen(hud_current_t.Load(int3(id, 0)).rgb);
     const int2 base = int2(floor(from - 0.5));
     float best = 1e9;
     [unroll] for (int i = 0; i < 4; ++i) {
         const int2 q = clamp(base + int2(i & 1, i >> 1), int2(0, 0), int2(out_size) - 1);
-        const float3 d = abs(c - hud_previous_t.Load(int3(q, 0)).rgb);
+        const float3 d = abs(c - seen(hud_previous_t.Load(int3(q, 0)).rgb));
         best = min(best, max(d.r, max(d.g, d.b)));
     }
     return best < 0.04;
@@ -785,7 +794,7 @@ bool sample_at(uint3 id, out uint2 p, out float3 frame, out float3 scene) {
     p = id.xy * 4;
     frame = 0; scene = 0;
     if (any(p >= out_size)) return false;
-    frame = sc_frame_t.Load(int3(p, 0)).rgb;
+    frame = seen(sc_frame_t.Load(int3(p, 0)).rgb);
     scene = max(sc_scene_t.Load(int3(p, 0)).rgb, 0);
     return true;
 }
@@ -878,7 +887,7 @@ groupshared float sc_tot[13];
         for (uint x = 0; x < 2; ++x) {
             const uint2 p = gid.xy * kTile + (tid.xy * 2 + uint2(x, y)) * 4;
             if (any(p >= out_size)) continue;
-            const float3 frame = sc_frame_t.Load(int3(p, 0)).rgb, scene = max(sc_scene_t.Load(int3(p, 0)).rgb, 0);
+            const float3 frame = seen(sc_frame_t.Load(int3(p, 0)).rgb), scene = max(sc_scene_t.Load(int3(p, 0)).rgb, 0);
             if (!counts(rect.z, p, frame, scene)) continue;
             const float3 pr = predictor(rect.x, scene);
             [unroll] for (uint c = 0; c < 3; ++c) {
@@ -974,7 +983,7 @@ void sh_tile_ab(uint2 id, out float3 a, out float3 b) {
             ls[j] = log2(max(sc_scene_t.Load(int3(clamp(p + offs[j], int2(0, 0), last), 0)).rgb, 1.0 / 4096.0));
         const float3 g = max(abs(ls[1] - ls[0]), abs(ls[3] - ls[2]));
         const float gradient = dot(abs(a * slope) * g, float3(1, 1, 1) / 3.0);
-        const bool hud = miss(sc_frame_t.Load(int3(p, 0)).rgb, pred) > 0.06 + 0.5 * gradient;
+        const bool hud = miss(seen(sc_frame_t.Load(int3(p, 0)).rgb), pred) > 0.06 + 0.5 * gradient;
         sc_hud_u[id.xy] = hud ? 1.0 : 0.0;
         if (hud) InterlockedAdd(sc_hud_pixels, 1);
     }
@@ -1853,16 +1862,58 @@ bool Renderer::init(const LUID& adapter_luid, HWND window, std::uint32_t width, 
     }
     swapchain_->SetMaximumFrameLatency(1);
     waitable_ = swapchain_->GetFrameLatencyWaitableObject();
-    UINT support = 0;
-    const auto cs = static_cast<DXGI_COLOR_SPACE_TYPE>(color_space);
-    if (SUCCEEDED(swapchain_->CheckColorSpaceSupport(cs, &support)) && (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT))
-        swapchain_->SetColorSpace1(cs);
+    apply_color_space(color_space);
     if (FAILED(DCompositionCreateDevice(nullptr, IID_PPV_ARGS(&dcomp_))) ||
         FAILED(dcomp_->CreateTargetForHwnd(window, TRUE, &target_)) || FAILED(dcomp_->CreateVisual(&visual_)) ||
         FAILED(visual_->SetContent(swapchain_.Get())) || FAILED(target_->SetRoot(visual_.Get())) || FAILED(dcomp_->Commit())) {
         error = "DirectComposition setup"; return false;
     }
     create_swapchain_views();
+    return true;
+}
+
+// The game's colour space on our swap chain (HDR10 PQ, scRGB, sRGB), if the swap chain takes it - noted for the log
+// either way: a refused HDR colour space shows the game's HDR pixels as SDR (grey, washed out).
+void Renderer::apply_color_space(std::uint32_t color_space) {
+    UINT support = 0;
+    const auto cs = static_cast<DXGI_COLOR_SPACE_TYPE>(color_space);
+    const bool can = SUCCEEDED(swapchain_->CheckColorSpaceSupport(cs, &support)) && (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT);
+    const bool set = can && SUCCEEDED(swapchain_->SetColorSpace1(cs));
+    color_space_ = color_space;
+    char note[200];
+    std::snprintf(note, sizeof(note), "output: format %u, colour space %u (%s) - %s", unsigned(swap_format_), unsigned(color_space),
+                  color_space == 12 ? "HDR10 PQ" : color_space == 1 ? "scRGB" : color_space == 0 ? "sRGB" : "other",
+                  set ? "set on the swap chain" : can ? "SetColorSpace1 FAILED" : "NOT SUPPORTED by the swap chain (shown as sRGB)");
+    notes_.push_back(note);
+}
+
+// The game changed its picture format or colour space (HDR switched on or off, often after the swap chain was set
+// up): the swap chain's buffers, the final pass and the colour space follow.
+bool Renderer::set_output(DXGI_FORMAT game_format, std::uint32_t color_space) {
+    const DXGI_FORMAT format = swapchain_format(game_format);
+    if (format == swap_format_ && color_space == color_space_) return true;
+    wait_idle();
+    if (format != swap_format_) {
+        if (FAILED(swapchain_->ResizeBuffers(3, width_, height_, format, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))) {
+            notes_.push_back("output: could not switch the swap chain to format " + std::to_string(unsigned(format)));
+            return false;
+        }
+        swap_format_ = format;
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC gd{};
+        gd.pRootSignature = root_.Get();
+        gd.VS = {blit_vs_->GetBufferPointer(), blit_vs_->GetBufferSize()};
+        gd.PS = {blit_ps_->GetBufferPointer(), blit_ps_->GetBufferSize()};
+        gd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        gd.SampleMask = UINT_MAX;
+        gd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID; gd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        gd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        gd.NumRenderTargets = 1; gd.RTVFormats[0] = swap_format_;
+        gd.SampleDesc.Count = 1;
+        ComPtr<ID3D12PipelineState> blit;
+        if (SUCCEEDED(device_->CreateGraphicsPipelineState(&gd, IID_PPV_ARGS(&blit)))) blit_ = blit;
+        create_swapchain_views();
+    }
+    apply_color_space(color_space);
     return true;
 }
 
@@ -1920,6 +1971,7 @@ bool Renderer::create_pipelines(std::string& error) {
     gd.NumRenderTargets = 1; gd.RTVFormats[0] = swap_format_;
     gd.SampleDesc.Count = 1;
     if (FAILED(device_->CreateGraphicsPipelineState(&gd, IID_PPV_ARGS(&blit_)))) { error = "blit pso"; return false; }
+    blit_vs_ = vs; blit_ps_ = ps;
 
     // Extrapolation passes: 32 constants, 4 SRVs, 2 UAVs.
     D3D12_DESCRIPTOR_RANGE xsrv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kXSrvCount, 0, 0, 0};
@@ -2044,7 +2096,11 @@ void Renderer::x_dispatch(ID3D12PipelineState* pso, const void* constants, UINT 
     list_->SetDescriptorHeaps(1, heaps);
     list_->SetComputeRootSignature(root_x_.Get());
     list_->SetPipelineState(pso);
-    list_->SetComputeRoot32BitConstants(0, 32, constants, 0);
+    // (flags, the last constant, bit 32768: the game's picture is linear scRGB - see seen() in the shaders)
+    std::uint32_t c[32];
+    std::memcpy(c, constants, sizeof(c));
+    if (color_space_ == 1) c[31] |= 32768u;
+    list_->SetComputeRoot32BitConstants(0, 32, c, 0);
     list_->SetComputeRootDescriptorTable(1, gpu(srv_table));
     list_->SetComputeRootDescriptorTable(2, gpu(uav_table));
     list_->Dispatch(groups_x, groups_y, 1);

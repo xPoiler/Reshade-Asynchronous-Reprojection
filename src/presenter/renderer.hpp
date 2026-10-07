@@ -56,6 +56,9 @@ public:
     HANDLE waitable() const { return waitable_; }
     const char* queue_priority() const { return priority_name_; }
     bool resize(std::uint32_t width, std::uint32_t height);
+    // The game's picture format and colour space (HDR on/off): swap chain format, final pass and colour space follow.
+    bool set_output(DXGI_FORMAT game_format, std::uint32_t color_space);
+    std::uint32_t color_space() const { return color_space_; }
     // 1: a frame can only start once the previous one is displayed; 2: one frame may wait in the queue.
     void set_frame_latency(UINT frames) { if (frames != frame_latency_) { swapchain_->SetMaximumFrameLatency(frames); frame_latency_ = frames; } }
     std::uint32_t width() const { return width_; }
@@ -340,6 +343,9 @@ private:
     bool keep_previous_ = false, previous_valid_ = false, previous_from_hudless_ = false, ingested_ = false, last_had_hudless_ = false;
     MotionFit fit_latest_;
     ComPtr<ID3D12PipelineState> cs_color_, cs_depth_, blit_;
+    ComPtr<ID3DBlob> blit_vs_, blit_ps_;  // (the final pass, rebuilt for another output format)
+    std::uint32_t color_space_ = 0;
+    void apply_color_space(std::uint32_t color_space);
     ComPtr<ID3D12DescriptorHeap> heap_, rtv_heap_;
     UINT descriptor_size_ = 0, rtv_size_ = 0;
     ComPtr<ID3D12QueryHeap> timestamps_;
