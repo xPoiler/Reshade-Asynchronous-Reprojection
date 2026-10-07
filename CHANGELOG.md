@@ -29,7 +29,7 @@
 * **Softer screen edges** (new default, "Uncovered screen edges" in the Warp section): what a fast turn uncovers
   past the frame's edge is a blur of the scenery along it, wider further out, instead of repeated edge pixels
   that streak. The old fill remains as an option.
-* **Latency-aware frame cap** (on by default, remembered per game): XPAR holds the game just below the rate its
+* **Prevent GPU queueing** (on by default, remembered per game; not a frame rate limit you set): XPAR holds the game just below the rate its
   GPU sustains, so no frame waits in the GPU's queue and the game reads input later - what NVIDIA Reflex does,
   for games without it and for AMD and Intel GPUs. It finds the rate by itself (slower when frames queue,
   faster while the GPU idles) and stands aside while the game's own Reflex is on (asked from the driver) and

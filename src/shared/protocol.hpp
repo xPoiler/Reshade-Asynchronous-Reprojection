@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 51;
+constexpr std::uint32_t kVersion = 52;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -114,7 +114,7 @@ struct Settings {
     float edge_limit_pct;              // Auto latency "camera as of now": the most of the screen's width (percent) the warp may uncover
                                        // beyond what the regular Auto latency uncovers lately (0: no more than it; saved per game)
     std::uint32_t edge_unlimited;      // ...or no limit at all (saved per game)
-    std::uint32_t frame_cap;           // default on: latency-aware frame cap for the game while its NVIDIA Reflex is off (add-on; saved per game)
+    std::uint32_t frame_cap;           // default on: prevent GPU queueing (hold the game just below its GPU rate) while its NVIDIA Reflex is off (add-on; saved per game)
 };
 
 // Presenter status, displayed by the add-on UI.
@@ -180,7 +180,7 @@ struct HookStats {
     std::int32_t pcl_lookup_result, reflex_lookup_result;
     std::uint32_t probe_calls[8];  // game-specific plugin probes (game_probe.cpp)
     std::uint32_t probe_installed;
-    // Latency-aware frame cap (frame_cap.hpp), for the presenter's log: 1 capping; the cap and the game's rate
+    // Prevent GPU queueing (frame_cap.hpp), for the presenter's log: 1 capping; the cap and the game's rate
     // (fps); the GPU done after the present / after the frame's start (medians, ms); held back per frame (ms).
     std::uint32_t cap_active, cap_reflex;  // (cap_reflex: the game's Reflex is on, the cap stands aside)
     float cap_fps, cap_game_fps, cap_present_to_done_ms, cap_start_to_done_ms, cap_wait_ms, cap_queued_pct;

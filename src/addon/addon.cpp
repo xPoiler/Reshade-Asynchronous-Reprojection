@@ -735,16 +735,17 @@ void draw_overlay(effect_runtime*) {
         if (auto_lead) ImGui::EndDisabled();
         hint("Manual: render this long before the next refresh; 0 = right after the previous one.");
         bool cap = s.frame_cap != 0;
-        if (ImGui::Checkbox("Latency-aware frame cap", &cap)) s.frame_cap = cap;
-        hint("Holds the game just below the rate its GPU sustains, so no frame waits in the GPU's queue and the game reads "
-             "input later (what NVIDIA Reflex does). Stands aside by itself while the game's Reflex is on. Remembered per game.");
+        if (ImGui::Checkbox("Prevent GPU queueing", &cap)) s.frame_cap = cap;
+        hint("Not a frame rate limit you set: XPAR finds by itself the rate the game's GPU sustains and holds the game just "
+             "below it, so no frame waits in the GPU's queue and the game reads input later (what NVIDIA Reflex does). Stands "
+             "aside by itself while the game's Reflex is on. Remembered per game.");
         if (cap) {
             const fw::FrameCapStatus st = fw::frame_cap_status();
             ImGui::SameLine();
             if (st.reflex)
                 ImGui::TextDisabled("(off: the game's Reflex is on)");
             else if (st.active)
-                ImGui::TextDisabled("(%.1f fps, game %.1f | GPU done %.1f ms after present | held %.1f ms)", st.cap_fps, st.game_fps,
+                ImGui::TextDisabled("(game held to %.1f fps, now %.1f | GPU done %.1f ms after present | held %.1f ms)", st.cap_fps, st.game_fps,
                                     st.present_to_done_ms, st.wait_ms);
             else
                 ImGui::TextDisabled("(measuring; off during frame generation, not for Vulkan yet)");

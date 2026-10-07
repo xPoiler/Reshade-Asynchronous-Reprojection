@@ -1037,6 +1037,9 @@ void render_thread() {
             const std::int64_t lead = static_cast<std::int64_t>(lead_ms * 1e-3 * f);
             const std::int64_t compose = static_cast<std::int64_t>(2.5e-3 * f);  // composition deadline after a vblank
             const std::int64_t now_q = qpc_now();
+            // (Pacing to the screen's own refreshes, VRR or not: XPAR's window is always composed by Windows, so a VRR
+            // screen runs at its maximum with it - a pace below that, Blur Busters' VRR rule, only repeated frames;
+            // tried 2026-10-07, the TV stayed at 119 Hz with NVIDIA's windowed G-SYNC on, for the presenter as well.)
             std::int64_t v = vblank.next_after(now_q - compose + lead);  // first vblank whose deadline - lead is ahead
             if (last_target_vblank && v <= last_target_vblank + static_cast<std::int64_t>(vblank.period / 2))
                 v = last_target_vblank + static_cast<std::int64_t>(vblank.period);
@@ -1761,9 +1764,9 @@ void render_thread() {
                              auto_lead.matched_logged, auto_lead.usual);
                     {
                         const auto& hk = sh.hooks;
-                        if (sh.settings.frame_cap && hk.cap_reflex) logf("frame cap: standing aside, the game's NVIDIA Reflex is on");
+                        if (sh.settings.frame_cap && hk.cap_reflex) logf("prevent GPU queueing: standing aside, the game's NVIDIA Reflex is on");
                         else if (hk.cap_active)
-                            logf("frame cap: %.1f fps (game %.1f fps) | GPU done %.1f ms after the game's present, %.1f ms after its frame start | held %.1f ms per frame | queued %.0f%%",
+                            logf("prevent GPU queueing: game held to %.1f fps (now %.1f fps) | GPU done %.1f ms after the game's present, %.1f ms after its frame start | held %.1f ms per frame | queued %.0f%%",
                                  hk.cap_fps, hk.cap_game_fps, hk.cap_present_to_done_ms, hk.cap_start_to_done_ms, hk.cap_wait_ms, hk.cap_queued_pct);
                     }
                     lat_behind.clear(); lat_display.clear(); lat_age.clear(); lat_queued.clear();

@@ -1,5 +1,5 @@
 #pragma once
-// Latency-aware frame cap for the game (option, off by default): holds the game back right after its present,
+// Prevent GPU queueing ("Latency-aware frame cap" internally; on by default): holds the game back right after its present,
 // a little below the rate its GPU sustains, so no frame waits in the GPU's queue and the next frame reads its
 // input as late as possible (the idea of NVIDIA Reflex, for games without it). FrameWarp keeps the output at the
 // display's rate, so a slightly lower game rate costs little.
