@@ -39,6 +39,7 @@ void default_settings(Settings& s) {
     s.present_lead_auto = 1;
     s.frame_cap = 1;  // prevent GPU queueing, standing aside while the game's Reflex is on
     s.orbit_mode = 0;  // the measured orbit, games without a camera of their own
+    s.floor_release = 1;  // the ground around the character moves with a measured orbit (acts only while one is in use)
     s.edge_limit_pct = 0.0f;  // camera as of now: no more of the edge uncovered than Auto's
     s.edge_fill = 1;  // soft edge (blur along the edge); extended edge pixels are the option
     s.no_warp_mask = 1;   // HUD detection in games without HUD layers

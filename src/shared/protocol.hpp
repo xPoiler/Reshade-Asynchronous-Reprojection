@@ -93,7 +93,7 @@ struct Settings {
     std::uint32_t moving_objects;  // XPAR engine: objects move at the display rate, between the game's frames (option, off by default)
     std::uint32_t no_warp_mask;    // games without HUD layers: detect the HUD and keep it unwarped
     std::uint32_t show_mask;       // debug: tint the no-warp mask (magenta) and the HUD score still learning (green)
-    std::uint32_t floor_release;   // option, off by default (saved per game): while turns are predicted around a measured orbit pivot, the
+    std::uint32_t floor_release;   // option, on by default (saved per game): while turns are predicted around a measured orbit pivot, the
                                    // turn rule does not hold the ground around the character (near the pivot's distance)
     std::uint32_t hud_from_scene;  // HUD detection, saved per game in ReShade.ini: 0 learned, 1 from the upscaler's output,
                                    // 2 (default) from the upscaler's output where the pixels do not follow the world (combined);
