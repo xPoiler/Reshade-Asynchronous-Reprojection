@@ -1,70 +1,84 @@
 # Changelog
 
-## Unreleased
+## 1.9.0
 
-* **HDR fixed** (#7): XPAR now follows the game's picture format and colour space while it runs - HDR switched
-  on after the game started or from its menus, HDR10 (PQ) and scRGB alike. Before, it kept what the game had
-  when it started: HDR shown as SDR (grey, washed out) or scRGB written into an HDR10 output (garish). The colour
-  space is read from the swap chain at every present, with no hook (a hook clashed with the Steam overlay's).
-  HUD detection works in scRGB too (it read bright sky as HUD).
-* The video memory warning also appears when the graphics card itself is almost full, and stays up for 30 s
-  (it came and went within seconds while the game and XPAR kept stuttering).
+HDR fixes, big reduction in artifacts around the screen edges and behind warped objects, while also cutting
+latency.
+
+### Latency and smoothness
+
+* **New default Auto latency: "Lowest latency without edge fill".** Every refresh XPAR shows the camera as late
+  as it can without revealing anything the game has not rendered: the camera as of now (your mouse up to this
+  moment) while you aim or turn slowly, falling back as far as one game frame during fast turns, where what the
+  warp reveals comes from the game's last two frames (keep Background memory on). Far fewer artifacts at the
+  screen edges and behind the character or weapon, at lower latency. The earlier Auto is still there, and so is
+  "Camera as of now (edge-limited)" with its "Extra uncovered edge" slider (0: no more edge than Auto) or no
+  limit at all.
+* **Automatic present lead** (new default): XPAR measures how long its warp takes and renders each refresh as
+  late as it still makes it, backing off when a frame misses (2.5-3.5 ms instead of 6). The camera is taken at
+  the planned moment before each refresh, so lead changes and wake-up jitter no longer move it. The slider
+  remains as a manual setting.
+* **No more frames queuing behind a late one:** the newest finished frame is shown at each refresh, so one missed
+  refresh costs that refresh only (before, every frame after it could stay a refresh later).
+* **Prevent GPU queueing** (on by default, remembered per game; not a frame rate limit you set): XPAR holds the
+  game just below the rate its GPU sustains, so no frame waits in the GPU's queue and the game reads input later -
+  what NVIDIA Reflex does, for games without it and for AMD and Intel GPUs. It finds the rate by itself and stands
+  aside while the game's own Reflex is on (asked from the driver) and during the game's frame generation.
+  Direct3D 12 and 11; not Vulkan yet.
+* **Latency breakdown** in the XPAR panel and the log: how far behind the displayed camera is, the time from
+  XPAR's present to the screen, and the age of the camera when it reaches the screen.
+
+### Fewer artifacts
+
+* **Softer screen edges** (new default, "Uncovered screen edges" in the Warp section): what a fast turn uncovers
+  past the frame's edge is a blur of the scenery along it, wider further out, instead of repeated edge pixels
+  that streak. The old fill remains as an option.
 * **Third-person cameras that circle the character, in games that give DLSS or FSR their motion vectors but no
   camera** (Assassin's Creed Black Flag Resynced): XPAR measures the point the camera turns around and predicts
   turns around it instead of on the spot ("Orbit pivot" in Camera motion: Measured by default, Off, or Manual
   with the Orbit distance slider). It is used only while the turns agree on one point (a first-person camera
-  never does), and not where XPAR works out the motion from the picture itself, which is too rough to measure
-  it. Games that send their own camera are unchanged.
-* New option where a measured orbit is in use, off by default: "Let the ground around the character move with
-  the orbit" - the ground at the character's feet is no longer held still while turning.
-* Record detailed diagnostics stays as it was when a new version resets the settings.
-* **Reset all settings to defaults**: a button at the top of the XPAR panel puts every setting back to its default
-  for the game (Enable reprojection and the learned camera model stay).
-* **New default Auto latency: "Lowest latency without edge fill".** Every refresh XPAR shows the camera as late as
-  it can without revealing anything the game has not rendered: the camera as of now (your mouse up to this
-  moment) while you aim or turn slowly, falling back as far as one game frame during fast turns, where what the
-  warp reveals comes from the game's last two frames (keep Background memory on). The earlier Auto is still
-  there, and so is "Camera as of now (edge-limited)" with its "Extra uncovered edge" slider (0: no more edge than
-  Auto) or no limit at all.
-* **Softer screen edges** (new default, "Uncovered screen edges" in the Warp section): what a fast turn uncovers
-  past the frame's edge is a blur of the scenery along it, wider further out, instead of repeated edge pixels
-  that streak. The old fill remains as an option.
-* **Prevent GPU queueing** (on by default, remembered per game; not a frame rate limit you set): XPAR holds the game just below the rate its
-  GPU sustains, so no frame waits in the GPU's queue and the game reads input later - what NVIDIA Reflex does,
-  for games without it and for AMD and Intel GPUs. It finds the rate by itself (slower when frames queue,
-  faster while the GPU idles) and stands aside while the game's own Reflex is on (asked from the driver) and
-  during the game's frame generation. Direct3D 12 and 11; not Vulkan yet.
-* The XPAR panel is reorganised: Camera motion, Latency, Warp and Debug sections; the explanations of the
-  options are shown when the mouse rests on them.
-* **Lower output latency, steadier timing.** The present lead is automatic (new default): XPAR measures how
-  long its warp takes and renders as late as it still makes the refresh, backing off when a frame misses
-  (Stalker 2: 2.5-3.5 ms instead of 6, present to screen 16 ms instead of 19.6). The camera is taken at the
-  planned moment before each refresh, so lead changes and wake-up jitter no longer move it. XPAR's frames no
-  longer queue behind a late one: the newest finished frame is shown at each refresh, so one missed refresh
-  costs that refresh only (before, every frame after it stayed a refresh later, up to 24.5 ms). The slider
-  remains as a manual setting.
-* The Output fps figure counts refreshes only (with Present lead 0 it counted idle checks: 373 fps shown).
-* The first-person weapon is held still while walking backwards too: its nearest part (behind where the
-  camera was a frame earlier) went unrecognised and warped with the scenery (DOOM Eternal).
+  never does), and not where XPAR works out the motion from the picture itself. Games that send their own camera
+  are unchanged. Where a measured orbit is in use, a new option (off by default) lets the ground around the
+  character move with the orbit instead of being held still.
+* The first-person weapon is held still while walking backwards too (DOOM Eternal: its nearest part warped with
+  the scenery).
 * **Games that hand DLSS full-resolution motion vectors work properly** (DLSS without Streamline tags, no
-  "low-resolution motion vectors" flag - Stalker 2 without frame generation). XPAR read only a quarter of
-  them: the camera estimate saw a narrower field of view, rejected most frames, and the mouse model learned
-  from a camera that barely moved. They are now taken whole and scaled to render pixels.
-* **The mouse model no longer unlearns the mouse.** Stretches where the camera clearly does not follow the
-  mouse (inventories, maps, dialogues with the game's own cursor) are left out of its fit, a learned model is
-  only refitted with enough usable data, and frames a camera estimate cannot explain are not learned from (the
-  XPAR panel says when the estimate is unreliable). A poor model is no longer saved.
-* A locked field of view of an estimated camera is learned again when it keeps failing, for the upscaler's
-  motion vectors too.
-* **Latency breakdown** in the XPAR panel and the log: how far behind the displayed camera is, the time from
-  XPAR's present to the screen, and the age of the camera when it reaches the screen.
-* Record detailed diagnostics also saves what the game hands its upscaler (`upscaler.csv`), and the DLSS
-  inputs are logged whenever they change. Captures continue numbering instead of overwriting earlier ones.
-* **More settings are remembered per game:** Keep still, Keep HUD still, Warp engine, Raw mouse drives
-  rotation, Auto latency and Latency <-> smoothness, Rotation extrapolation, Orbit distance, Max
-  extrapolation, Present lead, and Manual mouse gain with its values. Enable reprojection and the
-  comparison and debug switches (Show original, Debug strip, Invert warp, Show the mask) are not
-  remembered. As before, an update resets the remembered settings to the defaults.
+  "low-resolution motion vectors" flag: S.T.A.L.K.E.R. 2 without frame generation). XPAR read only a quarter of
+  them, saw a narrower field of view and learned a camera that barely moved.
+* **The mouse model no longer unlearns the mouse.** Stretches where the camera clearly does not follow the mouse
+  (inventories, maps, dialogues with the game's own cursor) are left out of its fit, a learned model is only
+  refitted with enough usable data, frames a camera estimate cannot explain are not learned from (the panel says
+  when the estimate is unreliable), and a poor model is no longer saved. A locked field of view of an estimated
+  camera is learned again when it keeps failing.
+
+### HDR
+
+* **HDR fixed** (#7): XPAR follows the game's picture format and colour space while it runs - HDR switched on
+  after the game started or from its menus, HDR10 (PQ) and scRGB alike. Before, it kept what the game had when it
+  started: HDR shown as SDR (grey, washed out) or scRGB written into an HDR10 output (garish). The colour space is
+  read from the swap chain, with no hook.
+* HUD detection works in scRGB too (it read bright sky as HUD).
+
+### Panel and settings
+
+* The XPAR panel is reorganised into Camera motion, Latency, Warp and Debug sections; the explanation of each
+  option shows when the mouse rests on it.
+* **Reset all settings to defaults**: a button at the top of the panel puts every setting back to its default for
+  the game (Enable reprojection and the learned camera model stay).
+* **More settings are remembered per game**, including Auto latency, Present lead, Keep still, Keep HUD still,
+  Warp engine, Orbit pivot and Manual mouse gain. Enable reprojection and the comparison and debug switches are
+  not. As before, an update resets the remembered settings to the defaults; Record detailed diagnostics now stays
+  as it was.
+* The video memory warning also appears when the graphics card itself is almost full, and stays up for 30 s.
+* The Output fps figure counts refreshes only.
+* Record detailed diagnostics also saves what the game hands its upscaler (`upscaler.csv`), and the DLSS inputs
+  are logged whenever they change. Captures continue numbering instead of overwriting earlier ones.
+
+### Notes
+
+* VRR (#3): while FrameWarp shows its frames, a VRR screen runs at its maximum refresh rate: FrameWarp's window is
+  always composited by Windows, so VRR cannot follow it (also with G-SYNC for windowed mode). FrameWarp paces
+  itself to the screen's refreshes and shows the newest frame at each, so nothing queues at the maximum.
 
 ## 1.8.5
 
