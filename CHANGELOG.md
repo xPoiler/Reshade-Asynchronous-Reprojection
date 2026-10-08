@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.9.1
+
+Red dot and holographic sight reticles stay on the gun, and third-person orbit cameras keep the ground right.
+
+* **Sight reticles held** (new, on by default; "Hold sight reticles" under Keep still, XPAR engine) (#8): a red dot
+  or holographic reticle the game draws without depth of its own (Resident Evil Requiem) skipped while turning - it
+  was warped with the scenery behind the glass and snapped back onto the gun with each game frame. Inside the
+  window the held weapon encloses, what is on the glass (reticle, glow) is now learned as a layer that follows the
+  reticle, within a few frames of turning; only the scenery under it is warped. Sights the game draws with depth
+  were held already and are unchanged. Works at any resolution and reticle size.
+* **"Let the ground around the character move with the orbit" is on by default**: in games where XPAR measures the
+  point a third-person camera circles (Assassin's Creed Black Flag Resynced, Red Dead Redemption 2), the ground at
+  the character's feet is no longer held still while the camera turns. It acts only while a measured orbit is in use.
+* **Red Dead Redemption 2** tested (DirectX 12, DLSS): see the README. The game crashes when the ReShade menu opens
+  unless ReShade's Generic Depth add-on is off, also without FrameWarp; the README's Troubleshooting has the fix.
+* Diagnostics: presenter.log lists the optional masks a game hands DLSS and FSR and the Streamline buffer types it
+  tags; captures also save the learned reticle layer.
+* As with every update, the settings remembered per game go back to the defaults (Record detailed diagnostics stays).
+
 ## 1.9.0
 
 HDR fixes, big reduction in artifacts around the screen edges and behind warped objects, while also cutting
