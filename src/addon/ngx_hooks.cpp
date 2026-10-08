@@ -185,6 +185,24 @@ NVSDK_NGX_Result NVSDK_CONV hk_evaluate(ID3D12GraphicsCommandList* list, const N
             if (params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &v) == NVSDK_NGX_Result_Success) s->subrect_w = v;
             if (params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &v) == NVSDK_NGX_Result_Success) s->subrect_h = v;
             if (params->Get(NVSDK_NGX_Parameter_Reset, &reset) == NVSDK_NGX_Result_Success && reset) ++s->resets;
+            // (diagnostics: which optional masks the game hands DLSS - pixels whose motion vectors it does not trust)
+            {
+                static const std::pair<const char*, std::uint32_t> kMasks[] = {
+                    {NVSDK_NGX_Parameter_TransparencyMask, kNgxMaskTransparency}, {NVSDK_NGX_Parameter_IsParticleMask, kNgxMaskParticles},
+                    {NVSDK_NGX_Parameter_AnimatedTextureMask, kNgxMaskAnimatedTexture},
+                    {NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, kNgxMaskBiasCurrentColor},
+                    {NVSDK_NGX_Parameter_DLSS_TransparencyLayer, kNgxMaskTransparencyLayer},
+                    {NVSDK_NGX_Parameter_DLSS_TransparencyLayerOpacity, kNgxMaskTransparencyOpacity},
+                    {NVSDK_NGX_Parameter_DLSS_TransparencyLayerMvecs, kNgxMaskTransparencyMvecs},
+                    {NVSDK_NGX_Parameter_DLSS_DisocclusionMask, kNgxMaskDisocclusion}, {NVSDK_NGX_Parameter_DLSS_ResponsivityMask, kNgxMaskResponsivity}};
+                std::uint32_t masks = 0;
+                for (const auto& [name, bit] : kMasks) {
+                    ID3D12Resource* r = nullptr;
+                    if (params->Get(name, &r) == NVSDK_NGX_Result_Success && r) masks |= bit;
+                }
+                s->masks = masks;
+                describe(params, NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, s->bias_w, s->bias_h, s->bias_format);
+            }
             // Games without a Streamline camera: publish this frame's depth and motion vectors with a camera
             // the presenter estimates from the motion vectors. (Streamline games publish through their own
             // hooks; once slSetConstants has been seen, this stays off - unless that camera was found

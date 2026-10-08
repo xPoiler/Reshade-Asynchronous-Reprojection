@@ -1,5 +1,6 @@
 #include "presenter/renderer.hpp"
 #include "presenter/pose.hpp"
+#include <cmath>
 #include <cstdlib>
 #include <d3dcompiler.h>
 #include <cstdio>
@@ -638,6 +639,204 @@ RWTexture2D<unorm float> att_u : register(u0);
     att_u[pr] = keep ? 1.0 : 0.0;
 }
 
+// Sight reticles (option): a reticle the game draws without depth or motion vectors of its own (a red dot on a
+// sight's glass) has the scenery's behind it, so the warp moves it with the scenery and every game frame snaps it
+// back onto the gun - it skips while turning. What is on the glass (reticle, its glow, reflections) is treated as
+// a layer fixed to the gun and added on top of the scenery seen through it: estimated per game frame inside the
+// sight's window (enclosed by the held character/weapon), and the warp moves only the scenery under it (the frame
+// minus the layer) and adds the layer back where the gun shows it. Nothing is held: no mask edges.
+// Sizes are shares of the screen height (the values that worked at 4K, scaled): coarse cells of groups_x render px
+// (0.55% of the height; mv_size: their grid).
+static const int2 kRetDirs[8] = {int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1), int2(1, 1), int2(1, -1), int2(-1, 1), int2(-1, -1)};
+// Per cell: the held pixels' mean on-screen motion to the previous frame (output px) and how many there are.
+Texture2D<float4> rc_object_t : register(t0);
+Texture2D<float> rc_depth_t : register(t1);
+RWTexture2D<float4> rc_cells_u : register(u0);
+[numthreads(8, 8, 1)] void cs_ret_cells(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= mv_size)) return;
+    float2 sum = 0;
+    float n = 0;
+    [loop] for (uint y = 0; y < groups_x; ++y)
+        [loop] for (uint x = 0; x < groups_x; ++x) {
+            const uint2 p = id.xy * groups_x + uint2(x, y);
+            if (any(p >= rect.zw)) continue;
+            const int2 pr = int2(rect.xy + p);
+            const float4 o = rc_object_t.Load(int3(pr, 0));
+            if (o.w < 1.5) continue;
+            const float2 uv = (float2(p) + 0.5) / float2(rect.zw);
+            const float4 pv = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, rc_depth_t.Load(int3(pr, 0)), 1), clip_to_prev);
+            const float2 cam = pv.w > 0 ? float2(pv.x / pv.w * 0.5 + 0.5, 0.5 - pv.y / pv.w * 0.5) - uv : float2(0, 0);
+            sum += (o.xy / float2(rect.zw) + cam) * float2(out_size);  // its own motion plus the camera's (see cs_analyze)
+            n += 1;
+        }
+    rc_cells_u[id.xy] = float4(n > 0 ? sum / n : float2(0, 0), n, 0);
+}
+// Per cell: enclosed by held cells (z 1) and the gun's motion there (xy: the mean of the 8 held cells met).
+// threshold: the reach in cells.
+Texture2D<float4> re_cells_t : register(t0);
+RWTexture2D<float4> re_encl_u : register(u0);
+[numthreads(8, 8, 1)] void cs_ret_enclose(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= mv_size)) return;
+    float4 r = 0;
+    if (re_cells_t.Load(int3(id.xy, 0)).z < 0.5) {
+        const int reach = int(threshold);
+        float2 g = 0;
+        uint hits = 0;
+        [loop] for (uint i = 0; i < 8 && hits == i; ++i) {
+            [loop] for (int k = 1; k <= reach; ++k) {
+                const int2 q = int2(id.xy) + kRetDirs[i] * k;
+                if (any(q < 0) || any(q >= int2(mv_size))) break;
+                const float4 c = re_cells_t.Load(int3(q, 0));
+                if (c.z > 0.5) { g += c.xy; ++hits; break; }
+            }
+        }
+        if (hits == 8) r = float4(g / 8.0, 1, 0);
+    }
+    re_encl_u[id.xy] = r;
+}
+// Where the reticle went: it does not move with the sight's frame (projected to infinity, it follows where the gun
+// points, not the frame's sway and bob - measured at 4K: 0-4 px while the frame moved up to 11). The previous layer
+// is lined up with this frame: for each of 17 x 17 shifts within +-0.37% of the screen height (+-8 px at 4K), the
+// layer's weight times this frame's brightness where it would be now, summed (fixed point, one sum per shift, and
+// the weight in the last); cs_ret_pick takes the best, refined to a fraction of a step, and cs_ret_shift hands it to
+// the cells (xy: the motion to the previous frame).
+static const int kRetTrack = 8, kRetTrackN = (2 * 8 + 1) * (2 * 8 + 1);
+float ret_track_step() { return float(out_size.y) / 2160.0; }  // output px per shift step
+SamplerState ra_linear : register(s0);
+Texture2D<float4> ra_cur_t : register(t0);
+Texture2D<float4> ra_hist_t : register(t1);
+RWByteAddressBuffer ra_buf_u : register(u1);
+groupshared uint ra_sums[kRetTrackN + 1];
+[numthreads(8, 8, 1)] void cs_ret_align(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+    for (uint k = gi; k <= uint(kRetTrackN); k += 64) ra_sums[k] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    // every second pixel each way, where the previous layer has something
+    if (all(id.xy < out_size) && ((id.x | id.y) & 1) == 0) {
+        const float4 l = ra_hist_t.Load(int3(id.xy, 0));
+        const float w = max(max(l.r, l.g), l.b);
+        if (w > 0.05) {
+            uint ignored;
+            InterlockedAdd(ra_sums[kRetTrackN], uint(w * 1024.0), ignored);
+            [loop] for (int dy = -kRetTrack; dy <= kRetTrack; ++dy)
+                [loop] for (int dx = -kRetTrack; dx <= kRetTrack; ++dx) {
+                    const float2 q = (float2(id.xy) + 0.5 + float2(dx, dy) * ret_track_step()) / float2(out_size);
+                    const float v = dot(seen(ra_cur_t.SampleLevel(ra_linear, q, 0).rgb), float3(0.299, 0.587, 0.114));
+                    InterlockedAdd(ra_sums[(dy + kRetTrack) * (2 * kRetTrack + 1) + dx + kRetTrack], uint(w * saturate(v) * 1024.0), ignored);
+                }
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for (uint k2 = gi; k2 <= uint(kRetTrackN); k2 += 64) {
+        uint ignored;
+        if (ra_sums[k2] != 0) ra_buf_u.InterlockedAdd(k2 * 4, ra_sums[k2], ignored);
+    }
+}
+RWByteAddressBuffer rp_buf_u : register(u0);
+[numthreads(1, 1, 1)] void cs_ret_pick(uint3 id : SV_DispatchThreadID) {
+    const int n = 2 * kRetTrack + 1;
+    uint best = 0;
+    int at = (kRetTrackN - 1) / 2;
+    [loop] for (int k = 0; k < kRetTrackN; ++k) {
+        const uint v = rp_buf_u.Load(uint(k) * 4);
+        if (v > best) { best = v; at = k; }
+    }
+    float2 shift = 0;
+    // (a layer to line up: ~256 px of it at 4K, every fourth one sampled - fewer at lower resolutions)
+    const float step = ret_track_step();
+    const bool enough = float(rp_buf_u.Load(uint(kRetTrackN) * 4)) > max(64.0 * step * step, 8.0) * 1024.0;
+    if (enough) {
+        const int bx = at % n, by = at / n;
+        shift = float2(bx - kRetTrack, by - kRetTrack);
+        // a fraction of a pixel from the neighbours (parabola through three)
+        if (bx > 0 && bx < n - 1) {
+            const float l = rp_buf_u.Load(uint(at - 1) * 4), c = best, r = rp_buf_u.Load(uint(at + 1) * 4);
+            const float den = l - 2 * c + r;
+            if (den < 0) shift.x += clamp(0.5 * (l - r) / den, -0.5, 0.5);
+        }
+        if (by > 0 && by < n - 1) {
+            const float u = rp_buf_u.Load(uint(at - n) * 4), c = best, d = rp_buf_u.Load(uint(at + n) * 4);
+            const float den = u - 2 * c + d;
+            if (den < 0) shift.y += clamp(0.5 * (u - d) / den, -0.5, 0.5);
+        }
+    }
+    rp_buf_u.Store2(uint(kRetTrackN + 1) * 4, asuint(shift * step));
+    [loop] for (int k2 = 0; k2 <= kRetTrackN; ++k2) rp_buf_u.Store(uint(k2) * 4, 0);
+}
+RWTexture2D<float4> rs_encl_u : register(u0);
+RWByteAddressBuffer rs_buf_u : register(u1);
+[numthreads(8, 8, 1)] void cs_ret_shift(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= mv_size)) return;
+    const float2 shift = asfloat(rs_buf_u.Load2(uint(kRetTrackN + 1) * 4));
+    float4 e = rs_encl_u[id.xy];
+    e.xy = -shift;  // (the motion to the previous frame)
+    rs_encl_u[id.xy] = e;
+}
+// The layer per output pixel (rgb; a: how well it has agreed lately), in this game frame's screen space. t0/t1:
+// this game frame's picture and the previous one's (both HUD-less when the previous one is), t2 depth, t3 the held
+// character/weapon (render px, widened), t4 the cells above, t5 the previous frame's layer. u0: the layer (the
+// next frame's history), u1: the same for the warp (the shown set). Flag 2: no history yet.
+// The residual - this frame minus the previous one where the scenery came from - is the layer plus what that
+// prediction got wrong (scenery just uncovered, blur, grain). The layer, carried along with the gun, takes in a
+// residual that agrees with it, and one that does not the less the longer it has agreed: a new reticle is learned
+// within a few frames, a one-frame error barely touches a learned one. Not where the scenery came from clearly more
+// layer than this pixel has (taking out the previous frame's reticle there, slightly off, left a copy of it one
+// scenery motion away - the same offset frame after frame in a steady turn, so it agreed and was learned: ghost
+// rings); the reticle's own pixels keep learning over its glow. Light added only (reticles and their glow).
+Texture2D<float4> rl_cur_t : register(t0);
+Texture2D<float4> rl_prev_t : register(t1);
+Texture2D<float> rl_depth_t : register(t2);
+Texture2D<unorm float> rl_att_t : register(t3);
+Texture2D<float4> rl_encl_t : register(t4);
+Texture2D<float4> rl_hist_t : register(t5);
+RWTexture2D<float4> rl_layer_u : register(u0);
+RWTexture2D<float4> rl_shown_u : register(u1);
+SamplerState rl_linear : register(s0);
+[numthreads(8, 8, 1)] void cs_ret_layer(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= out_size)) return;
+    const float2 uv = (float2(id.xy) + 0.5) / float2(out_size);
+    const int2 pr = int2(rect.xy) + int2(min(uint2(uv * float2(rect.zw)), rect.zw - 1));
+    const int2 cell = int2(uint2(pr - int2(rect.xy)) / groups_x);
+    float4 en = rl_encl_t.Load(int3(cell, 0));
+    // (the cells next to the window count too, where they are not gun themselves: reticle parts touching the gun - a
+    // chevron on the front post - are in cells the gun also reaches)
+    if (en.z < 0.5) {
+        uint cw, ch;
+        rl_encl_t.GetDimensions(cw, ch);
+        [unroll] for (uint i = 0; i < 8; ++i) {
+            const int2 q = clamp(cell + kRetDirs[i], int2(0, 0), int2(cw, ch) - 1);
+            if (rl_encl_t.Load(int3(q, 0)).z > 0.5) en.z = 1;
+        }
+    }
+    float4 L = 0;
+    if (en.z > 0.5 && rl_att_t.Load(int3(pr, 0)) < 0.5) {
+        // carried along with the reticle (en.xy: its motion to the previous frame, output px, see cs_ret_align)
+        if (!(flags & 2)) L = rl_hist_t.SampleLevel(rl_linear, uv + en.xy / float2(out_size), 0);
+        const float4 pv = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, rl_depth_t.Load(int3(pr, 0)), 1), clip_to_prev);
+        if (pv.w > 0) {
+            const float2 from = float2(pv.x / pv.w * 0.5 + 0.5, 0.5 - pv.y / pv.w * 0.5);  // where the scenery was
+            const int2 fr = int2(rect.xy) + int2(min(uint2(saturate(from) * float2(rect.zw)), rect.zw - 1));
+            // (not scenery that was behind the gun or off the screen: the previous frame does not show it)
+            const float3 before = (flags & 2) ? float3(0, 0, 0) : rl_hist_t.SampleLevel(rl_linear, from, 0).rgb;
+            const float here = max(max(L.r, L.g), L.b);
+            if (all(from > 0) && all(from < 1) && rl_att_t.Load(int3(fr, 0)) < 0.5 && max(max(before.r, before.g), before.b) < 0.03 + 0.5 * here) {
+                const float3 r = rl_cur_t.Load(int3(id.xy, 0)).rgb - (rl_prev_t.SampleLevel(rl_linear, from, 0).rgb - before);
+                const float3 d = r - L.rgb;
+                const float tol = 0.06 + 0.15 * max(max(abs(L.r), abs(L.g)), abs(L.b));
+                if (max(max(abs(d.r), abs(d.g)), abs(d.b)) < tol) {
+                    L.rgb += 0.5 * d;
+                    L.a = min(1.0, L.a + 0.2);
+                } else {
+                    L.rgb += (0.5 * (1.0 - L.a) * (1.0 - L.a) + 0.05) * d;
+                    L.a *= 0.7;
+                }
+                L.rgb = max(L.rgb, 0.0);
+            }
+        }
+    }
+    rl_layer_u[id.xy] = L;
+    rl_shown_u[id.xy] = L;
+}
+
 // Stretch around the character/weapon (option, XPAR engine): how far each render pixel is from the
 // camera-attached ones, as a share of the stretch width mv_size.x (render px, up to 32): 0 next to them,
 // 1 from the width on. Two passes: the distance along rows (px / 255), then the Euclidean one.
@@ -1041,7 +1240,10 @@ bool hud_near(Texture2D<float> score, int2 p) {
 // HUD, 16 depth inverted, 32 depth-independent (rotation only), 64 background memory (t4), 128 stretch,
 // 256 moving objects (t6-t9; alpha: game frames back towards the previous frame), 1024 soft edge (ow_soft_edge).
 // (512 is the moving-objects pass's debug colours, cs_obj_fix: the soft edge had it first and painted them in.)
-// t2: the XPAR warp's mask (cs_mask u1): held above 0.95.
+// t2: the XPAR warp's mask (cs_mask u1): held above 0.95. Flag 2048: sight reticles (t11, see cs_ret_layer) - the layer
+// on a sight's glass: where it covers the glass (the reticle, ow_cover) the game frame's own pixel is shown, as
+// held; where it is faint (glow) it is taken out where the warp takes the scenery from and added back here. The
+// scenery is never taken from under the reticle: the warp steps past it, as past held pixels.
 Texture2D<float4> ow_color_t : register(t0);
 Texture2D<float4> ow_ui_t : register(t1);
 Texture2D<float> ow_mask_t : register(t2);
@@ -1052,6 +1254,9 @@ Texture2D<uint> ow_keys_t : register(t7);     // ...their claims on the output p
 Texture2D<float4> ow_prev_t : register(t8);   // ...the previous frame's picture
 Texture2D<float> ow_prevz_t : register(t9);   // ...and depth
 Texture2D<uint> ow_out_tiles_t : register(t10); // ...the 8x8 output blocks they touch
+Texture2D<float4> ow_layer_t : register(t11);  // sight reticles: the layer on the glass (cs_ret_layer)
+// How much the layer covers the glass at a spot: 0 up to faint glow, 1 on the reticle itself.
+float ow_cover(float4 l) { return saturate((max(max(l.r, l.g), l.b) - 0.03) / 0.2); }
 RWTexture2D<float4> ow_out_u : register(u0);
 SamplerState ow_linear : register(s0);  // bilinear, clamped to the edge
 float4 ow_bilinear(float2 uv) { return ow_color_t.SampleLevel(ow_linear, uv, 0); }
@@ -1234,6 +1439,31 @@ float4 ow_scene(uint2 id, float2 uv, out float2 src, out bool valid) {
     bool valid;
     float4 c = ow_scene(id.xy, uv, src, valid);
     if ((flags & 2) && ow_held(int3(id.xy, 0))) c = ow_color_t.Load(int3(id.xy, 0));
+    else if ((flags & 2048) && valid) {
+        const float4 here = ow_layer_t.Load(int3(id.xy, 0)), there = ow_layer_t.SampleLevel(ow_linear, src, 0);
+        float3 scene = c.rgb - there.rgb;
+        const float under = ow_cover(there);
+        if (under > 0) {
+            // the scenery was taken from under the reticle: the nearest scenery past it along the warp instead
+            const int2 last = int2(out_size) - 1;
+            const float2 away = normalize((src - uv) * float2(out_size) + float2(1e-3, 0));
+            bool found = false;
+            float3 past = scene;
+            [loop] for (int k = 1; k <= 32 && !found; ++k)
+                [unroll] for (int side = 0; side < 2; ++side) {
+                    // (steps of 1/1080 of the height: up to 3% of it)
+                    const int2 qi = clamp(int2(src * float2(out_size) + away * (side ? -k : k) * max(1.0, float(out_size.y) / 1080.0)),
+                                          int2(0, 0), last);
+                    const float4 lq = ow_layer_t.Load(int3(qi, 0));
+                    if (!found && ow_cover(lq) <= 0 && !((flags & 2) && ow_held(int3(qi, 0)))) {
+                        past = ow_color_t.Load(int3(qi, 0)).rgb - lq.rgb;
+                        found = true;
+                    }
+                }
+            scene = lerp(scene, past, under);
+        }
+        c.rgb = lerp(scene + here.rgb, ow_color_t.Load(int3(id.xy, 0)).rgb, ow_cover(here));
+    }
     if (flags & 1) {
         const float4 ui = ow_ui_t.Load(int3(id.xy, 0));
         c.rgb = c.rgb * (1.0 - ui.a) + ui.rgb;
@@ -1689,15 +1919,19 @@ constexpr UINT kPrivSrv = kPrivUav + kPrivMax;  // + private id
 constexpr UINT kXSrvCount = 6;
 constexpr UINT kX = kPrivSrv + kPrivMax;  // first table
 constexpr UINT kXAnalyzeSrv = kX + 0, kXAnalyzeUav = kX + 6, kXReduceUav = kX + 8;
-constexpr UINT kXKindUav = kX + 10, kXHudAfterSrv = kX + 12;  // (kX + 18 .. 31: free)
+constexpr UINT kXKindUav = kX + 10, kXHudAfterSrv = kX + 12;
+constexpr UINT kXRetCellsSrv = kX + 18, kXRetCellsUav = kX + 24, kXRetPickUav = kX + 26, kXRetShiftUav = kX + 28;  // (kX + 30, 31: free)
 constexpr UINT kXHudSrv = kX + 32, kXHudUav = kX + 38, kXMaskSrv = kX + 40, kXMaskUav = kX + 46, kXSampleSrv = kX + 48, kXSampleUav = kX + 54;
 constexpr UINT kXTintSrv = kX + 56, kXTintUav = kX + 62, kXSceneSrv = kX + 64, kXSceneUav = kX + 70;
 constexpr UINT kXHudlessSrv = kX + 72, kXHudlessUav = kX + 78;
 constexpr UINT kXAttSrv = kX + 80, kXAttUav = kX + 86, kXWorldUav = kX + 88, kXFillSrv = kX + 90, kXFillUav = kX + 96;
 constexpr UINT kXMemSrv = kX + 98, kXMemUav = kX + 104, kXRowsSrv = kX + 106, kXRowsUav = kX + 112;
 constexpr UINT kXRampSrv = kX + 114, kXRampUav = kX + 120;
+constexpr UINT kXRetEnclSrv = kX + 122, kXRetEnclUav = kX + 128, kXRetSrv = kX + 130, kXRetUav = kX + 136;
+constexpr UINT kXRetAlignSrv = kX + 138, kXRetAlignUav = kX + 144;
+constexpr UINT kRetTrackN = 17 * 17;  // shifts tried by cs_ret_align (+-8 px)
 // Own motion estimation: one table of 6 SRVs + 2 UAVs per pass and direction (see estimate_motion).
-constexpr UINT kXFlow = kX + 122;
+constexpr UINT kXFlow = kX + 146;
 enum FlowTable : UINT { kFlowLuma, kFlowFeat, kFlowSearch, kFlowMedianAB, kFlowMedianBA, kFlowLkAB, kFlowLkBA, kFlowMotion, kFlowFillAB, kFlowFillBA, kFlowTables };
 // Passes on the second root signature (the XPAR warp and the moving objects): 12 SRVs t0-t11 and 2 UAVs
 // per table.
@@ -2003,7 +2237,9 @@ bool Renderer::create_pipelines(std::string& error) {
         {"cs_scene_grey_finish", &cs_scene_grey_finish_}, {"cs_scene_wash", &cs_scene_wash_}, {"cs_scene_wash_finish", &cs_scene_wash_finish_},
         {"cs_attached", &cs_attached_}, {"cs_memory", &cs_memory_}, {"cs_ramp_rows", &cs_ramp_rows_}, {"cs_ramp", &cs_ramp_},
         {"cs_flow_luma", &cs_flow_luma_}, {"cs_flow_feat", &cs_flow_feat_}, {"cs_flow_search", &cs_flow_search_}, {"cs_flow_lk", &cs_flow_lk_},
-        {"cs_flow_median", &cs_flow_median_}, {"cs_flow_motion", &cs_flow_motion_}, {"cs_flow_fill", &cs_flow_fill_}};
+        {"cs_flow_median", &cs_flow_median_}, {"cs_flow_motion", &cs_flow_motion_}, {"cs_flow_fill", &cs_flow_fill_},
+        {"cs_ret_cells", &cs_ret_cells_}, {"cs_ret_enclose", &cs_ret_enclose_}, {"cs_ret_layer", &cs_ret_layer_},
+        {"cs_ret_align", &cs_ret_align_}, {"cs_ret_pick", &cs_ret_pick_}, {"cs_ret_shift", &cs_ret_shift_}};
     for (auto& x : xs) {
         auto code = compile(x.entry, "cs_5_0", error, kShadersX);
         if (!code) return false;
@@ -2046,6 +2282,10 @@ bool Renderer::create_pipelines(std::string& error) {
     bd.Width = 16;
     if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&hud_counts_)))) {
         error = "HUD counter buffer"; return false;
+    }
+    bd.Width = (kRetTrackN + 4) * 4;  // sight reticles: a sum per shift tried, the weight, the shift chosen (cs_ret_align)
+    if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&ret_buf_)))) {
+        error = "reticle tracking buffer"; return false;
     }
     bd.Width = kSceneFitBytes;
     if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&scene_fit_)))) {
@@ -2347,7 +2587,7 @@ void Renderer::keep_history(PrivateId colour, std::uint32_t depth_w, std::uint32
 }
 
 ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const float clip_to_prev_clip[16], bool hud, bool attached,
-                                             bool keep_attached, bool depth_inverted, bool combined, bool fill, int stretch) {
+                                             bool keep_attached, bool depth_inverted, bool combined, bool fill, int stretch, bool reticles) {
     if (!src.has_depth || !private_[kPObject].texture) return nullptr;
     const UINT ow = private_[kPBackbuffer].width, oh = private_[kPBackbuffer].height;
     const bool new_score = !private_[kPHudScore].texture || private_[kPHudScore].width != ow || private_[kPHudScore].height != oh;
@@ -2506,6 +2746,73 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
         x_dispatch(cs_attached_.Get(), &c, kXAttSrv, kXAttUav, (c.rect[2] + 7) / 8, (c.rect[3] + 7) / 8);
         transition(private_[kPAttached], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
+    // Sight reticles drawn without depth (option, see cs_ret_layer): with the character/weapon held and the previous
+    // game frame's picture to compare this one with (the HUD-less pictures when the previous one is HUD-less).
+    bool reticle = false;
+    if (reticles && keep_att && previous_valid_ && private_[kPPrevious].texture && private_[kPPrevious].width == ow &&
+        private_[kPPrevious].height == oh) {
+        const PrivateId current = previous_from_hudless_ ? kPHudless : kPBackbuffer;
+        // cells of 0.55% of the render height (4 px at 720p)
+        const UINT cell = std::max(1u, static_cast<UINT>(std::lround(0.0055 * double(c.rect[3]))));
+        const UINT cw = (c.rect[2] + cell - 1) / cell, ch = (c.rect[3] + cell - 1) / cell;
+        ID3D12Resource* const history_before = private_[kPRetA].texture.Get();
+        reticle = private_[current].texture && private_[current].width == ow && private_[current].height == oh &&
+                  ensure_private(kPRetCells, cw, ch, DXGI_FORMAT_R16G16B16A16_FLOAT) &&
+                  ensure_private(kPRetEncl, cw, ch, DXGI_FORMAT_R16G16B16A16_FLOAT) &&
+                  ensure_private(kPRetA, ow, oh, DXGI_FORMAT_R16G16B16A16_FLOAT) && ensure_private(kPRetB, ow, oh, DXGI_FORMAT_R16G16B16A16_FLOAT) &&
+                  ensure_private(kPRetLayer, ow, oh, DXGI_FORMAT_R16G16B16A16_FLOAT);
+        if (reticle) {
+            const bool fresh = private_[kPRetA].texture.Get() != history_before;
+            const PrivateId from = ret_flip_ ? kPRetB : kPRetA, to = ret_flip_ ? kPRetA : kPRetB;
+            XConstants k = c;
+            k.mv_size[0] = cw; k.mv_size[1] = ch;
+            k.groups_x = cell;
+            // reach: 25% of the screen height, in cells (sight windows of any size; the gun is needed in all 8 directions)
+            k.threshold = std::ceil(0.25f * float(c.rect[3]) / float(cell));
+            k.flags = fresh ? 2u : 0u;
+            for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXRetCellsSrv + i, i == 1 ? kPDepth : kPObject);
+            set_x_uav(kXRetCellsUav + 0, kPRetCells); set_x_uav(kXRetCellsUav + 1, kPRetCells);
+            transition(private_[kPRetCells], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            x_dispatch(cs_ret_cells_.Get(), &k, kXRetCellsSrv, kXRetCellsUav, (cw + 7) / 8, (ch + 7) / 8);
+            transition(private_[kPRetCells], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXRetEnclSrv + i, kPRetCells);
+            set_x_uav(kXRetEnclUav + 0, kPRetEncl); set_x_uav(kXRetEnclUav + 1, kPRetEncl);
+            transition(private_[kPRetEncl], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            x_dispatch(cs_ret_enclose_.Get(), &k, kXRetEnclSrv, kXRetEnclUav, (cw + 7) / 8, (ch + 7) / 8);
+            // Where the reticle went since the previous frame (cs_ret_align, cs_ret_pick), into the cells (cs_ret_shift).
+            D3D12_UNORDERED_ACCESS_VIEW_DESC raw{};
+            raw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; raw.Format = DXGI_FORMAT_R32_TYPELESS;
+            raw.Buffer.NumElements = kRetTrackN + 4; raw.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+            D3D12_RESOURCE_BARRIER buf{}; buf.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; buf.UAV.pResource = ret_buf_.Get();
+            if (!fresh) {
+                for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXRetAlignSrv + i, i == 1 ? from : current);
+                set_x_uav(kXRetAlignUav + 0, kPRetCells);
+                device_->CreateUnorderedAccessView(ret_buf_.Get(), nullptr, &raw, cpu(kXRetAlignUav + 1));
+                x_dispatch(cs_ret_align_.Get(), &k, kXRetAlignSrv, kXRetAlignUav, (ow + 7) / 8, (oh + 7) / 8);
+                list_->ResourceBarrier(1, &buf);
+            }
+            device_->CreateUnorderedAccessView(ret_buf_.Get(), nullptr, &raw, cpu(kXRetPickUav + 0));
+            device_->CreateUnorderedAccessView(ret_buf_.Get(), nullptr, &raw, cpu(kXRetPickUav + 1));
+            x_dispatch(cs_ret_pick_.Get(), &k, kXRetCellsSrv, kXRetPickUav, 1, 1);
+            list_->ResourceBarrier(1, &buf);
+            set_x_uav(kXRetShiftUav + 0, kPRetEncl);
+            device_->CreateUnorderedAccessView(ret_buf_.Get(), nullptr, &raw, cpu(kXRetShiftUav + 1));
+            D3D12_RESOURCE_BARRIER encl{}; encl.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; encl.UAV.pResource = private_[kPRetEncl].texture.Get();
+            list_->ResourceBarrier(1, &encl);  // (the enclosure written above, read and rewritten here)
+            x_dispatch(cs_ret_shift_.Get(), &k, kXRetEnclSrv, kXRetShiftUav, (cw + 7) / 8, (ch + 7) / 8);
+            transition(private_[kPRetEncl], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            const PrivateId srvs[kXSrvCount] = {current, kPPrevious, kPDepth, kPAttached, kPRetEncl, from};
+            for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXRetSrv + i, srvs[i]);
+            set_x_uav(kXRetUav + 0, to); set_x_uav(kXRetUav + 1, kPRetLayer);
+            transition(private_[to], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            transition(private_[kPRetLayer], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            x_dispatch(cs_ret_layer_.Get(), &k, kXRetSrv, kXRetUav, (ow + 7) / 8, (oh + 7) / 8);
+            transition(private_[to], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            transition(private_[kPRetLayer], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            ret_flip_ = !ret_flip_;
+        }
+    }
+    layer_built_ = reticle;
     // The stretch around them (option): the distance share, in two passes.
     const bool ramp = keep_att && stretch > 0 && ensure_private(kPRampRows, w, h, DXGI_FORMAT_R8_UNORM) &&
                       ensure_private(kPRamp, w, h, DXGI_FORMAT_R8_UNORM);
@@ -2702,6 +3009,11 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
     } else {
         for (UINT i = 6; i < kWSrvCount; ++i) set_x_srv(t + i, kPDepth, true);
     }
+    // Sight reticles (option): the layer on the glass of the shown frame (not with the game's generated images: it
+    // belongs to the frame itself).
+    const bool layer = mask && !gen && (split_ ? shown_layer_ : layer_built_) && shown(kPRetLayer).texture &&
+                       shown(kPRetLayer).width == ow && shown(kPRetLayer).height == oh;
+    if (layer) { c.flags |= 2048u; set_x_srv(t + 11, kPRetLayer, true); }
     set_x_uav(kWUav(kWWarp) + 0, kPOutput); set_x_uav(kWUav(kWWarp) + 1, kPOutput);
     transition(private_[kPOutput], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     w_dispatch(cs_own_warp_.Get(), &c, wc, kWWarp, (ow + 7) / 8, (oh + 7) / 8);
@@ -2890,7 +3202,7 @@ bool Renderer::set_split(bool on) {
     // Turning on: what was taken in so far becomes the shown set. Turning off: the shown set goes back to
     // where the single queue reads everything.
     swap_shown();
-    if (on) { shown_mask_ = mask_ready_; shown_fill_ = fill_ready_; shown_stretch_ = stretch_built_; }
+    if (on) { shown_mask_ = mask_ready_; shown_fill_ = fill_ready_; shown_stretch_ = stretch_built_; shown_layer_ = layer_built_; }
     else { mask_ready_ = shown_mask_; fill_ready_ = shown_fill_; }
     private_[kPPrevious] = Private{};  // (with split queues an alias of a shown texture)
     previous_valid_ = false;
@@ -2915,6 +3227,7 @@ bool Renderer::show_intake() {
     shown_mask_ = built_mask_;
     shown_objects_ = objects_built_;
     shown_stretch_ = stretch_built_;
+    shown_layer_ = layer_built_;
     shown_fill_ = fill_ready_;
     mem_shown_ = mem_pending_;
     // Warps recorded so far may still read the set the intake writes next.
@@ -3027,7 +3340,7 @@ void Renderer::transition(Private& p, D3D12_RESOURCE_STATES to) {
 
 bool Renderer::open_session(DWORD pid, std::uint64_t session, std::string& error) {
     wait_idle();
-    pending_show_ = 0; release_wait_ = 0; shown_mask_ = shown_fill_ = false;
+    pending_show_ = 0; release_wait_ = 0; shown_mask_ = shown_fill_ = shown_layer_ = false;
     mem_last_ = mem_shown_ = mem_pending_ = -1;
     fence_game_.Reset();
     for (auto& slot : shared_) for (auto& t : slot) t = SharedTex{};
@@ -3610,7 +3923,7 @@ void Renderer::stash_source(int set, bool hudless) {
 bool Renderer::read_back(int which, std::vector<std::uint16_t>& pixels, std::uint32_t& w, std::uint32_t& h) {
     static const PrivateId kWhich[] = {kPBackbuffer, kPOutput, kPScene, kPDepth, kPMotion, kPObject, kPMask, kPHudScore, kPWorld, kPFill,
                                        kPStashColor, kPStashDepth, kPStashMotion, kPFlowB, kPStashHudless, kPStash2Color, kPStash2Hudless,
-                                       kPStash2Depth, kPStash2Motion, kPHudless, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPUi, kPWarpMask};
+                                       kPStash2Depth, kPStash2Motion, kPHudless, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPUi, kPWarpMask, kPRetLayer};
     if (which < 0 || which >= int(std::size(kWhich))) return false;
     auto& p = split_ && shown_id(kWhich[which]) ? front_[kWhich[which]] : private_[kWhich[which]];
     if (!p.texture) return false;

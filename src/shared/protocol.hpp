@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 52;
+constexpr std::uint32_t kVersion = 54;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -95,6 +95,8 @@ struct Settings {
     std::uint32_t show_mask;       // debug: tint the no-warp mask (magenta) and the HUD score still learning (green)
     std::uint32_t floor_release;   // option, on by default (saved per game): while turns are predicted around a measured orbit pivot, the
                                    // turn rule does not hold the ground around the character (near the pivot's distance)
+    std::uint32_t hold_reticles;   // option, on by default (saved per game): a sight's reticle drawn without depth of its own moves
+                                   // with the gun (what is on the glass, learned as a layer; see cs_ret_layer)
     std::uint32_t hud_from_scene;  // HUD detection, saved per game in ReShade.ini: 0 learned, 1 from the upscaler's output,
                                    // 2 (default) from the upscaler's output where the pixels do not follow the world (combined);
                                    // without an upscaler output the learned detection is used
@@ -229,7 +231,12 @@ struct NgxStats {
     std::uint32_t identified_by_inputs;  // DLSS handles recognised from their inputs (created before our hooks)
     std::uint32_t frames_published;  // frames published from DLSS calls (camera estimated by the presenter)
     std::uint32_t frames_joined;     // depth and motion vectors taken at the DLSS call for the game's own (Streamline) camera
+    // Optional masks the game hands DLSS (diagnostics; bits: kNgxMask...), and the bias-current-colour mask's texture.
+    std::uint32_t masks, bias_w, bias_h, bias_format;
 };
+enum NgxMask : std::uint32_t { kNgxMaskTransparency = 1, kNgxMaskParticles = 2, kNgxMaskAnimatedTexture = 4, kNgxMaskBiasCurrentColor = 8,
+                               kNgxMaskTransparencyLayer = 16, kNgxMaskTransparencyOpacity = 32, kNgxMaskTransparencyMvecs = 64,
+                               kNgxMaskDisocclusion = 128, kNgxMaskResponsivity = 256 };
 
 // AMD FidelityFX (FSR 3.1 / FSR 4) upscaler calls, for diagnostics and games without Streamline.
 struct FsrStats {
@@ -239,6 +246,8 @@ struct FsrStats {
     float jitter[2], mv_scale[2];
     float near_plane, far_plane, fov;  // as FSR is told them (fov: vertical, radians)
     std::uint32_t frames_published, outputs_copied;
+    // Optional masks the game hands FSR (diagnostics): bit 0 reactive, bit 1 transparency & composition; their sizes.
+    std::uint32_t masks, reactive_w, reactive_h, composition_w, composition_h;
 };
 
 struct Shared {

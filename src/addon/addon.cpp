@@ -106,6 +106,7 @@ constexpr Persisted kPersisted[] = {
     {"OrbitDistance", nullptr, &fw::Settings::orbit_distance},
     {"OrbitMode", &fw::Settings::orbit_mode, nullptr},
     {"FloorRelease", &fw::Settings::floor_release, nullptr},
+    {"HoldReticles", &fw::Settings::hold_reticles, nullptr},
     {"MaxExtrapolation", nullptr, &fw::Settings::max_horizon_ms},
     {"PresentLead", nullptr, &fw::Settings::present_lead_ms},
     {"PresentLeadAuto", &fw::Settings::present_lead_auto, nullptr},
@@ -824,6 +825,12 @@ void draw_overlay(effect_runtime*) {
                 reshade::set_config_value(nullptr, "FrameWarp", "HoldOrbitedCharacter", orbited ? "1" : "0");
             }
             hint("For over-the-shoulder cameras that circle the character: what barely moves on screen while turning is held.");
+            bool reticles = s.hold_reticles != 0;
+            if (ImGui::Checkbox("Hold sight reticles", &reticles)) s.hold_reticles = reticles;
+            hint("For red dot and holographic sights whose reticle skips while turning: the game draws it without depth of its own, "
+                 "so it is warped with the scenery behind the glass. Here what is on the glass (reticle, glow, reflections) is "
+                 "learned as a layer that moves with the gun, within a few frames of turning, and the warp moves only the scenery "
+                 "under it. Sights the game draws with depth are held already. XPAR engine. Remembered per game.");
         }
         if (mask) {
             static const char* const kHudFind[] = {"Learned from camera motion", "From the upscaler output (DLSS or FSR)",

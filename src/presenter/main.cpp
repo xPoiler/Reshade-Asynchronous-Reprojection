@@ -201,11 +201,50 @@ void record_hooks(const Shared& sh, double now) {
         static char logged[320] = "";
         char line[320];
         if (n.dlss_feature) {
+            static const std::pair<std::uint32_t, const char*> kMasks[] = {
+                {kNgxMaskTransparency, "transparency"}, {kNgxMaskParticles, "particles"}, {kNgxMaskAnimatedTexture, "animated textures"},
+                {kNgxMaskBiasCurrentColor, "bias current colour"}, {kNgxMaskTransparencyLayer, "transparency layer"},
+                {kNgxMaskTransparencyOpacity, "transparency opacity"}, {kNgxMaskTransparencyMvecs, "transparency motion vectors"},
+                {kNgxMaskDisocclusion, "disocclusion"}, {kNgxMaskResponsivity, "responsivity"}};
+            char masks[160] = "";
+            for (const auto& [bit, name] : kMasks)
+                if (n.masks & bit) std::snprintf(masks + std::strlen(masks), sizeof(masks) - std::strlen(masks), "%s%s", masks[0] ? ", " : "", name);
             std::snprintf(line, sizeof(line), "DLSS inputs: feature %u, flags 0x%x, render %ux%u -> %ux%u, subrect %ux%u, depth %ux%u fmt %u, motion vectors %ux%u fmt %u, "
-                          "scale %.6g x %.6g", n.dlss_feature, n.create_flags, n.render_w, n.render_h, n.out_w, n.out_h, n.subrect_w, n.subrect_h, n.depth_w,
-                          n.depth_h, n.depth_format, n.mv_w, n.mv_h, n.mv_format, n.mv_scale[0], n.mv_scale[1]);
+                          "scale %.6g x %.6g; optional masks: %s", n.dlss_feature, n.create_flags, n.render_w, n.render_h, n.out_w, n.out_h, n.subrect_w,
+                          n.subrect_h, n.depth_w, n.depth_h, n.depth_format, n.mv_w, n.mv_h, n.mv_format, n.mv_scale[0], n.mv_scale[1],
+                          masks[0] ? masks : "none");
+            if (n.masks & kNgxMaskBiasCurrentColor)
+                std::snprintf(line + std::strlen(line), sizeof(line) - std::strlen(line), " (bias mask %ux%u fmt %u)", n.bias_w, n.bias_h, n.bias_format);
             if (std::strcmp(line, logged) != 0) { logf("%s", line); std::snprintf(logged, sizeof(logged), "%s", line); }
         }
+    }
+    {
+        const auto& f = sh.fsr;
+        static char logged[200] = "";
+        char line[200];
+        if (f.upscale_dispatches) {
+            std::snprintf(line, sizeof(line), "FSR inputs: render %ux%u -> %ux%u, flags 0x%x; reactive mask %s, transparency & composition mask %s", f.render_w,
+                          f.render_h, f.out_w, f.out_h, f.create_flags, (f.masks & 1) ? "yes" : "none", (f.masks & 2) ? "yes" : "none");
+            if (f.masks & 1) std::snprintf(line + std::strlen(line), sizeof(line) - std::strlen(line), " (reactive %ux%u)", f.reactive_w, f.reactive_h);
+            if (f.masks & 2)
+                std::snprintf(line + std::strlen(line), sizeof(line) - std::strlen(line), " (composition %ux%u)", f.composition_w, f.composition_h);
+            if (std::strcmp(line, logged) != 0) { logf("%s", line); std::snprintf(logged, sizeof(logged), "%s", line); }
+        }
+    }
+    {
+        // The Streamline buffer types the game tags (sl_consts.h numbers; optional hints such as a reactive, transparency
+        // or bias-current-colour mask show up as extra types), whenever the set, a size or a format changes.
+        const auto& h = sh.hooks;
+        static char logged[600] = "";
+        char line[600] = "Streamline tags:";
+        bool any = false;
+        for (int t = 0; t < 64; ++t)
+            if (h.tag_count[t]) {
+                any = true;
+                std::snprintf(line + std::strlen(line), sizeof(line) - std::strlen(line), " %d (%ux%u fmt %u)", t, h.tag_width[t], h.tag_height[t],
+                              h.tag_format[t]);
+            }
+        if (any && std::strcmp(line, logged) != 0) { logf("%s", line); std::snprintf(logged, sizeof(logged), "%s", line); }
     }
     if (now - last < 1.0 || (!rec(g_app.csv_hooks) && !rec(g_app.csv_upscaler))) return;
     last = now;
@@ -604,7 +643,7 @@ void render_thread() {
     int poor_estimate_windows = 0;   // ...and, once it was found unusable, whether the estimate does any better
     bool have_source_kind = false, source_was_estimated = false, source_motion_estimated = false;
     double last_mv_log = 0, last_usage_log = 0;
-    bool game_has_hud_layers = false, mask_logged = false, source_masked = false, hudless_hud_logged = false;
+    bool game_has_hud_layers = false, mask_logged = false, source_masked = false, hudless_hud_logged = false, reticles_logged = false;
     CameraEstimator estimator;
     // Whether the estimated camera can be learned from: the frame itself was explained, and so were most of the last 60.
     std::deque<bool> estimate_rejects;
@@ -726,7 +765,9 @@ void render_thread() {
             // The previous frame's colour feeds the learned HUD detector; not needed while the HUD comes from
             // the upscaler's output.
             const bool hud_from_output = settings.hud_from_scene == 1 && m.tex[kScene].valid;  // (combined: 2 needs it)
-            renderer.set_keep_previous_colour(settings.no_warp_mask != 0 && !game_has_hud_layers && !hud_from_output);
+            // (sight reticles, option: compared with the previous frame too)
+            renderer.set_keep_previous_colour((settings.no_warp_mask != 0 && !game_has_hud_layers && !hud_from_output) ||
+                                              (settings.hold_reticles != 0 && settings.keep_attached != 0));
             // Moving objects (option, XPAR engine): every frame keeps the previous one's picture and depth.
             renderer.set_object_history(moving_objects_on());
             intake = {};
@@ -952,7 +993,8 @@ void render_thread() {
                     renderer.build_no_warp_mask(for_mask, cam.clip_to_prev_clip, hud_mask, s.has_motion && mv_scale.valid, attached_mask,
                                                 cam.depth_inverted != 0, settings.hud_from_scene == 2,
                                                 settings.hud_fill != 0 && (settings.warp_engine == 1 || !latewarp.ready()),
-                                                settings.warp_engine == 1 || !latewarp.ready() ? static_cast<int>(settings.stretch_width) : 0);
+                                                settings.warp_engine == 1 || !latewarp.ready() ? static_cast<int>(settings.stretch_width) : 0,
+                                                settings.hold_reticles != 0);
                     // Background memory (option, XPAR engine): the scenery last seen behind held pixels and just
                     // beyond the frame, for what the warp uncovers there.
                     if (settings.background_memory && (settings.warp_engine == 1 || !latewarp.ready())) {
@@ -975,6 +1017,10 @@ void render_thread() {
                                  hs.frames, hs.learned, hs.learned ? 100.0 * hs.share_sum / hs.learned : 0.0, hs.too_little, hs.guarded);
                     }
                     if (!mask_logged) { logf("no-warp mask: %s%s", hud_mask ? "HUD (the game has no HUD layers)" : "", attached_mask ? (hud_mask ? " + character/weapon" : "character/weapon") : ""); mask_logged = true; }
+                    if (settings.hold_reticles && attached_mask && !reticles_logged) {
+                        logf("sight reticles: what is on the glass the character/weapon encloses is learned as a layer that moves with the gun (option, XPAR engine)");
+                        reticles_logged = true;
+                    }
                     if (hud_mask && s.has_hudless && !s.has_ui && !hudless_hud_logged) {
                         logf("HUD: found from the game's HUD-less picture (sent without a UI layer)");
                         hudless_hud_logged = true;
@@ -1465,7 +1511,7 @@ void render_thread() {
                                               std::pair{15, L"prev2_frame"}, std::pair{16, L"prev2_hudless"}, std::pair{17, L"prev2_depth"},
                                               std::pair{18, L"prev2_motion"}, std::pair{19, L"hudless"}, std::pair{20, L"gen0"},
                                               std::pair{21, L"gen1"}, std::pair{22, L"gen2"}, std::pair{23, L"gen0_depth"},
-                                              std::pair{24, L"gen1_depth"}, std::pair{25, L"gen2_depth"}, std::pair{26, L"ui"}}) {
+                                              std::pair{24, L"gen1_depth"}, std::pair{25, L"gen2_depth"}, std::pair{26, L"ui"}, std::pair{28, L"layer"}}) {
                 std::vector<std::uint16_t> px;
                 std::uint32_t cw = 0, ch = 0;
                 if (which == 2 && !source.has_scene) { logf("capture %d: no upscaler output this frame", n); continue; }

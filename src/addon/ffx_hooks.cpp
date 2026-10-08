@@ -234,7 +234,15 @@ struct Upscale {
     FfxApiDimensions2D render, upscale;
     bool reset;
     float near_plane, far_plane, fov;
+    // (diagnostics) optional masks: bit 0 reactive, bit 1 transparency & composition; their sizes
+    std::uint32_t masks, reactive_w, reactive_h, composition_w, composition_h;
 };
+template <typename R> void note_masks(Upscale& u, const R& reactive, const R& composition) {
+    u.masks = (reactive.resource ? 1u : 0u) | (composition.resource ? 2u : 0u);
+    u.reactive_w = reactive.resource ? reactive.description.width : 0; u.reactive_h = reactive.resource ? reactive.description.height : 0;
+    u.composition_w = composition.resource ? composition.description.width : 0;
+    u.composition_h = composition.resource ? composition.description.height : 0;
+}
 
 // Before the upscaler records its work: statistics, and this frame's depth and motion vectors when nothing
 // else provides them (DLSS not publishing, Streamline sending no depth for the last second):
@@ -254,6 +262,8 @@ std::uint64_t before_upscale(const Upscale& u) {
     s->jitter[0] = u.jitter.x; s->jitter[1] = u.jitter.y;
     s->mv_scale[0] = u.mv_scale.x; s->mv_scale[1] = u.mv_scale.y;
     s->near_plane = u.near_plane; s->far_plane = u.far_plane; s->fov = u.fov;
+    s->masks = u.masks; s->reactive_w = u.reactive_w; s->reactive_h = u.reactive_h;
+    s->composition_w = u.composition_w; s->composition_h = u.composition_h;
     if (u.reset) ++s->resets;
     std::uint32_t flags = 0;
     const bool known = u.context && flags_of(u.context, flags);
@@ -400,6 +410,7 @@ ffxReturnCode_t hk_dispatch(ffxContext* context, const ffxApiHeader* desc) {
              d3d12_state(up->depth.state), d3d12_state(up->motionVectors.state), d3d12_state(up->output.state),
              up->jitterOffset, up->motionVectorScale, up->renderSize, up->upscaleSize, up->reset,
              up->cameraNear, up->cameraFar, up->cameraFovAngleVertical};
+        note_masks(u, up->reactive, up->transparencyAndComposition);
         published = before_upscale(u);
     }
     ++t_depth;
@@ -460,6 +471,7 @@ std::int32_t hk_sdk_dispatch(void* context, const FfxSdkUpscalerDispatchDescript
              d3d12_state(d->depth.state), d3d12_state(d->motionVectors.state), d3d12_state(d->output.state),
              d->jitterOffset, d->motionVectorScale, d->renderSize, {d->output.description.width, d->output.description.height}, d->reset,
              d->cameraNear, d->cameraFar, d->cameraFovAngleVertical};
+        note_masks(u, d->reactive, d->transparencyAndComposition);
         published = before_upscale(u);
     }
     ++t_depth;
@@ -501,13 +513,15 @@ int fsr2_layout(const void* desc) {
 
 template <typename R>
 Upscale fsr2_upscale(void* context, const Fsr2DispatchDescription<R>* d) {
-    return {context, static_cast<ID3D12GraphicsCommandList*>(d->commandList),
+    Upscale u{context, static_cast<ID3D12GraphicsCommandList*>(d->commandList),
             d->depth.resource, d->depth.state, d->depth.description.format,
             d->motionVectors.resource, d->motionVectors.state, d->motionVectors.description.format,
             d->output.resource, d->output.state,
             fsr2_state(d->depth.state), fsr2_state(d->motionVectors.state), fsr2_state(d->output.state),
             d->jitterOffset, d->motionVectorScale, d->renderSize, {d->output.description.width, d->output.description.height}, d->reset,
             d->cameraNear, d->cameraFar, d->cameraFovAngleVertical};
+    note_masks(u, d->reactive, d->transparencyAndComposition);
+    return u;
 }
 
 std::int32_t hk_fsr2_dispatch(void* context, const void* desc) {

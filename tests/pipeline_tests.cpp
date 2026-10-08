@@ -777,7 +777,7 @@ int main(int argc, char** argv) {
             renderer.begin_frame();
             IngestedSource s = renderer.ingest(sh, s_slot);
             renderer.analyze_motion(s, analyze_cam->clip_to_prev_clip, 1.0f, 1.0f, true, true, near_rule, turn_rule);
-            renderer.build_no_warp_mask(s, moving_cam.clip_to_prev_clip, hud, weapon, weapon, true, combined_hud, hud_fill, stretch);
+            renderer.build_no_warp_mask(s, moving_cam.clip_to_prev_clip, hud, weapon, weapon, true, combined_hud, hud_fill, stretch, true);  // (sight reticles on: must not disturb the masks)
             if (memory) renderer.update_memory(s, analyze_cam->clip_to_prev_clip, true, memory_consecutive);
             renderer.finish_frame(false, 0);
             renderer.wait_idle();
