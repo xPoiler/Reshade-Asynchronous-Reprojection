@@ -1,4 +1,5 @@
 #include "addon/streamline_hooks.hpp"
+#include "addon/ui_probe.hpp"
 #include "common/inline_hook.hpp"
 #include <array>
 #include <atomic>
@@ -262,6 +263,7 @@ int hk_set_tag_for_frame(const void* frame, const void* viewport, const void* ta
 
 int hk_evaluate(std::uint32_t feature, const void* frame, const void** inputs, std::uint32_t count, void* cmd) {
     if (auto* s = stats()) ++s->export_calls[3];
+    fw::ui_probe::mark(reinterpret_cast<std::uint64_t>(cmd), ("upscaler: Streamline evaluate, feature " + std::to_string(feature)).c_str());
     const int result = reinterpret_cast<EvaluateFeatureFn>(g_evaluate_hook.original())(feature, frame, inputs, count, cmd);
     std::uint32_t id = 0;
     if (g_producer && cmd && read_frame_token(frame, &id)) {

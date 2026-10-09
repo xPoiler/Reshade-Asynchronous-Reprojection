@@ -77,6 +77,13 @@ public:
     void on_tag(std::uint64_t frame, Tex kind, ID3D12Resource* source, D3D12_RESOURCE_STATES state,
                 std::uint32_t ext_x, std::uint32_t ext_y, std::uint32_t ext_w, std::uint32_t ext_h,
                 ID3D12GraphicsCommandList* list);
+    // The game's HUD layer (see ui_layer.hpp): copied where the game finishes with it, on its `list`, into a texture of
+    // our own - then at the present into the presented frame's UI slot (the GPU runs the two in that order, so the frame
+    // and its HUD stay together; a UI layer the game tags itself is left as it is).
+    void on_ui_layer(ID3D12Resource* source, D3D12_RESOURCE_STATES state, ID3D12GraphicsCommandList* list);
+    // The same for a HUD-less copy of the game's final picture (second pattern, ui_layer.hpp) - into the frame's HUD-less
+    // slot, unless the frame has a HUD layer or its own HUD-less picture.
+    void on_hudless_copy(ID3D12Resource* source, D3D12_RESOURCE_STATES state, ID3D12GraphicsCommandList* list);
     // At the game's present: copies the backbuffer via `list`, then the caller must submit `list`
     // on `queue`; finish_present() signals the fence afterwards.
     std::uint64_t begin_present(ID3D12Resource* backbuffer, ID3D12GraphicsCommandList* list);
@@ -162,6 +169,19 @@ private:
     HANDLE mapping_ = nullptr;
     Shared* shared_ = nullptr;
     Microsoft::WRL::ComPtr<ID3D12Device> device_;
+    Microsoft::WRL::ComPtr<ID3D12Resource> ui_pending_;  // the HUD layer taken this frame (on_ui_layer)
+    bool ui_pending_valid_ = false;
+    Microsoft::WRL::ComPtr<ID3D12Resource> hudless_pending_;  // the HUD-less copy taken this frame (on_hudless_copy)
+    std::uint32_t hudless_age_ = 2;  // presents since the last one (handed over while at most 1)
+    // ...handed over as its coverage only (alpha, 8-bit, one channel - made at the present on ReShade's list): a few MB a
+    // frame whatever the game's format, and the frames' textures never change when a menu brings a layer of another one.
+    Microsoft::WRL::ComPtr<ID3D12Resource> ui_alpha_;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> ui_root_;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> ui_pso_;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> ui_heap_;  // (a ring of SRV + UAV pairs: frames in flight keep theirs)
+    UINT ui_heap_step_ = 0, ui_ring_ = 0;
+    bool ui_pass_failed_ = false;
+    bool ensure_ui_pass();
     Microsoft::WRL::ComPtr<ID3D12Device> own_device_;  // Vulkan games
     std::unique_ptr<VkTransport> vk_;
     Microsoft::WRL::ComPtr<ID3D11Device5> d11_;

@@ -580,6 +580,8 @@ int main(int argc, char** argv) {
         // The game's HUD-less picture without a UI layer (Cyberpunk 2077 with frame generation): the frame as it
         // is just before the HUD patch is drawn.
         bool with_hudless = false;
+        bool hudless_copy = false;  // the HUD-less picture as the add-on copies a game's final picture before its HUD (no tag)
+        bool with_ui_layer = false;  // the HUD patch only in a UI layer of its own (as the add-on takes Cyberpunk's), nothing else
         // A bright yellow-white surface the tone mapping washes out towards white (as filmic tone mappers
         // do): scene (4, 4, 0.25) -> per channel (1, 1, 0.5), washed 80% towards its grey 0.964.
         bool washed_patch = false;
@@ -601,8 +603,15 @@ int main(int argc, char** argv) {
         bool hud_fill = false;      // own warp: fill behind the HUD from the upscaler's output
         bool near_rule = true;      // attached: near-camera pixels moving against the camera model count
         const D3D12_RECT washed_rect{LONG(W * 3 / 4), LONG(H * 5 / 8), LONG(W * 3 / 4) + 64, LONG(H * 5 / 8) + 64};
-        ComPtr<ID3D12Resource> scene_tex, hudless_tex;
+        ComPtr<ID3D12Resource> scene_tex, hudless_tex, ui_layer_tex;
         game->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &cd, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&hudless_tex));
+        game->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &cd, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&ui_layer_tex));
+        ComPtr<ID3D12DescriptorHeap> ui_layer_rtv;
+        {
+            D3D12_DESCRIPTOR_HEAP_DESC uh{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            game->CreateDescriptorHeap(&uh, IID_PPV_ARGS(&ui_layer_rtv));
+            game->CreateRenderTargetView(ui_layer_tex.Get(), nullptr, ui_layer_rtv->GetCPUDescriptorHandleForHeapStart());
+        }
         ComPtr<ID3D12DescriptorHeap> scene_rtv;
         {
             D3D12_RESOURCE_DESC sd = cd; sd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -722,6 +731,18 @@ int main(int argc, char** argv) {
             producer.on_tag(fid, kMotion, motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 0, 0, DW, DH, list.Get());
             if (with_scene) producer.on_tag(fid, kScene, scene_tex.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 0, 0, W, H, list.Get());
             if (with_hudless) producer.on_tag(fid, kHudless, hudless_tex.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 0, 0, W, H, list.Get());
+            if (with_ui_layer) {  // (transparent but for the HUD patch, as in the frame)
+                const auto urtv = ui_layer_rtv->GetCPUDescriptorHandleForHeapStart();
+                const float clear0[4] = {0, 0, 0, 0}, opaque[4] = {green[0], green[1], green[2], 1};
+                list->ClearRenderTargetView(urtv, clear0, 0, nullptr);
+                for (LONG x = hx0; x < hx1; x += 4) {
+                    const D3D12_RECT stripe{x, hy0, std::min(x + 2, hx1), hy1};
+                    list->ClearRenderTargetView(urtv, opaque, 1, &stripe);
+                }
+                // (as the add-on hands a game's HUD layer over: copied, then its coverage made at the present)
+                producer.on_ui_layer(ui_layer_tex.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, list.Get());
+            }
+            if (hudless_copy) producer.on_hudless_copy(hudless_tex.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, list.Get());
             const auto t = producer.begin_present(backbuffer.Get(), list.Get());
             list->Close();
             queue->ExecuteCommandLists(1, lists);
@@ -1143,17 +1164,45 @@ int main(int argc, char** argv) {
         renderer.reset_hud_detection();
         combined_hud = true;
         IngestedSource neon_src{};
-        for (int k = 0; k < 4; ++k) {
+        // (8 frames: the HUD is held once the learned map confirms it near there, after a few frames of camera motion - with
+        // the scenery moving with the camera, 6 px per frame like the neon: frozen while the camera moves, the whole
+        // textured scene looked like HUD, a suspect frame nothing is learned from)
+        for (int k = 0; k < 8; ++k) {
             neon_x = LONG(W * 5 / 8) - 6 * k;
+            stripe_phase = LONG(((12 - 6 * k) % 16 + 16) % 16);
             neon_src = ingest_frame(publish(731 + k, 0.1f, 0, false, true), true, false);
         }
+        stripe_phase = -1;
         show(neon_src, 0);
+        if (std::getenv("FW_LEARNED_DEBUG")) {
+            renderer.wait_idle();
+            renderer.begin_frame(); renderer.finish_frame(false, 0); renderer.wait_idle();  // (the slots' counters collected)
+            renderer.begin_frame(); renderer.finish_frame(false, 0); renderer.wait_idle();
+            const HudStats hs = renderer.take_hud_stats();
+            std::printf("learned: %d frames, learned from %d, too little detail %d, held back by the guard %d (unchanged %.0f, changed %.0f per frame)\n", hs.frames, hs.learned, hs.too_little, hs.guarded,
+                        hs.evidence_sum / std::max(1, hs.frames), hs.changed_sum / std::max(1, hs.frames));
+            {
+                std::vector<std::uint16_t> kp; std::uint32_t kw = 0, kh = 0;
+                if (renderer.read_back(34, kp, kw, kh)) {
+                    std::size_t counts[5] = {};
+                    for (std::size_t i = 0; i < std::size_t(kw) * kh; ++i) { const int k = int(half_to_float(kp[i * 4]) + 0.5f); if (k >= 0 && k < 5) ++counts[k]; }
+                    std::printf("kinds: none %zu, evidence %zu, changed %zu, weapon %zu, changed elsewhere %zu\n", counts[0], counts[1], counts[2], counts[3], counts[4]);
+                }
+            }
+            for (const int which : {32, 33}) {
+                std::vector<std::uint16_t> lp; std::uint32_t lw = 0, lh = 0;
+                if (!renderer.read_back(which, lp, lw, lh)) { std::printf("learned %d: not read\n", which); continue; }
+                float mx = 0; std::size_t above = 0;
+                for (std::size_t i = 0; i < std::size_t(lw) * lh; ++i) { const float v = half_to_float(lp[i * 4]); mx = std::max(mx, v); above += v > 0.6f; }
+                std::printf("learned %d: %ux%u max %.3f above 0.6: %zu\n", which, lw, lh, mx, above);
+            }
+        }
         const double cn_x0 = magenta_x(), ch_x0 = green_x();
         show(neon_src, yaw);
         const double cn_x1 = magenta_x(), ch_x1 = green_x();
         combined_hud = false;
-        neon_x = LONG(W * 5 / 8) - 24;
-        IngestedSource neon_only = ingest_frame(publish(735, 0.1f, 0, false, true), true, false);
+        neon_x = LONG(W * 5 / 8) - 48;
+        IngestedSource neon_only = ingest_frame(publish(739,0.1f, 0, false, true), true, false);
         neon_x = -1;
         show(neon_only, 0);
         const double on_x0 = magenta_x();
@@ -1427,6 +1476,46 @@ int main(int argc, char** argv) {
             EXPECT(hl_src.has_hudless && !hl_src.has_ui, "the HUD-less picture is ingested without a UI layer");
             EXPECT(hp_x0 > 0 && std::fabs(hp_x1 - hp_x0) < 2.0, "HUD found from the HUD-less picture in one frame (%.1f -> %.1f)", hp_x0, hp_x1);
             EXPECT(std::fabs(hb_x1 - hb_x0) > 20.0, "the scene next to that HUD still warps (%.0f -> %.0f)", hb_x0, hb_x1);
+        }
+        // (P) HUD from the game's own HUD layer (no HUD-less picture): exactly where the layer is not transparent, in the
+        // very first frame; scenery that only looks like HUD (here the static bar) is not in it and warps.
+        {
+            renderer.reset_hud_detection();
+            with_ui_layer = true;
+            IngestedSource ul_src = ingest_frame(publish(985, 0.1f, 0, false, true), true, false);
+            with_ui_layer = false;
+            own_engine = true;
+            show(ul_src, 0);
+            const double up_x0 = green_x(), ub_x0 = peak(px, w, h, true, 1);
+            show(ul_src, yaw);
+            const double up_x1 = green_x(), ub_x1 = peak(px, w, h, true, 1);
+            own_engine = false;
+            std::printf("HUD from the game's HUD layer: patch x %.1f -> %.1f, bar x %.0f -> %.0f\n", up_x0, up_x1, ub_x0, ub_x1);
+            EXPECT(ul_src.has_ui && !ul_src.has_hudless, "the HUD layer is ingested without a HUD-less picture");
+            EXPECT(up_x0 > 0 && std::fabs(up_x1 - up_x0) < 2.0, "HUD taken from the HUD layer in one frame (%.1f -> %.1f)", up_x0, up_x1);
+            EXPECT(std::fabs(ub_x1 - ub_x0) > 20.0, "the scene next to it warps (%.0f -> %.0f)", ub_x0, ub_x1);
+        }
+        // (Q) HUD from a HUD-less copy of the game's final picture (taken before its HUD is drawn, no tag): held in the
+        // very first frame, the scenery next to it warps; with a HUD layer in the same frame the copy is dropped.
+        {
+            renderer.reset_hud_detection();
+            hudless_copy = true;
+            IngestedSource hc_src = ingest_frame(publish(986, 0.1f, 0, false, true), true, false);
+            own_engine = true;
+            show(hc_src, 0);
+            const double hp_x0 = green_x(), hb_x0 = peak(px, w, h, true, 1);
+            show(hc_src, yaw);
+            const double hp_x1 = green_x(), hb_x1 = peak(px, w, h, true, 1);
+            own_engine = false;
+            with_ui_layer = true;
+            IngestedSource both_src = ingest_frame(publish(987, 0.1f, 0, false, true), true, false);
+            with_ui_layer = false;
+            hudless_copy = false;
+            std::printf("HUD from a HUD-less copy: patch x %.1f -> %.1f, bar x %.0f -> %.0f\n", hp_x0, hp_x1, hb_x0, hb_x1);
+            EXPECT(hc_src.has_hudless && !hc_src.has_ui, "the HUD-less copy is ingested as the HUD-less picture");
+            EXPECT(hp_x0 > 0 && std::fabs(hp_x1 - hp_x0) < 2.0, "HUD taken from the HUD-less copy in one frame (%.1f -> %.1f)", hp_x0, hp_x1);
+            EXPECT(std::fabs(hb_x1 - hb_x0) > 20.0, "the scene next to it warps (%.0f -> %.0f)", hb_x0, hb_x1);
+            EXPECT(both_src.has_ui && !both_src.has_hudless, "with a HUD layer the HUD-less copy is dropped");
         }
         std::printf("HUD from the upscaler's output: patch x %.1f -> %.1f, bar x %.0f -> %.0f; semi-transparent patch x %.1f -> %.1f; "
                     "no HUD: bar x %.0f -> %.0f\n", sp_x0, sp_x1, sb_x0, sb_x1, sg_x0, sg_x1, sc_x0, sc_x1);

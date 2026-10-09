@@ -3,6 +3,7 @@
 #include <reshade_api.hpp>
 #include "shared/camera_motion.hpp"
 #include <dxgi1_6.h>
+#include <d3dcompiler.h>
 #include <string>
 #include <algorithm>
 #include <cmath>
@@ -41,6 +42,7 @@ void default_settings(Settings& s) {
     s.orbit_mode = 0;  // the measured orbit, games without a camera of their own
     s.floor_release = 1;  // the ground around the character moves with a measured orbit (acts only while one is in use)
     s.hold_reticles = 1;  // sight reticles drawn without depth move with the gun (acts only inside a sight's window)
+    s.game_hud_layers = 1;  // the HUD from the game's own HUD layer / final picture where found
     s.edge_limit_pct = 0.0f;  // camera as of now: no more of the edge uncovered than Auto's
     s.edge_fill = 1;  // soft edge (blur along the edge); extended edge pixels are the option
     s.no_warp_mask = 1;   // HUD detection in games without HUD layers
@@ -393,6 +395,127 @@ int Producer::present_slot() {
     return slot;
 }
 
+void Producer::on_ui_layer(ID3D12Resource* source, D3D12_RESOURCE_STATES state, ID3D12GraphicsCommandList* list) {
+    std::lock_guard lock(mutex_);
+    if (!ready() || !source || !list || !device_) return;
+    const auto desc = source->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1) return;
+    const DXGI_FORMAT format = copy_format(desc.Format);
+    if (!ui_pending_ || ui_pending_->GetDesc().Width != desc.Width || ui_pending_->GetDesc().Height != desc.Height ||
+        ui_pending_->GetDesc().Format != format) {
+        // (the old one may still be in use on the GPU - the last frame's copies: kept until the fence is past it, as the
+        // shared textures are; released at once, the game hung and crashed when its pause menu brought a layer of
+        // another format)
+        if (ui_pending_) retired_.push_back({ui_pending_, nullptr, fence_value_ + 1, {}, nullptr});
+        ui_pending_.Reset();
+        ui_pending_valid_ = false;
+        collect_retired();
+        D3D12_RESOURCE_DESC d{};
+        d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        d.Width = desc.Width; d.Height = desc.Height; d.DepthOrArraySize = 1; d.MipLevels = 1;
+        d.Format = format; d.SampleDesc.Count = 1; d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&ui_pending_)))) {
+            set_message("HUD layer: create failed");
+            return;
+        }
+    }
+    copy_into(list, source, state, ui_pending_.Get());
+    ui_pending_valid_ = true;
+    shared_->hooks.ui_layer_w = static_cast<std::uint32_t>(desc.Width); shared_->hooks.ui_layer_h = desc.Height;
+    shared_->hooks.ui_layer_format = desc.Format;
+    ++shared_->hooks.ui_layer_taken;
+}
+
+void Producer::on_hudless_copy(ID3D12Resource* source, D3D12_RESOURCE_STATES state, ID3D12GraphicsCommandList* list) {
+    std::lock_guard lock(mutex_);
+    if (!ready() || !source || !list || !device_) return;
+    const auto desc = source->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1) return;
+    const DXGI_FORMAT format = copy_format(desc.Format);
+    if (!hudless_pending_ || hudless_pending_->GetDesc().Width != desc.Width || hudless_pending_->GetDesc().Height != desc.Height ||
+        hudless_pending_->GetDesc().Format != format) {
+        if (hudless_pending_) retired_.push_back({hudless_pending_, nullptr, fence_value_ + 1, {}, nullptr});
+        hudless_pending_.Reset();
+        hudless_age_ = 2;
+        collect_retired();
+        D3D12_RESOURCE_DESC d{};
+        d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        d.Width = desc.Width; d.Height = desc.Height; d.DepthOrArraySize = 1; d.MipLevels = 1;
+        d.Format = format; d.SampleDesc.Count = 1; d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&hudless_pending_)))) {
+            set_message("HUD-less copy: create failed");
+            return;
+        }
+    }
+    copy_into(list, source, state, hudless_pending_.Get());
+    hudless_age_ = 0;
+    ++shared_->hooks.hudless_copies;
+}
+
+// The HUD layer's coverage pass (see begin_present): alpha into an 8-bit one-channel texture.
+static const char kUiAlphaShader[] = R"(
+Texture2D<float4> layer : register(t0);
+RWTexture2D<unorm float> coverage : register(u0);
+[numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
+    uint w, h;
+    coverage.GetDimensions(w, h);
+    if (id.x < w && id.y < h) coverage[id.xy] = layer.Load(int3(id.xy, 0)).a;
+}
+)";
+constexpr UINT kUiRing = 8;
+bool Producer::ensure_ui_pass() {
+    if (ui_pso_) return true;
+    if (ui_pass_failed_ || !device_) return false;
+    ui_pass_failed_ = true;  // (until it succeeds: tried once)
+    ComPtr<ID3DBlob> code, errors;
+    if (FAILED(D3DCompile(kUiAlphaShader, sizeof(kUiAlphaShader) - 1, "ui_alpha", nullptr, nullptr, "main", "cs_5_0", 0, 0, &code, &errors))) {
+        set_message("HUD layer: shader failed");
+        shared_->hooks.ui_layer_pass = 2;
+        return false;
+    }
+    D3D12_DESCRIPTOR_RANGE ranges[2]{};
+    ranges[0] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+    ranges[1] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 1};
+    D3D12_ROOT_PARAMETER param{};
+    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    param.DescriptorTable = {2, ranges};
+    param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rd{1, &param, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ComPtr<ID3DBlob> blob;
+    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors)) ||
+        FAILED(device_->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&ui_root_)))) {
+        set_message("HUD layer: root signature failed");
+        shared_->hooks.ui_layer_pass = 2;
+        return false;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = ui_root_.Get();
+    pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2 * kUiRing, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    if (FAILED(device_->CreateComputePipelineState(&pd, IID_PPV_ARGS(&ui_pso_))) || FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&ui_heap_)))) {
+        ui_pso_.Reset();
+        set_message("HUD layer: pipeline failed");
+        shared_->hooks.ui_layer_pass = 2;
+        return false;
+    }
+    ui_heap_step_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    ui_pass_failed_ = false;
+    shared_->hooks.ui_layer_pass = 1;
+    return true;
+}
+// A shader can only read a typed format.
+static DXGI_FORMAT typed_format(DXGI_FORMAT f) {
+    switch (f) {
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        default: return f;
+    }
+}
+
 std::uint64_t Producer::begin_present(ID3D12Resource* backbuffer, ID3D12GraphicsCommandList* list) {
     std::lock_guard lock(mutex_);
     if (!ready() || !backbuffer || !list) return 0;
@@ -408,6 +531,75 @@ std::uint64_t Producer::begin_present(ID3D12Resource* backbuffer, ID3D12Graphics
         info.generation = t.generation; info.ext_x = info.ext_y = 0; info.ext_w = info.width; info.ext_h = info.height;
         info.valid = 1;
     }
+    // (the HUD layer taken this frame, see on_ui_layer: its coverage into the frame's UI slot - on this list, ReShade's,
+    // submitted right after: the descriptor heap bound here disturbs nothing of the game's)
+    if (ui_pending_valid_ && !m.tex[kUi].valid && ensure_ui_pass()) {
+        const auto pd = ui_pending_->GetDesc();
+        if (!ui_alpha_ || ui_alpha_->GetDesc().Width != pd.Width || ui_alpha_->GetDesc().Height != pd.Height) {
+            if (ui_alpha_) retired_.push_back({ui_alpha_, nullptr, fence_value_ + 1, {}, nullptr});
+            ui_alpha_.Reset();
+            D3D12_RESOURCE_DESC ad{};
+            ad.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            ad.Width = pd.Width; ad.Height = pd.Height; ad.DepthOrArraySize = 1; ad.MipLevels = 1;
+            ad.Format = DXGI_FORMAT_R8_UNORM; ad.SampleDesc.Count = 1; ad.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+            if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &ad, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&ui_alpha_))))
+                ui_alpha_.Reset();
+        }
+        if (ui_alpha_ && ensure_texture(slot, kUi, ui_alpha_->GetDesc())) {
+            const UINT base = (ui_ring_++ % kUiRing) * 2;
+            D3D12_CPU_DESCRIPTOR_HANDLE cpu = ui_heap_->GetCPUDescriptorHandleForHeapStart();
+            cpu.ptr += SIZE_T(base) * ui_heap_step_;
+            D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+            sv.Format = typed_format(pd.Format);
+            sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            sv.Texture2D.MipLevels = 1;
+            device_->CreateShaderResourceView(ui_pending_.Get(), &sv, cpu);
+            cpu.ptr += ui_heap_step_;
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+            uv.Format = DXGI_FORMAT_R8_UNORM;
+            uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            device_->CreateUnorderedAccessView(ui_alpha_.Get(), nullptr, &uv, cpu);
+            D3D12_RESOURCE_BARRIER b[2]{};
+            b[0].Type = b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b[0].Transition = {ui_pending_.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+            b[1].Transition = {ui_alpha_.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+            list->ResourceBarrier(2, b);
+            ID3D12DescriptorHeap* heaps[] = {ui_heap_.Get()};
+            list->SetDescriptorHeaps(1, heaps);
+            list->SetComputeRootSignature(ui_root_.Get());
+            list->SetPipelineState(ui_pso_.Get());
+            D3D12_GPU_DESCRIPTOR_HANDLE gpu = ui_heap_->GetGPUDescriptorHandleForHeapStart();
+            gpu.ptr += UINT64(base) * ui_heap_step_;
+            list->SetComputeRootDescriptorTable(0, gpu);
+            list->Dispatch(UINT((pd.Width + 7) / 8), (pd.Height + 7) / 8, 1);
+            for (auto& x : b) std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+            list->ResourceBarrier(2, b);
+            auto& t = textures_[slot][kUi];
+            copy_into(list, ui_alpha_.Get(), D3D12_RESOURCE_STATE_COMMON, t.resource.Get());
+            auto& info = m.tex[kUi];
+            info.width = static_cast<std::uint32_t>(t.desc.Width); info.height = t.desc.Height; info.format = t.desc.Format;
+            info.generation = t.generation; info.ext_x = info.ext_y = 0; info.ext_w = info.width; info.ext_h = info.height;
+            info.valid = 1;
+            ++shared_->hooks.ui_layer_handed;
+        }
+    }
+    ui_pending_valid_ = false;
+    // (the HUD-less copy taken for this frame, see on_hudless_copy: the latest one, its copy run on the GPU before this
+    // list; also when it was recorded just after the last present - a game recording ahead - but not older. Not with a
+    // HUD layer - the pair would pass for a game's HUD-less picture + UI layer - nor over the game's own)
+    if (m.tex[kUi].valid) hudless_age_ = 2;
+    if (hudless_pending_ && hudless_age_ <= 1 && !m.tex[kHudless].valid && ensure_texture(slot, kHudless, hudless_pending_->GetDesc())) {
+        auto& t = textures_[slot][kHudless];
+        copy_into(list, hudless_pending_.Get(), D3D12_RESOURCE_STATE_COMMON, t.resource.Get());
+        auto& info = m.tex[kHudless];
+        info.width = static_cast<std::uint32_t>(t.desc.Width); info.height = t.desc.Height; info.format = t.desc.Format;
+        info.generation = t.generation; info.ext_x = info.ext_y = 0; info.ext_w = info.width; info.ext_h = info.height;
+        info.valid = 1;
+        ++shared_->hooks.hudless_handed;
+    }
+    if (hudless_age_ < 2) ++hudless_age_;
     m.qpc_present = qpc_now();
     return m.frame_id + 1;  // 0 means "nothing to finish"
 }

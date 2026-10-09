@@ -1,5 +1,6 @@
 #include "addon/ngx_hooks.hpp"
 #include "addon/streamline_hooks.hpp"
+#include "addon/ui_probe.hpp"
 #include "common/inline_hook.hpp"
 #include <d3d11.h>
 #include <d3d12.h>
@@ -260,6 +261,7 @@ NVSDK_NGX_Result NVSDK_CONV hk_evaluate(ID3D12GraphicsCommandList* list, const N
             }
         }
     }
+    fw::ui_probe::mark(reinterpret_cast<std::uint64_t>(list), "upscaler: NGX evaluate (DLSS)");
     const NVSDK_NGX_Result result = reinterpret_cast<EvaluateFn>(g_evaluate_hook.original())(list, handle, params, callback);
     // The upscaled scene (before post-processing and HUD): DLSS writes its output as an unordered-access
     // resource, recorded on this list just now.

@@ -639,11 +639,15 @@ void render_thread() {
     bool presented_last = true, paced_last = false;
     double enabled_since = 0;
     bool generation_logged = false;
+    int fg_logged_images = 0;  // (XPAR frame generation: the images per game frame last logged)
+    int fg_images = 1;         // XPAR frame generation: images per game frame
     CameraCheck camera_check;        // the game's own camera against its motion vectors
     int poor_estimate_windows = 0;   // ...and, once it was found unusable, whether the estimate does any better
     bool have_source_kind = false, source_was_estimated = false, source_motion_estimated = false;
     double last_mv_log = 0, last_usage_log = 0;
     bool game_has_hud_layers = false, mask_logged = false, source_masked = false, hudless_hud_logged = false, reticles_logged = false;
+    bool layer_hud_logged = false;
+    std::uint32_t hud_source_counts[7] = {}, hud_source_frames = 0, hud_with_ui = 0, hud_with_hudless = 0;
     CameraEstimator estimator;
     // Whether the estimated camera can be learned from: the frame itself was explained, and so were most of the last 60.
     std::deque<bool> estimate_rejects;
@@ -713,7 +717,7 @@ void render_thread() {
         if (!g_app.running) break;
         const Settings settings = sh.settings;
         apply_gpu_priority(settings.gpu_priority);
-        // Moving objects at the display rate: an option of the XPAR engine.
+        // XPAR frame generation (moving objects at the display rate): an option of the XPAR engine.
         // XPAR's own warp engine (chosen, or Latewarp not available): the one that moves objects and shows the
         // game's generated images.
         auto own_engine_on = [&]() { return settings.warp_engine == 1 || !latewarp.ready(); };
@@ -964,12 +968,7 @@ void render_thread() {
                 renderer.analyze_motion(s, cam.clip_to_prev_clip, float(mv_scale.scale(0, s.depth_rect.w)),
                                         float(mv_scale.scale(1, s.depth_rect.h)), mv_scale.valid, cam.depth_inverted != 0,
                                         settings.near_camera_rule != 0, settings.turn_rule != 0, m.frame_id, floor_pivot_depth);
-                // Moving objects (option): what moves on its own, as a straight line back to the previous frame.
-                // Only with the game's own motion vectors (an upscaler's): those estimated from the picture are
-                // too rough at the edges of things.
-                // (with the motion seen in the picture, for what the game's motion vectors miss: shadows, glare)
-                // Frame generation (the game's own): objects move in its generated images instead - made
-                // ready for the warp here.
+                // Frame generation (the game's own): its generated images made ready for the warp here.
                 renderer.pass_stamp(Renderer::kPassAnalyze);
                 if (own_engine_on() && s.generated > 0) {
                     renderer.prepare_generated(s, float(mv_scale.scale(0, s.depth_rect.w)), float(mv_scale.scale(1, s.depth_rect.h)), mv_scale.valid,
@@ -979,10 +978,6 @@ void render_thread() {
                         logf("frame generation: showing the game's generated images (%d per frame), each moved to the displayed camera", s.per_frame);
                         generation_logged = true;
                     }
-                } else if (moving_objects_on() && s.has_motion && !s.motion_estimated && mv_scale.valid) {
-                    const bool picture = renderer.picture_motion();
-                    renderer.object_motion(s, cam.clip_to_prev_clip, cam.view_to_clip, float(mv_scale.scale(0, s.depth_rect.w)),
-                                           float(mv_scale.scale(1, s.depth_rect.h)), attached_mask, picture);
                 }
                 renderer.pass_stamp(Renderer::kPassObjects);
                 if (mask) {
@@ -1024,6 +1019,54 @@ void render_thread() {
                     if (hud_mask && s.has_hudless && !s.has_ui && !hudless_hud_logged) {
                         logf("HUD: found from the game's HUD-less picture (sent without a UI layer)");
                         hudless_hud_logged = true;
+                    }
+                    // (for the panel: where the HUD comes from)
+                    sh.presenter.hud_source = !hud_mask ? (game_has_hud_layers ? 1u : 0u) : s.has_hudless && !s.has_ui ? 2u : s.has_ui && !s.has_hudless ? 3u
+                                              : settings.hud_from_scene && s.has_scene ? (settings.hud_from_scene == 2 ? 5u : 4u) : 6u;
+                    // (every 600 frames: how many had the game's own HUD layer, how many fell back to detecting it)
+                    ++hud_source_counts[std::min<std::uint32_t>(sh.presenter.hud_source, 6)];
+                    if (++hud_source_frames >= 600) {
+                        logf("HUD source over %u frames: game's HUD layers %u, HUD-less picture %u, game's own HUD layer %u, detected %u (frames with a UI layer %u, with a HUD-less picture %u)",
+                             hud_source_frames, hud_source_counts[1], hud_source_counts[2], hud_source_counts[3],
+                             hud_source_counts[4] + hud_source_counts[5] + hud_source_counts[6], hud_with_ui, hud_with_hudless);
+                        hud_source_frames = hud_with_ui = hud_with_hudless = 0;
+                        for (auto& n : hud_source_counts) n = 0;
+                    }
+                    hud_with_ui += s.has_ui ? 1u : 0u;
+                    hud_with_hudless += s.has_hudless ? 1u : 0u;
+                    if (hud_mask && s.has_ui && !s.has_hudless && !layer_hud_logged) {
+                        logf("HUD: taken from the game's own HUD layer (the add-on found it where the game blends it onto the picture)");
+                        layer_hud_logged = true;
+                    }
+                }
+                // XPAR frame generation (option, XPAR engine, without the game's own): the images between the previous
+                // frame and this one, as many as fit the refreshes of a game frame (at most kMaxGenerated), shown as the
+                // game's generated images are - objects one game frame late, the camera not delayed.
+                if (moving_objects_on() && s.generated == 0 && s.has_motion && mv_scale.valid) {
+                    const double interval = g_app.model.frame_interval();
+                    const double hz = vblank.period > 0 ? double(g_qpc_frequency) / vblank.period : g_app.display_mode_hz.load();
+                    // (the refreshes in between, rounded up: rounded, 2.5 at 47 fps on 120 Hz flipped between 1 and 2 images
+                    // every few hundred ms; up as soon as a tenth of a refresh more is needed, down only once a fifth of one
+                    // fewer is)
+                    if (interval > 0 && hz > 0) {
+                        const double need = interval * hz - 1.0;
+                        if (need > fg_images + 0.1 || need < fg_images - 1.2)
+                            fg_images = std::clamp(int(std::ceil(need - 0.1)), 1, kMaxGenerated);
+                    }
+                    const int images = fg_images;
+                    const bool picture = !s.motion_estimated && renderer.picture_motion();
+                    const int made = renderer.generate_frames(s, images, cam.clip_to_prev_clip, cam.view_to_clip, float(mv_scale.scale(0, s.depth_rect.w)),
+                                                              float(mv_scale.scale(1, s.depth_rect.h)), settings.use_ui_tags != 0, picture, hud_mask);
+                    if (made > 0) {
+                        incoming.s.generated = made;
+                        incoming.s.per_frame = made;
+                        for (int i = 0; i < made; ++i) incoming.s.gen_index[i] = i + 1;
+                        last_generated = now_seconds();
+                        if (made != fg_logged_images) {
+                            logf("XPAR frame generation: %d image%s between game frames (%.1f fps on a %.0f Hz display)", made, made == 1 ? "" : "s",
+                                 interval > 0 ? 1.0 / interval : 0.0, hz);
+                            fg_logged_images = made;
+                        }
                     }
                 }
                 const double present_t = seconds(m.qpc_present);
@@ -1408,28 +1451,13 @@ void render_thread() {
                         m = generated_to_target(source_camera.clip_to_prev_clip, 1.0 - double(source.gen_index[generated]) / images, m);
                     }
                 }
-                // Moving objects (option), on their own clock, one game frame behind (frame generation): when a
-                // frame is first shown they are where the previous one had them, and over the next frame
-                // interval they move to where this one has them - always between two real frames, never guessed
-                // ahead. The camera is not delayed: it is the warp's, at the displayed moment.
-                Renderer::ObjectWarp objects;
-                const double interval = g_app.model.frame_interval();
-                objects.frames_back = interval > 0 ? float(std::clamp(1.0 - (now - shown_since) / interval, 0.0, 1.0)) : 0.0f;
-                Mat4 prev_clip{}, back{};
-                std::memcpy(prev_clip.data(), source_camera.clip_to_prev_clip, sizeof(float) * 16);
-                const bool with_objects = moving_objects_on() && source.generated == 0 && objects.frames_back > 0 && mat_inverse(prev_clip, back);
-                if (with_objects) {
-                    const Mat4 to_target = mat_mul(back, m);
-                    std::memcpy(objects.prev_to_target, to_target.data(), sizeof(objects.prev_to_target));
-                    std::memcpy(objects.view_to_clip, source_camera.view_to_clip, sizeof(objects.view_to_clip));
-                }
                 // Nothing moved since the frame (well under a hundredth of a pixel anywhere): every pixel stays
                 // where it is, so there is nothing to warp. (The mask's debug tint and moving objects need the
                 // warp pass.)
-                unmoved = !settings.show_mask && !with_objects && generated < 0;
+                unmoved = !settings.show_mask && generated < 0;
                 for (int i = 0; i < 16 && unmoved; ++i) unmoved = std::fabs(m.data()[i] - (i % 5 == 0 ? 1.0f : 0.0f)) < 2e-6f;
                 warped = unmoved || renderer.own_warp(source, settings.use_ui_tags != 0, inputs.no_warp_mask != nullptr, m.data(), inputs.depth_inverted,
-                                                     settings.background_memory != 0, with_objects ? &objects : nullptr, generated,
+                                                     settings.background_memory != 0, nullptr, generated,
                                                      settings.edge_fill != 0);
             } else {
                 warped = latewarp.evaluate(list, inputs, first_eval, view_matrix(p.camera, origin, z_sign),

@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 54;
+constexpr std::uint32_t kVersion = 57;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -90,7 +90,7 @@ struct Settings {
                                    // 6: the lowest latency that uncovers nothing the game has not rendered (now .. one game frame back)
     float present_lead_ms;         // render this long before the next vblank (0: right after the previous one)
     std::uint32_t gpu_priority;    // presenter GPU scheduling class: 0 realtime (default), 1 high, 2 normal
-    std::uint32_t moving_objects;  // XPAR engine: objects move at the display rate, between the game's frames (option, off by default)
+    std::uint32_t moving_objects;  // XPAR frame generation (XPAR engine): the picture between the game's frames at every refresh (option, off by default)
     std::uint32_t no_warp_mask;    // games without HUD layers: detect the HUD and keep it unwarped
     std::uint32_t show_mask;       // debug: tint the no-warp mask (magenta) and the HUD score still learning (green)
     std::uint32_t floor_release;   // option, on by default (saved per game): while turns are predicted around a measured orbit pivot, the
@@ -117,6 +117,8 @@ struct Settings {
                                        // beyond what the regular Auto latency uncovers lately (0: no more than it; saved per game)
     std::uint32_t edge_unlimited;      // ...or no limit at all (saved per game)
     std::uint32_t frame_cap;           // default on: prevent GPU queueing (hold the game just below its GPU rate) while its NVIDIA Reflex is off (add-on; saved per game)
+    std::uint32_t game_hud_layers;     // default on: the HUD from the game's own HUD layer / a HUD-less copy of its final picture where the add-on
+                                       // finds one (Direct3D 12; ui_layer.hpp); off: HUD detection only (add-on; saved per game)
 };
 
 // Presenter status, displayed by the add-on UI.
@@ -162,6 +164,10 @@ struct PresenterStatus {
     float present_lead_ms;
     float presents_queued;
     std::uint32_t orbit_in_use;  // turns are predicted around the measured orbit pivot right now (Orbit pivot: Measured, consistent)
+    // Where the HUD of the frames taken in comes from (the panel says it): 0 none (not kept still, or not known yet),
+    // 1 the game's HUD layers (HUD-less picture + UI layer), 2 the game's HUD-less picture, 3 the game's own HUD layer
+    // (found by the add-on), 4 the upscaler's output, 5 the upscaler's output + camera motion check, 6 learned.
+    std::uint32_t hud_source;
     char message[256];
 };
 
@@ -186,6 +192,12 @@ struct HookStats {
     // (fps); the GPU done after the present / after the frame's start (medians, ms); held back per frame (ms).
     std::uint32_t cap_active, cap_reflex;  // (cap_reflex: the game's Reflex is on, the cap stands aside)
     float cap_fps, cap_game_fps, cap_present_to_done_ms, cap_start_to_done_ms, cap_wait_ms, cap_queued_pct;
+    // The game's own HUD layer (ui_layer.hpp), for the panel: the last one found (size, DXGI format; 0: none), how many
+    // frames it was taken on and how many of them reached a frame handed over; its coverage pass: 0 not built yet, 1
+    // working, 2 failed.
+    std::uint32_t ui_layer_w, ui_layer_h, ui_layer_format, ui_layer_taken, ui_layer_handed, ui_layer_pass;
+    // ...and the HUD-less copies of its final picture (second pattern): taken, handed over with a frame.
+    std::uint32_t hudless_copies, hudless_handed;
 };
 
 // Game-side event log (lock-free ring) written by the add-on, dumped to CSV by the presenter.

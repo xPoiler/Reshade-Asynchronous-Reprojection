@@ -33,6 +33,7 @@ struct IngestedSource {
 // whole-frame guard (too many pixels looked like HUD).
 struct HudStats {
     int frames = 0, learned = 0, too_little = 0, guarded = 0;
+    double evidence_sum = 0, changed_sum = 0;  // the telling pixels that looked unchanged / changed, summed over frames
     double share_sum = 0;  // HUD-like share of the telling pixels, over learned frames
     int scene_frames = 0;  // frames whose HUD came from the upscaler's output instead
     double scene_share_sum = 0;  // share of the screen found to be HUD, summed over those frames
@@ -149,6 +150,13 @@ public:
     // to the image's moment) and, with the HUD-less picture and UI layer, the UI they show taken back out
     // (the warp puts the frame's UI back over it, as on every frame).
     void prepare_generated(const IngestedSource& src, float scale_x, float scale_y, bool scale_valid, bool use_ui_tags);
+    // XPAR frame generation (option): `count` images between the previous game frame and this one (at i / (count + 1)
+    // of the way, i = 1..count), made into the generated images' textures with their depth - shown through the same
+    // path as the game's own (the caller sets the frame's generated / per_frame / gen_index). From the frame kept by
+    // the object history (set_object_history), on the intake list after the no-warp mask. flow: picture_motion of
+    // this frame is there; hud: the mask's HUD stays where it is. Returns the images made (0: none).
+    int generate_frames(const IngestedSource& src, int count, const float clip_to_prev_clip[16], const float view_to_clip[16],
+                        float scale_x, float scale_y, bool use_ui_tags, bool flow, bool hud);
     // ...and once frame generation is off: whether its textures are still held, and letting them go (both
     // texture sets and the game's shared copies; waits for the GPU).
     bool has_generated() const;
@@ -234,7 +242,8 @@ public:
     // which: 0 the game's frame, 1 the warped output, 2 the upscaler's output (scene before HUD).
     // (10-12: the picture, depth and motion vectors kept by stash_source; 13: own motion estimation's displacements;
     // 14: the HUD-less picture kept; 15-18: the second kept set's picture, HUD-less picture, depth and motion vectors;
-    // 19: the game's HUD-less picture)
+    // 19: the game's HUD-less picture; 29-31: XPAR frame generation's motion, claims of this frame (last image) and on
+    // the previous frame)
     bool read_back(int which, std::vector<std::uint16_t>& pixels, std::uint32_t& w, std::uint32_t& h);
     // Diagnostics: keeps a copy of the current game frame's picture (and HUD-less picture), depth and motion
     // vectors on the GPU (a few milliseconds, nothing is read back), so a capture taken on a later game frame
@@ -248,7 +257,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     };
-    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKeys, kPObjMove, kPObjTiles, kPObjOutTiles, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevColour, kPPrevDepth, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPCount };
+    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKeys, kPObjMove, kPObjTiles, kPObjOutTiles, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevColour, kPPrevDepth, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPFgMotion, kPFgInv, kPFgK1, kPFgK0, kPHudLearned, kPHudTiles, kPCount };
 
     bool create_pipelines(std::string& error);
     // The format a private copy of a game colour image is kept in: the game's own 4-byte format when it
@@ -322,9 +331,10 @@ private:
     // Moving objects: the previous frame's picture and depth (ingest; the new frame's sizes and colour format).
     void keep_history(PrivateId colour, std::uint32_t depth_w, std::uint32_t depth_h, std::uint32_t colour_w, std::uint32_t colour_h,
                       DXGI_FORMAT colour_format);
-    ComPtr<ID3D12PipelineState> cs_obj_move_, cs_gen_depth_, cs_gen_unui_, cs_hudless_clear_, cs_hudless_count_, cs_hudless_score_, cs_hudless_fill_, cs_obj_join_init_, cs_obj_join_, cs_obj_join_final_, cs_obj_clear_, cs_obj_clear_tiles_, cs_obj_splat_, cs_obj_fix_, cs_copy4_, cs_copy1_;
+    ComPtr<ID3D12PipelineState> cs_obj_move_, cs_gen_depth_, cs_gen_unui_, cs_hudless_clear_, cs_hudless_count_, cs_hudless_score_, cs_hudless_fill_, cs_layer_hud_, cs_obj_join_init_, cs_obj_join_, cs_obj_join_final_, cs_obj_clear_, cs_obj_clear_tiles_, cs_obj_splat_, cs_obj_fix_, cs_copy4_, cs_copy1_;
+    ComPtr<ID3D12PipelineState> cs_fg_motion_, cs_fg_inverse_, cs_fg_clear_, cs_fg_splat_cur_, cs_fg_splat_prev_, cs_fg_resolve_, cs_fg_depth_;
     bool object_history_ = false, history_valid_ = false, objects_built_ = false, shown_objects_ = false;
-    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_memory_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_;
+    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_memory_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_;
     // Sight reticles (option): the passes, which history texture holds the latest layer, and whether the layer was
     // built for the frame taken in last / the shown one (see cs_ret_layer).
     ComPtr<ID3D12PipelineState> cs_ret_cells_, cs_ret_enclose_, cs_ret_layer_, cs_ret_align_, cs_ret_pick_, cs_ret_shift_;

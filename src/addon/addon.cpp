@@ -9,6 +9,8 @@
 #include "addon/ngx_hooks.hpp"
 #include "addon/ffx_hooks.hpp"
 #include "addon/depth_choice.hpp"
+#include "addon/ui_probe.hpp"
+#include "addon/ui_layer.hpp"
 #include "addon/reshade_feed.hpp"
 #include "addon/frame_cap.hpp"
 #include <d3d12.h>
@@ -107,6 +109,7 @@ constexpr Persisted kPersisted[] = {
     {"OrbitMode", &fw::Settings::orbit_mode, nullptr},
     {"FloorRelease", &fw::Settings::floor_release, nullptr},
     {"HoldReticles", &fw::Settings::hold_reticles, nullptr},
+    {"GameHudLayers", &fw::Settings::game_hud_layers, nullptr},
     {"MaxExtrapolation", nullptr, &fw::Settings::max_horizon_ms},
     {"PresentLead", nullptr, &fw::Settings::present_lead_ms},
     {"PresentLeadAuto", &fw::Settings::present_lead_auto, nullptr},
@@ -478,6 +481,9 @@ void on_present(command_queue*, swapchain* chain, const rect*, const rect*, uint
     // (the game's colour space, see read_color_space: the presenter's output follows it)
     if (g_producer && g_producer->shared() && chain &&
         reinterpret_cast<std::uint64_t>(chain->get_hwnd()) == g_producer->shared()->game_hwnd) {
+        // (diagnostics: the draws of one game frame, on Ctrl+Shift+D - see ui_probe.hpp)
+        fw::ui_probe::on_present(chain, g_producer->shared()->settings.record_diagnostics != 0);
+        fw::ui_layer::on_present(chain);
         std::uint32_t cs = 0;
         if (read_color_space(chain, cs) && g_producer->shared()->color_space != cs) {
             g_producer->shared()->color_space = cs;
@@ -783,12 +789,14 @@ void draw_overlay(effect_runtime*) {
              "the scenery along the edge more the further out, slightly less saturated; extended edge pixels repeat the "
              "edge (sharper close to it, streaks further out). Remembered per game.");
         bool moving = s.moving_objects != 0;
-        if (ImGui::Checkbox("Move objects at the display rate even without frame generation (XPAR engine, experimental)", &moving)) {
+        if (ImGui::Checkbox("XPAR frame generation (XPAR engine, experimental)", &moving)) {
             s.moving_objects = moving;
             reshade::set_config_value(nullptr, "FrameWarp", "MovingObjects", moving ? "1" : "0");
         }
-        hint("The game's own DLSS or FSR frame generation is used by itself when it is on; this moves cars, people and your "
-             "character/weapon at the display rate without it, one game frame late (the camera is not delayed). Games with DLSS or FSR.");
+        hint("XPAR's own frame generation, for when the game's is off (the game's DLSS or FSR frame generation is used by "
+             "itself when it is on): the picture between the last two game frames at every refresh, so cars, people, "
+             "animations and your character/weapon move at the display rate, one game frame late (the camera is not delayed). "
+             "Games with DLSS or FSR.");
         if (!latewarp)
             ImGui::TextDisabled("NVIDIA Latewarp is not installed (optional: nvngx_latewarp.dll, NVIDIA GPUs only)");
         bool ui = s.use_ui_tags != 0;
@@ -840,6 +848,33 @@ void draw_overlay(effect_runtime*) {
                 s.hud_from_scene = find;
                 static const char* const kValues[] = {"0", "1", "2"};
                 reshade::set_config_value(nullptr, "FrameWarp", "HudFromDlssOutput", kValues[find]);
+            }
+            bool layers = s.game_hud_layers != 0;
+            if (ImGui::Checkbox("Use the game's own HUD layer when found", &layers)) s.game_hud_layers = layers;
+            hint("Where the game draws its HUD into a layer of its own, or onto its final picture after a step XPAR can catch, the HUD "
+                 "is taken from there: exact, nothing to detect. Off: the HUD is always detected (as chosen above) - for a game "
+                 "where the wrong layer is taken. Direct3D 12 games. Remembered per game.");
+            // Where the HUD comes from right now, and the game's own HUD layer if XPAR found one.
+            if (g_producer && g_producer->shared()) {
+                const auto& ps = g_producer->shared()->presenter;
+                const auto& hs = g_producer->shared()->hooks;
+                static const char* const kSources[] = {"-", "the game's HUD layers (HUD-less picture + UI layer)", "the game's HUD-less picture",
+                                                       "the game's own HUD layer (exact)", "the upscaler output", "the upscaler output + camera motion check",
+                                                       "learned from camera motion"};
+                if (ps.hud_source > 0 && ps.hud_source < 7) ImGui::TextDisabled("HUD in use: from %s", kSources[ps.hud_source]);
+                if (!s.game_hud_layers)
+                    ImGui::TextDisabled("Game's HUD layer: not used (the HUD is detected)");
+                else if (hs.ui_layer_w)
+                    ImGui::TextDisabled("Game's HUD layer: found (%ux%u, format %u), taken on %u frames, %u handed over%s", hs.ui_layer_w, hs.ui_layer_h,
+                                        hs.ui_layer_format, hs.ui_layer_taken, hs.ui_layer_handed,
+                                        hs.ui_layer_pass == 2 ? " - its pass failed" : "");
+                else if (hs.hudless_copies)
+                    ImGui::TextDisabled("Game's HUD: drawn onto its final picture - HUD-less copies taken on %u frames, %u handed over",
+                                        hs.hudless_copies, hs.hudless_handed);
+                else if (ps.hud_source == 1 || ps.hud_source == 2)
+                    ImGui::TextDisabled("Game's HUD layer: not needed (the game hands its HUD over itself)");
+                else
+                    ImGui::TextDisabled("Game's HUD layer: not found (the HUD is detected)");
             }
             if (find == 0)
                 hint("Learns what stays put while the camera moves; the only choice without an upscaler output.");
@@ -955,6 +990,18 @@ void register_callbacks() {
     reshade::register_event<reshade::addon_event::reshade_finish_effects>(fw::on_reshade_finish_effects);
     reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(fw::on_reshade_reloaded_effects);
     fw::register_depth_choice_events();
+    fw::ui_probe::init();
+    fw::ui_layer::init(
+        [](std::uint64_t layer, std::uint32_t state, std::uint64_t list) {
+            if (g_producer && g_producer->shared() && g_producer->shared()->settings.game_hud_layers)
+                g_producer->on_ui_layer(reinterpret_cast<ID3D12Resource*>(layer), static_cast<D3D12_RESOURCE_STATES>(state),
+                                        reinterpret_cast<ID3D12GraphicsCommandList*>(list));
+        },
+        [](std::uint64_t picture, std::uint32_t state, std::uint64_t list) {
+            if (g_producer && g_producer->shared() && g_producer->shared()->settings.game_hud_layers)
+                g_producer->on_hudless_copy(reinterpret_cast<ID3D12Resource*>(picture), static_cast<D3D12_RESOURCE_STATES>(state),
+                                            reinterpret_cast<ID3D12GraphicsCommandList*>(list));
+        });
     reshade::register_event<reshade::addon_event::finish_present>(on_finish_present);
     reshade::register_event<reshade::addon_event::present>(on_present);
     reshade::register_event<reshade::addon_event::create_resource>(on_create_resource);
@@ -975,6 +1022,8 @@ void unregister_callbacks() {
     reshade::unregister_event<reshade::addon_event::finish_present>(on_finish_present);
     fw::frame_cap_shutdown();
     fw::unregister_depth_choice_events();
+    fw::ui_probe::shutdown();
+    fw::ui_layer::shutdown();
     reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(fw::on_reshade_reloaded_effects);
     reshade::unregister_event<reshade::addon_event::reshade_finish_effects>(fw::on_reshade_finish_effects);
     reshade::unregister_event<reshade::addon_event::reshade_present>(on_reshade_present);
