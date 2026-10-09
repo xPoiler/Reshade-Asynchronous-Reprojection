@@ -84,6 +84,17 @@ public:
     // The same for a HUD-less copy of the game's final picture (second pattern, ui_layer.hpp) - into the frame's HUD-less
     // slot, unless the frame has a HUD layer or its own HUD-less picture.
     void on_hudless_copy(ID3D12Resource* source, D3D12_RESOURCE_STATES state, ID3D12GraphicsCommandList* list);
+    // Vulkan games: the game's HUD layer (VkImage, its format, size, VkImageLayout) copied on the game's command buffer into
+    // a texture of our own, then at the present into the presented frame's UI slot (whole, the presenter takes its
+    // coverage).
+    void on_ui_layer_vk(std::uint64_t image, DXGI_FORMAT format, std::uint32_t width, std::uint32_t height, std::uint32_t layout,
+                        void* command_buffer);
+    // Direct3D 11 games, third pattern (ui_layer.hpp): the picture just before the game draws its HUD into it - copied;
+    // at the present the picture with its HUD compared with that copy, and what differs (the HUD) goes into the frame's UI
+    // slot as its coverage.
+    // kind (ui_layer.hpp): 0 copy, 1 no HUD this frame (an empty HUD handed over), 2 the copy confirmed (only a confirmed
+    // one is handed over), 3 the copy given up.
+    void on_hud_before_d3d11(ID3D11Resource* picture, std::uint32_t kind, ID3D11DeviceContext* context);
     // At the game's present: copies the backbuffer via `list`, then the caller must submit `list`
     // on `queue`; finish_present() signals the fence afterwards.
     std::uint64_t begin_present(ID3D12Resource* backbuffer, ID3D12GraphicsCommandList* list);
@@ -170,6 +181,17 @@ private:
     Shared* shared_ = nullptr;
     Microsoft::WRL::ComPtr<ID3D12Device> device_;
     Microsoft::WRL::ComPtr<ID3D12Resource> ui_pending_;  // the HUD layer taken this frame (on_ui_layer)
+    // Vulkan: the HUD layer taken (on_ui_layer_vk) and presents since (handed over while at most 1: a game recording ahead
+    // takes the next frame's before this present - the GPU runs the copies in order, so this frame's is there)
+    Texture ui_vk_;
+    std::uint32_t ui_vk_age_ = 2;
+    bool ensure_own(Texture& t, const D3D12_RESOURCE_DESC& source);
+    // Direct3D 11, third pattern: the copy before the HUD, the picture it was taken from, the comparison's pass and output
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> d11_before_, d11_cover_;
+    Microsoft::WRL::ComPtr<ID3D11Resource> d11_picture_;
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> d11_cover_cs_;
+    bool d11_before_taken_ = false, d11_cs_failed_ = false, d11_none_ = false, d11_confirmed_ = false;
+    void d3d11_cover(ID3D11DeviceContext* context, int slot);
     bool ui_pending_valid_ = false;
     Microsoft::WRL::ComPtr<ID3D12Resource> hudless_pending_;  // the HUD-less copy taken this frame (on_hudless_copy)
     std::uint32_t hudless_age_ = 2;  // presents since the last one (handed over while at most 1)

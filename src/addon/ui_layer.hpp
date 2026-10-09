@@ -24,8 +24,14 @@ namespace reshade::api { struct swapchain; struct command_list; }
 namespace fw::ui_layer {
 // take(resource, D3D12 state, native command list): records the copy into the frame's UI slot; take_hudless: the
 // same for the HUD-less picture.
+// take_vk (Vulkan games): the layer's VkImage, its format (ReShade's / DXGI), width, height, state (ReShade's usage) and
+// the VkCommandBuffer. take_before (Direct3D 11, third pattern): the picture (ID3D11Resource), what happened (0 the HUD
+// starts: copy it; 1 it reached the screen with no HUD this frame; 2 the copy confirmed: the final draw reads it; 3 the
+// copy given up) and the context.
 void init(std::function<void(std::uint64_t, std::uint32_t, std::uint64_t)> take,
-          std::function<void(std::uint64_t, std::uint32_t, std::uint64_t)> take_hudless);
+          std::function<void(std::uint64_t, std::uint32_t, std::uint64_t)> take_hudless,
+          std::function<void(std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint64_t)> take_vk,
+          std::function<void(std::uint64_t, std::uint32_t, std::uint64_t)> take_before);
 void shutdown();
 // Every present of the game's swapchain: its back buffers and size; one frame ends.
 void on_present(reshade::api::swapchain* chain);

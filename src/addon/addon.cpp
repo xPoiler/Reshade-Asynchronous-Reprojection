@@ -111,6 +111,7 @@ constexpr Persisted kPersisted[] = {
     {"HoldReticles", &fw::Settings::hold_reticles, nullptr},
     {"GameHudLayers", &fw::Settings::game_hud_layers, nullptr},
     {"ForwardSplatWarp", &fw::Settings::warp_splat, nullptr},
+    {"HoldWholeCharacter", &fw::Settings::hold_characters, nullptr},
     {"MaxExtrapolation", nullptr, &fw::Settings::max_horizon_ms},
     {"PresentLead", nullptr, &fw::Settings::present_lead_ms},
     {"PresentLeadAuto", &fw::Settings::present_lead_auto, nullptr},
@@ -839,6 +840,12 @@ void draw_overlay(effect_runtime*) {
                 reshade::set_config_value(nullptr, "FrameWarp", "HoldOrbitedCharacter", orbited ? "1" : "0");
             }
             hint("For over-the-shoulder cameras that circle the character: what barely moves on screen while turning is held.");
+            bool whole = s.hold_characters != 0;
+            if (ImGui::Checkbox("Hold the whole character", &whole)) s.hold_characters = whole;
+            hint("A character the camera follows - running, its limbs swinging, the camera lagging a little - is held as one: "
+                 "what stays in place on screen over several frames while the camera moves, and its moving parts touching it. "
+                 "Grass, walls and floor it passes are not (they slide by). Objects followed by turning the camera are not held. "
+                 "Remembered per game.");
             bool reticles = s.hold_reticles != 0;
             if (ImGui::Checkbox("Hold sight reticles", &reticles)) s.hold_reticles = reticles;
             hint("For red dot and holographic sights whose reticle skips while turning: the game draws it without depth of its own, "
@@ -1010,6 +1017,23 @@ void register_callbacks() {
             if (g_producer && g_producer->shared() && g_producer->shared()->settings.game_hud_layers)
                 g_producer->on_hudless_copy(reinterpret_cast<ID3D12Resource*>(picture), static_cast<D3D12_RESOURCE_STATES>(state),
                                             reinterpret_cast<ID3D12GraphicsCommandList*>(list));
+        },
+        [](std::uint64_t image, std::uint32_t format, std::uint32_t width, std::uint32_t height, std::uint32_t state, std::uint64_t cb) {
+            if (!g_producer || !g_producer->shared() || !g_producer->shared()->settings.game_hud_layers) return;
+            // (the layer's state as the D3D12 one it maps to - back to the Vulkan layout it is in: VkImageLayout values)
+            std::uint32_t layout = 1;  // GENERAL
+            if (state & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) layout = 1;
+            else if (state & (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE))
+                layout = 5;  // SHADER_READ_ONLY_OPTIMAL
+            else if (state & D3D12_RESOURCE_STATE_RENDER_TARGET) layout = 2;  // COLOR_ATTACHMENT_OPTIMAL
+            else if (state & D3D12_RESOURCE_STATE_COPY_SOURCE) layout = 6;  // TRANSFER_SRC_OPTIMAL
+            else if (state & D3D12_RESOURCE_STATE_COPY_DEST) layout = 7;  // TRANSFER_DST_OPTIMAL
+            g_producer->on_ui_layer_vk(image, static_cast<DXGI_FORMAT>(format), width, height, layout,
+                                       reinterpret_cast<void*>(cb));
+        },
+        [](std::uint64_t picture, std::uint32_t kind, std::uint64_t context) {
+            if (g_producer && g_producer->shared() && g_producer->shared()->settings.game_hud_layers)
+                g_producer->on_hud_before_d3d11(reinterpret_cast<ID3D11Resource*>(picture), kind, reinterpret_cast<ID3D11DeviceContext*>(context));
         });
     reshade::register_event<reshade::addon_event::finish_present>(on_finish_present);
     reshade::register_event<reshade::addon_event::present>(on_present);

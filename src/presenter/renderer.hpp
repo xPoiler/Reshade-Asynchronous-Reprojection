@@ -197,6 +197,16 @@ public:
     // False when there is nothing for the warp to move (no previous frame kept, a size change).
     // The XPAR warp by forward splat (cs_warp_claim) instead of the search alone.
     void set_warp_splat(bool on) { warp_splat_ = on; }
+    // The motion analysis holds what stays on screen only where the camera rig carries it (see cs_analyze, flag 2048):
+    // not objects the player follows by turning.
+    void set_rig_check(bool on) { rig_check_ = on; }
+    bool learning_stalled() const { return learning_stalled_; }
+    // Whole characters held (option), once per game frame after analyze_motion: what has stayed in place on screen lately
+    // while the camera moved (cs_still) is attached, and so is what moves on its own, touches it at about the same distance
+    // and has stayed in place too (cs_obj_join) - the character's swinging limbs, not the grass or walls it passes.
+    void hold_characters(const IngestedSource& src, const float clip_to_prev_clip[16], const float view_to_clip[16], bool scale_valid,
+                         bool depth_inverted);
+    void reset_still() { still_reset_ = true; }
     // The check of the game's HUD layer (see layer_trust_): its verdict, and starting it over (another texture taken as
     // the layer, or the option turned off).
     int layer_trust() const { return layer_trust_; }
@@ -271,7 +281,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     };
-    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKeys, kPObjMove, kPObjTiles, kPObjOutTiles, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevColour, kPPrevDepth, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPFgMotion, kPFgInv, kPFgK1, kPFgK0, kPHudLearned, kPHudTiles, kPWarpClaims, kPCount };
+    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKeys, kPObjMove, kPObjTiles, kPObjOutTiles, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevColour, kPPrevDepth, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPFgMotion, kPFgInv, kPFgK1, kPFgK0, kPHudLearned, kPHudTiles, kPWarpClaims, kPStill, kPGrowA, kPGrowB, kPCount };
 
     bool create_pipelines(std::string& error);
     // The format a private copy of a game colour image is kept in: the game's own 4-byte format when it
@@ -345,10 +355,20 @@ private:
     // Moving objects: the previous frame's picture and depth (ingest; the new frame's sizes and colour format).
     void keep_history(PrivateId colour, std::uint32_t depth_w, std::uint32_t depth_h, std::uint32_t colour_w, std::uint32_t colour_h,
                       DXGI_FORMAT colour_format);
-    ComPtr<ID3D12PipelineState> cs_obj_move_, cs_gen_depth_, cs_gen_unui_, cs_hudless_clear_, cs_hudless_count_, cs_hudless_score_, cs_hudless_fill_, cs_layer_hud_, cs_layer_check_clear_, cs_layer_check_, cs_obj_join_init_, cs_obj_join_, cs_obj_join_final_, cs_obj_clear_, cs_obj_clear_tiles_, cs_obj_splat_, cs_obj_fix_, cs_copy4_, cs_copy1_;
+    ComPtr<ID3D12PipelineState> cs_obj_move_, cs_gen_depth_, cs_gen_unui_, cs_hudless_clear_, cs_hudless_count_, cs_hudless_score_, cs_hudless_fill_, cs_layer_hud_, cs_layer_check_clear_, cs_layer_check_, cs_obj_join_init_, cs_obj_join_, cs_obj_join_final_, cs_still_, cs_hold_fill_, cs_grow_init_, cs_grow_clear_, cs_grow_, cs_grow_final_, cs_obj_clear_, cs_obj_clear_tiles_, cs_obj_splat_, cs_obj_fix_, cs_copy4_, cs_copy1_;
     ComPtr<ID3D12PipelineState> cs_fg_motion_, cs_fg_inverse_, cs_fg_clear_, cs_fg_splat_cur_, cs_fg_splat_prev_, cs_fg_resolve_, cs_fg_depth_;
     bool object_history_ = false, history_valid_ = false, objects_built_ = false, shown_objects_ = false;
     bool warp_splat_ = false;  // set_warp_splat
+    bool rig_check_ = false;   // set_rig_check
+    bool still_reset_ = false; // hold_characters: the score starts over
+    // hold_characters' growing along depth: the held area's size on the half grid (read back), its buffers
+    ComPtr<ID3D12Resource> grow_counts_, grow_readback_;
+    bool grow_pending_[kRing] = {};
+    std::uint32_t grow_cells_ = 0;
+    // The learned HUD detection learning here (combined detection's confirmation, see build_no_warp_mask): frames learned
+    // from of the last 300; stalled (fewer than a tenth, and before the first 300) - no confirmation.
+    std::uint32_t learn_frames_ = 0, learn_learned_ = 0;
+    bool learning_stalled_ = true;
     std::uint32_t detection_idle_ = 0;  // game frames since the HUD was last detected (build_no_warp_mask)
     std::uint32_t scene_idle_ = 0;      // game frames since the upscaler's output last came (ingest)
     ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_warp_claims_clear_, cs_warp_claim_, cs_memory_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_;

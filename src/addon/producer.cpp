@@ -44,6 +44,7 @@ void default_settings(Settings& s) {
     s.hold_reticles = 1;  // sight reticles drawn without depth move with the gun (acts only inside a sight's window)
     s.game_hud_layers = 1;  // the HUD from the game's own HUD layer / final picture where found
     s.warp_splat = 1;  // the XPAR warp by forward splat
+    s.hold_characters = 1;  // whole characters held
     s.edge_limit_pct = 0.0f;  // camera as of now: no more of the edge uncovered than Auto's
     s.edge_fill = 1;  // soft edge (blur along the edge); extended edge pixels are the option
     s.no_warp_mask = 1;   // HUD detection in games without HUD layers
@@ -85,6 +86,7 @@ Producer::~Producer() {
     detach_vulkan();
     for (auto& slot : textures_)
         for (auto& t : slot) if (t.handle) CloseHandle(t.handle);
+    if (ui_vk_.handle) CloseHandle(ui_vk_.handle);
     for (auto& r : retired_) if (r.handle) CloseHandle(r.handle);
     if (fence_handle_) CloseHandle(fence_handle_);
     if (shared_) { shared_->magic = 0; UnmapViewOfFile(shared_); }
@@ -179,6 +181,12 @@ void Producer::release_textures() {
             if (t.handle) CloseHandle(t.handle);
             t = Texture{};
         }
+    if (vk_) vk_->destroy(ui_vk_.vk);
+    if (ui_vk_.handle) CloseHandle(ui_vk_.handle);
+    ui_vk_ = Texture{};
+    ui_vk_age_ = 2;
+    d11_before_.Reset(); d11_cover_.Reset(); d11_picture_.Reset(); d11_cover_cs_.Reset();
+    d11_before_taken_ = d11_cs_failed_ = d11_none_ = d11_confirmed_ = false;
     for (auto& r : retired_) {
         if (vk_) vk_->destroy(r.vk);
         if (r.handle) CloseHandle(r.handle);
@@ -456,6 +464,227 @@ void Producer::on_hudless_copy(ID3D12Resource* source, D3D12_RESOURCE_STATES sta
     copy_into(list, source, state, hudless_pending_.Get());
     hudless_age_ = 0;
     ++shared_->hooks.hudless_copies;
+}
+
+bool Producer::ensure_own(Texture& t, const D3D12_RESOURCE_DESC& source) {
+    const DXGI_FORMAT format = copy_format(source.Format);
+    if (t.resource && t.desc.Width == source.Width && t.desc.Height == source.Height && t.desc.Format == format && (!vk_ || t.vk.image)) return true;
+    if (t.resource) retired_.push_back({t.resource, t.handle, fence_value_ + 1, t.vk, t.d11});
+    t = Texture{};
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = source.Width; desc.Height = source.Height; desc.DepthOrArraySize = 1; desc.MipLevels = 1;
+    desc.Format = format; desc.SampleDesc.Count = 1; desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+    D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&t.resource))) ||
+        FAILED(device_->CreateSharedHandle(t.resource.Get(), nullptr, GENERIC_ALL, nullptr, &t.handle))) {
+        set_message("HUD layer (Vulkan): create failed"); t = Texture{}; return false;
+    }
+    t.desc = desc;
+    if (vk_) {
+        std::string error;
+        if (!vk_->import(t.handle, vk_format_of(format), static_cast<std::uint32_t>(desc.Width), desc.Height, 0, t.vk, error)) {
+            set_message(error.c_str());
+            CloseHandle(t.handle); t = Texture{};
+            return false;
+        }
+    }
+    return true;
+}
+
+void Producer::on_ui_layer_vk(std::uint64_t image, DXGI_FORMAT format, std::uint32_t width, std::uint32_t height, std::uint32_t layout,
+                              void* command_buffer) {
+    std::lock_guard lock(mutex_);
+    if (!ready() || !vk_ || !image || !command_buffer || !width || !height || vk_format_of(copy_format(format)) == VK_FORMAT_UNDEFINED) return;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width; desc.Height = height; desc.Format = format;
+    collect_retired();
+    if (!ensure_own(ui_vk_, desc)) return;
+    vk_->copy(static_cast<VkCommandBuffer>(command_buffer), reinterpret_cast<VkImage>(image), VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
+              static_cast<VkImageLayout>(layout), ui_vk_.vk, width, height);
+    ui_vk_age_ = 0;
+    shared_->hooks.ui_layer_w = width; shared_->hooks.ui_layer_h = height; shared_->hooks.ui_layer_format = format;
+    ++shared_->hooks.ui_layer_taken;
+}
+
+// Direct3D 11, third pattern: the comparison of the picture with its HUD and the copy before it (see on_hud_before_d3d11).
+static const char kD11CoverShader[] = R"(
+Texture2D<float4> now_t : register(t0);
+Texture2D<float4> before_t : register(t1);
+RWTexture2D<unorm float> cover : register(u0);
+[numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
+    uint w, h;
+    cover.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    const float3 a = now_t.Load(int3(id.xy, 0)).rgb, b = before_t.Load(int3(id.xy, 0)).rgb;
+    // (what the HUD changed: more than a step of an 8-bit picture, or 3% of an HDR one)
+    cover[id.xy] = any(abs(a - b) > 0.004 + 0.03 * max(abs(a), abs(b))) ? 1.0 : 0.0;
+}
+)";
+void Producer::on_hud_before_d3d11(ID3D11Resource* picture, std::uint32_t kind, ID3D11DeviceContext* context) {
+    std::lock_guard lock(mutex_);
+    if (!ready() || !d11_ || !context) return;
+    if (kind == 1) {  // (no HUD this frame; a copy taken this frame comes first)
+        if (!d11_before_taken_) d11_none_ = true;
+        return;
+    }
+    if (kind == 2) {
+        if (d11_before_taken_) d11_confirmed_ = true;
+        return;
+    }
+    if (kind == 3) {
+        d11_before_taken_ = d11_confirmed_ = false;
+        d11_picture_.Reset();
+        return;
+    }
+    if (!picture) return;
+    ComPtr<ID3D11Texture2D> texture;
+    D3D11_TEXTURE2D_DESC pd{};
+    if (FAILED(picture->QueryInterface(IID_PPV_ARGS(&texture)))) return;
+    texture->GetDesc(&pd);
+    if (pd.SampleDesc.Count != 1) return;
+    D3D11_TEXTURE2D_DESC bd{};
+    if (d11_before_) d11_before_->GetDesc(&bd);
+    if (!d11_before_ || bd.Width != pd.Width || bd.Height != pd.Height || bd.Format != pd.Format) {
+        ComPtr<ID3D11Device> device;
+        context->GetDevice(&device);
+        D3D11_TEXTURE2D_DESC d = pd;
+        d.MipLevels = 1; d.ArraySize = 1; d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE; d.CPUAccessFlags = 0; d.MiscFlags = 0;
+        d11_before_.Reset();
+        if (!device || FAILED(device->CreateTexture2D(&d, nullptr, &d11_before_))) { set_message("HUD (Direct3D 11): copy failed"); return; }
+    }
+    if (pd.MipLevels == 1 && pd.ArraySize == 1) context->CopyResource(d11_before_.Get(), picture);
+    else context->CopySubresourceRegion(d11_before_.Get(), 0, 0, 0, 0, picture, 0, nullptr);
+    d11_picture_ = picture;
+    d11_before_taken_ = true;
+    d11_none_ = d11_confirmed_ = false;
+    shared_->hooks.ui_layer_w = pd.Width; shared_->hooks.ui_layer_h = pd.Height; shared_->hooks.ui_layer_format = pd.Format;
+    ++shared_->hooks.ui_layer_taken;
+}
+static DXGI_FORMAT d11_srv_format(DXGI_FORMAT f) {
+    switch (f) {
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        case DXGI_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+        default: return f;
+    }
+}
+void Producer::d3d11_cover(ID3D11DeviceContext* context, int slot) {
+    // (under the lock; the game's compute stage is restored after)
+    const bool none = d11_none_ && !d11_before_taken_;
+    const bool confirmed = d11_confirmed_;
+    d11_none_ = d11_confirmed_ = false;
+    if (!none && (!d11_before_taken_ || !confirmed || !d11_picture_ || !d11_before_)) {  // (unconfirmed: not handed over)
+        d11_before_taken_ = false;
+        d11_picture_.Reset();
+        return;
+    }
+    d11_before_taken_ = false;
+    auto& m = shared_->slots[slot];
+    if (m.tex[kUi].valid) { d11_picture_.Reset(); return; }  // (a UI layer the game tags itself)
+    ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    if (!device) return;
+    if (none) {  // (an empty HUD: the coverage cleared, the picture's size - the back buffer's)
+        const auto& bb = m.tex[kBackbuffer];
+        if (!bb.valid || !bb.width || !bb.height) return;
+        D3D11_TEXTURE2D_DESC cd{};
+        if (d11_cover_) d11_cover_->GetDesc(&cd);
+        if (!d11_cover_ || cd.Width != bb.width || cd.Height != bb.height) {
+            D3D11_TEXTURE2D_DESC d{};
+            d.Width = bb.width; d.Height = bb.height; d.MipLevels = 1; d.ArraySize = 1; d.Format = DXGI_FORMAT_R8_UNORM;
+            d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+            d11_cover_.Reset();
+            if (FAILED(device->CreateTexture2D(&d, nullptr, &d11_cover_))) return;
+        }
+        ComPtr<ID3D11UnorderedAccessView> cover_view;
+        if (FAILED(device->CreateUnorderedAccessView(d11_cover_.Get(), nullptr, &cover_view))) return;
+        const float zero[4] = {};
+        context->ClearUnorderedAccessViewFloat(cover_view.Get(), zero);
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = bb.width; desc.Height = bb.height; desc.Format = DXGI_FORMAT_R8_UNORM;
+        if (!ensure_texture(slot, kUi, desc)) return;
+        auto& t = textures_[slot][kUi];
+        context->CopyResource(t.d11.Get(), d11_cover_.Get());
+        auto& info = m.tex[kUi];
+        info.width = bb.width; info.height = bb.height; info.format = t.desc.Format;
+        info.generation = t.generation; info.ext_x = info.ext_y = 0; info.ext_w = bb.width; info.ext_h = bb.height;
+        info.valid = 1;
+        ++shared_->hooks.ui_layer_handed;
+        return;
+    }
+    if (!d11_cover_cs_ && !d11_cs_failed_) {
+        ComPtr<ID3DBlob> code, errors;
+        d11_cs_failed_ = true;
+        if (SUCCEEDED(D3DCompile(kD11CoverShader, sizeof(kD11CoverShader) - 1, "hud_cover", nullptr, nullptr, "main", "cs_5_0", 0, 0, &code, &errors)) &&
+            SUCCEEDED(device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &d11_cover_cs_)))
+            d11_cs_failed_ = false;
+        else set_message("HUD (Direct3D 11): shader failed");
+    }
+    if (!d11_cover_cs_) return;
+    D3D11_TEXTURE2D_DESC bd{};
+    d11_before_->GetDesc(&bd);
+    D3D11_TEXTURE2D_DESC cd{};
+    if (d11_cover_) d11_cover_->GetDesc(&cd);
+    if (!d11_cover_ || cd.Width != bd.Width || cd.Height != bd.Height) {
+        D3D11_TEXTURE2D_DESC d{};
+        d.Width = bd.Width; d.Height = bd.Height; d.MipLevels = 1; d.ArraySize = 1; d.Format = DXGI_FORMAT_R8_UNORM;
+        d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+        d11_cover_.Reset();
+        if (FAILED(device->CreateTexture2D(&d, nullptr, &d11_cover_))) return;
+    }
+    ComPtr<ID3D11ShaderResourceView> now_view, before_view;
+    ComPtr<ID3D11UnorderedAccessView> cover_view;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = d11_srv_format(bd.Format); sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels = 1;
+    if (FAILED(device->CreateShaderResourceView(d11_picture_.Get(), &sv, &now_view)) ||
+        FAILED(device->CreateShaderResourceView(d11_before_.Get(), &sv, &before_view)) ||
+        FAILED(device->CreateUnorderedAccessView(d11_cover_.Get(), nullptr, &cover_view))) {
+        d11_picture_.Reset();
+        return;
+    }
+    // (the game's compute stage as it was: shader, the two views, the one output)
+    ComPtr<ID3D11ComputeShader> old_cs;
+    ComPtr<ID3D11ClassInstance> instances[256];
+    UINT instance_count = 256;
+    ID3D11ClassInstance* raw_instances[256] = {};
+    context->CSGetShader(&old_cs, raw_instances, &instance_count);
+    for (UINT i = 0; i < instance_count; ++i) instances[i].Attach(raw_instances[i]);
+    ID3D11ShaderResourceView* old_srv[2] = {};
+    ID3D11UnorderedAccessView* old_uav[1] = {};
+    context->CSGetShaderResources(0, 2, old_srv);
+    context->CSGetUnorderedAccessViews(0, 1, old_uav);
+    ID3D11ShaderResourceView* srvs[2] = {now_view.Get(), before_view.Get()};
+    ID3D11UnorderedAccessView* uavs[1] = {cover_view.Get()};
+    context->CSSetShader(d11_cover_cs_.Get(), nullptr, 0);
+    context->CSSetShaderResources(0, 2, srvs);
+    context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+    context->Dispatch((bd.Width + 7) / 8, (bd.Height + 7) / 8, 1);
+    ID3D11ShaderResourceView* none_srv[2] = {};
+    context->CSSetShaderResources(0, 2, none_srv);
+    context->CSSetShader(old_cs.Get(), raw_instances, instance_count);
+    context->CSSetShaderResources(0, 2, old_srv);
+    context->CSSetUnorderedAccessViews(0, 1, old_uav, nullptr);
+    for (auto* v : old_srv) if (v) v->Release();
+    for (auto* v : old_uav) if (v) v->Release();
+    d11_picture_.Reset();
+    // ...into the frame's UI slot
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = bd.Width; desc.Height = bd.Height; desc.Format = DXGI_FORMAT_R8_UNORM;
+    if (!ensure_texture(slot, kUi, desc)) return;
+    auto& t = textures_[slot][kUi];
+    context->CopyResource(t.d11.Get(), d11_cover_.Get());
+    auto& info = m.tex[kUi];
+    info.width = bd.Width; info.height = bd.Height; info.format = t.desc.Format;
+    info.generation = t.generation; info.ext_x = info.ext_y = 0; info.ext_w = bd.Width; info.ext_h = bd.Height;
+    info.valid = 1;
+    ++shared_->hooks.ui_layer_handed;
 }
 
 // The HUD layer's coverage pass (see begin_present): alpha into an 8-bit one-channel texture.
@@ -893,6 +1122,18 @@ std::uint64_t Producer::begin_present_vk(std::uint64_t image, DXGI_FORMAT format
         info.generation = t.generation; info.ext_x = info.ext_y = 0; info.ext_w = width; info.ext_h = height;
         info.valid = 1;
     }
+    // (the HUD layer taken, see on_ui_layer_vk: into the frame's UI slot, unless the game tags one itself)
+    if (ui_vk_.resource && ui_vk_age_ <= 1 && !m.tex[kUi].valid && ensure_texture(slot, kUi, ui_vk_.desc)) {
+        auto& t = textures_[slot][kUi];
+        vk_->copy(static_cast<VkCommandBuffer>(command_buffer), reinterpret_cast<VkImage>(ui_vk_.vk.image), VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
+                  VK_IMAGE_LAYOUT_GENERAL, t.vk, static_cast<std::uint32_t>(ui_vk_.desc.Width), ui_vk_.desc.Height);
+        auto& info = m.tex[kUi];
+        info.width = static_cast<std::uint32_t>(t.desc.Width); info.height = t.desc.Height; info.format = t.desc.Format;
+        info.generation = t.generation; info.ext_x = info.ext_y = 0; info.ext_w = info.width; info.ext_h = info.height;
+        info.valid = 1;
+        ++shared_->hooks.ui_layer_handed;
+    }
+    if (ui_vk_age_ < 2) ++ui_vk_age_;
     m.qpc_present = qpc_now();
     return m.frame_id + 1;  // 0 means "nothing to finish"
 }
@@ -1018,6 +1259,7 @@ std::uint64_t Producer::begin_present_d3d11(ID3D11Resource* backbuffer, ID3D11De
         info.generation = t.generation; info.ext_x = info.ext_y = 0; info.ext_w = sd.Width; info.ext_h = sd.Height;
         info.valid = 1;
     }
+    d3d11_cover(context, slot);  // (third pattern: the HUD, if a copy before it was taken this frame)
     m.qpc_present = qpc_now();
     return m.frame_id + 1;  // 0 means "nothing to finish"
 }

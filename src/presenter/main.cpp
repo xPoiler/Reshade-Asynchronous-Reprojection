@@ -965,9 +965,20 @@ void render_thread() {
                     const double cz = z * p[10] + p[14], cw = z * p[11] + p[15];
                     if (std::fabs(cw) > 1e-9 && cz / cw > 0) floor_pivot_depth = float(cz / cw);
                 }
+                renderer.set_rig_check(true);  // (objects the player follows by turning are not held: see cs_analyze)
                 renderer.analyze_motion(s, cam.clip_to_prev_clip, float(mv_scale.scale(0, s.depth_rect.w)),
                                         float(mv_scale.scale(1, s.depth_rect.h)), mv_scale.valid, cam.depth_inverted != 0,
                                         settings.near_camera_rule != 0, settings.turn_rule != 0, m.frame_id, floor_pivot_depth);
+                // Whole characters held (option): before the mask and the moving objects, which both read the analysis.
+                {
+                    static bool was_holding = false;
+                    const bool holding = settings.hold_characters != 0 && attached_mask && mv_scale.valid;
+                    if (holding) {
+                        if (!was_holding) renderer.reset_still();
+                        renderer.hold_characters(s, cam.clip_to_prev_clip, cam.view_to_clip, mv_scale.valid, cam.depth_inverted != 0);
+                    }
+                    was_holding = holding;
+                }
                 // Frame generation (the game's own): its generated images made ready for the warp here.
                 renderer.pass_stamp(Renderer::kPassAnalyze);
                 if (own_engine_on() && s.generated > 0) {
@@ -1010,8 +1021,11 @@ void render_thread() {
                                  hs.scene_pass_ms[17] / hs.scene_frames);
                         }
                         if (hs.frames)
-                            logf("HUD detection: %d frames, learned from %d (HUD-like share %.0f%%), %d with too little detail, %d held back by the guard",
-                                 hs.frames, hs.learned, hs.learned ? 100.0 * hs.share_sum / hs.learned : 0.0, hs.too_little, hs.guarded);
+                            logf("HUD detection: %d frames, learned from %d (HUD-like share %.0f%%), %d with too little detail, %d held back by the guard%s",
+                                 hs.frames, hs.learned, hs.learned ? 100.0 * hs.share_sum / hs.learned : 0.0, hs.too_little, hs.guarded,
+                                 settings.hud_from_scene == 2 && hs.scene_frames ? (renderer.learning_stalled()
+                                     ? " - barely learning: the upscaler output's HUD taken without its confirmation"
+                                     : " - confirming the upscaler output's HUD") : "");
                     }
                     if (!mask_logged) { logf("no-warp mask: %s%s", hud_mask ? "HUD (the game has no HUD layers)" : "", attached_mask ? (hud_mask ? " + character/weapon" : "character/weapon") : ""); mask_logged = true; }
                     if (settings.hold_reticles && attached_mask && !reticles_logged) {

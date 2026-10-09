@@ -133,6 +133,20 @@ bool floor_at(int2 p, int k) {
                 // people) do not do that, and they must keep warping. The near rule can be switched off (flag
                 // 64): with an estimated camera the nearby floor can miss the camera model while strafing.
                 const float2 screen_px = g * mv_scale * float2(rect.zw);
+                // The camera's turn alone here (its motion at infinite distance).
+                const float4 far = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, 0, 1), clip_to_prev);
+                const float2 turn_px = far.w > 0 ? (float2(far.x / far.w * 0.5 + 0.5, 0.5 - far.y / far.w * 0.5) - uv) * float2(rect.zw)
+                                                 : float2(0, 0);
+                // Part of the camera rig (flag 2048): what stays on screen because it moves with the camera, not because
+                // the player keeps it there (a car or a person followed by turning the camera stays on screen too, and
+                // must warp - held, it split from the scenery, worse still with XPAR frame generation). Two ways of being
+                // carried by the camera: where the camera's motion at this spot comes mostly from its moving, not its
+                // turning (walking with a third-person character: the scenery shifts by its distance), or where the turn
+                // is cancelled at this distance (the centre an orbiting camera turns around: the character). A followed
+                // object far from both stays on screen against a turn that is not cancelled there.
+                const float cam_len = length(cam_px), turn_len = length(turn_px);
+                const bool carried = !(flags & 2048) || length(cam_px - turn_px) >= 0.5 * cam_len;
+                const bool orbit_centre = !(flags & 2048) || cam_len < 0.5 * turn_len;
                 // Still compared with the turn alone (flag 128, on by default): a camera orbiting a third-person
                 // character keeps it nearly still on screen. The camera model includes the orbit, so the
                 // character follows it and the rule above does not hold it - but the warp turns the view
@@ -140,10 +154,7 @@ bool floor_at(int2 p, int k) {
                 // moves under 20% of what the turn alone (the camera motion at infinite distance) moves.
                 bool turn_still = false;
                 if (flags & 128) {
-                    const float4 far = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, 0, 1), clip_to_prev);
-                    const float2 turn_px = far.w > 0 ? (float2(far.x / far.w * 0.5 + 0.5, 0.5 - far.y / far.w * 0.5) - uv) * float2(rect.zw)
-                                                     : float2(0, 0);
-                    turn_still = d > 1.0 / 4096.0 && length(turn_px) >= 2.0 && length(screen_px) < 0.2 * length(turn_px);
+                    turn_still = trusted && d > 1.0 / 4096.0 && turn_len >= 2.0 && length(screen_px) < 0.2 * turn_len && orbit_centre;
                     // Floor release (flag 512, debug test; alpha: the depth value of the orbit pivot, only set while turns
                     // are predicted around a measured pivot): the ground around the orbited character barely moves on
                     // screen either, but the warp moves it right now - not held when it is floor (two of three spots
@@ -155,9 +166,13 @@ bool floor_at(int2 p, int k) {
                         if (votes >= 2) turn_still = false;
                     }
                 }
+                // (near the camera - the first-person weapon and hands - the rig needs no proof. Stuck to the screen only
+                // where the motion is known: XPAR's own estimate, filled in where the picture has no detail, can come out
+                // near zero there - a dark floor or a flat wall was held, up to 29% of the screen in RE2)
                 const bool attached = (flags & 1) && (flags & 16) &&
                                       ((!(flags & 64) && d > 1.0 / 64.0 && moving) ||
-                                       (d > 1.0 / 4096.0 && length(cam_px) >= 2.0 && length(screen_px) < 0.2 * length(cam_px)) ||
+                                       (trusted && d > 1.0 / 4096.0 && cam_len >= 2.0 && length(screen_px) < 0.2 * cam_len &&
+                                        (d > 1.0 / 64.0 || carried)) ||
                                        turn_still);
                 o = float4(own, d, attached ? 2 : (moving ? 1 : 0));
                 // The scale fit only uses pixels whose motion vector points along the camera motion (either
@@ -498,17 +513,25 @@ bool fg_pick(float2 x, out float4 c, out float z) {
 // camera's motion, tearing it apart. So what moves on its own and touches something attached at about the same
 // distance becomes attached too: jumps of 64, 32, ... 1 render px between pixels within 15% of each other's
 // distance spread it over the whole object; the result goes back into the analysis, so the mask holds it too.
+// Holding whole characters (option, rect.y 1 - see Renderer::hold_characters): the same spreading, but only into spots
+// that have stayed in place on screen lately (t3, the score of cs_still: swinging limbs do, grass, walls and floor the
+// character runs past do not - a different bit of them there every frame, moving with the camera), and spots that have
+// stayed in place for several frames are attached themselves (seeds).
 Texture2D<float4> oj_object_t : register(t0);
 Texture2D<float> oj_kind_t : register(t1);
 Texture2D<float> oj_depth_t : register(t2);
+Texture2D<float> oj_still_t : register(t3);
 RWTexture2D<float> oj_kind_u : register(u0);
 [numthreads(8, 8, 1)] void cs_obj_join_init(uint3 id : SV_DispatchThreadID) {
-    if (all(id.xy < grid)) oj_kind_u[id.xy] = oj_object_t.Load(int3(id.xy, 0)).w;
+    if (any(id.xy >= grid)) return;
+    float k = oj_object_t.Load(int3(id.xy, 0)).w;
+    if ((uint(rect.y) & 1) && oj_still_t.Load(int3(id.xy, 0)) >= 0.6) k = 2.0;
+    oj_kind_u[id.xy] = k;
 }
 [numthreads(8, 8, 1)] void cs_obj_join(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= grid)) return;
     float k = oj_kind_t.Load(int3(id.xy, 0));
-    if (abs(k - 1.0) < 0.5) {
+    if (abs(k - 1.0) < 0.5 && (!(uint(rect.y) & 1) || oj_still_t.Load(int3(id.xy, 0)) >= 0.3)) {
         const float w = view_w(oj_depth_t.Load(int3(id.xy, 0)));
         const int step = int(rect.x);
         [unroll] for (int y = -1; y <= 1; ++y)
@@ -518,6 +541,155 @@ RWTexture2D<float> oj_kind_u : register(u0);
             }
     }
     oj_kind_u[id.xy] = k;
+}
+// How much each spot of the screen has stayed in place lately while the camera moved (render px; 0..1, a quarter of the way
+// towards this frame's verdict every frame the camera moves at least 2 px there; unchanged when it does not). This
+// frame's verdict: on screen under half of what the camera's motion would move it, and held the way the motion analysis
+// holds (near the camera, or carried by the camera's moving, or at the centre an orbit turns around - not an object
+// followed by turning), where the motion is known (XPAR's own motion: its trusted spots). A character jittering a few
+// pixels each frame - the camera following with lag, limbs swinging - stays in place this way; scenery passes by.
+// rect: the depth region; flags 1 scale known, 2 own motion (t2: its trust, out_size its size), 8 start over,
+// 16 depth inverted.
+Texture2D<float4> st_object_t : register(t0);
+Texture2D<float> st_depth_t : register(t1);
+Texture2D<float4> st_flow_t : register(t2);
+RWTexture2D<float> st_score_u : register(u0);
+[numthreads(8, 8, 1)] void cs_still(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= rect.zw)) return;
+    const int2 pr = int2(rect.xy + id.xy);
+    float s = (flags & 8) ? 0.0 : st_score_u[pr];
+    const float4 o = st_object_t.Load(int3(pr, 0));
+    const float d = st_depth_t.Load(int3(pr, 0));
+    const float2 uv = (float2(id.xy) + 0.5) / float2(rect.zw);
+    const float4 prev = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, d, 1), clip_to_prev);
+    const float4 far = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, 0, 1), clip_to_prev);
+    if ((flags & 1) && (flags & 16) && prev.w > 0 && far.w > 0 && d > 1.0 / 4096.0) {
+        const float2 cam_px = (float2(prev.x / prev.w * 0.5 + 0.5, 0.5 - prev.y / prev.w * 0.5) - uv) * float2(rect.zw);
+        const float2 turn_px = (float2(far.x / far.w * 0.5 + 0.5, 0.5 - far.y / far.w * 0.5) - uv) * float2(rect.zw);
+        const float cam_len = length(cam_px), turn_len = length(turn_px);
+        if (cam_len >= 2.0) {
+            bool trusted = true;
+            if (flags & 2) trusted = st_flow_t.Load(int3(min(uint2((float2(pr) + 0.5) * float2(out_size) / float2(grid)), out_size - 1), 0)).z > 0.5;
+            const bool rig = d > 1.0 / 64.0 || length(cam_px - turn_px) >= 0.5 * cam_len || cam_len < 0.5 * turn_len;
+            const float2 screen_px = o.xy + cam_px;  // (o.xy: its own motion against the camera's, cs_analyze)
+            const bool still = trusted && rig && any(o != 0) && length(screen_px) < 0.5 * cam_len;
+            s = lerp(s, still ? 1.0 : 0.0, 0.25);
+        }
+    }
+    st_score_u[pr] = s;
+}
+// ...and holes in it (cs_hold_fill): a spot not held, enclosed by held pixels at its own distance (within 15%) in at least
+// 7 of 8 directions within 3% of the screen height (the frame's edge counts, a character cut off by it), before anything
+// nearer or farther comes in the way, is part of what is held. Flat skin or cloth XPAR's own motion estimate cannot
+// follow (RE2) left the character full of small holes that warped with the scenery: it fell apart into specks. The
+// floor at its feet or a wall beside it touch it on one side only; what is seen between an arm and the body is farther.
+// Into a kind texture (u0, 2 held), back into the analysis by cs_obj_join_final. rect.x: the step (render px), rect.y the
+// steps.
+static const int2 kHoldDirs[8] = {int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1), int2(1, 1), int2(1, -1), int2(-1, 1), int2(-1, -1)};
+[numthreads(8, 8, 1)] void cs_hold_fill(uint3 id : SV_DispatchThreadID) {
+    // (one thread per 2x2 block - holes are blobs, not single pixels: a quarter of the walks; the block's pixels at its
+    // first one's distance are filled with it)
+    const int2 b = int2(id.xy) * 2;
+    if (any(b >= int2(grid))) return;
+    const float4 o = oj_object_t.Load(int3(b, 0));
+    const float w0 = view_w(oj_depth_t.Load(int3(b, 0)));
+    bool fill = false;
+    if (w0 > 0) {
+        const int step = max(1, int(rect.x)), steps = int(rect.y);
+        uint enclosed = 0, open = 0;
+        [loop] for (uint i = 0; i < 8 && open < 2; ++i) {  // (two open directions: not enclosed - most spots stop here)
+            const int2 dir = kHoldDirs[i];
+            bool hit = false;
+            [loop] for (int n = 1; n <= steps; ++n) {
+                const int2 q = b + dir * (n * step);
+                if (any(q < 0) || any(q >= int2(grid))) { hit = true; break; }
+                const float wq = view_w(oj_depth_t.Load(int3(q, 0)));
+                if (wq <= 0 || abs(wq - w0) > 0.15 * w0) break;
+                if (oj_object_t.Load(int3(q, 0)).w > 1.5) { hit = true; break; }
+            }
+            if (hit) ++enclosed; else ++open;
+        }
+        fill = enclosed >= 7;
+    }
+    [unroll] for (int k = 0; k < 4; ++k) {
+        const int2 p = b + int2(k & 1, k >> 1);
+        if (any(p >= int2(grid))) continue;
+        float kind = oj_object_t.Load(int3(p, 0)).w;
+        if (fill && kind < 1.5) {
+            const float wp = view_w(oj_depth_t.Load(int3(p, 0)));
+            if (wp > 0 && abs(wp - w0) <= 0.15 * w0) kind = 2.0;
+        }
+        oj_kind_u[p] = kind;
+    }
+}
+// Growing what is held along depth (hold_characters), only where XPAR's own motion estimate is not trusted - where the
+// motion cannot tell (dark hair, a black gun stock: RE2 has no motion vectors): held spreads, one cell of half the
+// render grid per pass, into such spots whose distance continues from a held neighbour's (within 15%: the same object -
+// what is seen behind it is farther), never into the floor (it gets nearer evenly down the screen: the ground under the
+// feet). As many passes as a tenth of the held area's size (rect.x passes; the area counted here, read back a few frames
+// later). Games with motion vectors never come here: every pixel's motion is known.
+// Half grid (out_size): x held, y depth (of the cell's held pixel if any, else its nearest).
+Texture2D<float4> og_object_t : register(t0);
+Texture2D<float> og_depth_t : register(t2);
+Texture2D<float4> og_flow_t : register(t4);
+Texture2D<float2> og_half_t : register(t5);
+RWTexture2D<float2> og_half_u : register(u0);
+RWByteAddressBuffer og_count_u : register(u1);
+groupshared uint og_n;
+[numthreads(8, 8, 1)] void cs_grow_init(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+    if (gi == 0) og_n = 0;
+    GroupMemoryBarrierWithGroupSync();
+    if (all(id.xy < out_size)) {
+        float held = 0, d_held = 0, d_near = (flags & 16) ? 0.0 : 1.0;
+        [unroll] for (int k = 0; k < 4; ++k) {
+            const int2 p = min(int2(id.xy) * 2 + int2(k & 1, k >> 1), int2(grid) - 1);
+            const float d = og_depth_t.Load(int3(p, 0));
+            d_near = (flags & 16) ? max(d_near, d) : min(d_near, d);
+            if (og_object_t.Load(int3(p, 0)).w > 1.5) { held = 1; d_held = d; }
+        }
+        og_half_u[id.xy] = float2(held, held > 0 ? d_held : d_near);
+        if (held > 0) { uint ignored; InterlockedAdd(og_n, 1, ignored); }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (gi == 0 && og_n) { uint ignored; og_count_u.InterlockedAdd(0, og_n, ignored); }
+}
+[numthreads(1, 1, 1)] void cs_grow_clear(uint3 id : SV_DispatchThreadID) { og_count_u.Store(0, 0); }
+// (floor: the depth value grows down the screen, evenly - as floor_at, on the half grid)
+bool grow_floor(int2 p) {
+    const int k = max(1, int(round(float(out_size.y) / 190.0)));
+    const int2 hi = int2(out_size) - 1;
+    const float a = og_half_t.Load(int3(clamp(p - int2(0, k), int2(0, 0), hi), 0)).y;
+    const float c = og_half_t.Load(int3(p, 0)).y;
+    const float b = og_half_t.Load(int3(clamp(p + int2(0, k), int2(0, 0), hi), 0)).y;
+    const float slope = (b - a) / float(2 * k) * float(out_size.y);
+    return (flags & 16) && slope > 0 && slope > 0.6 * max(c, 1e-6) && abs(b - 2 * c + a) < 0.25 * abs(b - a);
+}
+[numthreads(8, 8, 1)] void cs_grow(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= out_size)) return;
+    float2 v = og_half_t.Load(int3(id.xy, 0));
+    if (v.x < 0.5 && og_flow_t.Load(int3(id.xy, 0)).z < 0.5) {
+        const float w = view_w(v.y);
+        if (w > 0 && !grow_floor(int2(id.xy))) {
+            [unroll] for (int k = 0; k < 8; ++k) {
+                const int2 q = clamp(int2(id.xy) + kHoldDirs[k], int2(0, 0), int2(out_size) - 1);
+                const float2 n = og_half_t.Load(int3(q, 0));
+                if (n.x > 0.5 && abs(view_w(n.y) - w) <= 0.15 * w) v.x = 1;
+            }
+        }
+    }
+    og_half_u[id.xy] = v;
+}
+// Back into the analysis: a pixel of a grown cell at its distance (within 15%), where the motion is not trusted.
+RWTexture2D<float4> og_object_u : register(u0);
+[numthreads(8, 8, 1)] void cs_grow_final(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= grid)) return;
+    float4 o = og_object_u[id.xy];
+    if (o.w > 1.5) return;
+    const int2 h = min(int2(id.xy) / 2, int2(out_size) - 1);
+    const float2 v = og_half_t.Load(int3(h, 0));
+    if (v.x < 0.5 || og_flow_t.Load(int3(h, 0)).z >= 0.5) return;
+    const float w = view_w(og_depth_t.Load(int3(id.xy, 0))), wc = view_w(v.y);
+    if (w > 0 && wc > 0 && abs(w - wc) <= 0.15 * wc) { o.w = 2.0; og_object_u[id.xy] = o; }
 }
 RWTexture2D<float4> oj_object_u : register(u0);
 [numthreads(8, 8, 1)] void cs_obj_join_final(uint3 id : SV_DispatchThreadID) {
@@ -1582,6 +1754,7 @@ Texture2D<float> ow_prevz_t : register(t9);   // ...and depth
 Texture2D<uint> ow_out_tiles_t : register(t10); // ...the 8x8 output blocks they touch
 Texture2D<float4> ow_layer_t : register(t11);  // sight reticles: the layer on the glass (cs_ret_layer)
 Texture2D<uint> ow_claims_t : register(t12);   // forward splat: the claims on the displayed spots (cs_warp_claim)
+Texture2D<float> ow_memz_t : register(t13);    // background memory's depth (flag 64)
 // How much the layer covers the glass at a spot: 0 up to faint glow, 1 on the reticle itself.
 float ow_cover(float4 l) { return saturate((max(max(l.r, l.g), l.b) - 0.03) / 0.2); }
 RWTexture2D<float4> ow_out_u : register(u0);
@@ -1598,14 +1771,28 @@ float ow_depth(float2 uv) {
 // Background memory (flag 64, see cs_memory): the scenery last seen at this spot of the source frame -
 // behind held pixels, or outside the frame - if seen within the last 60 game frames. Bilinear where all
 // four texels hold something, the nearest texel otherwise.
+// Nearness from the stored depth alone (32 steps per doubling of the distance; reversed or standard depth, flag 16), so
+// depths compare without the projection (the forward splat's claims, the background memory's depth).
+float ow_near(float d) {
+    const float x = (flags & 16) ? d : 1.0 - d;
+    return 1.0 + saturate((log2(max(x, 1e-12)) + 30.0) / 32.0) * 1022.0;
+}
 static const float kMemMargin = 0.125;  // the memory covers the screen plus this much on every side
 static const float kMemForget = 60.0;   // game frames
 Texture2D<float4> ow_mem_t : register(t4);
-// ...or only what it keeps from before (not seen now: behind what is in front, or held, or outside the frame).
-bool ow_from_memory_behind(float2 s, out float4 c) {
+// ...or only what it keeps from before (not seen now: behind what is in front, or held, or outside the frame), and only
+// where what it keeps is the scenery behind (far_near: its nearness, ow_near) - not a copy of what has moved on from
+// there (the character a few frames ago: a ghost of it in the gap it leaves).
+bool ow_from_memory_behind(float2 s, float far_near, out float4 c) {
     c = 0;
     const float2 mu = (s + kMemMargin) / (1.0 + 2.0 * kMemMargin);
     if (any(mu < 0) || any(mu > 1)) return false;
+    {
+        uint zw, zh;
+        ow_memz_t.GetDimensions(zw, zh);
+        const float z = ow_memz_t.Load(int3(min(uint2(mu * float2(zw, zh)), uint2(zw, zh) - 1), 0));
+        if (abs(ow_near(z) - far_near) > 10.0) return false;
+    }
     const float4 ages = ow_mem_t.GatherAlpha(ow_linear, mu);
     if (min(min(ages.x, ages.y), min(ages.z, ages.w)) >= 1.0 && max(max(ages.x, ages.y), max(ages.z, ages.w)) < kMemForget) {
         c = float4(ow_mem_t.SampleLevel(ow_linear, mu, 0).rgb, 1);
@@ -1715,12 +1902,7 @@ bool ow_search(float2 uv, out float2 src) {
     }
     return true;
 }
-// Forward splat (flag 4096). Nearness from the stored depth alone (32 steps per doubling of the distance; reversed or
-// standard depth, flag 16), so claims compare without the projection.
-float ow_near(float d) {
-    const float x = (flags & 16) ? d : 1.0 - d;
-    return 1.0 + saturate((log2(max(x, 1e-12)) + 30.0) / 32.0) * 1022.0;
-}
+// Forward splat (flag 4096): see ow_near.
 // Every rendered pixel (not held) claims the spot it lands on, in rendered-pixel cells of the displayed picture:
 // nearness << 22 | the claimant's offset from the cell (11 bits each, +1024). The nearest claim wins.
 RWTexture2D<uint> wc_claims_u : register(u0);
@@ -1754,16 +1936,21 @@ bool ow_on_surface(float2 s, float nk) {
 // A claim: its claimant's rendered pixel (the cell it claimed + the offset in the key).
 int2 ow_claimant(int2 cell, uint key) { return cell + int2(int((key >> 11) & 2047u) - 1024, int(key & 2047u) - 1024); }
 // From a claimant, the steps of the search over its own surface: true if they end on uv (< 0.5 px), still on that surface.
+// (the steps at the claimant's own depth: the claimant is within a rendered pixel of uv, so its surface is as good as
+// flat there - and steady where the depth changes every rendered pixel: with the depth under each step, hair and foliage
+// against what is behind them made the steps jump between the two, and the claim was dropped - the hair came out
+// speckled with the scenery behind it)
 bool ow_refine(float2 uv, int2 p, float nk, out float2 s) {
     s = (float2(p) + 0.5) / float2(rect.zw);
+    const float dp = ow_depth(s);
     [loop] for (int it = 0; it < 6; ++it) {
-        const float3 f = ow_forward(s);
+        const float3 f = ow_forward_at(s, dp);
         if (f.z <= 1e-6) return false;
         const float2 miss = uv - ow_lands(s, f);
         s += miss;
         if (all(abs(miss * float2(out_size)) < 0.25)) break;
     }
-    const float3 f = ow_forward(s);
+    const float3 f = ow_forward_at(s, dp);
     return f.z > 1e-6 && all(abs((uv - ow_lands(s, f)) * float2(out_size)) < 0.5) && ow_on_surface(s, nk);
 }
 // Uncovered at uv: the farthest claimant's surface (the scenery behind), carried on to uv at its own depth - as far as the
@@ -1783,7 +1970,7 @@ float2 ow_behind(float2 uv, int2 p, float far_near) {
         s += uv - ow_lands(s, f);
     }
     if (all(s >= 0) && all(s <= 1) && abs(ow_near(ow_depth(s)) - far_near) > 6.0) {
-        if (flags & 64) ow_hidden = ow_from_memory_behind(s, ow_hidden_c);
+        if (flags & 64) ow_hidden = ow_from_memory_behind(s, far_near, ow_hidden_c);
         float lo = 0, hi = 1;
         [unroll] for (int b = 0; b < 5; ++b) {
             const float m = 0.5 * (lo + hi);
@@ -1826,25 +2013,36 @@ bool ow_claimed(float2 uv, out float2 src, out bool hole) {
     return true;
 }
 // No claims in the 3x3 around uv: an uncovered area wider than that (a near object moved off it), or a surface stretched
-// that much. The nearest ring of cells around (8 directions, out to 32 rendered px) that holds claims: its nearest
-// claimant if its surface reaches uv (stretched), otherwise the scenery behind from its farthest (ow_behind).
+// that much. Looked for along the way near things move against far ones here (the camera's moving: what the depth at uv
+// does against infinity), first behind - where the scenery the gap uncovers continues - then ahead, then all 8
+// directions (no such way: a turn alone): the same way for every pixel of the gap, so they agree (picked per pixel
+// among 8 directions, neighbours took different scenery: a criss-cross). The nearest claimant found if its surface
+// reaches uv (stretched), otherwise the scenery behind from the farthest (ow_behind).
 bool ow_ring(float2 uv, out float2 src) {
     src = uv;
     const int2 c0 = int2(uv * float2(rect.zw));
     static const int kRadii[9] = {2, 3, 4, 6, 8, 12, 16, 24, 32};
     uint near_key = 0, far_key = 0xFFFFFFFFu;
     int2 near_cell = c0, far_cell = c0;
-    [loop] for (int r = 0; r < 9 && near_key == 0; ++r)
-        [unroll] for (int d = 0; d < 8; ++d) {
-            const int2 dir = int2(d == 0 || d == 1 || d == 7 ? 1 : d == 3 || d == 4 || d == 5 ? -1 : 0,
-                                  d == 1 || d == 2 || d == 3 ? 1 : d == 5 || d == 6 || d == 7 ? -1 : 0);
-            const int2 cell = c0 + dir * kRadii[r];
-            if (any(cell < 0) || any(cell >= int2(rect.zw))) continue;
-            const uint key = ow_claims_t.Load(int3(cell, 0));
-            if (!key) continue;
-            if (key > near_key) { near_key = key; near_cell = cell; }
-            if ((key >> 22) < (far_key >> 22)) { far_key = key; far_cell = cell; }
-        }
+    const float3 fn = ow_forward(uv), ff = ow_forward_at(uv, (flags & 16) ? 0.0 : 1.0);
+    float2 way = (ow_lands(uv, fn) - ow_lands(uv, ff)) * float2(rect.zw);
+    const bool along = fn.z > 1e-6 && ff.z > 1e-6 && dot(way, way) > 0.25;
+    way = along ? normalize(way) : float2(1, 0);
+    [loop] for (int way_try = 0; way_try < 3 && near_key == 0; ++way_try) {
+        if (way_try < 2 && !along) continue;
+        [loop] for (int r = 0; r < 9 && near_key == 0; ++r)
+            [loop] for (int d = 0; d < (way_try < 2 ? 1 : 8); ++d) {
+                const float2 dir = way_try == 0 ? -way : way_try == 1 ? way
+                                 : float2(d == 0 || d == 1 || d == 7 ? 1 : d == 3 || d == 4 || d == 5 ? -1 : 0,
+                                          d == 1 || d == 2 || d == 3 ? 1 : d == 5 || d == 6 || d == 7 ? -1 : 0);
+                const int2 cell = c0 + int2(round(dir * float(kRadii[r])));
+                if (any(cell < 0) || any(cell >= int2(rect.zw))) continue;
+                const uint key = ow_claims_t.Load(int3(cell, 0));
+                if (!key) continue;
+                if (key > near_key) { near_key = key; near_cell = cell; }
+                if ((key >> 22) < (far_key >> 22)) { far_key = key; far_cell = cell; }
+            }
+    }
     if (near_key == 0) return false;
     float2 s;
     if (ow_refine(uv, ow_claimant(near_cell, near_key), float(near_key >> 22), s)) { src = s; return true; }
@@ -2454,7 +2652,7 @@ RWTexture2D<float4> tint_u : register(u0);
 
 // Descriptor layout in the shader-visible heap.
 constexpr UINT kSrcSrv = 0;         // + slot * kTexCount + kind: shared textures
-constexpr UINT kPrivMax = 64;       // private textures at most
+constexpr UINT kPrivMax = 80;       // private textures at most
 constexpr UINT kPrivUav = 40;       // + private id
 constexpr UINT kPrivSrv = kPrivUav + kPrivMax;  // + private id
 // Compute pass tables (6 SRVs t0-t5, 2 UAVs u0-u1 each).
@@ -2477,13 +2675,15 @@ constexpr UINT kXFlow = kX + 146;
 enum FlowTable : UINT { kFlowLuma, kFlowFeat, kFlowSearch, kFlowMedianAB, kFlowMedianBA, kFlowLkAB, kFlowLkBA, kFlowMotion, kFlowFillAB, kFlowFillBA, kFlowTables };
 // Passes on the second root signature (the XPAR warp and the moving objects): 12 SRVs t0-t11 and 2 UAVs
 // per table.
-constexpr UINT kWSrvCount = 13, kWTableSize = kWSrvCount + 2;
+constexpr UINT kWSrvCount = 14, kWTableSize = kWSrvCount + 2;
 // Combined HUD detection: the learned score kept alongside (cs_hud: u0 the score, u1 the counts) and its tiles (6 + 2).
 constexpr UINT kXLearnedUav = kXFlow + kFlowTables * 8, kXTilesSrv = kXLearnedUav + 2, kXTilesUav = kXTilesSrv + 6;
 constexpr UINT kW = kXTilesUav + 2;
 enum WTable : UINT { kWWarp, kWShown, kWClear, kWSplat, kWMove, kWCopyColour, kWCopyDepth, kWJoinInit, kWJoinAB, kWJoinBA, kWJoinFinal,
                      kWGenDepth0, kWGenDepth1, kWGenDepth2, kWGenUi0, kWGenUi1, kWGenUi2, kWFgMotion, kWFgInverse, kWClaim,
-                     kWFgImages, kWTables = kWFgImages + 5 * 3 };
+                     kWStill, kWHoldInit, kWHoldAB, kWHoldBA, kWHoldFinal, kWHoldFill, kWHoldFillFinal, kWGrowInit, kWGrowAB, kWGrowBA,
+                     kWGrowFinal, kWFgImages,
+                     kWTables = kWFgImages + 5 * 3 };
 // XPAR frame generation: each image's own tables (descriptors are read when the GPU runs the pass, so one set reused
 // for every image would have them all write the last one).
 constexpr UINT kWFgClear = 0, kWFgSplatCur = 1, kWFgSplatPrev = 2, kWFgResolve = 3, kWFgDepth = 4;
@@ -2797,7 +2997,7 @@ bool Renderer::create_pipelines(std::string& error) {
         xd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
         if (FAILED(device_->CreateComputePipelineState(&xd, IID_PPV_ARGS(x.pso->ReleaseAndGetAddressOf())))) { error = std::string(x.entry) + " pso"; return false; }
     }
-    // The XPAR warp and the moving objects: the same 32 constants (b0), 20 more (b1), 13 SRVs, 2 UAVs.
+    // The XPAR warp and the moving objects: the same 32 constants (b0), 20 more (b1), 14 SRVs, 2 UAVs.
     D3D12_DESCRIPTOR_RANGE wsrv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kWSrvCount, 0, 0, 0};
     D3D12_ROOT_PARAMETER wp[4]{};
     wp[0] = xp[0];
@@ -2811,7 +3011,7 @@ bool Renderer::create_pipelines(std::string& error) {
         error = "warp root signature"; return false;
     }
     struct { const char* entry; ComPtr<ID3D12PipelineState>* pso; } ws[] = {
-        {"cs_own_warp", &cs_own_warp_}, {"cs_warp_claims_clear", &cs_warp_claims_clear_}, {"cs_warp_claim", &cs_warp_claim_}, {"cs_obj_fix", &cs_obj_fix_}, {"cs_obj_move", &cs_obj_move_}, {"cs_gen_depth", &cs_gen_depth_}, {"cs_gen_unui", &cs_gen_unui_}, {"cs_obj_join_init", &cs_obj_join_init_}, {"cs_obj_join", &cs_obj_join_}, {"cs_obj_join_final", &cs_obj_join_final_}, {"cs_obj_clear", &cs_obj_clear_}, {"cs_obj_clear_tiles", &cs_obj_clear_tiles_}, {"cs_obj_splat", &cs_obj_splat_},
+        {"cs_own_warp", &cs_own_warp_}, {"cs_warp_claims_clear", &cs_warp_claims_clear_}, {"cs_warp_claim", &cs_warp_claim_}, {"cs_obj_fix", &cs_obj_fix_}, {"cs_obj_move", &cs_obj_move_}, {"cs_gen_depth", &cs_gen_depth_}, {"cs_gen_unui", &cs_gen_unui_}, {"cs_obj_join_init", &cs_obj_join_init_}, {"cs_obj_join", &cs_obj_join_}, {"cs_obj_join_final", &cs_obj_join_final_}, {"cs_still", &cs_still_}, {"cs_hold_fill", &cs_hold_fill_}, {"cs_grow_init", &cs_grow_init_}, {"cs_grow_clear", &cs_grow_clear_}, {"cs_grow", &cs_grow_}, {"cs_grow_final", &cs_grow_final_}, {"cs_obj_clear", &cs_obj_clear_}, {"cs_obj_clear_tiles", &cs_obj_clear_tiles_}, {"cs_obj_splat", &cs_obj_splat_},
         {"cs_copy4", &cs_copy4_}, {"cs_copy1", &cs_copy1_}, {"cs_fg_motion", &cs_fg_motion_}, {"cs_fg_inverse", &cs_fg_inverse_},
         {"cs_fg_clear", &cs_fg_clear_}, {"cs_fg_splat_cur", &cs_fg_splat_cur_}, {"cs_fg_splat_prev", &cs_fg_splat_prev_},
         {"cs_fg_resolve", &cs_fg_resolve_}, {"cs_fg_depth", &cs_fg_depth_}};
@@ -2834,6 +3034,10 @@ bool Renderer::create_pipelines(std::string& error) {
     if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&hud_counts_)))) {
         error = "HUD counter buffer"; return false;
     }
+    bd.Width = 16;  // the held area's size (cs_grow_init)
+    if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&grow_counts_)))) {
+        error = "held area buffer"; return false;
+    }
     bd.Width = 16;  // the HUD layer's check (cs_layer_check)
     if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&layer_counts_)))) {
         error = "HUD layer check buffer"; return false;
@@ -2850,6 +3054,10 @@ bool Renderer::create_pipelines(std::string& error) {
     bd.Width = kRing * 2 * 16; bd.Flags = D3D12_RESOURCE_FLAG_NONE;
     if (FAILED(device_->CreateCommittedResource(&rbh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&fit_readback_)))) {
         error = "motion fit readback"; return false;
+    }
+    bd.Width = kRing * 4;
+    if (FAILED(device_->CreateCommittedResource(&rbh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&grow_readback_)))) {
+        error = "held area readback"; return false;
     }
     bd.Width = kRing * 8;
     if (FAILED(device_->CreateCommittedResource(&rbh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&layer_readback_)))) {
@@ -2962,7 +3170,7 @@ void Renderer::analyze_motion(const IngestedSource& src, const float clip_to_pre
     c.threshold = 1.0f;
     c.groups_x = gx;
     c.flags = (scale_valid ? 1u : 0u) | (depth_inverted ? 16u : 0u) | (near_rule ? 0u : 64u) | (turn_rule ? 128u : 0u) |
-              (floor_pivot_depth > 0 ? 512u : 0u);
+              (floor_pivot_depth > 0 ? 512u : 0u) | (rig_check_ ? 2048u : 0u);
     c.alpha = floor_pivot_depth;  // (the floor release's pivot depth; alpha is unused by this pass otherwise)
     if (own_motion_) { c.flags |= 2u; c.out_size[0] = std::max(1u, w / 2); c.out_size[1] = std::max(1u, h / 2); }  // (level 0 of the displacements)
     transition(private_[kPObject], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -3135,6 +3343,141 @@ void Renderer::prepare_generated(const IngestedSource& src, float scale_x, float
             transition(private_[colour], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         }
     }
+}
+
+void Renderer::hold_characters(const IngestedSource& src, const float clip_to_prev_clip[16], const float view_to_clip[16], bool scale_valid,
+                                bool depth_inverted) {
+    const auto& depth = private_[kPDepth];
+    if (!src.has_depth || !src.has_motion || !private_[kPObject].texture || !depth.texture) return;
+    const UINT w = depth.width, h = depth.height;
+    if (private_[kPObject].width != w || private_[kPObject].height != h) return;
+    const bool fresh = !private_[kPStill].texture || private_[kPStill].width != w || private_[kPStill].height != h;
+    if (!ensure_private(kPStill, w, h, DXGI_FORMAT_R16_FLOAT) || !ensure_private(kPObjKindA, w, h, DXGI_FORMAT_R16_FLOAT) ||
+        !ensure_private(kPObjKindB, w, h, DXGI_FORMAT_R16_FLOAT))
+        return;
+    float wc[20] = {};
+    projection_terms(view_to_clip, wc + 16);
+    // How much each spot has stayed in place lately (cs_still).
+    XConstants c{};
+    std::memcpy(c.clip_to_prev, clip_to_prev_clip, sizeof(c.clip_to_prev));
+    const Rect2 r = src.depth_rect.w ? src.depth_rect : Rect2{0, 0, w, h};
+    c.rect[0] = r.x; c.rect[1] = r.y; c.rect[2] = std::min(r.w, w - r.x); c.rect[3] = std::min(r.h, h - r.y);
+    c.grid[0] = w; c.grid[1] = h;
+    c.flags = (scale_valid ? 1u : 0u) | (depth_inverted ? 16u : 0u) | (fresh || still_reset_ ? 8u : 0u);
+    if (own_motion_ && private_[kPFlowB].texture) { c.flags |= 2u; c.out_size[0] = std::max(1u, w / 2); c.out_size[1] = std::max(1u, h / 2); }
+    still_reset_ = false;
+    for (UINT i = 0; i < kWSrvCount; ++i) set_x_srv(kWSrv(kWStill) + i, kPDepth);
+    set_x_srv(kWSrv(kWStill) + 0, kPObject);
+    set_x_srv(kWSrv(kWStill) + 1, kPDepth);
+    if (c.flags & 2u) set_x_srv(kWSrv(kWStill) + 2, kPFlowB);
+    set_x_uav(kWUav(kWStill) + 0, kPStill); set_x_uav(kWUav(kWStill) + 1, kPStill);
+    transition(private_[kPStill], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    w_dispatch(cs_still_.Get(), &c, wc, kWStill, (c.rect[2] + 7) / 8, (c.rect[3] + 7) / 8);
+    transition(private_[kPStill], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    // One character, held whole (cs_obj_join with the score): written back into the analysis before the mask is built.
+    XConstants j{};
+    j.grid[0] = w; j.grid[1] = h;
+    j.rect[1] = 1;
+    auto table = [&](UINT t, PrivateId kind_in, PrivateId out) {
+        for (UINT i = 0; i < kWSrvCount; ++i) set_x_srv(kWSrv(t) + i, kPDepth);
+        set_x_srv(kWSrv(t) + 0, kPObject);
+        set_x_srv(kWSrv(t) + 1, kind_in);
+        set_x_srv(kWSrv(t) + 2, kPDepth);
+        set_x_srv(kWSrv(t) + 3, kPStill);
+        set_x_uav(kWUav(t) + 0, out); set_x_uav(kWUav(t) + 1, out);
+    };
+    auto barrier = [&](PrivateId id) {
+        D3D12_RESOURCE_BARRIER b{}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; b.UAV.pResource = private_[id].texture.Get();
+        list_->ResourceBarrier(1, &b);
+    };
+    table(kWHoldInit, kPObjKindB, kPObjKindA);
+    table(kWHoldAB, kPObjKindA, kPObjKindB);
+    table(kWHoldBA, kPObjKindB, kPObjKindA);
+    transition(private_[kPObjKindA], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    w_dispatch(cs_obj_join_init_.Get(), &j, wc, kWHoldInit, (w + 7) / 8, (h + 7) / 8);
+    bool in_a = true;
+    for (const UINT step : {64u, 32u, 16u, 8u, 4u, 2u, 1u}) {
+        const PrivateId from = in_a ? kPObjKindA : kPObjKindB, to = in_a ? kPObjKindB : kPObjKindA;
+        transition(private_[from], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        transition(private_[to], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        barrier(to);
+        j.rect[0] = step;
+        w_dispatch(cs_obj_join_.Get(), &j, wc, in_a ? kWHoldAB : kWHoldBA, (w + 7) / 8, (h + 7) / 8);
+        in_a = !in_a;
+    }
+    const PrivateId result = in_a ? kPObjKindA : kPObjKindB;
+    transition(private_[result], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    table(kWHoldFinal, result, kPObject);
+    transition(private_[kPObject], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    w_dispatch(cs_obj_join_final_.Get(), &j, wc, kWHoldFinal, (w + 7) / 8, (h + 7) / 8);
+    transition(private_[kPObject], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    // Holes in what is held (cs_hold_fill): 3% of the render height, in 12 steps.
+    const UINT reach = std::max(4u, static_cast<UINT>(std::lround(0.03 * double(c.rect[3]))));
+    XConstants f = j;
+    f.rect[0] = std::max(1u, (reach + 11) / 12); f.rect[1] = std::min(12u, reach);
+    const PrivateId scratch = in_a ? kPObjKindB : kPObjKindA;  // (the one the join did not end in)
+    table(kWHoldFill, kPDepth, scratch);
+    transition(private_[scratch], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    w_dispatch(cs_hold_fill_.Get(), &f, wc, kWHoldFill, (w / 2 + 8) / 8, (h / 2 + 8) / 8);
+    transition(private_[scratch], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    table(kWHoldFillFinal, scratch, kPObject);
+    transition(private_[kPObject], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    w_dispatch(cs_obj_join_final_.Get(), &j, wc, kWHoldFillFinal, (w + 7) / 8, (h + 7) / 8);
+    transition(private_[kPObject], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    // Growing along depth where the motion is unknown (cs_grow_*): only with XPAR's own motion estimate, on the half grid
+    // (its size); as many passes as a tenth of the held area's size (its cell count, read back a few frames ago).
+    const UINT hw = std::max(1u, w / 2), hh = std::max(1u, h / 2);
+    if (!(c.flags & 2u) || private_[kPFlowB].width != hw || private_[kPFlowB].height != hh ||
+        !ensure_private(kPGrowA, hw, hh, DXGI_FORMAT_R16G16_FLOAT) || !ensure_private(kPGrowB, hw, hh, DXGI_FORMAT_R16G16_FLOAT))
+        return;
+    const UINT passes = std::min(24u, static_cast<UINT>(std::lround(0.1 * std::sqrt(double(grow_cells_)))));
+    XConstants g{};
+    g.grid[0] = w; g.grid[1] = h;
+    g.out_size[0] = hw; g.out_size[1] = hh;
+    g.flags = c.flags & 16u;
+    auto gtable = [&](UINT t, PrivateId half_in, PrivateId out) {
+        for (UINT i = 0; i < kWSrvCount; ++i) set_x_srv(kWSrv(t) + i, kPDepth);
+        set_x_srv(kWSrv(t) + 0, kPObject);
+        set_x_srv(kWSrv(t) + 2, kPDepth);
+        set_x_srv(kWSrv(t) + 4, kPFlowB);
+        set_x_srv(kWSrv(t) + 5, half_in);
+        set_x_uav(kWUav(t) + 0, out);
+    };
+    D3D12_UNORDERED_ACCESS_VIEW_DESC raw{};
+    raw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; raw.Format = DXGI_FORMAT_R32_TYPELESS;
+    raw.Buffer.NumElements = 4; raw.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    gtable(kWGrowInit, kPGrowB, kPGrowA);
+    device_->CreateUnorderedAccessView(grow_counts_.Get(), nullptr, &raw, cpu(kWUav(kWGrowInit) + 1));
+    D3D12_RESOURCE_BARRIER counts{}; counts.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; counts.UAV.pResource = grow_counts_.Get();
+    transition(private_[kPGrowA], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    w_dispatch(cs_grow_clear_.Get(), &g, wc, kWGrowInit, 1, 1);
+    list_->ResourceBarrier(1, &counts);
+    w_dispatch(cs_grow_init_.Get(), &g, wc, kWGrowInit, (hw + 7) / 8, (hh + 7) / 8);
+    auto to_copy = transition_barrier(grow_counts_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list_->ResourceBarrier(1, &to_copy);
+    list_->CopyBufferRegion(grow_readback_.Get(), UINT64(frame_index_) * 4, grow_counts_.Get(), 0, 4);
+    std::swap(to_copy.Transition.StateBefore, to_copy.Transition.StateAfter);
+    list_->ResourceBarrier(1, &to_copy);
+    grow_pending_[frame_index_] = true;
+    gtable(kWGrowAB, kPGrowA, kPGrowB);
+    gtable(kWGrowBA, kPGrowB, kPGrowA);
+    for (UINT kWG : {kWGrowAB, kWGrowBA}) set_x_uav(kWUav(kWG) + 1, kWG == kWGrowAB ? kPGrowB : kPGrowA);
+    set_x_uav(kWUav(kWGrowInit) + 0, kPGrowA);
+    bool grow_a = true;  // (the result is in A)
+    for (UINT n = 0; n < passes; ++n) {
+        const PrivateId from = grow_a ? kPGrowA : kPGrowB, to = grow_a ? kPGrowB : kPGrowA;
+        transition(private_[from], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        transition(private_[to], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        w_dispatch(cs_grow_.Get(), &g, wc, grow_a ? kWGrowAB : kWGrowBA, (hw + 7) / 8, (hh + 7) / 8);
+        grow_a = !grow_a;
+    }
+    const PrivateId grown = grow_a ? kPGrowA : kPGrowB;
+    transition(private_[grown], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    gtable(kWGrowFinal, grown, kPObject);
+    set_x_uav(kWUav(kWGrowFinal) + 1, kPObject);
+    transition(private_[kPObject], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    w_dispatch(cs_grow_final_.Get(), &g, wc, kWGrowFinal, (w + 7) / 8, (h + 7) / 8);
+    transition(private_[kPObject], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 }
 
 bool Renderer::object_motion(const IngestedSource& src, const float clip_to_prev_clip[16], const float view_to_clip[16], float scale_x,
@@ -3455,7 +3798,11 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
                     x_dispatch(cs_hud_spread_.Get(), &sp, kXTilesSrv, kXTilesUav, (tw + off + 15) / 16, (th + off + 15) / 16);
                 }
                 transition(private_[kPHudTiles], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                confirmed_tiles = true;
+                // (the confirmation only while the learned detection is learning here: in a game where it barely does - dark
+                // scenes held back by its guard, DOOM Eternal: 0-49 of 300 frames - it confirmed almost nothing, and almost
+                // all of the HUD found was dropped and warped. Then what the upscaler's output finds is taken as it is,
+                // with the camera-motion check alone, as before the confirmation; see learning_stalled_)
+                confirmed_tiles = !learning_stalled_;
             }
         }
     }
@@ -3780,6 +4127,9 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
     // Forward splat (warp_splat_): the claims first, from the same depth, mask and camera (not for a pure turn: nothing
     // to sort out without depth).
     set_x_srv(t + 12, kPDepth, true);
+    // (the memory's depth, t13: what it keeps is the scenery behind - see ow_from_memory_behind)
+    if (remembered) set_x_srv(t + 13, static_cast<PrivateId>(kPMemZ0 + mem_shown_));
+    else set_x_srv(t + 13, kPDepth, true);
     if (warp_splat_ && !no_depth && ensure_private(kPWarpClaims, dw, dh, DXGI_FORMAT_R32_UINT)) {
         const UINT ct = kWSrv(kWClaim);
         for (UINT i = 0; i < kWSrvCount; ++i) set_x_srv(ct + i, kPDepth, true);
@@ -4286,6 +4636,16 @@ ID3D12GraphicsCommandList* Renderer::begin(int context) {
             scene_stamps_readback_->Unmap(0, &none);
         }
     }
+    if (grow_pending_[frame_index_] && grow_readback_) {
+        grow_pending_[frame_index_] = false;
+        std::uint32_t* v = nullptr;
+        D3D12_RANGE range{frame_index_ * 4, frame_index_ * 4 + 4};
+        if (SUCCEEDED(grow_readback_->Map(0, &range, reinterpret_cast<void**>(&v)))) {
+            grow_cells_ = v[frame_index_];
+            D3D12_RANGE none{0, 0};
+            grow_readback_->Unmap(0, &none);
+        }
+    }
     if (layer_pending_[frame_index_] && layer_readback_) {
         layer_pending_[frame_index_] = false;
         std::uint32_t* v = nullptr;
@@ -4322,6 +4682,13 @@ ID3D12GraphicsCommandList* Renderer::begin(int context) {
             if (evidence + changed < 256) ++hud_stats_.too_little;
             else if (evidence > 0.35 * (evidence + changed)) ++hud_stats_.guarded;
             else { ++hud_stats_.learned; hud_stats_.share_sum += double(evidence) / double(evidence + changed); }
+            // (is it learning here: at least a tenth of every 300 frames learned from)
+            ++learn_frames_;
+            if (evidence + changed >= 256 && evidence <= 0.35 * (evidence + changed)) ++learn_learned_;
+            if (learn_frames_ >= 300) {
+                learning_stalled_ = learn_learned_ < 30;
+                learn_frames_ = learn_learned_ = 0;
+            }
             D3D12_RANGE none{0, 0};
             hud_readback_->Unmap(0, &none);
         }
@@ -4775,7 +5142,7 @@ void Renderer::release_stash() {
 }
 
 std::string Renderer::memory_report() {
-    static const char* const kNames[] = {"Backbuffer", "Hudless", "Ui", "Depth", "Motion", "ZeroUi", "Output", "Object", "ObjKeys", "ObjMove", "ObjTiles", "ObjOutTiles", "ObjKindA", "ObjKindB", "Gen0", "Gen1", "Gen2", "GenZ0", "GenZ1", "GenZ2", "PrevColour", "PrevDepth", "Previous", "HudScore", "Mask", "Scene", "Attached", "World", "Fill", "Mem0", "Mem1", "MemZ0", "MemZ1", "RampRows", "Ramp", "WarpMask", "HudKind", "StashColor", "StashDepth", "StashMotion", "StashHudless", "Stash2Color", "Stash2Hudless", "Stash2Depth", "Stash2Motion", "LumaA", "LumaB", "Feat", "FlowA", "FlowB", "RetCells", "RetEncl", "RetA", "RetB", "RetLayer", "FgMotion", "FgInv", "FgK1", "FgK0", "HudLearned", "HudTiles", "WarpClaims"};
+    static const char* const kNames[] = {"Backbuffer", "Hudless", "Ui", "Depth", "Motion", "ZeroUi", "Output", "Object", "ObjKeys", "ObjMove", "ObjTiles", "ObjOutTiles", "ObjKindA", "ObjKindB", "Gen0", "Gen1", "Gen2", "GenZ0", "GenZ1", "GenZ2", "PrevColour", "PrevDepth", "Previous", "HudScore", "Mask", "Scene", "Attached", "World", "Fill", "Mem0", "Mem1", "MemZ0", "MemZ1", "RampRows", "Ramp", "WarpMask", "HudKind", "StashColor", "StashDepth", "StashMotion", "StashHudless", "Stash2Color", "Stash2Hudless", "Stash2Depth", "Stash2Motion", "LumaA", "LumaB", "Feat", "FlowA", "FlowB", "RetCells", "RetEncl", "RetA", "RetB", "RetLayer", "FgMotion", "FgInv", "FgK1", "FgK0", "HudLearned", "HudTiles", "WarpClaims", "Still", "GrowA", "GrowB"};
     static_assert(sizeof(kNames) / sizeof(kNames[0]) == kPCount, "a name for every private texture");
     struct Item { std::string name; double mb; };
     std::vector<Item> items;

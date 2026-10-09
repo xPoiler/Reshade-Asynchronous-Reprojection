@@ -134,6 +134,8 @@ int main(int argc, char** argv) {
     std::printf("presenter queue priority: %s\n", renderer.queue_priority());
     // (FW_WARP_SPLAT=1: every own-warp test with the forward splat)
     if (std::getenv("FW_WARP_SPLAT")) { renderer.set_warp_splat(true); std::printf("own warp: forward splat\n"); }
+    // (the motion analysis with the rig check, as the presenter runs it)
+    renderer.set_rig_check(true);
     EXPECT(renderer.open_session(sh.producer_pid, sh.session, error), "open session: %s", error.c_str());
     Latewarp12 latewarp;
     wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
@@ -933,15 +935,32 @@ int main(int argc, char** argv) {
             EXPECT(remembered < 0.5 * stretched, "the background memory shows what was behind the held strip (%.4f vs %.4f)", remembered, stretched);
         }
         // (A1b) a third-person character: attached to the camera too, but a few metres away (300x the near
-        // plane). Held as well.
+        // plane), stuck to the screen while the camera walks along with it (the scenery shifts by its distance).
+        // Held as well.
+        Camera walk = moving_cam;
+        walk.clip_to_prev_clip[12] = 0.0f;
+        walk.clip_to_prev_clip[8] = 2.0f * shift * 300.0f;  // prev.x = x + 2*shift*300*d: the camera moves, nothing turns
         strip_depth = 1.0f / 300.0f;
+        analyze_cam = &walk;
         IngestedSource third_src = ingest_frame(publish(220, 0.1f, 0, true, false), false, true);
-        strip_depth = 0.5f;
         show(third_src, 0);
         const double third_x0 = peak(px, w, h, true, 1);
         show(third_src, yaw);
         const double third_x1 = peak(px, w, h, true, 1);
+        // (A1b') the same, stuck to the screen while the camera only turns: an object the player follows by turning
+        // (a car, a person) - not part of the camera rig, it keeps warping (with the rig check).
+        analyze_cam = &moving_cam;
+        IngestedSource followed_src = ingest_frame(publish(221, 0.1f, 0, true, false), false, true);
+        strip_depth = 0.5f;
+        show(followed_src, 0);
+        const double followed_x0 = peak(px, w, h, true, 1);
+        show(followed_src, yaw);
+        const double followed_x1 = peak(px, w, h, true, 1);
+        std::printf("third-person character (camera walking) x %.0f -> %.0f; followed object (camera turning) x %.0f -> %.0f\n", third_x0,
+                    third_x1, followed_x0, followed_x1);
         EXPECT(std::fabs(third_x1 - third_x0) < 2.0, "a third-person character a few metres away is not warped (%.0f -> %.0f)", third_x0, third_x1);
+        EXPECT(std::fabs(followed_x1 - followed_x0) > 20.0, "an object followed by turning the camera is warped (%.0f -> %.0f)", followed_x0,
+                   followed_x1);
         // (A1c) something at that distance moving on its own while the camera turns (a car, a person): its
         // motion is not the camera's and it is not stuck to the screen - it keeps warping.
         strip_depth = 1.0f / 300.0f;

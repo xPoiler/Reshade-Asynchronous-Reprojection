@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 59;
+constexpr std::uint32_t kVersion = 60;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -121,6 +121,8 @@ struct Settings {
                                        // finds one (Direct3D 12; ui_layer.hpp); off: HUD detection only (add-on; saved per game)
     std::uint32_t warp_splat;          // default on: the XPAR warp by forward splat (every rendered pixel claims where it lands, the nearest
                                        // winning) instead of the search from each displayed pixel alone (saved per game)
+    std::uint32_t hold_characters;     // default on: what stays in place on screen over several frames while the camera moves is
+                                       // held, and the character's limbs with it (Renderer::hold_characters; saved per game)
 };
 
 // Presenter status, displayed by the add-on UI.

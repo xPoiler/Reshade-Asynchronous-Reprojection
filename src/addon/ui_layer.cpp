@@ -2,8 +2,10 @@
 #include <reshade.hpp>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <iterator>
 #include <mutex>
+#include <d3d11.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -13,7 +15,22 @@ namespace {
 using namespace reshade::api;
 
 std::function<void(std::uint64_t, std::uint32_t, std::uint64_t)> g_take, g_take_hudless;
+std::function<void(std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint64_t)> g_take_vk;
+std::function<void(std::uint64_t, std::uint32_t, std::uint64_t)> g_take_before;
 std::mutex g_mutex;
+device_api g_api = device_api::d3d12;  // the game's (its swapchain's device)
+bool g_triggered = false;              // a frame's end was seen since the last present
+// Third pattern (Direct3D 11): the render target bound on each context, with or without depth; the blending of each
+// pipeline (render target 0: 0 overwrite, 1 alpha blend, 2 other); the pictures overwritten since their last HUD copy.
+struct Bound { std::uint64_t res = 0; bool depth = false; };
+std::unordered_map<std::uint64_t, Bound> g_rt;
+std::unordered_map<std::uint64_t, std::uint8_t> g_blend, g_bound_blend;
+std::unordered_set<std::uint64_t> g_overwritten;
+std::uint64_t g_logged_before = 0;
+std::uint64_t g_hud_picture = 0;  // the picture the HUD was last seen drawn into (third pattern)
+// This frame: the picture a copy was taken from (0: none), and pictures given up on (overwritten after their copy).
+std::uint64_t g_took = 0;
+std::unordered_set<std::uint64_t> g_given_up;
 std::vector<std::uint64_t> g_back_buffers;
 std::uint32_t g_width = 0, g_height = 0;
 // This frame (since the last present): the layers cleared to transparent, and when each was last drawn into (0: not).
@@ -21,6 +38,10 @@ std::unordered_map<std::uint64_t, std::uint64_t> g_cleared;  // resource -> draw
 std::unordered_set<std::uint64_t> g_with_depth;               // ...of them, drawn with a depth buffer bound since cleared
 std::uint64_t g_order = 0;
 bool g_taken = false;
+// Vulkan: the frame's end seen while no layer was readable yet (DOOM Eternal may make it readable just after): taken when
+// one becomes readable; dropped when the next frame's layers start, or after two presents.
+bool g_end_pending = false;
+std::uint32_t g_pending_presents = 0, g_waited = 0;
 // The layers' states as changed on each command list (native list -> resource -> state after its last change there).
 std::unordered_map<std::uint64_t, std::unordered_map<std::uint64_t, std::uint32_t>> g_states;
 // ...and on whichever list it was changed last this frame (a game may make it readable at the end of the list that draws
@@ -48,6 +69,8 @@ std::unordered_map<std::uint64_t, std::uint32_t> g_rt_bound;
 std::uint64_t g_logged = 0;
 std::uint32_t g_frames = 0, g_same_list = 0, g_elsewhere = 0, g_skipped = 0, g_not_read = 0, g_at_copy = 0, g_with_depth_n = 0;
 
+void end_of_frame(device* dev, command_list* cmd, const char* at);
+const char kComputeEnd[] = "a compute pass writing the back buffer";
 bool is_back_buffer(std::uint64_t r) {
     for (const std::uint64_t b : g_back_buffers) if (b == r) return true;
     return false;
@@ -58,43 +81,76 @@ std::uint32_t d3d12_state(resource_usage u) {
     return (v & 0x80000000u) ? 0u : v;
 }
 
+// The first pattern's bookkeeping runs in Direct3D 12 and Vulkan (the add-on can hand a layer over in both).
+bool layer_api(device* dev) { return dev && (dev->get_api() == device_api::d3d12 || dev->get_api() == device_api::vulkan); }
+// A texture the size of the back buffer cleared to transparent: a candidate layer (a clear command, or a render pass that
+// starts by clearing it - Vulkan's way, DOOM Eternal).
+void cleared_to_transparent(device* dev, resource_view rtv) {
+    const resource r = dev->get_resource_from_view(rtv);
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!r.handle || !g_width || is_back_buffer(r.handle)) return;
+    const resource_desc d = dev->get_resource_desc(r);
+    if (d.texture.width != g_width || d.texture.height != g_height || d.texture.samples > 1) return;
+    if (g_end_pending) {  // (the next frame's layers start: the frame that waited is not taken)
+        g_end_pending = false;
+        ++g_frames; ++g_not_read;
+        g_cleared.clear(); g_with_depth.clear(); g_last_state.clear(); g_order = 0; g_taken = false;
+    }
+    g_cleared[r.handle] = 0;
+    g_with_depth.erase(r.handle);
+}
 bool on_clear(command_list* cmd, resource_view rtv, const float color[4], uint32_t, const rect*) {
     if (!cmd || !rtv.handle || !color || color[0] != 0 || color[1] != 0 || color[2] != 0 || color[3] != 0) return false;
     device* dev = cmd->get_device();
-    if (!dev || dev->get_api() != device_api::d3d12) return false;
-    const resource r = dev->get_resource_from_view(rtv);
-    std::lock_guard<std::mutex> lock(g_mutex);
-    if (!r.handle || !g_width || is_back_buffer(r.handle)) return false;
-    const resource_desc d = dev->get_resource_desc(r);
-    if (d.texture.width != g_width || d.texture.height != g_height || d.texture.samples > 1) return false;
-    g_cleared[r.handle] = 0;
-    g_with_depth.erase(r.handle);
+    if (layer_api(dev)) cleared_to_transparent(dev, rtv);
     return false;
 }
 void on_barrier(command_list* cmd, uint32_t count, const resource* resources, const resource_usage*, const resource_usage* new_states) {
     if (!cmd || !count) return;
-    std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_cleared.empty() && g_finals.empty()) return;
-    for (uint32_t i = 0; i < count; ++i) {
-        if (g_cleared.count(resources[i].handle)) {
-            g_states[cmd->get_native()][resources[i].handle] = d3d12_state(new_states[i]);
-            g_last_state[resources[i].handle] = d3d12_state(new_states[i]);
+    // A back buffer made writable by compute shaders: the frame's end, written by a compute pass (DOOM Eternal composes
+    // its picture and HUD layer into the back buffer that way: no draw onto it, no copy).
+    device* dev = cmd->get_device();
+    bool compute_end = false, made_readable = false;
+    const bool vulkan = dev && dev->get_api() == device_api::vulkan;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        // (unordered access in Direct3D 12; Vulkan games write it as a storage image in the general layout - DOOM
+        // Eternal in game: ReShade's resource_usage::general, 0x80000000 alone)
+        for (uint32_t i = 0; i < count; ++i) {
+            const std::uint32_t st = static_cast<std::uint32_t>(new_states[i]);
+            if ((((st & static_cast<std::uint32_t>(resource_usage::unordered_access)) && !(st & 0x80000000u)) ||
+                 (vulkan && st == static_cast<std::uint32_t>(resource_usage::general))) && is_back_buffer(resources[i].handle))
+                compute_end = true;
         }
-        if (const auto f = g_finals.find(resources[i].handle); f != g_finals.end()) {
-            f->second.states[cmd->get_native()] = d3d12_state(new_states[i]);
-            f->second.last = d3d12_state(new_states[i]);
-            f->second.known = true;
+        // (this call's own changes first: a game makes its HUD layer readable and the back buffer writable in one
+        // barrier - the end below then sees the layer as it is after it)
+        for (uint32_t i = 0; i < count && !(g_cleared.empty() && g_finals.empty()); ++i) {
+            if (g_cleared.count(resources[i].handle)) {
+                g_states[cmd->get_native()][resources[i].handle] = d3d12_state(new_states[i]);
+                g_last_state[resources[i].handle] = d3d12_state(new_states[i]);
+                if (g_cleared.at(resources[i].handle) && (d3d12_state(new_states[i]) & 0xC0u)) made_readable = true;
+            }
+            if (const auto f = g_finals.find(resources[i].handle); f != g_finals.end()) {
+                f->second.states[cmd->get_native()] = d3d12_state(new_states[i]);
+                f->second.last = d3d12_state(new_states[i]);
+                f->second.known = true;
+            }
         }
+        made_readable = made_readable && g_end_pending;
     }
+    if (!layer_api(dev)) return;
+    if (compute_end) end_of_frame(dev, cmd, kComputeEnd);
+    else if (made_readable) end_of_frame(dev, cmd, "the layer made readable after the frame's end");
 }
 // The end of a frame (first pattern): of the layers drawn into this frame, the last one the game can read now (a pixel or
 // compute shader resource - its state as changed on this very list, else as changed last this frame). One still a render
 // target is not what the frame's end blends on (Requiem clears and draws a second such texture in some scenes: taken as
 // the HUD layer, the HUD that is not in it warped). Layers drawn with depth only in a frame with no layer drawn without.
 // (under the lock; true: layer/state set)
-bool pick(device* dev, command_list* cmd, bool at_copy, std::uint64_t& layer, std::uint32_t& state) {
-    g_taken = true;
-    ++g_frames;
+// may_wait: none readable yet - nothing counted or taken, false returned with `waits` set (see g_end_pending).
+bool pick(device* dev, command_list* cmd, const char* at, std::uint64_t& layer, std::uint32_t& state, bool may_wait, bool& waits) {
+    const bool at_copy = at[0] == 'a' && at[2] == 'c';  // ("a copy onto the back buffer")
+    waits = false;
     const auto states = g_states.find(cmd->get_native());
     bool any_plain = false;
     for (const auto& [res, order] : g_cleared)
@@ -113,6 +169,9 @@ bool pick(device* dev, command_list* cmd, bool at_copy, std::uint64_t& layer, st
         if (!(st & 0xC0u) || order <= best_order) continue;
         best_order = order; layer = res; state = st; same_list = here;
     }
+    if (!layer && any_state && may_wait) { waits = true; return false; }
+    g_taken = true;
+    ++g_frames;
     if (!layer) { ++(any_state ? g_not_read : g_skipped); return false; }
     ++(same_list ? g_same_list : g_elsewhere);
     if (at_copy) ++g_at_copy;
@@ -123,7 +182,7 @@ bool pick(device* dev, command_list* cmd, bool at_copy, std::uint64_t& layer, st
         char text[224];
         std::snprintf(text, sizeof(text), "XPAR: the game's HUD layer found (%ux%u, format %u, state 0x%x%s, at %s) - taken as the frame's UI layer",
                       g_width, g_height, static_cast<unsigned>(dev->get_resource_desc(resource{layer}).texture.format), state,
-                      with_depth ? ", drawn with depth" : "", at_copy ? "a copy onto the back buffer" : "the final draw");
+                      with_depth ? ", drawn with depth" : "", at);
         reshade::log::message(reshade::log::level::info, text);
     }
     return true;
@@ -134,8 +193,7 @@ void copied(command_list* cmd, resource src, resource dst) {
     if (!cmd || !src.handle || !dst.handle) return;
     device* dev = cmd->get_device();
     if (!dev || dev->get_api() != device_api::d3d12) return;
-    std::uint64_t layer = 0;
-    std::uint32_t state = 0;
+    bool end = false;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (is_back_buffer(dst.handle)) {
@@ -145,14 +203,14 @@ void copied(command_list* cmd, resource src, resource dst) {
                 g_finals[src.handle].seen = g_serial;
                 const auto bound = g_rt_bound.find(src.handle);
                 const bool drawn = bound != g_rt_bound.end() && g_serial - bound->second <= 1;
-                if (!drawn && g_order && !g_taken && !pick(dev, cmd, true, layer, state)) return;
+                end = !drawn && g_order && !g_taken;
             }
         } else if (const auto f = g_finals.find(dst.handle); f != g_finals.end()) {
             f->second.armed = true;
             ++g_copies_in;
         }
     }
-    if (layer && g_take) g_take(layer, state, cmd->get_native());
+    if (end) end_of_frame(dev, cmd, "a copy onto the back buffer");
 }
 bool on_copy_resource(command_list* cmd, resource src, resource dst) { copied(cmd, src, dst); return false; }
 bool on_copy_region(command_list* cmd, resource src, uint32_t, const subresource_box*, resource dst, uint32_t, const subresource_box*, filter_mode) {
@@ -162,12 +220,16 @@ bool on_copy_region(command_list* cmd, resource src, uint32_t, const subresource
 void target(command_list* cmd, resource_view first, bool depth) {
     if (!cmd || !first.handle) return;
     device* dev = cmd->get_device();
-    if (!dev || dev->get_api() != device_api::d3d12) return;
+    if (!dev) return;
     const resource r = dev->get_resource_from_view(first);
-    std::uint64_t layer = 0, list = 0;
-    std::uint32_t state = 0;
+    if (dev->get_api() == device_api::d3d11) {  // (third pattern: what each draw goes into)
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_rt[cmd->get_native()] = {r.handle, depth};
+        return;
+    }
+    if (!layer_api(dev)) return;
     // Second pattern: the final picture bound as a render target after a picture was copied into it: the HUD's turn.
-    {
+    if (dev->get_api() == device_api::d3d12) {
         std::uint64_t hudless = 0;
         std::uint32_t hstate = 0;
         {
@@ -212,17 +274,169 @@ void target(command_list* cmd, resource_view first, bool depth) {
             if (depth) g_with_depth.insert(r.handle);
             return;
         }
-        // The final draw (a back buffer bound as the render target).
-        if (!is_back_buffer(r.handle) || !g_order || g_taken || !pick(dev, cmd, false, layer, state)) return;
-        list = cmd->get_native();
+        if (!is_back_buffer(r.handle) || !g_order || g_taken) return;
     }
-    if (g_take) g_take(layer, state, list);
+    // The final draw (a back buffer bound as the render target).
+    end_of_frame(dev, cmd, "the final draw");
+}
+// The frame's end (first pattern): the layer the game can read now handed over - on this command list - and the frame's
+// layers start over. Driven by the game's own steps, not by presents: a game recording ahead (DOOM Eternal) records the
+// next frame's layer before the present that ends this one (a present only starts over what no frame's end did).
+void end_of_frame(device* dev, command_list* cmd, const char* at) {
+    std::uint64_t layer = 0;
+    std::uint32_t state = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (!g_order || g_taken) return;
+        // (Vulkan, at a compute pass writing the back buffer: a layer not readable yet is waited for, once)
+        const bool may_wait = !g_end_pending && dev->get_api() == device_api::vulkan && std::strcmp(at, kComputeEnd) == 0;
+        bool waits = false;
+        const bool picked = pick(dev, cmd, at, layer, state, may_wait, waits);
+        g_triggered = true;
+        if (waits) {
+            g_end_pending = true;
+            g_pending_presents = 0;
+            ++g_waited;
+            return;
+        }
+        g_end_pending = false;
+        g_cleared.clear();
+        g_with_depth.clear();
+        g_last_state.clear();
+        g_order = 0;
+        g_taken = false;
+        if (!picked) return;
+    }
+    if (dev->get_api() == device_api::vulkan) {
+        if (!g_take_vk) return;
+        const resource_desc d = dev->get_resource_desc(resource{layer});
+        g_take_vk(layer, static_cast<std::uint32_t>(d.texture.format), d.texture.width, d.texture.height, state, cmd->get_native());
+    } else if (g_take) {
+        g_take(layer, state, cmd->get_native());
+    }
 }
 void on_bind(command_list* cmd, uint32_t n, const resource_view* rtvs, resource_view dsv) { if (n && rtvs) target(cmd, rtvs[0], dsv.handle != 0); }
 bool on_begin_pass(command_list* cmd, uint32_t n, const render_pass_render_target_desc* rts, const render_pass_depth_stencil_desc* ds, render_pass_flags) {
+    if (n && rts && rts[0].load_op == render_pass_load_op::clear && rts[0].view.handle && rts[0].clear_color[0] == 0 &&
+        rts[0].clear_color[1] == 0 && rts[0].clear_color[2] == 0 && rts[0].clear_color[3] == 0 && cmd && layer_api(cmd->get_device()))
+        cleared_to_transparent(cmd->get_device(), rts[0].view);
     if (n && rts) target(cmd, rts[0].view, ds && ds->view.handle);
     return false;
 }
+// Third pattern (Direct3D 11; Resident Evil 2): the HUD drawn into the game's picture after its post-processing, then one
+// draw converts the picture onto the back buffer - no layer, no copy. In the game's picture (back buffer size, drawn
+// without depth) the post-processing overwrites; the HUD blends over it. So the first alpha-blended draw without depth
+// into a picture overwritten since: the HUD's turn - a copy of the picture then (the HUD-less picture, in the picture's
+// own colours), and at the present the picture with its HUD compared with it: the HUD (see Producer::on_hud_before).
+// The scene's own transparencies blend with depth: not taken.
+std::uint8_t blend_kind(const blend_desc& b) {
+    if (!b.blend_enable[0]) return 0;
+    const blend_factor s = b.source_color_blend_factor[0], d = b.dest_color_blend_factor[0];
+    return (s == blend_factor::source_alpha || s == blend_factor::one) && d == blend_factor::one_minus_source_alpha ? 1 : 2;
+}
+void on_init_pipeline(device* dev, pipeline_layout, uint32_t count, const pipeline_subobject* subobjects, pipeline p) {
+    if (!p.handle || !dev || dev->get_api() != device_api::d3d11) return;
+    for (uint32_t i = 0; i < count; ++i)
+        if (subobjects[i].type == pipeline_subobject_type::blend_state && subobjects[i].data) {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_blend[p.handle] = blend_kind(*static_cast<const blend_desc*>(subobjects[i].data));
+        }
+}
+void on_destroy_pipeline(device* dev, pipeline p) {
+    if (!dev || dev->get_api() != device_api::d3d11) return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_blend.erase(p.handle);
+}
+void on_bind_pipeline(command_list* cmd, pipeline_stage stages, pipeline p) {
+    if (g_api != device_api::d3d11 || !cmd || !(static_cast<uint32_t>(stages) & static_cast<uint32_t>(pipeline_stage::output_merger))) return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    const auto it = g_blend.find(p.handle);
+    g_bound_blend[cmd->get_native()] = it != g_blend.end() ? it->second : 0;
+}
+// Does the draw about to happen on this context read `picture` (a pixel shader resource bound to it)?
+bool reads(command_list* cmd, std::uint64_t picture) {
+    auto* context = reinterpret_cast<ID3D11DeviceContext*>(cmd->get_native());
+    ID3D11ShaderResourceView* views[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
+    context->PSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, views);
+    bool found = false;
+    for (ID3D11ShaderResourceView* v : views) {
+        if (!v) continue;
+        ID3D11Resource* r = nullptr;
+        v->GetResource(&r);
+        if (r && reinterpret_cast<std::uint64_t>(r) == picture) found = true;
+        if (r) r->Release();
+        v->Release();
+    }
+    return found;
+}
+// What each draw means (kinds handed over: 0 the copy before the HUD, 1 no HUD this frame, 2 the copy confirmed - the
+// final draw reads its picture, 3 the copy given up). A copy counts only once the draw onto the back buffer reads the
+// picture it was taken from (a game's alpha-blended draw into some other picture is never handed over); a picture
+// overwritten after its copy (a post-processing pass after an alpha-blended one, or a HUD with opaque parts) is given
+// up for the frame - the fallback then, not a HUD that is part of the picture.
+void drawn(command_list* cmd) {
+    if (g_api != device_api::d3d11 || !cmd) return;
+    std::uint64_t picture = 0, given_up = 0;
+    std::uint32_t kind = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        const auto rt = g_rt.find(cmd->get_native());
+        if (rt == g_rt.end() || !rt->second.res || rt->second.depth) return;
+        const std::uint64_t res = rt->second.res;
+        if (is_back_buffer(res)) {
+            if (g_took) {  // (the copy taken: confirmed if this draw reads its picture)
+                picture = g_took;
+                g_took = 0;
+                if (!reads(cmd, picture)) return;
+                kind = 2;
+                g_hud_picture = picture;
+                if (picture != g_logged_before) {
+                    g_logged_before = picture;
+                    reshade::log::message(reshade::log::level::info,
+                                          "XPAR: the game draws its HUD into its picture after the post-processing (Direct3D 11) - a copy taken before it");
+                }
+            } else {
+                // (the picture the HUD went into reaching the screen with no HUD drawn into it since its post-processing:
+                // no HUD this frame - Resident Evil 2 hides it unless aiming or hurt. Handed over as an empty HUD, not
+                // nothing)
+                if (!g_hud_picture || g_given_up.count(g_hud_picture) || !g_overwritten.erase(g_hud_picture) || !reads(cmd, g_hud_picture)) return;
+                kind = 1;
+            }
+        } else {
+            if (g_given_up.count(res)) return;
+            const auto bb = g_bound_blend.find(cmd->get_native());
+            const std::uint8_t blend = bb != g_bound_blend.end() ? bb->second : 0;
+            if (blend == 0) {
+                if (res == g_took) {  // (overwritten after its copy: given up for this frame)
+                    g_given_up.insert(res);
+                    g_took = 0;
+                    picture = res;
+                    kind = 3;
+                } else {
+                    device* dev = cmd->get_device();
+                    if (!dev || !g_width) return;
+                    const resource_desc d = dev->get_resource_desc(resource{res});
+                    if (d.texture.width == g_width && d.texture.height == g_height && d.texture.samples <= 1) g_overwritten.insert(res);
+                    return;
+                }
+            } else {
+                if (blend != 1 || !g_overwritten.erase(res)) return;
+                if (g_took) {  // (a second picture: the first given up, this one taken)
+                    g_given_up.insert(g_took);
+                    given_up = g_took;
+                }
+                picture = res;
+                g_took = res;
+                kind = 0;
+            }
+        }
+    }
+    if (!g_take_before) return;
+    if (given_up) g_take_before(given_up, 3, cmd->get_native());
+    g_take_before(picture, kind, cmd->get_native());
+}
+bool on_draw(command_list* cmd, uint32_t, uint32_t, uint32_t, uint32_t) { drawn(cmd); return false; }
+bool on_draw_indexed(command_list* cmd, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) { drawn(cmd); return false; }
 void on_reset(command_list* cmd) {
     if (!cmd) return;
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -232,9 +446,18 @@ void on_reset(command_list* cmd) {
 }  // namespace
 
 void init(std::function<void(std::uint64_t, std::uint32_t, std::uint64_t)> take,
-          std::function<void(std::uint64_t, std::uint32_t, std::uint64_t)> take_hudless) {
+          std::function<void(std::uint64_t, std::uint32_t, std::uint64_t)> take_hudless,
+          std::function<void(std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint64_t)> take_vk,
+          std::function<void(std::uint64_t, std::uint32_t, std::uint64_t)> take_before) {
     g_take = std::move(take);
     g_take_hudless = std::move(take_hudless);
+    g_take_vk = std::move(take_vk);
+    g_take_before = std::move(take_before);
+    reshade::register_event<reshade::addon_event::init_pipeline>(on_init_pipeline);
+    reshade::register_event<reshade::addon_event::destroy_pipeline>(on_destroy_pipeline);
+    reshade::register_event<reshade::addon_event::bind_pipeline>(on_bind_pipeline);
+    reshade::register_event<reshade::addon_event::draw>(on_draw);
+    reshade::register_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
     reshade::register_event<reshade::addon_event::copy_resource>(on_copy_resource);
     reshade::register_event<reshade::addon_event::copy_texture_region>(on_copy_region);
     reshade::register_event<reshade::addon_event::clear_render_target_view>(on_clear);
@@ -251,8 +474,15 @@ void shutdown() {
     reshade::unregister_event<reshade::addon_event::clear_render_target_view>(on_clear);
     reshade::unregister_event<reshade::addon_event::copy_texture_region>(on_copy_region);
     reshade::unregister_event<reshade::addon_event::copy_resource>(on_copy_resource);
+    reshade::unregister_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
+    reshade::unregister_event<reshade::addon_event::draw>(on_draw);
+    reshade::unregister_event<reshade::addon_event::bind_pipeline>(on_bind_pipeline);
+    reshade::unregister_event<reshade::addon_event::destroy_pipeline>(on_destroy_pipeline);
+    reshade::unregister_event<reshade::addon_event::init_pipeline>(on_init_pipeline);
     g_take = nullptr;
     g_take_hudless = nullptr;
+    g_take_vk = nullptr;
+    g_take_before = nullptr;
 }
 
 void on_present(swapchain* chain) {
@@ -264,15 +494,24 @@ void on_present(swapchain* chain) {
     if (dev && !g_back_buffers.empty()) {
         const resource_desc d = dev->get_resource_desc(resource{g_back_buffers[0]});
         g_width = d.texture.width; g_height = d.texture.height;
+        g_api = dev->get_api();
+    }
+    g_overwritten.clear();
+    g_took = 0;
+    g_given_up.clear();
+    if (g_end_pending && ++g_pending_presents >= 2) {  // (never made readable: not taken)
+        g_end_pending = false;
+        ++g_frames; ++g_not_read;
+        g_cleared.clear(); g_with_depth.clear(); g_last_state.clear(); g_order = 0; g_taken = false;
     }
     // (every 600 frames, how often the layer could not be taken)
     if (g_frames >= 600) {
-        char text[192];
+        char text[224];
         std::snprintf(text, sizeof(text), "XPAR: HUD layer over %u frames: state from the final list %u, from earlier this frame %u, none readable %u, "
-                      "not taken %u; at a copy onto the back buffer %u, drawn with depth %u",
-                      g_frames, g_same_list, g_elsewhere, g_not_read, g_skipped, g_at_copy, g_with_depth_n);
+                      "not taken %u; at a copy onto the back buffer %u, drawn with depth %u, waited to become readable %u",
+                      g_frames, g_same_list, g_elsewhere, g_not_read, g_skipped, g_at_copy, g_with_depth_n, g_waited);
         reshade::log::message(reshade::log::level::info, text);
-        g_frames = g_same_list = g_elsewhere = g_not_read = g_skipped = g_at_copy = g_with_depth_n = 0;
+        g_frames = g_same_list = g_elsewhere = g_not_read = g_skipped = g_at_copy = g_with_depth_n = g_waited = 0;
     }
     // (final pictures not copied onto a back buffer for 300 presents are forgotten)
     ++g_serial;
@@ -290,10 +529,14 @@ void on_present(swapchain* chain) {
         }
         g_presents = g_copies_out = g_copies_in = g_final_binds = g_unarmed = g_hudless_taken_n = g_hudless_unknown = 0;
     }
-    g_cleared.clear();
-    g_with_depth.clear();
-    g_last_state.clear();
-    g_order = 0;
-    g_taken = false;
+    // (the frame's layers start over at its end - end_of_frame; here only when no end was seen since the last present)
+    if (!g_triggered && !g_end_pending) {
+        g_cleared.clear();
+        g_with_depth.clear();
+        g_last_state.clear();
+        g_order = 0;
+        g_taken = false;
+    }
+    g_triggered = false;
 }
 }  // namespace fw::ui_layer
