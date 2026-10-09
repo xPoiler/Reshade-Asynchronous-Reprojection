@@ -98,7 +98,7 @@ public:
     // after_depth (optional) runs once depth and motion vectors are recorded, before the colour work.
     IngestedSource ingest(const Shared& shared, int slot, const std::function<void(const IngestedSource&)>& after_depth = {});
     // Latewarp inputs referring to the private textures of the last ingest.
-    LatewarpInputs latewarp_inputs(const IngestedSource& src, bool use_ui_tags);
+    LatewarpInputs latewarp_inputs(const IngestedSource& src, bool use_ui_tags, bool for_latewarp = true);
     // Blits the warped output (or the unwarped private backbuffer) to the swapchain and presents.
     // marker: 0 none, 1 green (warped), 2 red (original).
     // newest: the swapchain shows the newest finished frame at each refresh and drops one still waiting (paced:
@@ -195,6 +195,16 @@ public:
     // frame, after analyze_motion: for each pixel the analysis found moving on its own, its straight-line
     // motion in 3D to the previous frame (both frames' depth; the game's clipToPrevClip and projection).
     // False when there is nothing for the warp to move (no previous frame kept, a size change).
+    // The XPAR warp by forward splat (cs_warp_claim) instead of the search alone.
+    void set_warp_splat(bool on) { warp_splat_ = on; }
+    // The check of the game's HUD layer (see layer_trust_): its verdict, and starting it over (another texture taken as
+    // the layer, or the option turned off).
+    int layer_trust() const { return layer_trust_; }
+    double layer_drawn_over_share() const { return layer_covered_ ? double(layer_drawn_over_) / double(layer_covered_) : 0.0; }
+    void reset_layer_trust() { layer_trust_ = 0; layer_covered_ = layer_drawn_over_ = layer_frames_ = 0; }
+    // (for the log while it runs: frames checked, the share of the screen the layer covers on them, of it drawn over)
+    std::uint64_t layer_frames_checked() const { return layer_frames_; }
+    double layer_cover_share() const { return layer_frames_ && layer_frame_samples_ > 0 ? double(layer_covered_) / (double(layer_frames_) * layer_frame_samples_) : 0.0; }
     void set_object_history(bool on) { object_history_ = on; if (!on) history_valid_ = objects_built_ = shown_objects_ = false; }
     // held: what is attached to the camera and kept still (character/weapon) moves along its own on-screen motion.
     // picture: also what the picture shows moving differently from the game's motion vectors (shadows, glare,
@@ -249,6 +259,10 @@ public:
     // vectors on the GPU (a few milliseconds, nothing is read back), so a capture taken on a later game frame
     // holds consecutive ones. Two sets: 0 is read back as 10-14, 1 as 15-18.
     void stash_source(int set = 0, bool hudless = false);
+    // The capture's copies released once it is written (8 textures at output and render size).
+    void release_stash();
+    // The presenter's textures, largest first (name WxH MB), and their total; for the log.
+    std::string memory_report();
 
 private:
     struct Private {
@@ -257,7 +271,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     };
-    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKeys, kPObjMove, kPObjTiles, kPObjOutTiles, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevColour, kPPrevDepth, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPFgMotion, kPFgInv, kPFgK1, kPFgK0, kPHudLearned, kPHudTiles, kPCount };
+    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKeys, kPObjMove, kPObjTiles, kPObjOutTiles, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevColour, kPPrevDepth, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPFgMotion, kPFgInv, kPFgK1, kPFgK0, kPHudLearned, kPHudTiles, kPWarpClaims, kPCount };
 
     bool create_pipelines(std::string& error);
     // The format a private copy of a game colour image is kept in: the game's own 4-byte format when it
@@ -285,7 +299,7 @@ private:
                  std::uint32_t source_w = 0, std::uint32_t source_h = 0);
     void create_swapchain_views();
     // HUD in this frame from the upscaler's output (into the HUD score texture, 1 = HUD).
-    void detect_hud_from_scene(const struct XConstants& base, bool fill);
+    bool detect_hud_from_scene(const struct XConstants& base, bool fill, PrivateId out = kPHudScore);
     void set_x_srv(UINT index, PrivateId id, bool from_shown = false);
     void set_x_uav(UINT index, PrivateId id);
     void x_dispatch(ID3D12PipelineState* pso, const void* constants, UINT srv_table, UINT uav_table, UINT groups_x, UINT groups_y);
@@ -331,21 +345,38 @@ private:
     // Moving objects: the previous frame's picture and depth (ingest; the new frame's sizes and colour format).
     void keep_history(PrivateId colour, std::uint32_t depth_w, std::uint32_t depth_h, std::uint32_t colour_w, std::uint32_t colour_h,
                       DXGI_FORMAT colour_format);
-    ComPtr<ID3D12PipelineState> cs_obj_move_, cs_gen_depth_, cs_gen_unui_, cs_hudless_clear_, cs_hudless_count_, cs_hudless_score_, cs_hudless_fill_, cs_layer_hud_, cs_obj_join_init_, cs_obj_join_, cs_obj_join_final_, cs_obj_clear_, cs_obj_clear_tiles_, cs_obj_splat_, cs_obj_fix_, cs_copy4_, cs_copy1_;
+    ComPtr<ID3D12PipelineState> cs_obj_move_, cs_gen_depth_, cs_gen_unui_, cs_hudless_clear_, cs_hudless_count_, cs_hudless_score_, cs_hudless_fill_, cs_layer_hud_, cs_layer_check_clear_, cs_layer_check_, cs_obj_join_init_, cs_obj_join_, cs_obj_join_final_, cs_obj_clear_, cs_obj_clear_tiles_, cs_obj_splat_, cs_obj_fix_, cs_copy4_, cs_copy1_;
     ComPtr<ID3D12PipelineState> cs_fg_motion_, cs_fg_inverse_, cs_fg_clear_, cs_fg_splat_cur_, cs_fg_splat_prev_, cs_fg_resolve_, cs_fg_depth_;
     bool object_history_ = false, history_valid_ = false, objects_built_ = false, shown_objects_ = false;
-    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_memory_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_;
+    bool warp_splat_ = false;  // set_warp_splat
+    std::uint32_t detection_idle_ = 0;  // game frames since the HUD was last detected (build_no_warp_mask)
+    std::uint32_t scene_idle_ = 0;      // game frames since the upscaler's output last came (ingest)
+    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_warp_claims_clear_, cs_warp_claim_, cs_memory_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_;
     // Sight reticles (option): the passes, which history texture holds the latest layer, and whether the layer was
     // built for the frame taken in last / the shown one (see cs_ret_layer).
     ComPtr<ID3D12PipelineState> cs_ret_cells_, cs_ret_enclose_, cs_ret_layer_, cs_ret_align_, cs_ret_pick_, cs_ret_shift_;
     ComPtr<ID3D12Resource> ret_buf_;  // the reticle's tracking sums and the shift chosen (cs_ret_align)
     bool ret_flip_ = false, layer_built_ = false, shown_layer_ = false;
+    PrivateId ret_latest_ = kPRetA, ret_shown_ = kPRetA;  // the sight reticles' layer the intake wrote last / the shown frame's
     ComPtr<ID3D12Resource> samples_, samples_readback_;
     UINT samples_count_ = 0;
     float last_flush_ms_ = 0;
     float last_present_call_ms_ = 0;
     std::int64_t last_submit_qpc_ = 0;
     ComPtr<ID3D12Resource> hud_counts_, hud_readback_, scene_fit_, scene_stamps_readback_;
+    // The game's HUD layer checked (cs_layer_check): 0 not yet, 1 a HUD (trusted: a frame without it shows no HUD), 2 not
+    // a HUD (ignored, the HUD is detected). Counts every second pixel: covered, and of them drawn over the picture.
+    ComPtr<ID3D12Resource> layer_counts_, layer_readback_;
+    bool layer_pending_[kRing] = {};
+    int layer_trust_ = 0;
+    std::uint64_t layer_covered_ = 0, layer_drawn_over_ = 0, layer_frames_ = 0;
+    double layer_frame_samples_ = 0;  // samples per frame (every second pixel each way)
+    // Textures released once the GPU is past them (no waiting: no hitch), see retire.
+    struct Retired { ComPtr<ID3D12Resource> texture; std::uint64_t after0, after1; };
+    std::vector<Retired> retired_;
+    void retire_texture(ComPtr<ID3D12Resource>& r);
+    void retire(PrivateId id);
+    void collect_retired();
     ComPtr<ID3D12QueryHeap> scene_stamps_;
     bool hud_pending_[kRing] = {}, hud_scene_pending_[kRing] = {}, hud_from_scene_ = false;
     double hud_scene_pixels_ = 1;

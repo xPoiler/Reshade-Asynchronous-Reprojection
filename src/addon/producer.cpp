@@ -43,6 +43,7 @@ void default_settings(Settings& s) {
     s.floor_release = 1;  // the ground around the character moves with a measured orbit (acts only while one is in use)
     s.hold_reticles = 1;  // sight reticles drawn without depth move with the gun (acts only inside a sight's window)
     s.game_hud_layers = 1;  // the HUD from the game's own HUD layer / final picture where found
+    s.warp_splat = 1;  // the XPAR warp by forward splat
     s.edge_limit_pct = 0.0f;  // camera as of now: no more of the edge uncovered than Auto's
     s.edge_fill = 1;  // soft edge (blur along the edge); extended edge pixels are the option
     s.no_warp_mask = 1;   // HUD detection in games without HUD layers
@@ -326,6 +327,9 @@ void Producer::on_tag(std::uint64_t frame, Tex kind, ID3D12Resource* source, D3D
     if (!ready() || !source || !list) return;
     const auto desc = source->GetDesc();
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1) return;
+    // (the upscaler's output is only for detecting the HUD: not while the game hands its HUD over - a HUD layer or a
+    // HUD-less picture with every one of the last 60 frames; see begin_present)
+    if (kind == kScene && hud_given_ >= 60) return;
     const int slot = slot_for_frame(frame, true);
     if (slot < 0) return;
     collect_retired();
@@ -600,6 +604,21 @@ std::uint64_t Producer::begin_present(ID3D12Resource* backbuffer, ID3D12Graphics
         ++shared_->hooks.hudless_handed;
     }
     if (hudless_age_ < 2) ++hudless_age_;
+    // Frames in a row the game handed its HUD over (a HUD-less picture, a UI layer it tags, or the HUD layer the add-on takes
+    // once the presenter has checked it - until then the check needs the upscaler's output; and then a frame without it is
+    // one where the game hides its HUD): past 60 the upscaler's output is no longer copied (on_tag); at 300 its slot
+    // textures are released (64 MB each at 4K).
+    const bool tagged_ui = m.tex[kUi].valid && m.tex[kUi].format != DXGI_FORMAT_R8_UNORM;  // (the add-on's is its coverage, R8)
+    hud_given_ = m.tex[kHudless].valid || tagged_ui || shared_->presenter.layer_trust == 1 ? hud_given_ + 1 : 0;
+    if (hud_given_ == 300)
+        for (int s = 0; s < kSlots; ++s) {
+            auto& t = textures_[s][kScene];
+            if (!t.resource) continue;
+            retired_.push_back({t.resource, t.handle, fence_value_ + 1, t.vk, t.d11});
+            const std::uint32_t generation = t.generation;  // (a new one gets a new name: the old may still be open)
+            t = Texture{};
+            t.generation = generation;
+        }
     m.qpc_present = qpc_now();
     return m.frame_id + 1;  // 0 means "nothing to finish"
 }

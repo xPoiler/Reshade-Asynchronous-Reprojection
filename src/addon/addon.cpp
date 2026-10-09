@@ -110,6 +110,7 @@ constexpr Persisted kPersisted[] = {
     {"FloorRelease", &fw::Settings::floor_release, nullptr},
     {"HoldReticles", &fw::Settings::hold_reticles, nullptr},
     {"GameHudLayers", &fw::Settings::game_hud_layers, nullptr},
+    {"ForwardSplatWarp", &fw::Settings::warp_splat, nullptr},
     {"MaxExtrapolation", nullptr, &fw::Settings::max_horizon_ms},
     {"PresentLead", nullptr, &fw::Settings::present_lead_ms},
     {"PresentLeadAuto", &fw::Settings::present_lead_auto, nullptr},
@@ -776,6 +777,11 @@ void draw_overlay(effect_runtime*) {
         ImGui::BeginDisabled(!latewarp);
         if (ImGui::Combo("Warp engine", &engine, kEngines, 2)) s.warp_engine = static_cast<std::uint32_t>(engine);
         ImGui::EndDisabled();
+        bool splat = s.warp_splat != 0;
+        if (ImGui::Checkbox("Forward-splat warp (XPAR engine)", &splat)) s.warp_splat = splat;
+        hint("Every point of the game's frame is placed where your camera now sees it, the nearest one winning, and what "
+             "nothing reaches is filled from the scenery behind: near objects keep their shape and edges are not doubled "
+             "when strafing. Off: the earlier warp, which searches from each pixel of the screen. Remembered per game.");
         bool memory = s.background_memory != 0;
         if (ImGui::Checkbox("Background memory for uncovered areas (XPAR engine)", &memory)) {
             s.background_memory = memory;
@@ -864,9 +870,12 @@ void draw_overlay(effect_runtime*) {
                 if (ps.hud_source > 0 && ps.hud_source < 7) ImGui::TextDisabled("HUD in use: from %s", kSources[ps.hud_source]);
                 if (!s.game_hud_layers)
                     ImGui::TextDisabled("Game's HUD layer: not used (the HUD is detected)");
+                else if (hs.ui_layer_w && ps.layer_trust == 2)
+                    ImGui::TextDisabled("Game's HUD layer: a layer was found, but it is not drawn over the finished picture - not a HUD: the HUD is detected");
                 else if (hs.ui_layer_w)
-                    ImGui::TextDisabled("Game's HUD layer: found (%ux%u, format %u), taken on %u frames, %u handed over%s", hs.ui_layer_w, hs.ui_layer_h,
+                    ImGui::TextDisabled("Game's HUD layer: found (%ux%u, format %u), taken on %u frames, %u handed over%s%s", hs.ui_layer_w, hs.ui_layer_h,
                                         hs.ui_layer_format, hs.ui_layer_taken, hs.ui_layer_handed,
+                                        ps.layer_trust == 1 ? " - checked: it is the HUD" : " - being checked",
                                         hs.ui_layer_pass == 2 ? " - its pass failed" : "");
                 else if (hs.hudless_copies)
                     ImGui::TextDisabled("Game's HUD: drawn onto its final picture - HUD-less copies taken on %u frames, %u handed over",

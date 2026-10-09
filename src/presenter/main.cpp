@@ -985,6 +985,8 @@ void render_thread() {
                     // proven for every game); otherwise the learned HUD map, which works everywhere.
                     IngestedSource for_mask = s;
                     if (!settings.hud_from_scene) for_mask.has_scene = false;
+                    // (the check of the game's HUD layer starts over when the option is off: no layer is taken then)
+                    if (!settings.game_hud_layers) renderer.reset_layer_trust();
                     renderer.build_no_warp_mask(for_mask, cam.clip_to_prev_clip, hud_mask, s.has_motion && mv_scale.valid, attached_mask,
                                                 cam.depth_inverted != 0, settings.hud_from_scene == 2,
                                                 settings.hud_fill != 0 && (settings.warp_engine == 1 || !latewarp.ready()),
@@ -1020,8 +1022,30 @@ void render_thread() {
                         logf("HUD: found from the game's HUD-less picture (sent without a UI layer)");
                         hudless_hud_logged = true;
                     }
-                    // (for the panel: where the HUD comes from)
-                    sh.presenter.hud_source = !hud_mask ? (game_has_hud_layers ? 1u : 0u) : s.has_hudless && !s.has_ui ? 2u : s.has_ui && !s.has_hudless ? 3u
+                    // The game's HUD layer checked (see Renderer::layer_trust): the verdict to the add-on and the log (and the
+                    // check's numbers every 300 frames while it runs).
+                    const int trust = renderer.layer_trust();
+                    static std::uint64_t check_logged = 0;
+                    if (trust == 0 && renderer.layer_frames_checked() >= check_logged + 300) {
+                        check_logged = renderer.layer_frames_checked();
+                        logf("HUD layer check: %llu frames, the layer covers %.1f%% of the screen on them, %.0f%% of that drawn over the "
+                             "finished picture", static_cast<unsigned long long>(check_logged), 100.0 * renderer.layer_cover_share(),
+                             100.0 * renderer.layer_drawn_over_share());
+                    }
+                    if (trust == 0 && renderer.layer_frames_checked() < check_logged) check_logged = 0;
+                    if (trust != int(sh.presenter.layer_trust)) {
+                        if (trust == 1)
+                            logf("HUD: the game's own HUD layer checked - %.0f%% of what it covers is drawn over the finished picture: it is the "
+                                 "HUD (frames without it show none)", 100.0 * renderer.layer_drawn_over_share());
+                        else if (trust == 2)
+                            logf("HUD: the layer taken as the game's HUD is not drawn over the finished picture (%.0f%% of it, covering %.1f%% "
+                                 "of the screen): not a HUD - ignored, the HUD is detected", 100.0 * renderer.layer_drawn_over_share(),
+                                 100.0 * renderer.layer_cover_share());
+                        sh.presenter.layer_trust = std::uint32_t(trust);
+                    }
+                    // (for the panel: where the HUD comes from - a checked layer the game hides counts as its HUD layer)
+                    const bool own_layer = (s.has_ui && !s.has_hudless && trust != 2) || (!s.has_ui && !s.has_hudless && trust == 1);
+                    sh.presenter.hud_source = !hud_mask ? (game_has_hud_layers ? 1u : 0u) : s.has_hudless && !s.has_ui ? 2u : own_layer ? 3u
                                               : settings.hud_from_scene && s.has_scene ? (settings.hud_from_scene == 2 ? 5u : 4u) : 6u;
                     // (every 600 frames: how many had the game's own HUD layer, how many fell back to detecting it)
                     ++hud_source_counts[std::min<std::uint32_t>(sh.presenter.hud_source, 6)];
@@ -1426,7 +1450,7 @@ void render_thread() {
             const Vec3 origin = source_basis.pos;
             Mat4 projection;
             std::memcpy(projection.data(), source_camera.view_to_clip, sizeof(projection));
-            auto inputs = renderer.latewarp_inputs(source, settings.use_ui_tags != 0);
+            auto inputs = renderer.latewarp_inputs(source, settings.use_ui_tags != 0, !own_engine);
             inputs.depth_inverted = source_camera.depth_inverted != 0;
             if (source_masked) {
                 inputs.no_warp_mask = renderer.no_warp_mask();
@@ -1456,6 +1480,7 @@ void render_thread() {
                 // warp pass.)
                 unmoved = !settings.show_mask && generated < 0;
                 for (int i = 0; i < 16 && unmoved; ++i) unmoved = std::fabs(m.data()[i] - (i % 5 == 0 ? 1.0f : 0.0f)) < 2e-6f;
+                renderer.set_warp_splat(settings.warp_splat != 0);
                 warped = unmoved || renderer.own_warp(source, settings.use_ui_tags != 0, inputs.no_warp_mask != nullptr, m.data(), inputs.depth_inverted,
                                                      settings.background_memory != 0, nullptr, generated,
                                                      settings.edge_fill != 0);
@@ -1539,7 +1564,7 @@ void render_thread() {
                                               std::pair{15, L"prev2_frame"}, std::pair{16, L"prev2_hudless"}, std::pair{17, L"prev2_depth"},
                                               std::pair{18, L"prev2_motion"}, std::pair{19, L"hudless"}, std::pair{20, L"gen0"},
                                               std::pair{21, L"gen1"}, std::pair{22, L"gen2"}, std::pair{23, L"gen0_depth"},
-                                              std::pair{24, L"gen1_depth"}, std::pair{25, L"gen2_depth"}, std::pair{26, L"ui"}, std::pair{28, L"layer"}}) {
+                                              std::pair{24, L"gen1_depth"}, std::pair{25, L"gen2_depth"}, std::pair{26, L"ui"}, std::pair{27, L"warp_mask"}, std::pair{28, L"layer"}}) {
                 std::vector<std::uint16_t> px;
                 std::uint32_t cw = 0, ch = 0;
                 if (which == 2 && !source.has_scene) { logf("capture %d: no upscaler output this frame", n); continue; }
@@ -1578,6 +1603,7 @@ void render_thread() {
             }
             logf("capture %d saved: game frames %llu (prev2_), %llu (prev_), %llu", n, static_cast<unsigned long long>(dump_frames[0].frame),
                  static_cast<unsigned long long>(dump_frames[1].frame), static_cast<unsigned long long>(shown_frame));
+            renderer.release_stash();  // (its copies of the earlier frames: written, not kept in video memory)
         }
         g_app.dump_was_down = dump_down;
         if (rec(g_app.csv_outputs)) {
@@ -1774,6 +1800,9 @@ void render_thread() {
                          (u.intake_ms + u.warp_ms) / (span * 10.0), u.intakes / span, u.intakes ? u.intake_ms / u.intakes : 0.0,
                          u.access_ms / n, u.depth_ms / n, u.colour_ms / n, u.rest_ms / n, u.warps / span, u.warps ? u.warp_ms / u.warps : 0.0,
                          u.skipped / span);
+                    // (what the presenter's video memory holds, once a minute)
+                    static int memory_reports = 0;
+                    if (memory_reports++ % 6 == 0) logf("presenter memory: %s", renderer.memory_report().c_str());
                 }
             }
             {

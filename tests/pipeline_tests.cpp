@@ -132,6 +132,8 @@ int main(int argc, char** argv) {
     std::string error;
     if (!renderer.init(sh.adapter, window, W, H, kColour, 0, error)) { std::printf("FAIL renderer: %s\n", error.c_str()); return 1; }
     std::printf("presenter queue priority: %s\n", renderer.queue_priority());
+    // (FW_WARP_SPLAT=1: every own-warp test with the forward splat)
+    if (std::getenv("FW_WARP_SPLAT")) { renderer.set_warp_splat(true); std::printf("own warp: forward splat\n"); }
     EXPECT(renderer.open_session(sh.producer_pid, sh.session, error), "open session: %s", error.c_str());
     Latewarp12 latewarp;
     wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
@@ -582,6 +584,7 @@ int main(int argc, char** argv) {
         bool with_hudless = false;
         bool hudless_copy = false;  // the HUD-less picture as the add-on copies a game's final picture before its HUD (no tag)
         bool with_ui_layer = false;  // the HUD patch only in a UI layer of its own (as the add-on takes Cyberpunk's), nothing else
+        bool patch_in_scene = false;  // the HUD patch in the upscaler's output too (a layer that is part of the 3D picture: no HUD)
         // A bright yellow-white surface the tone mapping washes out towards white (as filmic tone mappers
         // do): scene (4, 4, 0.25) -> per channel (1, 1, 0.5), washed 80% towards its grey 0.964.
         bool washed_patch = false;
@@ -689,6 +692,13 @@ int main(int argc, char** argv) {
                     list->ClearRenderTargetView(srtv, sgrey, 1, &stripe);
                 }
                 list->ClearRenderTargetView(srtv, swhite, 1, &bar);
+                if (patch_in_scene) {
+                    const float sgreen[4] = {0, 4, 0, 1};
+                    for (LONG x = hx0; x < hx1; x += 4) {
+                        const D3D12_RECT stripe{x, hy0, std::min(x + 2, hx1), hy1};
+                        list->ClearRenderTargetView(srtv, sgreen, 1, &stripe);
+                    }
+                }
                 if (washed_patch) {
                     const float swashed[4] = {4, 4, 0.25f, 1};
                     list->ClearRenderTargetView(srtv, swashed, 1, &washed_rect);
@@ -1516,6 +1526,40 @@ int main(int argc, char** argv) {
             EXPECT(hp_x0 > 0 && std::fabs(hp_x1 - hp_x0) < 2.0, "HUD taken from the HUD-less copy in one frame (%.1f -> %.1f)", hp_x0, hp_x1);
             EXPECT(std::fabs(hb_x1 - hb_x0) > 20.0, "the scene next to it warps (%.0f -> %.0f)", hb_x0, hb_x1);
             EXPECT(both_src.has_ui && !both_src.has_hudless, "with a HUD layer the HUD-less copy is dropped");
+        }
+        // (R) The game's HUD layer checked against the upscaler's output: drawn over the finished picture, it is the HUD -
+        // trusted, and a frame without it (the game hides its HUD) shows none: the patch there (a light that stays put)
+        // is not held. A layer that is part of the 3D picture (in the upscaler's output too) is no HUD: ignored.
+        {
+            renderer.reset_hud_detection();
+            renderer.reset_layer_trust();
+            with_ui_layer = true; with_scene = true;
+            for (int f = 0; f < 40 && renderer.layer_trust() == 0; ++f) ingest_frame(publish(1000 + f, 0.1f, 0, false, true), true, false);
+            const int trusted = renderer.layer_trust();
+            const double trusted_share = renderer.layer_drawn_over_share();
+            with_ui_layer = false;
+            IngestedSource hidden_src = ingest_frame(publish(1040, 0.1f, 0, false, true), true, false);
+            with_scene = false;
+            own_engine = true;
+            show(hidden_src, 0);
+            const double hp0 = green_x();
+            show(hidden_src, yaw);
+            const double hp1 = green_x();
+            own_engine = false;
+            renderer.reset_hud_detection();
+            renderer.reset_layer_trust();
+            with_ui_layer = true; with_scene = true; patch_in_scene = true;
+            for (int f = 0; f < 90 && renderer.layer_trust() == 0; ++f) ingest_frame(publish(1050 + f, 0.1f, 0, false, true), true, false);
+            const int rejected = renderer.layer_trust();
+            const double rejected_share = renderer.layer_drawn_over_share();
+            with_ui_layer = false; with_scene = false; patch_in_scene = false;
+            renderer.reset_layer_trust();
+            renderer.reset_hud_detection();
+            std::printf("HUD layer check: drawn over the picture -> %d (%.0f%% differs), hidden HUD: patch x %.1f -> %.1f; "
+                        "part of the 3D picture -> %d (%.0f%%)\n", trusted, 100.0 * trusted_share, hp0, hp1, rejected, 100.0 * rejected_share);
+            EXPECT(trusted == 1, "a HUD layer drawn over the finished picture is trusted (%d)", trusted);
+            EXPECT(hp0 > 0 && std::fabs(hp1 - hp0) > 20.0, "with the trusted layer hidden, a patch that stays put is not held (%.1f -> %.1f)", hp0, hp1);
+            EXPECT(rejected == 2, "a layer that is part of the 3D picture is not trusted (%d)", rejected);
         }
         std::printf("HUD from the upscaler's output: patch x %.1f -> %.1f, bar x %.0f -> %.0f; semi-transparent patch x %.1f -> %.1f; "
                     "no HUD: bar x %.0f -> %.0f\n", sp_x0, sp_x1, sb_x0, sb_x1, sg_x0, sg_x1, sc_x0, sc_x1);

@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 57;
+constexpr std::uint32_t kVersion = 59;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -119,6 +119,8 @@ struct Settings {
     std::uint32_t frame_cap;           // default on: prevent GPU queueing (hold the game just below its GPU rate) while its NVIDIA Reflex is off (add-on; saved per game)
     std::uint32_t game_hud_layers;     // default on: the HUD from the game's own HUD layer / a HUD-less copy of its final picture where the add-on
                                        // finds one (Direct3D 12; ui_layer.hpp); off: HUD detection only (add-on; saved per game)
+    std::uint32_t warp_splat;          // default on: the XPAR warp by forward splat (every rendered pixel claims where it lands, the nearest
+                                       // winning) instead of the search from each displayed pixel alone (saved per game)
 };
 
 // Presenter status, displayed by the add-on UI.
@@ -168,6 +170,9 @@ struct PresenterStatus {
     // 1 the game's HUD layers (HUD-less picture + UI layer), 2 the game's HUD-less picture, 3 the game's own HUD layer
     // (found by the add-on), 4 the upscaler's output, 5 the upscaler's output + camera motion check, 6 learned.
     std::uint32_t hud_source;
+    // The game's HUD layer (found by the add-on) checked: 0 not yet, 1 drawn over the finished picture - a HUD (a frame
+    // without it shows none; the add-on stops copying the upscaler's output), 2 not a HUD (ignored, the HUD is detected).
+    std::uint32_t layer_trust;
     char message[256];
 };
 

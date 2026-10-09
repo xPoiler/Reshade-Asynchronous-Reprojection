@@ -885,6 +885,32 @@ RWTexture2D<float> hl_score_u : register(u0);
     if (any(id.xy >= out_size)) return;
     hl_score_u[id.xy] = hl_layer_t.Load(int3(id.xy, 0)).a > 0.02 ? 1.0 : 0.0;
 }
+// Is that layer the game's HUD (see Renderer::layer_trust)? Everything of a HUD - fixed or anchored in the world - is drawn
+// over the finished picture, after the upscaler: where the layer clearly covers, the frame differs from the upscaler's
+// output (cs_scene_hud's verdict, t1). Every second pixel each way: [0] covered, [4] covered and differing (a pixel
+// next to one that differs counts: the verdict misses anti-aliased edges).
+Texture2D<float4> lc_layer_t : register(t0);
+Texture2D<float> lc_found_t : register(t1);
+RWByteAddressBuffer lc_counts_u : register(u0);
+groupshared uint lc_n[2];
+[numthreads(1, 1, 1)] void cs_layer_check_clear(uint3 id : SV_DispatchThreadID) { lc_counts_u.Store2(0, uint2(0, 0)); }
+[numthreads(8, 8, 1)] void cs_layer_check(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+    if (gi == 0) { lc_n[0] = 0; lc_n[1] = 0; }
+    GroupMemoryBarrierWithGroupSync();
+    const int2 p = int2(id.xy * 2);
+    if (all(p < int2(out_size)) && lc_layer_t.Load(int3(p, 0)).a > 0.5) {
+        uint ignored;
+        InterlockedAdd(lc_n[0], 1, ignored);
+        bool found = false;
+        [unroll] for (int k = 0; k < 5; ++k) {
+            const int2 q = clamp(p + int2(k == 1 ? 1 : k == 2 ? -1 : 0, k == 3 ? 1 : k == 4 ? -1 : 0), int2(0, 0), int2(out_size) - 1);
+            found = found || lc_found_t.Load(int3(q, 0)) > 0.5;
+        }
+        if (found) InterlockedAdd(lc_n[1], 1, ignored);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (gi == 0 && lc_n[0]) { uint ignored; lc_counts_u.InterlockedAdd(0, lc_n[0], ignored); lc_counts_u.InterlockedAdd(4, lc_n[1], ignored); }
+}
 
 // HUD from the game's HUD-less picture (a game that sends it without a UI layer - Cyberpunk 2077 with frame
 // generation): exactly where the frame differs from it, every frame (the mask widens it by a pixel). Unless
@@ -1066,8 +1092,9 @@ RWByteAddressBuffer rs_buf_u : register(u1);
 }
 // The layer per output pixel (rgb; a: how well it has agreed lately), in this game frame's screen space. t0/t1:
 // this game frame's picture and the previous one's (both HUD-less when the previous one is), t2 depth, t3 the held
-// character/weapon (render px, widened), t4 the cells above, t5 the previous frame's layer. u0: the layer (the
-// next frame's history), u1: the same for the warp (the shown set). Flag 2: no history yet.
+// character/weapon (render px, widened), t4 the cells above, t5 the previous frame's layer. u0: the layer - the next
+// frame's history, and what the warp reads (the two take turns: the one written last is the frame's). Flag 2: no
+// history yet.
 // The residual - this frame minus the previous one where the scenery came from - is the layer plus what that
 // prediction got wrong (scenery just uncovered, blur, grain). The layer, carried along with the gun, takes in a
 // residual that agrees with it, and one that does not the less the longer it has agreed: a new reticle is learned
@@ -1082,7 +1109,6 @@ Texture2D<unorm float> rl_att_t : register(t3);
 Texture2D<float4> rl_encl_t : register(t4);
 Texture2D<float4> rl_hist_t : register(t5);
 RWTexture2D<float4> rl_layer_u : register(u0);
-RWTexture2D<float4> rl_shown_u : register(u1);
 SamplerState rl_linear : register(s0);
 [numthreads(8, 8, 1)] void cs_ret_layer(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= out_size)) return;
@@ -1127,7 +1153,6 @@ SamplerState rl_linear : register(s0);
         }
     }
     rl_layer_u[id.xy] = L;
-    rl_shown_u[id.xy] = L;
 }
 
 // Stretch around the character/weapon (option, XPAR engine): how far each render pixel is from the
@@ -1539,6 +1564,8 @@ bool hud_near(Texture2D<float> score, int2 p) {
 // HUD, 16 depth inverted, 32 depth-independent (rotation only), 64 background memory (t4), 128 stretch,
 // 256 moving objects (t6-t9; alpha: game frames back towards the previous frame), 1024 soft edge (ow_soft_edge).
 // (512 is the moving-objects pass's debug colours, cs_obj_fix: the soft edge had it first and painted them in.)
+// Flag 4096: forward splat (t12, cs_warp_claim) - every rendered pixel first claims the spot it lands on, the nearest
+// winning, and each output pixel takes the nearest claimant around it whose surface reaches it (see ow_find).
 // t2: the XPAR warp's mask (cs_mask u1): held above 0.95. Flag 2048: sight reticles (t11, see cs_ret_layer) - the layer
 // on a sight's glass: where it covers the glass (the reticle, ow_cover) the game frame's own pixel is shown, as
 // held; where it is faint (glow) it is taken out where the warp takes the scenery from and added back here. The
@@ -1554,6 +1581,7 @@ Texture2D<float4> ow_prev_t : register(t8);   // ...the previous frame's picture
 Texture2D<float> ow_prevz_t : register(t9);   // ...and depth
 Texture2D<uint> ow_out_tiles_t : register(t10); // ...the 8x8 output blocks they touch
 Texture2D<float4> ow_layer_t : register(t11);  // sight reticles: the layer on the glass (cs_ret_layer)
+Texture2D<uint> ow_claims_t : register(t12);   // forward splat: the claims on the displayed spots (cs_warp_claim)
 // How much the layer covers the glass at a spot: 0 up to faint glow, 1 on the reticle itself.
 float ow_cover(float4 l) { return saturate((max(max(l.r, l.g), l.b) - 0.03) / 0.2); }
 RWTexture2D<float4> ow_out_u : register(u0);
@@ -1573,6 +1601,23 @@ float ow_depth(float2 uv) {
 static const float kMemMargin = 0.125;  // the memory covers the screen plus this much on every side
 static const float kMemForget = 60.0;   // game frames
 Texture2D<float4> ow_mem_t : register(t4);
+// ...or only what it keeps from before (not seen now: behind what is in front, or held, or outside the frame).
+bool ow_from_memory_behind(float2 s, out float4 c) {
+    c = 0;
+    const float2 mu = (s + kMemMargin) / (1.0 + 2.0 * kMemMargin);
+    if (any(mu < 0) || any(mu > 1)) return false;
+    const float4 ages = ow_mem_t.GatherAlpha(ow_linear, mu);
+    if (min(min(ages.x, ages.y), min(ages.z, ages.w)) >= 1.0 && max(max(ages.x, ages.y), max(ages.z, ages.w)) < kMemForget) {
+        c = float4(ow_mem_t.SampleLevel(ow_linear, mu, 0).rgb, 1);
+        return true;
+    }
+    uint mw, mh;
+    ow_mem_t.GetDimensions(mw, mh);
+    const float4 v = ow_mem_t.Load(int3(min(uint2(mu * float2(mw, mh)), uint2(mw, mh) - 1), 0));
+    if (v.a < 1.0 || v.a >= kMemForget) return false;
+    c = float4(v.rgb, 1);
+    return true;
+}
 bool ow_from_memory(float2 s, out float4 c) {
     c = 0;
     const float2 mu = (s + kMemMargin) / (1.0 + 2.0 * kMemMargin);
@@ -1590,10 +1635,11 @@ bool ow_from_memory(float2 s, out float4 c) {
     return true;
 }
 // Rendered-frame uv (at its depth) -> displayed uv; w <= 0: behind the displayed camera.
-float3 ow_forward(float2 uv) {
-    const float4 f = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, ow_depth(uv), 1), clip_to_prev);
+float3 ow_forward_at(float2 uv, float d) {
+    const float4 f = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, d, 1), clip_to_prev);
     return float3(f.x / f.w * 0.5 + 0.5, 0.5 - f.y / f.w * 0.5, f.w);
 }
+float3 ow_forward(float2 uv) { return ow_forward_at(uv, ow_depth(uv)); }
 // Moving objects: how much of a spot of the rendered frame is a moving object, bilinear between the four
 // render pixels around it (the object's outline at output resolution, not in render-pixel steps).
 float ow_moving(float2 uv) {
@@ -1652,24 +1698,188 @@ float4 ow_soft_edge(float2 src, float2 inside) {
         }
     return c / total;
 }
-// The rendered pixel that lands on uv; false: none (behind the displayed camera).
-bool ow_find(float2 uv, out float2 src) {
+// Where the point at rendered-frame uv s is shown (f: ow_forward(s)), with the stretch's share of the warp.
+float2 ow_lands(float2 s, float3 f) { return (flags & 128) ? s + (f.xy - s) * ow_follow(s) : f.xy; }
+// The rendered pixel that lands on uv, searched from it; false: none (behind the displayed camera). Where several
+// surfaces land on uv (a near object passing in front of the scenery) or none does (what it uncovers), the search
+// ends on whichever its steps happen to reach: neighbouring pixels can take different ones (doubled edges).
+bool ow_search(float2 uv, out float2 src) {
     src = uv;
     const int steps = (flags & 128) ? 12 : 6;
     [loop] for (int it = 0; it < steps; ++it) {
         const float3 f = ow_forward(src);
         if (f.z <= 1e-6) return false;
-        float2 lands = f.xy;
-        if (flags & 128) lands = src + (f.xy - src) * ow_follow(src);
-        const float2 miss = uv - lands;
+        const float2 miss = uv - ow_lands(src, f);
         src += miss;
         if (all(abs(miss * float2(out_size)) < 0.25)) break;
     }
     return true;
 }
+// Forward splat (flag 4096). Nearness from the stored depth alone (32 steps per doubling of the distance; reversed or
+// standard depth, flag 16), so claims compare without the projection.
+float ow_near(float d) {
+    const float x = (flags & 16) ? d : 1.0 - d;
+    return 1.0 + saturate((log2(max(x, 1e-12)) + 30.0) / 32.0) * 1022.0;
+}
+// Every rendered pixel (not held) claims the spot it lands on, in rendered-pixel cells of the displayed picture:
+// nearness << 22 | the claimant's offset from the cell (11 bits each, +1024). The nearest claim wins.
+RWTexture2D<uint> wc_claims_u : register(u0);
+[numthreads(8, 8, 1)] void cs_warp_claims_clear(uint3 id : SV_DispatchThreadID) {
+    if (all(id.xy < rect.zw)) wc_claims_u[id.xy] = 0;
+}
+[numthreads(8, 8, 1)] void cs_warp_claim(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= rect.zw)) return;
+    const float2 s = (float2(id.xy) + 0.5) / float2(rect.zw);
+    if ((flags & 2) && ow_held(int3(min(uint2(s * float2(out_size)), out_size - 1), 0))) return;
+    const float3 f = ow_forward(s);
+    if (f.z <= 1e-6) return;
+    const float2 l = ow_lands(s, f);
+    if (any(l < 0) || any(l >= 1)) return;
+    const int2 cell = int2(l * float2(rect.zw));
+    const int2 d = int2(id.xy) - cell;
+    if (any(abs(d) > 1023)) return;
+    InterlockedMax(wc_claims_u[cell], (uint(ow_near(ow_depth(s))) << 22) | (uint(d.x + 1024) << 11) | uint(d.y + 1024));
+}
+// Is the rendered frame's spot s on the surface of nearness nk: any of the four rendered pixels around it within 6
+// steps (~14%). (One rendered pixel spans several output pixels: tested on the nearest alone, a near object's outline
+// came out in steps of whole rendered pixels; this way its anti-aliased edge goes with it, as the frame shows it.)
+bool ow_on_surface(float2 s, float nk) {
+    const float2 p = clamp(s * float2(rect.zw) - 0.5, 0, float2(rect.zw) - 1.001);
+    const int2 i = int2(rect.xy) + int2(floor(p));
+    bool on = false;
+    [unroll] for (int k = 0; k < 4; ++k)
+        on = on || abs(ow_near(ow_depth_t.Load(int3(i + int2(k & 1, k >> 1), 0))) - nk) <= 6.0;
+    return on;
+}
+// A claim: its claimant's rendered pixel (the cell it claimed + the offset in the key).
+int2 ow_claimant(int2 cell, uint key) { return cell + int2(int((key >> 11) & 2047u) - 1024, int(key & 2047u) - 1024); }
+// From a claimant, the steps of the search over its own surface: true if they end on uv (< 0.5 px), still on that surface.
+bool ow_refine(float2 uv, int2 p, float nk, out float2 s) {
+    s = (float2(p) + 0.5) / float2(rect.zw);
+    [loop] for (int it = 0; it < 6; ++it) {
+        const float3 f = ow_forward(s);
+        if (f.z <= 1e-6) return false;
+        const float2 miss = uv - ow_lands(s, f);
+        s += miss;
+        if (all(abs(miss * float2(out_size)) < 0.25)) break;
+    }
+    const float3 f = ow_forward(s);
+    return f.z > 1e-6 && all(abs((uv - ow_lands(s, f)) * float2(out_size)) < 0.5) && ow_on_surface(s, nk);
+}
+// Uncovered at uv: the farthest claimant's surface (the scenery behind), carried on to uv at its own depth - as far as the
+// rendered frame still shows that surface on the way there; beyond, the nearer thing in front hides it: stopped at its
+// edge (stretched scenery, not a copy of what is in front, nor blocks of one pixel).
+// (with background memory, flag 64: where a nearer thing hides that surface in the rendered frame, the memory may have
+// seen it before - ow_hidden is set, and ow_scene shows the memory's)
+static bool ow_hidden = false;
+static float4 ow_hidden_c = 0;
+float2 ow_behind(float2 uv, int2 p, float far_near) {
+    const float2 s0 = (float2(p) + 0.5) / float2(rect.zw);
+    const float far_d = ow_depth(s0);
+    float2 s = s0;
+    [loop] for (int it = 0; it < 4; ++it) {
+        const float3 f = ow_forward_at(s, far_d);
+        if (f.z <= 1e-6) break;
+        s += uv - ow_lands(s, f);
+    }
+    if (all(s >= 0) && all(s <= 1) && abs(ow_near(ow_depth(s)) - far_near) > 6.0) {
+        if (flags & 64) ow_hidden = ow_from_memory_behind(s, ow_hidden_c);
+        float lo = 0, hi = 1;
+        [unroll] for (int b = 0; b < 5; ++b) {
+            const float m = 0.5 * (lo + hi);
+            if (abs(ow_near(ow_depth(lerp(s0, s, m))) - far_near) <= 6.0) lo = m; else hi = m;
+        }
+        s = lerp(s0, s, lo);
+    }
+    return s;
+}
+// The claims around uv (3x3 cells), nearest first: the first claimant whose surface reaches uv (ow_refine) is what is
+// shown there - the nearest surface that reaches it. None: uncovered here (hole: ow_behind from the farthest), or no
+// claims around at all (false).
+bool ow_claimed(float2 uv, out float2 src, out bool hole) {
+    src = uv;
+    hole = false;
+    const int2 c0 = int2(uv * float2(rect.zw));
+    uint keys[9];
+    uint far_key = 0xFFFFFFFFu;
+    int2 far_cell = c0;
+    [unroll] for (int k = 0; k < 9; ++k) {
+        const int2 cell = clamp(c0 + int2(k % 3 - 1, k / 3 - 1), int2(0, 0), int2(rect.zw) - 1);
+        keys[k] = ow_claims_t.Load(int3(cell, 0));
+        if (keys[k] && (keys[k] >> 22) < (far_key >> 22)) { far_key = keys[k]; far_cell = cell; }
+    }
+    if (far_key == 0xFFFFFFFFu) return false;
+    [loop] for (int attempt = 0; attempt < 3; ++attempt) {
+        uint best = 0;
+        int bi = 0;
+        [unroll] for (int k = 0; k < 9; ++k) if (keys[k] > best) { best = keys[k]; bi = k; }
+        if (best == 0) break;
+        const int2 pb = ow_claimant(clamp(c0 + int2(bi % 3 - 1, bi / 3 - 1), int2(0, 0), int2(rect.zw) - 1), best);
+        // (the same claimant may hold several cells around: tried once)
+        [unroll] for (int k = 0; k < 9; ++k)
+            if (keys[k] && all(ow_claimant(clamp(c0 + int2(k % 3 - 1, k / 3 - 1), int2(0, 0), int2(rect.zw) - 1), keys[k]) == pb)) keys[k] = 0;
+        float2 s;
+        if (ow_refine(uv, pb, float(best >> 22), s)) { src = s; return true; }
+    }
+    src = ow_behind(uv, ow_claimant(far_cell, far_key), float(far_key >> 22));
+    hole = true;
+    return true;
+}
+// No claims in the 3x3 around uv: an uncovered area wider than that (a near object moved off it), or a surface stretched
+// that much. The nearest ring of cells around (8 directions, out to 32 rendered px) that holds claims: its nearest
+// claimant if its surface reaches uv (stretched), otherwise the scenery behind from its farthest (ow_behind).
+bool ow_ring(float2 uv, out float2 src) {
+    src = uv;
+    const int2 c0 = int2(uv * float2(rect.zw));
+    static const int kRadii[9] = {2, 3, 4, 6, 8, 12, 16, 24, 32};
+    uint near_key = 0, far_key = 0xFFFFFFFFu;
+    int2 near_cell = c0, far_cell = c0;
+    [loop] for (int r = 0; r < 9 && near_key == 0; ++r)
+        [unroll] for (int d = 0; d < 8; ++d) {
+            const int2 dir = int2(d == 0 || d == 1 || d == 7 ? 1 : d == 3 || d == 4 || d == 5 ? -1 : 0,
+                                  d == 1 || d == 2 || d == 3 ? 1 : d == 5 || d == 6 || d == 7 ? -1 : 0);
+            const int2 cell = c0 + dir * kRadii[r];
+            if (any(cell < 0) || any(cell >= int2(rect.zw))) continue;
+            const uint key = ow_claims_t.Load(int3(cell, 0));
+            if (!key) continue;
+            if (key > near_key) { near_key = key; near_cell = cell; }
+            if ((key >> 22) < (far_key >> 22)) { far_key = key; far_cell = cell; }
+        }
+    if (near_key == 0) return false;
+    float2 s;
+    if (ow_refine(uv, ow_claimant(near_cell, near_key), float(near_key >> 22), s)) { src = s; return true; }
+    src = ow_behind(uv, ow_claimant(far_cell, far_key), float(far_key >> 22));
+    return true;
+}
+// The rendered pixel shown at uv; false: none (behind the displayed camera).
+bool ow_find(float2 uv, out float2 src) {
+    if (flags & 4096) {
+        bool hole;
+        if (ow_claimed(uv, src, hole)) {
+            if (!hole) return true;
+            // Uncovered. Next to held pixels (the character/weapon, the HUD: they claim nothing) the search's own
+            // way - background memory, or stepping past them - shows what is behind them; elsewhere the scenery behind.
+            float2 b;
+            if ((flags & 2) && ow_search(uv, b) && all(b >= 0) && all(b <= 1) &&
+                ow_held(int3(min(uint2(b * float2(out_size)), out_size - 1), 0))) { src = b; ow_hidden = false; }
+            return true;
+        }
+        // No claims around: past the frame's edge or behind held pixels the search's way (soft edge, background memory,
+        // stepping past); otherwise uncovered wider than the 3x3 (ow_ring) - the search would end on what moved off it
+        // and copy it there (a second, ghost copy beside a near character when strafing).
+        if (!ow_search(uv, src)) return false;
+        if (any(src < 0) || any(src > 1) || ((flags & 2) && ow_held(int3(min(uint2(src * float2(out_size)), out_size - 1), 0)))) return true;
+        float2 r;
+        if (ow_ring(uv, r)) src = r;
+        return true;
+    }
+    return ow_search(uv, src);
+}
 // What the warp shows at an output pixel that is not held (src: where its search landed).
 float4 ow_scene(uint2 id, float2 uv, out float2 src, out bool valid) {
+    ow_hidden = false;
     valid = ow_find(uv, src);
+    if (valid && ow_hidden) return ow_hidden_c;  // (uncovered, the memory has what is behind)
     float4 c;
     if (!valid) {
         c = ow_color_t.Load(int3(id.xy, 0));  // nothing sensible to show (e.g. more than 90 degrees away)
@@ -1937,6 +2147,9 @@ float4 ow_scene(uint2 id, float2 uv, out float2 src, out bool valid) {
 // warp does), one frame older; after kMemForget frames it is forgotten. rgb: colour, a: game frames since
 // seen (255: nothing); a second texture holds the depth. flags: 1 previous memory valid, 16 depth inverted;
 // grid: memory size; rect: the depth region; clip_to_prev: this frame's clip -> the previous frame's.
+// What is visible does not replace remembered scenery clearly farther away (a person walking past, a pole the camera
+// moves by): the memory keeps what is behind it, as last seen, for the warp to show where moving the view uncovers it
+// (see ow_find); with age it is forgotten, and what is in front written in.
 Texture2D<float4> mem_frame_t : register(t0);
 Texture2D<float> mem_mask_t : register(t1);
 Texture2D<float> mem_depth_t : register(t2);
@@ -1944,15 +2157,45 @@ Texture2D<float4> mem_prev_t : register(t3);
 Texture2D<float> mem_prevz_t : register(t4);
 RWTexture2D<float4> mem_u : register(u0);
 RWTexture2D<float> memz_u : register(u1);
+// Nearness of a stored depth (larger = nearer), whichever way round depth is stored: ~32 steps per doubling.
+float mem_near(float d) {
+    const float x = (flags & 16) ? d : 1.0 - d;
+    return log2(max(x, 1e-12)) * 32.0;
+}
 [numthreads(8, 8, 1)] void cs_memory(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= grid)) return;
     const float2 s = (float2(id.xy) + 0.5) / float2(grid) * (1.0 + 2.0 * kMemMargin) - kMemMargin;
-    if (all(s >= 0) && all(s <= 1) && mem_mask_t.Load(int3(min(uint2(s * float2(out_size)), out_size - 1), 0)) <= 0.5) {
-        mem_u[id.xy] = float4(mem_frame_t.SampleLevel(ow_linear, s, 0).rgb, 0);
-        memz_u[id.xy] = mem_depth_t.Load(int3(rect.xy + min(uint2(s * float2(rect.zw)), rect.zw - 1), 0));
+    const bool visible = all(s >= 0) && all(s <= 1) && mem_mask_t.Load(int3(min(uint2(s * float2(out_size)), out_size - 1), 0)) <= 0.5;
+    const float far = (flags & 16) ? 0.0 : 1.0;
+    if (visible) {
+        const float vz = mem_depth_t.Load(int3(rect.xy + min(uint2(s * float2(rect.zw)), rect.zw - 1), 0));
+        // (what was remembered here, carried with the camera at its own depth: kept if clearly farther than what is
+        // visible now - more than ~25% - and not too old)
+        bool keep = false;
+        float4 kept = 0;
+        float kz = far;
+        if (flags & 1) {
+            float d = far;
+            bool ok = true;
+            uint2 pi = uint2(0, 0);
+            [loop] for (int it = 0; it < 3 && ok; ++it) {
+                const float4 p = mul(float4(s.x * 2 - 1, 1 - s.y * 2, d, 1), clip_to_prev);
+                ok = p.w > 0;
+                const float2 pu = (float2(p.x / p.w * 0.5 + 0.5, 0.5 - p.y / p.w * 0.5) + kMemMargin) / (1.0 + 2.0 * kMemMargin);
+                ok = ok && all(pu >= 0) && all(pu < 1);
+                pi = min(uint2(saturate(pu) * float2(grid)), grid - 1);
+                if (ok) d = mem_prevz_t.Load(int3(pi, 0));
+            }
+            if (ok) {
+                const float4 prev = mem_prev_t.Load(int3(pi, 0));
+                keep = prev.a + 1.0 < kMemForget && mem_near(d) + 10.0 < mem_near(vz);
+                kept = float4(prev.rgb, prev.a + 1.0); kz = d;
+            }
+        }
+        mem_u[id.xy] = keep ? kept : float4(mem_frame_t.SampleLevel(ow_linear, s, 0).rgb, 0);
+        memz_u[id.xy] = keep ? kz : vz;
         return;
     }
-    const float far = (flags & 16) ? 0.0 : 1.0;
     float4 v = float4(0, 0, 0, 255);
     float z = far;
     if (flags & 1) {
@@ -2234,12 +2477,12 @@ constexpr UINT kXFlow = kX + 146;
 enum FlowTable : UINT { kFlowLuma, kFlowFeat, kFlowSearch, kFlowMedianAB, kFlowMedianBA, kFlowLkAB, kFlowLkBA, kFlowMotion, kFlowFillAB, kFlowFillBA, kFlowTables };
 // Passes on the second root signature (the XPAR warp and the moving objects): 12 SRVs t0-t11 and 2 UAVs
 // per table.
-constexpr UINT kWSrvCount = 12, kWTableSize = kWSrvCount + 2;
+constexpr UINT kWSrvCount = 13, kWTableSize = kWSrvCount + 2;
 // Combined HUD detection: the learned score kept alongside (cs_hud: u0 the score, u1 the counts) and its tiles (6 + 2).
 constexpr UINT kXLearnedUav = kXFlow + kFlowTables * 8, kXTilesSrv = kXLearnedUav + 2, kXTilesUav = kXTilesSrv + 6;
 constexpr UINT kW = kXTilesUav + 2;
 enum WTable : UINT { kWWarp, kWShown, kWClear, kWSplat, kWMove, kWCopyColour, kWCopyDepth, kWJoinInit, kWJoinAB, kWJoinBA, kWJoinFinal,
-                     kWGenDepth0, kWGenDepth1, kWGenDepth2, kWGenUi0, kWGenUi1, kWGenUi2, kWFgMotion, kWFgInverse,
+                     kWGenDepth0, kWGenDepth1, kWGenDepth2, kWGenUi0, kWGenUi1, kWGenUi2, kWFgMotion, kWFgInverse, kWClaim,
                      kWFgImages, kWTables = kWFgImages + 5 * 3 };
 // XPAR frame generation: each image's own tables (descriptors are read when the GPU runs the pass, so one set reused
 // for every image would have them all write the last one).
@@ -2536,7 +2779,7 @@ bool Renderer::create_pipelines(std::string& error) {
     struct { const char* entry; ComPtr<ID3D12PipelineState>* pso; } xs[] = {
         {"cs_analyze", &cs_analyze_}, {"cs_reduce", &cs_reduce_},
         {"cs_hud", &cs_hud_}, {"cs_hud_world", &cs_hud_world_}, {"cs_mask", &cs_mask_}, {"cs_clear_score", &cs_clear_score_}, {"cs_hudless_clear", &cs_hudless_clear_}, {"cs_hudless_count", &cs_hudless_count_},
-        {"cs_hudless_score", &cs_hudless_score_}, {"cs_hudless_fill", &cs_hudless_fill_}, {"cs_layer_hud", &cs_layer_hud_},
+        {"cs_hudless_score", &cs_hudless_score_}, {"cs_hudless_fill", &cs_hudless_fill_}, {"cs_layer_hud", &cs_layer_hud_}, {"cs_layer_check_clear", &cs_layer_check_clear_}, {"cs_layer_check", &cs_layer_check_},
         {"cs_hud_count", &cs_hud_count_}, {"cs_clear_counts", &cs_clear_counts_}, {"cs_sample", &cs_sample_}, {"cs_tint", &cs_tint_}, {"cs_hud_tiles", &cs_hud_tiles_}, {"cs_hud_spread", &cs_hud_spread_},
         {"cs_scene_clear", &cs_scene_clear_}, {"cs_scene_accum", &cs_scene_accum_}, {"cs_scene_finish", &cs_scene_finish_},
         {"cs_scene_tiles", &cs_scene_tiles_}, {"cs_scene_hud", &cs_scene_hud_}, {"cs_scene_fill", &cs_scene_fill_}, {"cs_scene_grey", &cs_scene_grey_},
@@ -2554,7 +2797,7 @@ bool Renderer::create_pipelines(std::string& error) {
         xd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
         if (FAILED(device_->CreateComputePipelineState(&xd, IID_PPV_ARGS(x.pso->ReleaseAndGetAddressOf())))) { error = std::string(x.entry) + " pso"; return false; }
     }
-    // The XPAR warp and the moving objects: the same 32 constants (b0), 20 more (b1), 12 SRVs, 2 UAVs.
+    // The XPAR warp and the moving objects: the same 32 constants (b0), 20 more (b1), 13 SRVs, 2 UAVs.
     D3D12_DESCRIPTOR_RANGE wsrv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kWSrvCount, 0, 0, 0};
     D3D12_ROOT_PARAMETER wp[4]{};
     wp[0] = xp[0];
@@ -2568,7 +2811,7 @@ bool Renderer::create_pipelines(std::string& error) {
         error = "warp root signature"; return false;
     }
     struct { const char* entry; ComPtr<ID3D12PipelineState>* pso; } ws[] = {
-        {"cs_own_warp", &cs_own_warp_}, {"cs_obj_fix", &cs_obj_fix_}, {"cs_obj_move", &cs_obj_move_}, {"cs_gen_depth", &cs_gen_depth_}, {"cs_gen_unui", &cs_gen_unui_}, {"cs_obj_join_init", &cs_obj_join_init_}, {"cs_obj_join", &cs_obj_join_}, {"cs_obj_join_final", &cs_obj_join_final_}, {"cs_obj_clear", &cs_obj_clear_}, {"cs_obj_clear_tiles", &cs_obj_clear_tiles_}, {"cs_obj_splat", &cs_obj_splat_},
+        {"cs_own_warp", &cs_own_warp_}, {"cs_warp_claims_clear", &cs_warp_claims_clear_}, {"cs_warp_claim", &cs_warp_claim_}, {"cs_obj_fix", &cs_obj_fix_}, {"cs_obj_move", &cs_obj_move_}, {"cs_gen_depth", &cs_gen_depth_}, {"cs_gen_unui", &cs_gen_unui_}, {"cs_obj_join_init", &cs_obj_join_init_}, {"cs_obj_join", &cs_obj_join_}, {"cs_obj_join_final", &cs_obj_join_final_}, {"cs_obj_clear", &cs_obj_clear_}, {"cs_obj_clear_tiles", &cs_obj_clear_tiles_}, {"cs_obj_splat", &cs_obj_splat_},
         {"cs_copy4", &cs_copy4_}, {"cs_copy1", &cs_copy1_}, {"cs_fg_motion", &cs_fg_motion_}, {"cs_fg_inverse", &cs_fg_inverse_},
         {"cs_fg_clear", &cs_fg_clear_}, {"cs_fg_splat_cur", &cs_fg_splat_cur_}, {"cs_fg_splat_prev", &cs_fg_splat_prev_},
         {"cs_fg_resolve", &cs_fg_resolve_}, {"cs_fg_depth", &cs_fg_depth_}};
@@ -2591,6 +2834,10 @@ bool Renderer::create_pipelines(std::string& error) {
     if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&hud_counts_)))) {
         error = "HUD counter buffer"; return false;
     }
+    bd.Width = 16;  // the HUD layer's check (cs_layer_check)
+    if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&layer_counts_)))) {
+        error = "HUD layer check buffer"; return false;
+    }
     bd.Width = (kRetTrackN + 4) * 4;  // sight reticles: a sum per shift tried, the weight, the shift chosen (cs_ret_align)
     if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&ret_buf_)))) {
         error = "reticle tracking buffer"; return false;
@@ -2603,6 +2850,10 @@ bool Renderer::create_pipelines(std::string& error) {
     bd.Width = kRing * 2 * 16; bd.Flags = D3D12_RESOURCE_FLAG_NONE;
     if (FAILED(device_->CreateCommittedResource(&rbh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&fit_readback_)))) {
         error = "motion fit readback"; return false;
+    }
+    bd.Width = kRing * 8;
+    if (FAILED(device_->CreateCommittedResource(&rbh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&layer_readback_)))) {
+        error = "HUD layer check readback"; return false;
     }
     bd.Width = kRing * 16;
     if (FAILED(device_->CreateCommittedResource(&rbh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&hud_readback_)))) {
@@ -2617,6 +2868,11 @@ void Renderer::set_x_srv(UINT index, PrivateId id, bool from_shown) {
     d.Texture2D.MipLevels = 1;
     const auto& p = from_shown ? shown(id) : private_[id];
     d.Format = p.texture ? p.format : DXGI_FORMAT_R8G8B8A8_UNORM;
+    // (the UI layer kept as its coverage, one channel: read as (0, 0, 0, a), as a UI layer)
+    if (id == kPUi && p.format == DXGI_FORMAT_R8_UNORM)
+        d.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
+            D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0,
+            D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0, D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0);
     device_->CreateShaderResourceView(p.texture.Get(), &d, cpu(index));
 }
 
@@ -2994,7 +3250,6 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
     const UINT ow = private_[kPBackbuffer].width, oh = private_[kPBackbuffer].height;
     const bool new_score = !private_[kPHudScore].texture || private_[kPHudScore].width != ow || private_[kPHudScore].height != oh;
     if (!ensure_private(kPHudScore, ow, oh, DXGI_FORMAT_R32_FLOAT) || !ensure_private(kPMask, ow, oh, DXGI_FORMAT_R8_UNORM)) return nullptr;
-    if (hud && !ensure_private(kPHudKind, ow, oh, DXGI_FORMAT_R32G32_FLOAT)) return nullptr;
     XConstants c{};
     std::memcpy(c.clip_to_prev, clip_to_prev_clip, sizeof(c.clip_to_prev));
     const UINT w = private_[kPObject].width, h = private_[kPObject].height;
@@ -3018,11 +3273,30 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
     // A HUD-less picture without a UI layer: the HUD is where the frame differs from it (see cs_hudless_*).
     const bool from_hudless = hud && src.has_hudless && !src.has_ui && private_[kPHudless].texture && private_[kPHudless].width == ow &&
                               private_[kPHudless].height == oh;
-    // A HUD layer without a HUD-less picture (taken by the add-on, see cs_layer_hud): the HUD exactly, nothing to detect.
+    // A HUD layer without a HUD-less picture (taken by the add-on, see cs_layer_hud): the HUD exactly, nothing to detect -
+    // unless the check found it is no HUD (layer_trust_ 2).
     const bool from_layer = hud && !from_hudless && src.has_ui && !src.has_hudless && private_[kPUi].texture && private_[kPUi].width == ow &&
-                            private_[kPUi].height == oh;
-    const bool from_scene = hud && !from_hudless && !from_layer && src.has_scene && private_[kPScene].texture && private_[kPScene].width == ow &&
-                            private_[kPScene].height == oh;
+                            private_[kPUi].height == oh && layer_trust_ != 2;
+    // A frame without it once it has been checked (layer_trust_ 1): the game hides its HUD (Requiem, when not needed) -
+    // no HUD, nothing to detect (detecting brought back lights taken for HUD, and its cost).
+    const bool hidden = hud && !from_hudless && !from_layer && !src.has_hudless && layer_trust_ == 1;
+    // Checking the layer (see cs_layer_check): with the upscaler's output, not on a frame that starts the score over.
+    const bool check = from_layer && layer_trust_ == 0 && !reset && src.has_scene && private_[kPScene].texture &&
+                       private_[kPScene].width == ow && private_[kPScene].height == oh;
+    const bool from_scene = hud && !from_hudless && !from_layer && !hidden && src.has_scene && private_[kPScene].texture &&
+                            private_[kPScene].width == ow && private_[kPScene].height == oh;
+    // The detections' own textures: only while the HUD is detected. Where the game hands its HUD over (its HUD-less
+    // picture, its HUD layer) they are released after 300 game frames without (not at once: a game that alternates
+    // would have them made again and again, each time waiting for the GPU).
+    if (hud && !from_hudless && !from_layer && !hidden) {
+        detection_idle_ = 0;
+        if (!ensure_private(kPHudKind, ow, oh, DXGI_FORMAT_R32G32_FLOAT)) return nullptr;
+    } else if (check) {
+        detection_idle_ = 0;
+    } else if (++detection_idle_ == 300) {
+        // (released once the GPU is past them - no waiting here: no hitch)
+        for (const PrivateId id : {kPHudKind, kPWorld, kPHudLearned, kPHudTiles}) retire(id);
+    }
     if (from_hudless) {
         hud_from_scene_ = true;  // (the learned map starts over when this stops)
         XConstants h = c;
@@ -3057,10 +3331,42 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
         }
     } else if (from_layer) {
         hud_from_scene_ = true;  // (the learned map starts over when this stops)
+        // (the check first: the upscaler-output detection into a texture of its own - kPWorld, unused without detection)
+        const bool checking = check && ensure_private(kPWorld, ow, oh, DXGI_FORMAT_R32_FLOAT) && detect_hud_from_scene(c, false, kPWorld);
         for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXHudlessSrv + i, kPUi);
         set_x_uav(kXHudlessUav + 0, kPHudScore); set_x_uav(kXHudlessUav + 1, kPHudScore);
         transition(private_[kPHudScore], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         x_dispatch(cs_layer_hud_.Get(), &c, kXHudlessSrv, kXHudlessUav, (ow + 7) / 8, (oh + 7) / 8);
+        transition(private_[kPHudScore], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (checking) {
+            // (its own tables: the learned detection's, which never runs on a frame with the layer)
+            transition(private_[kPWorld], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXHudSrv + i, i == 0 ? kPUi : kPWorld);
+            D3D12_UNORDERED_ACCESS_VIEW_DESC raw{};
+            raw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; raw.Format = DXGI_FORMAT_R32_TYPELESS;
+            raw.Buffer.NumElements = 4; raw.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+            device_->CreateUnorderedAccessView(layer_counts_.Get(), nullptr, &raw, cpu(kXHudUav + 0));
+            device_->CreateUnorderedAccessView(layer_counts_.Get(), nullptr, &raw, cpu(kXHudUav + 1));
+            D3D12_RESOURCE_BARRIER counts{}; counts.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; counts.UAV.pResource = layer_counts_.Get();
+            x_dispatch(cs_layer_check_clear_.Get(), &c, kXHudSrv, kXHudUav, 1, 1);
+            list_->ResourceBarrier(1, &counts);
+            x_dispatch(cs_layer_check_.Get(), &c, kXHudSrv, kXHudUav, (ow / 2 + 7) / 8, (oh / 2 + 7) / 8);
+            auto to_copy = transition_barrier(layer_counts_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list_->ResourceBarrier(1, &to_copy);
+            list_->CopyBufferRegion(layer_readback_.Get(), UINT64(frame_index_) * 8, layer_counts_.Get(), 0, 8);
+            std::swap(to_copy.Transition.StateBefore, to_copy.Transition.StateAfter);
+            list_->ResourceBarrier(1, &to_copy);
+            layer_pending_[frame_index_] = true;
+            layer_frame_samples_ = double(ow / 2) * double(oh / 2);
+        }
+    } else if (hidden) {
+        // (the checked layer is not there: the game shows no HUD now)
+        hud_from_scene_ = true;
+        transition(private_[kPHudScore], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        set_x_uav(kXHudUav + 0, kPHudScore); set_x_uav(kXHudUav + 1, kPHudScore);
+        XConstants z = c; z.flags = 0;
+        for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXHudSrv + i, kPBackbuffer);
+        x_dispatch(cs_clear_score_.Get(), &z, kXHudSrv, kXHudUav, (ow + 7) / 8, (oh + 7) / 8);
         transition(private_[kPHudScore], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     } else if (from_scene) {
         hud_from_scene_ = true;
@@ -3153,7 +3459,9 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
             }
         }
     }
-    if (hud && previous && !from_scene && !from_hudless) {
+    // (the learned detection: not over a HUD the game hands over - it cost ~2.4 ms per game frame at 4K for nothing, and
+    // could add to the layer's exact HUD what it learned)
+    if (hud && previous && !from_scene && !from_hudless && !from_layer && !hidden) {
         set_x_srv(kXHudSrv + 0, kPBackbuffer);
         set_x_srv(kXHudSrv + 1, kPPrevious);
         set_x_srv(kXHudSrv + 2, kPDepth);
@@ -3211,8 +3519,7 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
         reticle = private_[current].texture && private_[current].width == ow && private_[current].height == oh &&
                   ensure_private(kPRetCells, cw, ch, DXGI_FORMAT_R16G16B16A16_FLOAT) &&
                   ensure_private(kPRetEncl, cw, ch, DXGI_FORMAT_R16G16B16A16_FLOAT) &&
-                  ensure_private(kPRetA, ow, oh, DXGI_FORMAT_R16G16B16A16_FLOAT) && ensure_private(kPRetB, ow, oh, DXGI_FORMAT_R16G16B16A16_FLOAT) &&
-                  ensure_private(kPRetLayer, ow, oh, DXGI_FORMAT_R16G16B16A16_FLOAT);
+                  ensure_private(kPRetA, ow, oh, DXGI_FORMAT_R16G16B16A16_FLOAT) && ensure_private(kPRetB, ow, oh, DXGI_FORMAT_R16G16B16A16_FLOAT);
         if (reticle) {
             const bool fresh = private_[kPRetA].texture.Get() != history_before;
             const PrivateId from = ret_flip_ ? kPRetB : kPRetA, to = ret_flip_ ? kPRetA : kPRetB;
@@ -3255,13 +3562,12 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
             transition(private_[kPRetEncl], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             const PrivateId srvs[kXSrvCount] = {current, kPPrevious, kPDepth, kPAttached, kPRetEncl, from};
             for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXRetSrv + i, srvs[i]);
-            set_x_uav(kXRetUav + 0, to); set_x_uav(kXRetUav + 1, kPRetLayer);
+            set_x_uav(kXRetUav + 0, to); set_x_uav(kXRetUav + 1, to);
             transition(private_[to], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            transition(private_[kPRetLayer], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             x_dispatch(cs_ret_layer_.Get(), &k, kXRetSrv, kXRetUav, (ow + 7) / 8, (oh + 7) / 8);
             transition(private_[to], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            transition(private_[kPRetLayer], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             ret_flip_ = !ret_flip_;
+            ret_latest_ = to;
         }
     }
     layer_built_ = reticle;
@@ -3304,20 +3610,20 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
     return private_[kPMask].texture.Get();
 }
 
-void Renderer::detect_hud_from_scene(const XConstants& base, bool fill) {
+bool Renderer::detect_hud_from_scene(const XConstants& base, bool fill, PrivateId out) {
     const UINT ow = private_[kPBackbuffer].width, oh = private_[kPBackbuffer].height;
     XConstants c = base;
     c.grid[0] = (ow + kSceneTile - 1) / kSceneTile; c.grid[1] = (oh + kSceneTile - 1) / kSceneTile;
-    if (c.grid[0] * c.grid[1] > kSceneMaxTiles) return;
+    if (c.grid[0] * c.grid[1] > kSceneMaxTiles) return false;
     set_x_srv(kXSceneSrv + 0, kPBackbuffer);
     set_x_srv(kXSceneSrv + 1, kPScene);
     for (UINT i = 2; i < kXSrvCount; ++i) set_x_srv(kXSceneSrv + i, kPScene);
-    set_x_uav(kXSceneUav + 0, kPHudScore);
+    set_x_uav(kXSceneUav + 0, out);
     D3D12_UNORDERED_ACCESS_VIEW_DESC raw{};
     raw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; raw.Format = DXGI_FORMAT_R32_TYPELESS;
     raw.Buffer.NumElements = kSceneFitBytes / 4; raw.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
     device_->CreateUnorderedAccessView(scene_fit_.Get(), nullptr, &raw, cpu(kXSceneUav + 1));
-    transition(private_[kPHudScore], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    transition(private_[out], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     D3D12_RESOURCE_BARRIER fit{}; fit.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; fit.UAV.pResource = scene_fit_.Get();
     auto run_pass = [&](ID3D12PipelineState* pso, UINT read, UINT write, UINT rule, UINT gx, UINT gy) {
         c.rect[0] = read; c.rect[1] = write; c.rect[2] = rule; c.rect[3] = 0;
@@ -3378,6 +3684,7 @@ void Renderer::detect_hud_from_scene(const XConstants& base, bool fill) {
                                 scene_stamps_readback_.Get(), UINT64(frame_index_) * kSceneStamps * 8);
     hud_scene_pending_[frame_index_] = true;
     hud_scene_pixels_ = double(ow) * double(oh);
+    return true;
 }
 
 bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_mask, const float source_to_target[16], bool depth_inverted,
@@ -3464,9 +3771,30 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
     }
     // Sight reticles (option): the layer on the glass of the shown frame (not with the game's generated images: it
     // belongs to the frame itself).
-    const bool layer = mask && !gen && (split_ ? shown_layer_ : layer_built_) && shown(kPRetLayer).texture &&
-                       shown(kPRetLayer).width == ow && shown(kPRetLayer).height == oh;
-    if (layer) { c.flags |= 2048u; set_x_srv(t + 11, kPRetLayer, true); }
+    // (the history texture written last by the shown frame: the next intake writes the other one, and the one after
+    // waits for the warps that read this, as for every shown texture - release_wait_)
+    const PrivateId ret = split_ ? ret_shown_ : ret_latest_;
+    const bool layer = mask && !gen && (split_ ? shown_layer_ : layer_built_) && private_[ret].texture &&
+                       private_[ret].width == ow && private_[ret].height == oh;
+    if (layer) { c.flags |= 2048u; set_x_srv(t + 11, ret); }
+    // Forward splat (warp_splat_): the claims first, from the same depth, mask and camera (not for a pure turn: nothing
+    // to sort out without depth).
+    set_x_srv(t + 12, kPDepth, true);
+    if (warp_splat_ && !no_depth && ensure_private(kPWarpClaims, dw, dh, DXGI_FORMAT_R32_UINT)) {
+        const UINT ct = kWSrv(kWClaim);
+        for (UINT i = 0; i < kWSrvCount; ++i) set_x_srv(ct + i, kPDepth, true);
+        set_x_srv(ct + 2, mask ? kPWarpMask : kPDepth, true);
+        set_x_srv(ct + 3, gen ? static_cast<PrivateId>(kPGenZ0 + generated) : kPDepth, true);
+        set_x_uav(kWUav(kWClaim) + 0, kPWarpClaims); set_x_uav(kWUav(kWClaim) + 1, kPWarpClaims);
+        transition(private_[kPWarpClaims], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        w_dispatch(cs_warp_claims_clear_.Get(), &c, wc, kWClaim, (c.rect[2] + 7) / 8, (c.rect[3] + 7) / 8);
+        D3D12_RESOURCE_BARRIER cleared{}; cleared.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; cleared.UAV.pResource = private_[kPWarpClaims].texture.Get();
+        list_->ResourceBarrier(1, &cleared);
+        w_dispatch(cs_warp_claim_.Get(), &c, wc, kWClaim, (c.rect[2] + 7) / 8, (c.rect[3] + 7) / 8);
+        transition(private_[kPWarpClaims], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        set_x_srv(t + 12, kPWarpClaims);
+        c.flags |= 4096u;
+    }
     set_x_uav(kWUav(kWWarp) + 0, kPOutput); set_x_uav(kWUav(kWWarp) + 1, kPOutput);
     transition(private_[kPOutput], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     w_dispatch(cs_own_warp_.Get(), &c, wc, kWWarp, (ow + 7) / 8, (oh + 7) / 8);
@@ -3655,7 +3983,7 @@ bool Renderer::set_split(bool on) {
     // Turning on: what was taken in so far becomes the shown set. Turning off: the shown set goes back to
     // where the single queue reads everything.
     swap_shown();
-    if (on) { shown_mask_ = mask_ready_; shown_fill_ = fill_ready_; shown_stretch_ = stretch_built_; shown_layer_ = layer_built_; }
+    if (on) { shown_mask_ = mask_ready_; shown_fill_ = fill_ready_; shown_stretch_ = stretch_built_; shown_layer_ = layer_built_; ret_shown_ = ret_latest_; }
     else { mask_ready_ = shown_mask_; fill_ready_ = shown_fill_; }
     private_[kPPrevious] = Private{};  // (with split queues an alias of a shown texture)
     previous_valid_ = false;
@@ -3681,6 +4009,7 @@ bool Renderer::show_intake() {
     shown_objects_ = objects_built_;
     shown_stretch_ = stretch_built_;
     shown_layer_ = layer_built_;
+    ret_shown_ = ret_latest_;
     shown_fill_ = fill_ready_;
     mem_shown_ = mem_pending_;
     // Warps recorded so far may still read the set the intake writes next.
@@ -3849,7 +4178,26 @@ ID3D12Resource* Renderer::shared_texture(int slot, int kind, std::uint32_t gener
 
 ID3D12GraphicsCommandList* Renderer::begin_frame() { return begin(0); }
 
+void Renderer::retire_texture(ComPtr<ID3D12Resource>& r) {
+    if (r) retired_.push_back({std::move(r), fence_values_[0] + 1, fence_values_[1] + 1});
+    r.Reset();
+}
+void Renderer::retire(PrivateId id) {
+    retire_texture(private_[id].texture);
+    private_[id] = Private{};
+}
+void Renderer::collect_retired() {
+    if (retired_.empty() || !fences_[0]) return;
+    const std::uint64_t done0 = fences_[0]->GetCompletedValue(), done1 = fences_[1] ? fences_[1]->GetCompletedValue() : 0;
+    // (past both queues' next submission after it was retired; the intake queue only counts with split queues - without,
+    // everything runs on the first)
+    retired_.erase(std::remove_if(retired_.begin(), retired_.end(), [&](const Retired& r) {
+                       return done0 >= r.after0 && (!split_ || done1 >= r.after1);
+                   }), retired_.end());
+}
+
 ID3D12GraphicsCommandList* Renderer::begin(int context) {
+    collect_retired();
     context_ = context;
     list_ = lists_[context];
     ring_pos_[context] = (ring_pos_[context] + 1) % 3;
@@ -3938,6 +4286,30 @@ ID3D12GraphicsCommandList* Renderer::begin(int context) {
             scene_stamps_readback_->Unmap(0, &none);
         }
     }
+    if (layer_pending_[frame_index_] && layer_readback_) {
+        layer_pending_[frame_index_] = false;
+        std::uint32_t* v = nullptr;
+        D3D12_RANGE range{frame_index_ * 8, frame_index_ * 8 + 8};
+        if (SUCCEEDED(layer_readback_->Map(0, &range, reinterpret_cast<void**>(&v)))) {
+            const double frame = std::max(1.0, layer_frame_samples_);
+            // (a frame where the layer covers most of the screen - a menu, a full-screen overlay - leaves no 3D picture to
+            // compare it with: it counts neither way. Requiem's pause menu: a darkened copy of the scene, which the
+            // upscaler-output model predicts - taken for "not drawn over", the layer was rejected from menu frames alone)
+            if (layer_trust_ == 0 && v[frame_index_ * 2] && double(v[frame_index_ * 2]) < 0.5 * frame) {
+                layer_covered_ += v[frame_index_ * 2]; layer_drawn_over_ += v[frame_index_ * 2 + 1];
+                ++layer_frames_;
+                // Trusted: at least 30 frames with some of it, as much of it seen as a tenth of a frame, and most of it drawn
+                // over the picture. Not a HUD: 60 frames, a quarter of a frame's worth seen, little of it drawn over (a
+                // texture of the 3D picture). In between: more frames.
+                if (layer_frames_ >= 30 && double(layer_covered_) >= 0.1 * frame && layer_drawn_over_ >= 0.6 * double(layer_covered_))
+                    layer_trust_ = 1;
+                else if (layer_frames_ >= 60 && double(layer_covered_) >= 0.25 * frame && layer_drawn_over_ < 0.25 * double(layer_covered_))
+                    layer_trust_ = 2;
+            }
+            D3D12_RANGE none{0, 0};
+            layer_readback_->Unmap(0, &none);
+        }
+    }
     if (hud_pending_[frame_index_] && hud_readback_) {
         hud_pending_[frame_index_] = false;
         std::uint32_t* v = nullptr;
@@ -3989,8 +4361,9 @@ void Renderer::convert(ID3D12Resource* source, DXGI_FORMAT source_format, int sl
     sv.Format = srv_format(source_format);
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    // (a one-channel UI layer is the coverage of the game's HUD layer, as the add-on hands it over: read as (0, 0, 0, a))
-    if (kind == kUi && source_format == DXGI_FORMAT_R8_UNORM)
+    // (a one-channel UI layer is the coverage of the game's HUD layer, as the add-on hands it over: read as (0, 0, 0, a) -
+    // unless it is kept one-channel, see set_x_srv)
+    if (kind == kUi && source_format == DXGI_FORMAT_R8_UNORM && private_[target].format != DXGI_FORMAT_R8_UNORM)
         sv.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
             D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0,
             D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0, D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0);
@@ -4212,7 +4585,9 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
         out.has_hudless = true;
     }
     const auto& ui = m.tex[kUi];
-    if (sources[kUi] && ui.width == bb.width && ui.height == bb.height && ensure_private(kPUi, bb.width, bb.height, DXGI_FORMAT_R16G16B16A16_FLOAT)) {
+    // (the coverage of the game's HUD layer, as the add-on hands it over, stays one channel: 8 MB at 4K instead of 64)
+    const DXGI_FORMAT ui_format = static_cast<DXGI_FORMAT>(ui.format) == DXGI_FORMAT_R8_UNORM ? DXGI_FORMAT_R8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
+    if (sources[kUi] && ui.width == bb.width && ui.height == bb.height && ensure_private(kPUi, bb.width, bb.height, ui_format)) {
         convert(sources[kUi], static_cast<DXGI_FORMAT>(ui.format), slot, kUi, kPUi, bb.width, bb.height);
         out.has_ui = true;
     }
@@ -4221,6 +4596,16 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
         ensure_private(kPScene, bb.width, bb.height, colour_format(static_cast<DXGI_FORMAT>(sc.format)))) {
         convert(sources[kScene], static_cast<DXGI_FORMAT>(sc.format), slot, kScene, kPScene, bb.width, bb.height);
         out.has_scene = true;
+        scene_idle_ = 0;
+    } else if (++scene_idle_ == 300) {
+        // (the upscaler's output no longer comes - the add-on leaves it out while the game hands its HUD over: released
+        // once the GPU is past it, no waiting)
+        retire(kPScene);
+        for (int s = 0; s < kSlots; ++s) {  // (and the add-on's slot textures it had open: theirs are released too)
+            retire_texture(shared_[s][kScene].resource);
+            shared_[s][kScene] = SharedTex{};
+            srv_resource_[kSrcSrv + s * kTexCount + kScene] = nullptr;
+        }
     }
     // Frame generation: the images generated before this frame, in order (with its depth only).
     for (int i = 0; i < std::min<int>(int(m.generated), kMaxGenerated) && out.has_depth; ++i) {
@@ -4244,14 +4629,18 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
     return out;
 }
 
-LatewarpInputs Renderer::latewarp_inputs(const IngestedSource& src, bool use_ui_tags) {
+LatewarpInputs Renderer::latewarp_inputs(const IngestedSource& src, bool use_ui_tags, bool for_latewarp) {
     LatewarpInputs in;
     const bool split = use_ui_tags && src.has_hudless && src.has_ui;
     in.backbuffer = private_[kPBackbuffer].texture.Get();
     in.hudless = split ? private_[kPHudless].texture.Get() : in.backbuffer;
-    // Latewarp always takes a UI layer: an empty one (zero-initialised, 8-bit) for games without.
-    if (!split && private_[kPBackbuffer].texture)
+    // Latewarp always takes a UI layer: an empty one (zero-initialised, 8-bit, screen size) for games without - only
+    // while Latewarp is the engine (32 MB at 4K).
+    if (for_latewarp && !split && private_[kPBackbuffer].texture)
         ensure_private(kPZeroUi, private_[kPBackbuffer].width, private_[kPBackbuffer].height, DXGI_FORMAT_R8G8B8A8_UNORM);
+    else if (!for_latewarp && private_[kPZeroUi].texture) {
+        retire(kPZeroUi);
+    }
     in.ui = split ? private_[kPUi].texture.Get() : private_[kPZeroUi].texture.Get();
     in.depth = private_[kPDepth].texture.Get();
     in.motion = private_[kPMotion].texture.Get();
@@ -4379,12 +4768,58 @@ void Renderer::stash_source(int set, bool hudless) {
     wait_idle();
 }
 
+void Renderer::release_stash() {
+    wait_idle();
+    for (const PrivateId id : {kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion})
+        private_[id] = Private{};
+}
+
+std::string Renderer::memory_report() {
+    static const char* const kNames[] = {"Backbuffer", "Hudless", "Ui", "Depth", "Motion", "ZeroUi", "Output", "Object", "ObjKeys", "ObjMove", "ObjTiles", "ObjOutTiles", "ObjKindA", "ObjKindB", "Gen0", "Gen1", "Gen2", "GenZ0", "GenZ1", "GenZ2", "PrevColour", "PrevDepth", "Previous", "HudScore", "Mask", "Scene", "Attached", "World", "Fill", "Mem0", "Mem1", "MemZ0", "MemZ1", "RampRows", "Ramp", "WarpMask", "HudKind", "StashColor", "StashDepth", "StashMotion", "StashHudless", "Stash2Color", "Stash2Hudless", "Stash2Depth", "Stash2Motion", "LumaA", "LumaB", "Feat", "FlowA", "FlowB", "RetCells", "RetEncl", "RetA", "RetB", "RetLayer", "FgMotion", "FgInv", "FgK1", "FgK0", "HudLearned", "HudTiles", "WarpClaims"};
+    static_assert(sizeof(kNames) / sizeof(kNames[0]) == kPCount, "a name for every private texture");
+    struct Item { std::string name; double mb; };
+    std::vector<Item> items;
+    double total = 0;
+    auto add = [&](const std::string& name, ID3D12Resource* r) {
+        if (!r) return;
+        const auto desc = r->GetDesc();
+        const double mb = double(device_->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes) / 1048576.0;
+        char text[96];
+        std::snprintf(text, sizeof(text), "%s %llux%u", name.c_str(), static_cast<unsigned long long>(desc.Width), desc.Height);
+        items.push_back({text, mb});
+        total += mb;
+    };
+    for (int i = 0; i < kPCount; ++i) {
+        add(kNames[i], private_[i].texture.Get());
+        add(std::string(kNames[i]) + " (shown)", front_[i].texture.Get());
+    }
+    double shared = 0;
+    for (int s = 0; s < kSlots; ++s)
+        for (int t = 0; t < kTexCount; ++t)
+            if (ID3D12Resource* r = shared_[s][t].resource.Get()) {
+                const auto desc = r->GetDesc();
+                shared += double(device_->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes) / 1048576.0;
+            }
+    std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.mb > b.mb; });
+    std::string out;
+    char text[160];
+    std::snprintf(text, sizeof(text), "own textures %.0f MB (%zu), game frame slots %.0f MB; largest:", total, items.size(), shared);
+    out = text;
+    for (std::size_t i = 0; i < items.size() && i < 14; ++i) {
+        std::snprintf(text, sizeof(text), " %s %.0f,", items[i].name.c_str(), items[i].mb);
+        out += text;
+    }
+    if (!out.empty() && out.back() == ',') out.pop_back();
+    return out;
+}
+
 bool Renderer::read_back(int which, std::vector<std::uint16_t>& pixels, std::uint32_t& w, std::uint32_t& h) {
     static const PrivateId kWhich[] = {kPBackbuffer, kPOutput, kPScene, kPDepth, kPMotion, kPObject, kPMask, kPHudScore, kPWorld, kPFill,
                                        kPStashColor, kPStashDepth, kPStashMotion, kPFlowB, kPStashHudless, kPStash2Color, kPStash2Hudless,
                                        kPStash2Depth, kPStash2Motion, kPHudless, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPUi, kPWarpMask, kPRetLayer, kPFgMotion, kPFgK1, kPFgInv, kPHudLearned, kPHudTiles, kPHudKind};
     if (which < 0 || which >= int(std::size(kWhich))) return false;
-    auto& p = split_ && shown_id(kWhich[which]) ? front_[kWhich[which]] : private_[kWhich[which]];
+    // (the sight reticles' layer: the history texture written last)
+    auto& p = kWhich[which] == kPRetLayer ? private_[ret_latest_] : split_ && shown_id(kWhich[which]) ? front_[kWhich[which]] : private_[kWhich[which]];
     if (!p.texture) return false;
     wait_idle();
     context_ = 0; list_ = lists_[0]; frame_index_ = static_cast<std::uint32_t>(ring_pos_[0]);
