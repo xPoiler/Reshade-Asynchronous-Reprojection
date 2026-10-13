@@ -200,6 +200,8 @@ public:
     // The motion analysis holds what stays on screen only where the camera rig carries it (see cs_analyze, flag 2048):
     // not objects the player follows by turning.
     void set_rig_check(bool on) { rig_check_ = on; }
+    // Forward splat in two passes (cs_own_warp_lean / _rest; default on): off runs the full warp on every pixel (A/B).
+    void set_warp_blocks(bool on) { warp_blocks_ = on; }
     bool learning_stalled() const { return learning_stalled_; }
     // Whole characters held (option), once per game frame after analyze_motion: what has stayed in place on screen lately
     // while the camera moved (cs_still) is attached, and so is what moves on its own, touches it at about the same distance
@@ -352,6 +354,8 @@ private:
     ComPtr<ID3D12RootSignature> root_, root_x_, root_w_;
     // Passes with the second constant block and 10 SRVs (the XPAR warp and the moving objects).
     void w_dispatch(ID3D12PipelineState* pso, const void* constants, const float w[20], UINT table, UINT groups_x, UINT groups_y);
+    void w_dispatch_indirect(ID3D12PipelineState* pso, const void* constants, const float w[20], UINT table, ID3D12Resource* args);
+    bool ensure_warp_list(UINT ow, UINT oh);
     // Moving objects: the previous frame's picture and depth (ingest; the new frame's sizes and colour format).
     void keep_history(PrivateId colour, std::uint32_t depth_w, std::uint32_t depth_h, std::uint32_t colour_w, std::uint32_t colour_h,
                       DXGI_FORMAT colour_format);
@@ -368,10 +372,11 @@ private:
     // The learned HUD detection learning here (combined detection's confirmation, see build_no_warp_mask): frames learned
     // from of the last 300; stalled (fewer than a tenth, and before the first 300) - no confirmation.
     std::uint32_t learn_frames_ = 0, learn_learned_ = 0;
+    bool warp_blocks_ = true;
     bool learning_stalled_ = true;
     std::uint32_t detection_idle_ = 0;  // game frames since the HUD was last detected (build_no_warp_mask)
     std::uint32_t scene_idle_ = 0;      // game frames since the upscaler's output last came (ingest)
-    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_warp_claims_clear_, cs_warp_claim_, cs_memory_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_;
+    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_own_warp_reset_, cs_own_warp_lean_, cs_own_warp_args_, cs_own_warp_rest_, cs_warp_claims_clear_, cs_warp_claim_, cs_memory_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_;
     // Sight reticles (option): the passes, which history texture holds the latest layer, and whether the layer was
     // built for the frame taken in last / the shown one (see cs_ret_layer).
     ComPtr<ID3D12PipelineState> cs_ret_cells_, cs_ret_enclose_, cs_ret_layer_, cs_ret_align_, cs_ret_pick_, cs_ret_shift_;
@@ -387,6 +392,8 @@ private:
     // The game's HUD layer checked (cs_layer_check): 0 not yet, 1 a HUD (trusted: a frame without it shows no HUD), 2 not
     // a HUD (ignored, the HUD is detected). Counts every second pixel: covered, and of them drawn over the picture.
     ComPtr<ID3D12Resource> layer_counts_, layer_readback_;
+    ComPtr<ID3D12Resource> warp_list_, warp_args_, warp_list_old_;  // (see ensure_warp_list; the old one kept until the next resize)
+    ComPtr<ID3D12CommandSignature> dispatch_sig_;
     bool layer_pending_[kRing] = {};
     int layer_trust_ = 0;
     std::uint64_t layer_covered_ = 0, layer_drawn_over_ = 0, layer_frames_ = 0;

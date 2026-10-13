@@ -235,7 +235,7 @@ NVSDK_NGX_Result NVSDK_CONV hk_evaluate(ID3D12GraphicsCommandList* list, const N
             // Only after 60 DLSS evaluations without any Streamline camera: a Streamline game sets its camera
             // before its first DLSS call, so it can never reach this (and frame numbers cannot mix).
             if (inputs && no_camera) {
-                const std::uint64_t frame = next_estimated_frame();
+                const std::uint64_t frame = next_upscaler_frame();
                 g_last_dlss_publish = qpc_now();
                 Camera cam{};
                 cam.valid = 1;
@@ -333,7 +333,7 @@ NVSDK_NGX_Result NVSDK_CONV hk_vk_evaluate(VkCommandBuffer cb, const NVSDK_NGX_H
             const auto* depth = vk_image(params, NVSDK_NGX_Parameter_Depth);
             const auto* motion = vk_image(params, NVSDK_NGX_Parameter_MotionVectors);
             if (s->dlss_calls > 60 && depth && motion) {
-                const std::uint64_t frame = next_estimated_frame();
+                const std::uint64_t frame = next_upscaler_frame();
                 g_last_dlss_publish = qpc_now();
                 Camera cam{};
                 cam.valid = 1;
@@ -368,6 +368,14 @@ NVSDK_NGX_Result NVSDK_CONV hk_vk_evaluate(VkCommandBuffer cb, const NVSDK_NGX_H
 // A game that still sends frame markers (Reflex / PCL render submit) names the frame being rendered: the
 // estimated frame then takes that id, and with it the frame's simulation time. Otherwise the sequence
 // continues after the highest id seen, so a frame after a switch is never taken for an older one.
+// An upscaler call's frame: the oldest open frame (see Producer::upscaler_frame) when the game sends markers.
+std::uint64_t next_upscaler_frame() {
+    const std::uint64_t open = g_producer ? g_producer->upscaler_frame() : 0;
+    if (!open) return next_estimated_frame();
+    std::uint64_t f = g_frame.load();
+    while (open > f && !g_frame.compare_exchange_weak(f, open)) {}
+    return open;
+}
 std::uint64_t next_estimated_frame() {
     const std::uint64_t rendering = g_producer ? g_producer->rendering_frame() : 0;
     const std::uint64_t highest = g_producer ? g_producer->highest_frame() : 0;

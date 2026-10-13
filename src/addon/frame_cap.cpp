@@ -250,6 +250,11 @@ void control(bool capping) {
     if (capping) {
         if (g.interval <= 0) {
             g.interval = frame * 1.05e-3;  // (5% under the uncapped rate: the queue it had drains within a second)
+        } else if (queued_share >= 0.05 && g.interval < frame * 1e-3) {
+            // Frames queue while the cap is above the rate the game reaches - it holds nothing back (RE4: cap 110 fps,
+            // game 43-70, 10-20% queued, the GPU 2-3 frames behind, most frames overwritten before the presenter could
+            // take them): 5% under the game's own rate at once, as at the start.
+            g.interval = frame * 1.05e-3;
         } else if (queued_share > 0.25) {
             g.interval *= 1.03;  // frames wait in the GPU's queue: slower
         } else if (queued_share < 0.05) {

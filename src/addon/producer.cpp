@@ -12,6 +12,8 @@
 #include <thread>
 
 namespace fw {
+thread_local bool tl_tagging = false;
+thread_local std::uint64_t tl_tag_list = 0;
 using Microsoft::WRL::ComPtr;
 
 namespace {
@@ -135,6 +137,7 @@ int Producer::slot_for_frame(std::uint64_t frame, bool create) {
         if (InterlockedCompareExchange(&shared_->slots[i].state, kWriting, from) != from) return false;
         auto& m = shared_->slots[i];
         m.frame_id = frame; m.fence_value = 0; m.qpc_sim_start = 0; m.qpc_constants = 0; m.qpc_present = 0;
+        slot_list_[i] = 0; slot_submitted_[i] = false;
         m.camera.valid = 0;
         for (auto& t : m.tex) t.valid = 0;
         m.generated = m.per_frame = m.gen_last = 0;
@@ -321,10 +324,18 @@ void Producer::on_sim_start(std::uint64_t frame, std::int64_t qpc) {
     push_event(shared_, kEvSimStart, frame);
 }
 
+void Producer::on_execute(std::uint64_t list) {
+    std::lock_guard lock(mutex_);
+    if (!shared_ || !list) return;
+    for (int i = 0; i < kSlots; ++i)
+        if (slot_list_[i] == list && shared_->slots[i].state == kWriting) slot_submitted_[i] = true;
+}
+
 void Producer::on_present_marker(std::uint64_t frame) {
     std::lock_guard lock(mutex_);
     pending_present_frame_ = frame;
     have_present_marker_ = true;
+    close_frames(frame);
     push_event(shared_, kEvPresentMarker, frame);
 }
 
@@ -340,10 +351,15 @@ void Producer::on_tag(std::uint64_t frame, Tex kind, ID3D12Resource* source, D3D
     if (kind == kScene && hud_given_ >= 60) return;
     const int slot = slot_for_frame(frame, true);
     if (slot < 0) return;
+    slot_submitted_[slot] = false;
     collect_retired();
     if (!ensure_texture(slot, kind, desc)) { ++shared_->hooks.copies_failed; return; }
     auto& t = textures_[slot][kind];
+    // (the list as ReShade names it when the game hands it to the GPU - see tl_tag_list)
+    tl_tagging = true; tl_tag_list = 0;
     copy_into(list, source, state, t.resource.Get());
+    tl_tagging = false;
+    slot_list_[slot] = tl_tag_list ? tl_tag_list : reinterpret_cast<std::uint64_t>(list);
     auto& info = shared_->slots[slot].tex[kind];
     info.width = static_cast<std::uint32_t>(t.desc.Width); info.height = t.desc.Height;
     info.format = t.desc.Format; info.generation = t.generation;
@@ -380,11 +396,21 @@ int Producer::present_slot() {
         push_event(shared_, kEvPresent, pending_present_frame_, 0);
         return -1;
     }
-    // Which frame is being presented: the PCL present-start marker when the game sends it,
-    // otherwise the oldest frame still being written (frames present in submission order).
+    // Which frame is being presented: the PCL present-start marker when the game sends it; otherwise the newest frame
+    // whose data the GPU was given before this present (the command list its tags were recorded on submitted) - a game
+    // that records the next frame ahead (DOOM Eternal) has not submitted that one yet, a game that does not (Hi-Fi
+    // Rush) has submitted this one; the oldest frame still being written paired Hi-Fi Rush's every picture with the
+    // frame before, for good, once a frame was left behind. Without that, the oldest frame still being written.
     int slot = -1;
-    std::uint64_t via = 0;  // 1: present marker, 2: oldest-frame fallback
+    std::uint64_t via = 0;  // 1: present marker, 2: oldest-frame fallback, 3: newest submitted
     if (have_present_marker_) { slot = slot_for_frame(pending_present_frame_, false); if (slot >= 0) via = 1; }
+    if (slot < 0) {
+        for (int i = 0; i < kSlots; ++i)
+            if (shared_->slots[i].state == kWriting && shared_->slots[i].camera.valid && slot_submitted_[i] &&
+                qpc_now() - shared_->slots[i].qpc_constants < shared_->qpc_frequency &&
+                (slot < 0 || shared_->slots[i].frame_id > shared_->slots[slot].frame_id)) slot = i;
+        if (slot >= 0) via = 3;
+    }
     if (slot < 0) {
         via = 2;
         for (int i = 0; i < kSlots; ++i)
@@ -399,6 +425,7 @@ int Producer::present_slot() {
     if (slot < 0) { InterlockedIncrement(&shared_->presents_without_frame); return -1; }
     InterlockedExchange(&shared_->presents_without_frame, 0);
     auto& m = shared_->slots[slot];
+    close_frames(m.frame_id);  // (without present markers: the frame presented closes here)
     // Frames older than the one being presented will never be presented: release them.
     for (int i = 0; i < kSlots; ++i)
         if (i != slot && shared_->slots[i].state == kWriting && shared_->slots[i].frame_id < m.frame_id)
@@ -441,7 +468,8 @@ void Producer::on_ui_layer(ID3D12Resource* source, D3D12_RESOURCE_STATES state, 
 
 void Producer::on_hudless_copy(ID3D12Resource* source, D3D12_RESOURCE_STATES state, ID3D12GraphicsCommandList* list) {
     std::lock_guard lock(mutex_);
-    if (!ready() || !source || !list || !device_) return;
+    if (!source) { hudless_age_ = 2; return; }  // (the copy taken this frame given up: not handed over)
+    if (!ready() || !list || !device_) return;
     const auto desc = source->GetDesc();
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1) return;
     const DXGI_FORMAT format = copy_format(desc.Format);
@@ -1074,6 +1102,7 @@ void Producer::on_tag_vk(std::uint64_t frame, Tex kind, std::uint64_t image, std
     }
     const int slot = slot_for_frame(frame, true);
     if (slot < 0) return;
+    slot_list_[slot] = reinterpret_cast<std::uint64_t>(command_buffer); slot_submitted_[slot] = false;
     collect_retired();
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -1215,6 +1244,7 @@ void Producer::on_tag_d3d11(std::uint64_t frame, Tex kind, ID3D11Resource* sourc
     if (sd.SampleDesc.Count != 1) return;
     const int slot = slot_for_frame(frame, true);
     if (slot < 0) return;
+    slot_list_[slot] = 0; slot_submitted_[slot] = true;  // (the immediate context: on the GPU's way at once)
     collect_retired();
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;

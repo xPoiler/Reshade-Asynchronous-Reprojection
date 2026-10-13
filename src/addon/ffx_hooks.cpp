@@ -289,7 +289,7 @@ std::uint64_t before_upscale(const Upscale& u) {
         ++s->frames_published;
         return frame;
     }
-    const std::uint64_t frame = next_estimated_frame();
+    const std::uint64_t frame = next_upscaler_frame();
     Camera cam{};
     cam.valid = 1;
     cam.estimated = 1;

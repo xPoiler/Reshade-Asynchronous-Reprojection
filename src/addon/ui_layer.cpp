@@ -32,6 +32,16 @@ std::uint64_t g_hud_picture = 0;  // the picture the HUD was last seen drawn int
 std::uint64_t g_took = 0;
 std::unordered_set<std::uint64_t> g_given_up;
 std::vector<std::uint64_t> g_back_buffers;
+// Fourth pattern (Direct3D 12; Hi-Fi Rush, Unreal's Slate): the picture drawn onto the back buffer by one overwriting draw,
+// then the HUD alpha-blended straight onto it. Each back buffer's step this frame (1 overwritten, no HUD yet; 2 HUD-less
+// copy taken; 3 given up - overwritten after its copy), whether the pattern was seen (then a frame that leaves the back
+// buffer with no HUD drawn hands it over as it is: no HUD), and what the recording thread bound last (draws are many:
+// checked without the lock - a command list is recorded on one thread at a time).
+std::unordered_map<std::uint64_t, std::uint8_t> g_bb_step;
+std::unordered_map<std::uint64_t, std::uint64_t> g_bb_picture_pipeline;  // (the pipeline that drew the picture onto it)
+bool g_bb_seen = false;
+thread_local std::uint64_t tl_list = 0, tl_back_buffer = 0, tl_pipe_list = 0, tl_pipeline = 0;
+thread_local bool tl_depth = false;
 std::uint32_t g_width = 0, g_height = 0;
 // This frame (since the last present): the layers cleared to transparent, and when each was last drawn into (0: not).
 std::unordered_map<std::uint64_t, std::uint64_t> g_cleared;  // resource -> draw order
@@ -111,6 +121,8 @@ void on_barrier(command_list* cmd, uint32_t count, const resource* resources, co
     // its picture and HUD layer into the back buffer that way: no draw onto it, no copy).
     device* dev = cmd->get_device();
     bool compute_end = false, made_readable = false;
+    std::uint64_t no_hud = 0;
+    std::uint32_t no_hud_state = 0;
     const bool vulkan = dev && dev->get_api() == device_api::vulkan;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -137,7 +149,17 @@ void on_barrier(command_list* cmd, uint32_t count, const resource* resources, co
             }
         }
         made_readable = made_readable && g_end_pending;
+        // (fourth pattern: a back buffer no longer a render target - its frame's drawing is over; overwritten with no HUD
+        // after it: handed over as it is, no HUD this frame)
+        if (!vulkan && !g_bb_step.empty())
+            for (uint32_t i = 0; i < count; ++i) {
+                const auto s = g_bb_step.find(resources[i].handle);
+                if (s == g_bb_step.end() || (d3d12_state(new_states[i]) & 0x4u)) continue;
+                if (s->second == 1 && g_bb_seen && !no_hud) { no_hud = resources[i].handle; no_hud_state = d3d12_state(new_states[i]); }
+                g_bb_step.erase(s);
+            }
     }
+    if (no_hud && g_take_hudless) g_take_hudless(no_hud, no_hud_state, cmd->get_native());
     if (!layer_api(dev)) return;
     if (compute_end) end_of_frame(dev, cmd, kComputeEnd);
     else if (made_readable) end_of_frame(dev, cmd, "the layer made readable after the frame's end");
@@ -222,6 +244,12 @@ void target(command_list* cmd, resource_view first, bool depth) {
     device* dev = cmd->get_device();
     if (!dev) return;
     const resource r = dev->get_resource_from_view(first);
+    if (dev->get_api() == device_api::d3d12) {  // (fourth pattern: a back buffer drawn into)
+        tl_list = cmd->get_native();
+        tl_depth = depth;
+        std::lock_guard<std::mutex> lock(g_mutex);
+        tl_back_buffer = is_back_buffer(r.handle) ? r.handle : 0;
+    }
     if (dev->get_api() == device_api::d3d11) {  // (third pattern: what each draw goes into)
         std::lock_guard<std::mutex> lock(g_mutex);
         g_rt[cmd->get_native()] = {r.handle, depth};
@@ -335,7 +363,7 @@ std::uint8_t blend_kind(const blend_desc& b) {
     return (s == blend_factor::source_alpha || s == blend_factor::one) && d == blend_factor::one_minus_source_alpha ? 1 : 2;
 }
 void on_init_pipeline(device* dev, pipeline_layout, uint32_t count, const pipeline_subobject* subobjects, pipeline p) {
-    if (!p.handle || !dev || dev->get_api() != device_api::d3d11) return;
+    if (!p.handle || !dev || (dev->get_api() != device_api::d3d11 && dev->get_api() != device_api::d3d12)) return;
     for (uint32_t i = 0; i < count; ++i)
         if (subobjects[i].type == pipeline_subobject_type::blend_state && subobjects[i].data) {
             std::lock_guard<std::mutex> lock(g_mutex);
@@ -343,11 +371,16 @@ void on_init_pipeline(device* dev, pipeline_layout, uint32_t count, const pipeli
         }
 }
 void on_destroy_pipeline(device* dev, pipeline p) {
-    if (!dev || dev->get_api() != device_api::d3d11) return;
+    if (!dev || (dev->get_api() != device_api::d3d11 && dev->get_api() != device_api::d3d12)) return;
     std::lock_guard<std::mutex> lock(g_mutex);
     g_blend.erase(p.handle);
 }
 void on_bind_pipeline(command_list* cmd, pipeline_stage stages, pipeline p) {
+    if (g_api == device_api::d3d12 && cmd && (static_cast<uint32_t>(stages) & static_cast<uint32_t>(pipeline_stage::output_merger))) {
+        tl_pipe_list = cmd->get_native();  // (looked up only at a draw into a back buffer)
+        tl_pipeline = p.handle;
+        return;
+    }
     if (g_api != device_api::d3d11 || !cmd || !(static_cast<uint32_t>(stages) & static_cast<uint32_t>(pipeline_stage::output_merger))) return;
     std::lock_guard<std::mutex> lock(g_mutex);
     const auto it = g_blend.find(p.handle);
@@ -374,7 +407,45 @@ bool reads(command_list* cmd, std::uint64_t picture) {
 // picture it was taken from (a game's alpha-blended draw into some other picture is never handed over); a picture
 // overwritten after its copy (a post-processing pass after an alpha-blended one, or a HUD with opaque parts) is given
 // up for the frame - the fallback then, not a HUD that is part of the picture.
+// Fourth pattern: a draw into a back buffer (Direct3D 12). Overwriting: the picture (again); the first alpha-blended
+// draw without depth after it: the HUD's turn - a HUD-less copy of the back buffer then (render target state), handed
+// over as a game's HUD-less picture is (HUD = what differs). The picture drawn again after that copy (the same
+// pipeline): given up for the frame.
+void drawn_back_buffer(command_list* cmd) {
+    const std::uint64_t list = cmd->get_native();
+    if (tl_list != list || !tl_back_buffer || tl_depth) return;
+    const std::uint64_t bb = tl_back_buffer;
+    bool take = false, give_up = false;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        const auto it = tl_pipe_list == list ? g_blend.find(tl_pipeline) : g_blend.end();
+        if (it == g_blend.end()) return;  // (blending unknown: not counted)
+        std::uint8_t& step = g_bb_step[bb];
+        if (it->second == 0) {
+            // (after the copy, an overwriting draw by the pipeline that drew the picture: the picture drawn again - given
+            // up; by another one: an opaque part of the HUD - Hi-Fi Rush draws one among its blended ones)
+            if (step == 2) {
+                if (tl_pipeline == g_bb_picture_pipeline[bb]) { step = 3; give_up = true; }
+            } else if (step != 3) {
+                step = 1;
+                g_bb_picture_pipeline[bb] = tl_pipeline;
+            }
+        } else if (it->second == 1 && step == 1) {
+            step = 2;
+            take = true;
+            if (!g_bb_seen) {
+                g_bb_seen = true;
+                reshade::log::message(reshade::log::level::info,
+                                      "XPAR: the game draws its HUD straight onto the back buffer after the picture - a HUD-less copy taken before it");
+            }
+        }
+    }
+    if (!g_take_hudless) return;
+    if (take) g_take_hudless(bb, 0x4u /* D3D12_RESOURCE_STATE_RENDER_TARGET */, list);
+    if (give_up) g_take_hudless(0, 0, list);
+}
 void drawn(command_list* cmd) {
+    if (g_api == device_api::d3d12 && cmd) { drawn_back_buffer(cmd); return; }
     if (g_api != device_api::d3d11 || !cmd) return;
     std::uint64_t picture = 0, given_up = 0;
     std::uint32_t kind = 0;

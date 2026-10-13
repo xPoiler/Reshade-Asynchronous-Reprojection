@@ -9,6 +9,7 @@ namespace fw {
 void install_ngx_hooks(Producer* producer);
 // Frame ids for frames whose camera the presenter estimates (DLSS and FSR share one sequence).
 std::uint64_t next_estimated_frame();
+std::uint64_t next_upscaler_frame();
 // DLSS published a frame within the last second (FSR then leaves the frames to it).
 bool dlss_publishing();
 }

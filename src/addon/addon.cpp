@@ -11,6 +11,7 @@
 #include "addon/depth_choice.hpp"
 #include "addon/ui_probe.hpp"
 #include "addon/ui_layer.hpp"
+#include "addon/shader_scan.hpp"
 #include "addon/reshade_feed.hpp"
 #include "addon/frame_cap.hpp"
 #include <d3d12.h>
@@ -479,6 +480,21 @@ void present_vulkan(effect_runtime* runtime, command_queue* queue) {
 }
 
 // Every present ReShade sees (frame generation diagnostics: which swapchains get which images).
+// (the producer's own copy of a tag, recorded on the game's list: ReShade's name for that list, see tl_tag_list)
+void on_tag_barrier(command_list* cmd, uint32_t, const resource*, const resource_usage*, const resource_usage*) {
+    if (fw::tl_tagging && cmd) fw::tl_tag_list = cmd->get_native();
+}
+bool on_tag_copy_region(command_list* cmd, resource, uint32_t, const subresource_box*, resource, uint32_t, const subresource_box*, filter_mode) {
+    if (fw::tl_tagging && cmd) fw::tl_tag_list = cmd->get_native();
+    return false;
+}
+bool on_tag_copy(command_list* cmd, resource, resource) {
+    if (fw::tl_tagging && cmd) fw::tl_tag_list = cmd->get_native();
+    return false;
+}
+void on_execute_command_list(command_queue*, command_list* cmd) {
+    if (g_producer && cmd) g_producer->on_execute(cmd->get_native());
+}
 void on_present(command_queue*, swapchain* chain, const rect*, const rect*, uint32_t, const rect*) {
     // (the game's colour space, see read_color_space: the presenter's output follows it)
     if (g_producer && g_producer->shared() && chain &&
@@ -753,6 +769,9 @@ void draw_overlay(effect_runtime*) {
             ImGui::SameLine();
             if (st.reflex)
                 ImGui::TextDisabled("(off: the game's Reflex is on)");
+            else if (st.active && st.game_fps < 0.97f * st.cap_fps)  // (the cap rises while no queue forms: a game locked lower never reaches it)
+                ImGui::TextDisabled("(cap %.1f fps, not reached: the game runs at %.1f | GPU done %.1f ms after present | held %.1f ms)", st.cap_fps,
+                                    st.game_fps, st.present_to_done_ms, st.wait_ms);
             else if (st.active)
                 ImGui::TextDisabled("(game held to %.1f fps, now %.1f | GPU done %.1f ms after present | held %.1f ms)", st.cap_fps, st.game_fps,
                                     st.present_to_done_ms, st.wait_ms);
@@ -877,17 +896,20 @@ void draw_overlay(effect_runtime*) {
                 if (ps.hud_source > 0 && ps.hud_source < 7) ImGui::TextDisabled("HUD in use: from %s", kSources[ps.hud_source]);
                 if (!s.game_hud_layers)
                     ImGui::TextDisabled("Game's HUD layer: not used (the HUD is detected)");
-                else if (hs.ui_layer_w && ps.layer_trust == 2)
+                // (a game may use both: Hi-Fi Rush has a layer in its splash screens, draws its HUD straight onto the
+                // picture in game - each shown)
+                if (s.game_hud_layers && hs.ui_layer_w && ps.layer_trust == 2)
                     ImGui::TextDisabled("Game's HUD layer: a layer was found, but it is not drawn over the finished picture - not a HUD: the HUD is detected");
-                else if (hs.ui_layer_w)
+                else if (s.game_hud_layers && hs.ui_layer_w)
                     ImGui::TextDisabled("Game's HUD layer: found (%ux%u, format %u), taken on %u frames, %u handed over%s%s", hs.ui_layer_w, hs.ui_layer_h,
                                         hs.ui_layer_format, hs.ui_layer_taken, hs.ui_layer_handed,
                                         ps.layer_trust == 1 ? " - checked: it is the HUD" : " - being checked",
                                         hs.ui_layer_pass == 2 ? " - its pass failed" : "");
-                else if (hs.hudless_copies)
-                    ImGui::TextDisabled("Game's HUD: drawn onto its final picture - HUD-less copies taken on %u frames, %u handed over",
-                                        hs.hudless_copies, hs.hudless_handed);
-                else if (ps.hud_source == 1 || ps.hud_source == 2)
+                if (s.game_hud_layers && hs.hudless_copies)
+                    ImGui::TextDisabled("Game's HUD drawn straight into its picture: HUD-less copies taken on %u frames, %u handed over%s",
+                                        hs.hudless_copies, hs.hudless_handed, ps.hud_source == 2 ? " - in use" : "");
+                if (!s.game_hud_layers || hs.ui_layer_w || hs.hudless_copies) {
+                } else if (ps.hud_source == 1 || ps.hud_source == 2)
                     ImGui::TextDisabled("Game's HUD layer: not needed (the game hands its HUD over itself)");
                 else
                     ImGui::TextDisabled("Game's HUD layer: not found (the HUD is detected)");
@@ -1007,6 +1029,7 @@ void register_callbacks() {
     reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(fw::on_reshade_reloaded_effects);
     fw::register_depth_choice_events();
     fw::ui_probe::init();
+    fw::shader_scan::init();
     fw::ui_layer::init(
         [](std::uint64_t layer, std::uint32_t state, std::uint64_t list) {
             if (g_producer && g_producer->shared() && g_producer->shared()->settings.game_hud_layers)
@@ -1037,6 +1060,10 @@ void register_callbacks() {
         });
     reshade::register_event<reshade::addon_event::finish_present>(on_finish_present);
     reshade::register_event<reshade::addon_event::present>(on_present);
+    reshade::register_event<reshade::addon_event::execute_command_list>(on_execute_command_list);
+    reshade::register_event<reshade::addon_event::barrier>(on_tag_barrier);
+    reshade::register_event<reshade::addon_event::copy_texture_region>(on_tag_copy_region);
+    reshade::register_event<reshade::addon_event::copy_resource>(on_tag_copy);
     reshade::register_event<reshade::addon_event::create_resource>(on_create_resource);
     reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
     reshade::register_event<reshade::addon_event::reshade_open_overlay>(on_open_overlay);
@@ -1052,11 +1079,16 @@ void unregister_callbacks() {
     reshade::unregister_event<reshade::addon_event::destroy_device>(on_destroy_device);
     reshade::unregister_event<reshade::addon_event::create_resource>(on_create_resource);
     reshade::unregister_event<reshade::addon_event::present>(on_present);
+    reshade::unregister_event<reshade::addon_event::execute_command_list>(on_execute_command_list);
+    reshade::unregister_event<reshade::addon_event::barrier>(on_tag_barrier);
+    reshade::unregister_event<reshade::addon_event::copy_texture_region>(on_tag_copy_region);
+    reshade::unregister_event<reshade::addon_event::copy_resource>(on_tag_copy);
     reshade::unregister_event<reshade::addon_event::finish_present>(on_finish_present);
     fw::frame_cap_shutdown();
     fw::unregister_depth_choice_events();
     fw::ui_probe::shutdown();
     fw::ui_layer::shutdown();
+    fw::shader_scan::shutdown();
     reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(fw::on_reshade_reloaded_effects);
     reshade::unregister_event<reshade::addon_event::reshade_finish_effects>(fw::on_reshade_finish_effects);
     reshade::unregister_event<reshade::addon_event::reshade_present>(on_reshade_present);

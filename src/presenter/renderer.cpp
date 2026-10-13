@@ -1198,13 +1198,23 @@ Texture2D<float4> ra_cur_t : register(t0);
 Texture2D<float4> ra_hist_t : register(t1);
 RWByteAddressBuffer ra_buf_u : register(u1);
 groupshared uint ra_sums[kRetTrackN + 1];
+groupshared uint ra_any;
 [numthreads(8, 8, 1)] void cs_ret_align(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
-    for (uint k = gi; k <= uint(kRetTrackN); k += 64) ra_sums[k] = 0;
-    GroupMemoryBarrierWithGroupSync();
-    // every second pixel each way, where the previous layer has something
+    // every second pixel each way, where the previous layer has something - a group without any stops here (the layer
+    // is a sight's glass: nearly all of the screen has none, and each group cleared and summed its 290 counters anyway)
+    float w = 0;
     if (all(id.xy < out_size) && ((id.x | id.y) & 1) == 0) {
         const float4 l = ra_hist_t.Load(int3(id.xy, 0));
-        const float w = max(max(l.r, l.g), l.b);
+        w = max(max(l.r, l.g), l.b);
+    }
+    if (gi == 0) ra_any = 0;
+    GroupMemoryBarrierWithGroupSync();
+    if (w > 0.05) InterlockedOr(ra_any, 1u);
+    GroupMemoryBarrierWithGroupSync();
+    if (ra_any == 0) return;
+    for (uint k = gi; k <= uint(kRetTrackN); k += 64) ra_sums[k] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    {
         if (w > 0.05) {
             uint ignored;
             InterlockedAdd(ra_sums[kRetTrackN], uint(w * 1024.0), ignored);
@@ -1983,9 +1993,11 @@ float2 ow_behind(float2 uv, int2 p, float far_near) {
 // The claims around uv (3x3 cells), nearest first: the first claimant whose surface reaches uv (ow_refine) is what is
 // shown there - the nearest surface that reaches it. None: uncovered here (hole: ow_behind from the farthest), or no
 // claims around at all (false).
+static bool ow_first = false;  // (ow_claimed: the nearest claim around was the one taken)
 bool ow_claimed(float2 uv, out float2 src, out bool hole) {
     src = uv;
     hole = false;
+    ow_first = false;
     const int2 c0 = int2(uv * float2(rect.zw));
     uint keys[9];
     uint far_key = 0xFFFFFFFFu;
@@ -2006,7 +2018,7 @@ bool ow_claimed(float2 uv, out float2 src, out bool hole) {
         [unroll] for (int k = 0; k < 9; ++k)
             if (keys[k] && all(ow_claimant(clamp(c0 + int2(k % 3 - 1, k / 3 - 1), int2(0, 0), int2(rect.zw) - 1), keys[k]) == pb)) keys[k] = 0;
         float2 s;
-        if (ow_refine(uv, pb, float(best >> 22), s)) { src = s; return true; }
+        if (ow_refine(uv, pb, float(best >> 22), s)) { src = s; ow_first = attempt == 0; return true; }
     }
     src = ow_behind(uv, ow_claimant(far_cell, far_key), float(far_key >> 22));
     hole = true;
@@ -2049,12 +2061,15 @@ bool ow_ring(float2 uv, out float2 src) {
     src = ow_behind(uv, ow_claimant(far_cell, far_key), float(far_key >> 22));
     return true;
 }
-// The rendered pixel shown at uv; false: none (behind the displayed camera).
+// The rendered pixel shown at uv; false: none (behind the displayed camera). ow_plain: found as the nearest claim around,
+// nothing else involved (the 2x2 blocks' shortcut, see cs_own_warp, builds on those only).
+static bool ow_plain = false;
 bool ow_find(float2 uv, out float2 src) {
+    ow_plain = false;
     if (flags & 4096) {
         bool hole;
         if (ow_claimed(uv, src, hole)) {
-            if (!hole) return true;
+            if (!hole) { ow_plain = ow_first; return true; }
             // Uncovered. Next to held pixels (the character/weapon, the HUD: they claim nothing) the search's own
             // way - background memory, or stepping past them - shows what is behind them; elsewhere the scenery behind.
             float2 b;
@@ -2074,9 +2089,13 @@ bool ow_find(float2 uv, out float2 src) {
     return ow_search(uv, src);
 }
 // What the warp shows at an output pixel that is not held (src: where its search landed).
+float4 ow_scene_from(uint2 id, float2 uv, float2 src, bool valid);
 float4 ow_scene(uint2 id, float2 uv, out float2 src, out bool valid) {
     ow_hidden = false;
     valid = ow_find(uv, src);
+    return ow_scene_from(id, uv, src, valid);
+}
+float4 ow_scene_from(uint2 id, float2 uv, float2 src, bool valid) {
     if (valid && ow_hidden) return ow_hidden_c;  // (uncovered, the memory has what is behind)
     float4 c;
     if (!valid) {
@@ -2139,12 +2158,11 @@ float4 ow_scene(uint2 id, float2 uv, out float2 src, out bool valid) {
     }
     return c;
 }
-[numthreads(8, 8, 1)] void cs_own_warp(uint3 id : SV_DispatchThreadID) {
-    if (any(id.xy >= out_size)) return;
-    const float2 uv = (float2(id.xy) + 0.5) / float2(out_size);
-    float2 src;
-    bool valid;
-    float4 c = ow_scene(id.xy, uv, src, valid);
+// The output pixel's colour from where its search landed: the scene there, held pixels as the frame shows them, the
+// sight-reticle layer, the UI layer.
+void ow_finish(uint2 pid, float2 uv, float2 src, bool valid) {
+    const uint3 id = uint3(pid, 0);
+    float4 c = ow_scene_from(id.xy, uv, src, valid);
     if ((flags & 2) && ow_held(int3(id.xy, 0))) c = ow_color_t.Load(int3(id.xy, 0));
     else if ((flags & 2048) && valid) {
         const float4 here = ow_layer_t.Load(int3(id.xy, 0)), there = ow_layer_t.SampleLevel(ow_linear, src, 0);
@@ -2176,6 +2194,94 @@ float4 ow_scene(uint2 id, float2 uv, out float2 src, out bool valid) {
         c.rgb = c.rgb * (1.0 - ui.a) + ui.rgb;
     }
     ow_out_u[id.xy] = float4(c.rgb, 1);
+}
+// One thread per output pixel (search warp, a pure turn).
+[numthreads(8, 8, 1)] void cs_own_warp(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= out_size)) return;
+    const float2 uv = (float2(id.xy) + 0.5) / float2(out_size);
+    float2 src;
+    ow_hidden = false;
+    const bool valid = ow_find(uv, src);
+    ow_finish(id.xy, uv, src, valid);
+}
+// Forward splat, in two passes. The warp as one shader needs so many registers - for its rare cases: holes, the ring,
+// memory, soft edges, reticles - that the GPU runs few threads at a time and waits on every read (1.0 ms at 4K, where the
+// same reads and writes in a small shader take 0.1). cs_own_warp_lean: every output pixel whose full warp is plain - the
+// nearest claim around lands on it (ow_claimed's first try), on a spot inside the frame and not held, no reticle under
+// it - gets exactly what the full warp gives it; held pixels the game frame's own. The rest of each 2x2 block goes on
+// the list (u1) for cs_own_warp_rest, the full warp, packed: whole groups of threads on the rare cases only.
+RWByteAddressBuffer ow_list_u : register(u1);  // [0] how many, [16..] per block: x | y << 12 | its pixels left << 24
+RWByteAddressBuffer ow_args_u : register(u0);  // cs_own_warp_args: the full warp's dispatch (groups x, y, z)
+[numthreads(1, 1, 1)] void cs_own_warp_reset(uint3 id : SV_DispatchThreadID) { ow_list_u.Store(0, 0); }
+// The nearest claim around uv, if its surface reaches uv (ow_claimed's first try: the same claim, the same steps).
+bool ow_lean_claim(float2 uv, out float2 src) {
+    src = uv;
+    const int2 c0 = int2(uv * float2(rect.zw));
+    uint best = 0;
+    int bi = 0;
+    [unroll] for (int k = 0; k < 9; ++k) {
+        const uint key = ow_claims_t.Load(int3(clamp(c0 + int2(k % 3 - 1, k / 3 - 1), int2(0, 0), int2(rect.zw) - 1), 0));
+        if (key > best) { best = key; bi = k; }
+    }
+    if (best == 0) return false;
+    const int2 pb = ow_claimant(clamp(c0 + int2(bi % 3 - 1, bi / 3 - 1), int2(0, 0), int2(rect.zw) - 1), best);
+    return ow_refine(uv, pb, float(best >> 22), src);
+}
+// Output pixel p the plain way: true if written (what ow_scene + ow_finish give it), false: left for the full warp.
+bool ow_lean(uint2 p) {
+    const int3 pi = int3(p, 0);
+    float4 c;
+    if ((flags & 2) && ow_held(pi)) {
+        c = ow_color_t.Load(pi);
+    } else {
+        const float2 uv = (float2(p) + 0.5) / float2(out_size);
+        float2 src;
+        if (!ow_lean_claim(uv, src)) return false;
+        const float2 half_px = 0.5 / float2(out_size);
+        if (any(src < half_px) || any(src > 1.0 - half_px)) return false;
+        if ((flags & 2) && ow_held(int3(clamp(int2(src * float2(out_size)), int2(0, 0), int2(out_size) - 1), 0))) return false;
+        c = ow_bilinear(src);
+        if (flags & 2048) {
+            const float4 here = ow_layer_t.Load(pi), there = ow_layer_t.SampleLevel(ow_linear, src, 0);
+            if (ow_cover(there) > 0) return false;
+            c.rgb = lerp(c.rgb - there.rgb + here.rgb, ow_color_t.Load(pi).rgb, ow_cover(here));
+        }
+    }
+    if (flags & 1) {
+        const float4 ui = ow_ui_t.Load(pi);
+        c.rgb = c.rgb * (1.0 - ui.a) + ui.rgb;
+    }
+    ow_out_u[p] = float4(c.rgb, 1);
+    return true;
+}
+[numthreads(8, 8, 1)] void cs_own_warp_lean(uint3 id : SV_DispatchThreadID) {
+    const uint2 p0 = id.xy * 2;
+    if (any(p0 >= out_size)) return;
+    uint rest = 0;
+    [loop] for (uint k = 0; k < 4; ++k) {
+        const uint2 p = p0 + uint2(k & 1, k >> 1);
+        if (all(p < out_size) && !ow_lean(p)) rest |= 1u << k;
+    }
+    if (rest) {
+        uint i;
+        ow_list_u.InterlockedAdd(0, 1, i);
+        ow_list_u.Store(16 + 4 * i, id.x | (id.y << 12) | (rest << 24));
+    }
+}
+[numthreads(1, 1, 1)] void cs_own_warp_args(uint3 id : SV_DispatchThreadID) {
+    ow_args_u.Store3(0, uint3((ow_list_u.Load(0) * 4 + 63) / 64, 1, 1));  // (a thread per pixel of each block)
+}
+[numthreads(64, 1, 1)] void cs_own_warp_rest(uint3 id : SV_DispatchThreadID) {
+    // (a thread per pixel of each listed block: its four in parallel, those not left idle)
+    if (id.x / 4 >= ow_list_u.Load(0)) return;
+    const uint e = ow_list_u.Load(16 + 4 * (id.x / 4)), k = id.x & 3u;
+    if (!((e >> (24 + k)) & 1u)) return;
+    const uint2 p = uint2(e & 4095u, (e >> 12) & 4095u) * 2 + uint2(k & 1, k >> 1);
+    const float2 uv = (float2(p) + 0.5) / float2(out_size);
+    float2 src;
+    ow_hidden = false;
+    const bool valid = ow_find(uv, src);
+    ow_finish(p, uv, src, valid);
 }
 
 // Moving objects (option), after the warp: only the output pixels a moving pixel claimed (cs_obj_splat)
@@ -2451,25 +2557,38 @@ float fl_tone(float3 c) {
 }
 Texture2D<float4> fl_color_t : register(t0);
 RWTexture2D<float> fl_luma_u : register(u0);
-[numthreads(8, 8, 1)] void cs_flow_luma(uint3 id : SV_DispatchThreadID) {
-    uint k = 0;
-    uint2 p = id.xy;
-    if (id.x >= grid.x) {
-        bool found = false;
-        for (uint j = 1; j < kFlowLevels && !found; ++j) {
-            const uint2 o = fl_origin(j), s = fl_size(j);
-            if (all(id.xy >= o) && all(id.xy < o + s)) { k = j; p = id.xy - o; found = true; }
+// Level 0 from the picture (the part of it each pixel stands for, averaged: bilinear taps two source pixels apart), the
+// coarser levels each from the 2x2 pixels of the level below, in the group's shared memory: one 16x16 group of level 0
+// makes one pixel of level 4. (Each level from the picture itself read the whole picture once per level - up to 1024
+// taps per pixel at the coarsest, a few threads holding up the pass: 0.7 ms at 4K. Where a level's span is a whole
+// number of taps - the render grid half the output, as usual - the averages are the same.)
+groupshared float fl_gs[256];
+[numthreads(16, 16, 1)] void cs_flow_luma(uint3 id : SV_DispatchThreadID, uint3 gt : SV_GroupThreadID) {
+    float v = 0;
+    if (all(id.xy < grid)) {
+        const float2 span = float2(out_size) / float2(grid);
+        const int n = clamp(int(ceil(max(span.x, span.y) * 0.5)), 1, 32);
+        [loop] for (int j = 0; j < n; ++j)
+            [loop] for (int i = 0; i < n; ++i)
+                v += fl_tone(fl_color_t.SampleLevel(ow_linear, (float2(id.xy) + (float2(i, j) + 0.5) / float(n)) * span / float2(out_size), 0).rgb);
+        v /= float(n * n);
+        fl_luma_u[id.xy] = v;
+    }
+    const uint g = gt.y * 16 + gt.x;
+    fl_gs[g] = v;
+    [unroll] for (uint k = 1; k < kFlowLevels; ++k) {
+        GroupMemoryBarrierWithGroupSync();
+        const uint h = 1u << (k - 1);
+        const bool lead = all((gt.xy & ((h << 1) - 1)) == 0);
+        float r = 0;
+        if (lead) r = 0.25 * (fl_gs[g] + fl_gs[g + h] + fl_gs[g + h * 16] + fl_gs[g + h * 16 + h]);
+        GroupMemoryBarrierWithGroupSync();
+        if (lead) {
+            fl_gs[g] = r;
+            const uint2 q = id.xy >> k;
+            if (all(q < fl_size(k))) fl_luma_u[fl_origin(k) + q] = r;
         }
-        if (!found) return;
-    } else if (id.y >= grid.y) return;
-    // The part of the picture this pixel stands for, averaged (bilinear taps two source pixels apart).
-    const float2 span = float2(out_size) / float2(grid) * float(1u << k);
-    const int n = clamp(int(ceil(max(span.x, span.y) * 0.5)), 1, 32);
-    float sum = 0;
-    [loop] for (int j = 0; j < n; ++j)
-        [loop] for (int i = 0; i < n; ++i)
-            sum += fl_tone(fl_color_t.SampleLevel(ow_linear, (float2(p) + (float2(i, j) + 0.5) / float(n)) * span / float2(out_size), 0).rgb);
-    fl_luma_u[id.xy] = sum / float(n * n);
+    }
 }
 // Brightness and its gradients (x: brightness, y/z: central differences, 0 on a level's border).
 Texture2D<float> fl_luma_t : register(t0);
@@ -2682,7 +2801,7 @@ constexpr UINT kW = kXTilesUav + 2;
 enum WTable : UINT { kWWarp, kWShown, kWClear, kWSplat, kWMove, kWCopyColour, kWCopyDepth, kWJoinInit, kWJoinAB, kWJoinBA, kWJoinFinal,
                      kWGenDepth0, kWGenDepth1, kWGenDepth2, kWGenUi0, kWGenUi1, kWGenUi2, kWFgMotion, kWFgInverse, kWClaim,
                      kWStill, kWHoldInit, kWHoldAB, kWHoldBA, kWHoldFinal, kWHoldFill, kWHoldFillFinal, kWGrowInit, kWGrowAB, kWGrowBA,
-                     kWGrowFinal, kWFgImages,
+                     kWGrowFinal, kWWarpArgs, kWFgImages,
                      kWTables = kWFgImages + 5 * 3 };
 // XPAR frame generation: each image's own tables (descriptors are read when the GPU runs the pass, so one set reused
 // for every image would have them all write the last one).
@@ -3011,7 +3130,7 @@ bool Renderer::create_pipelines(std::string& error) {
         error = "warp root signature"; return false;
     }
     struct { const char* entry; ComPtr<ID3D12PipelineState>* pso; } ws[] = {
-        {"cs_own_warp", &cs_own_warp_}, {"cs_warp_claims_clear", &cs_warp_claims_clear_}, {"cs_warp_claim", &cs_warp_claim_}, {"cs_obj_fix", &cs_obj_fix_}, {"cs_obj_move", &cs_obj_move_}, {"cs_gen_depth", &cs_gen_depth_}, {"cs_gen_unui", &cs_gen_unui_}, {"cs_obj_join_init", &cs_obj_join_init_}, {"cs_obj_join", &cs_obj_join_}, {"cs_obj_join_final", &cs_obj_join_final_}, {"cs_still", &cs_still_}, {"cs_hold_fill", &cs_hold_fill_}, {"cs_grow_init", &cs_grow_init_}, {"cs_grow_clear", &cs_grow_clear_}, {"cs_grow", &cs_grow_}, {"cs_grow_final", &cs_grow_final_}, {"cs_obj_clear", &cs_obj_clear_}, {"cs_obj_clear_tiles", &cs_obj_clear_tiles_}, {"cs_obj_splat", &cs_obj_splat_},
+        {"cs_own_warp", &cs_own_warp_}, {"cs_own_warp_reset", &cs_own_warp_reset_}, {"cs_own_warp_lean", &cs_own_warp_lean_}, {"cs_own_warp_args", &cs_own_warp_args_}, {"cs_own_warp_rest", &cs_own_warp_rest_}, {"cs_warp_claims_clear", &cs_warp_claims_clear_}, {"cs_warp_claim", &cs_warp_claim_}, {"cs_obj_fix", &cs_obj_fix_}, {"cs_obj_move", &cs_obj_move_}, {"cs_gen_depth", &cs_gen_depth_}, {"cs_gen_unui", &cs_gen_unui_}, {"cs_obj_join_init", &cs_obj_join_init_}, {"cs_obj_join", &cs_obj_join_}, {"cs_obj_join_final", &cs_obj_join_final_}, {"cs_still", &cs_still_}, {"cs_hold_fill", &cs_hold_fill_}, {"cs_grow_init", &cs_grow_init_}, {"cs_grow_clear", &cs_grow_clear_}, {"cs_grow", &cs_grow_}, {"cs_grow_final", &cs_grow_final_}, {"cs_obj_clear", &cs_obj_clear_}, {"cs_obj_clear_tiles", &cs_obj_clear_tiles_}, {"cs_obj_splat", &cs_obj_splat_},
         {"cs_copy4", &cs_copy4_}, {"cs_copy1", &cs_copy1_}, {"cs_fg_motion", &cs_fg_motion_}, {"cs_fg_inverse", &cs_fg_inverse_},
         {"cs_fg_clear", &cs_fg_clear_}, {"cs_fg_splat_cur", &cs_fg_splat_cur_}, {"cs_fg_splat_prev", &cs_fg_splat_prev_},
         {"cs_fg_resolve", &cs_fg_resolve_}, {"cs_fg_depth", &cs_fg_depth_}};
@@ -3102,6 +3221,43 @@ void Renderer::w_dispatch(ID3D12PipelineState* pso, const void* constants, const
     list_->SetComputeRootDescriptorTable(2, gpu(kWSrv(table)));
     list_->SetComputeRootDescriptorTable(3, gpu(kWUav(table)));
     list_->Dispatch(groups_x, groups_y, 1);
+}
+
+void Renderer::w_dispatch_indirect(ID3D12PipelineState* pso, const void* constants, const float w[20], UINT table, ID3D12Resource* args) {
+    ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
+    list_->SetDescriptorHeaps(1, heaps);
+    list_->SetComputeRootSignature(root_w_.Get());
+    list_->SetPipelineState(pso);
+    list_->SetComputeRoot32BitConstants(0, 32, constants, 0);
+    list_->SetComputeRoot32BitConstants(1, 20, w, 0);
+    list_->SetComputeRootDescriptorTable(2, gpu(kWSrv(table)));
+    list_->SetComputeRootDescriptorTable(3, gpu(kWUav(table)));
+    list_->ExecuteIndirect(dispatch_sig_.Get(), 1, args, 0, nullptr, 0);
+}
+
+// The full warp's list (cs_own_warp_lean: a count, then one entry per 2x2 block of the output) and its dispatch.
+bool Renderer::ensure_warp_list(UINT ow, UINT oh) {
+    const UINT64 bytes = 16 + 4ull * ((ow + 1) / 2) * ((oh + 1) / 2);
+    if (warp_list_ && warp_list_->GetDesc().Width >= bytes && warp_args_ && dispatch_sig_) return true;
+    D3D12_HEAP_PROPERTIES def{}; def.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC bd{}; bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = bytes; bd.Height = 1;
+    bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (!warp_list_ || warp_list_->GetDesc().Width < bytes) {
+        warp_list_old_ = warp_list_;  // (a refresh in flight may still use it)
+        warp_list_.Reset();
+        if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&warp_list_)))) return false;
+    }
+    if (!warp_args_) {
+        bd.Width = 16;
+        if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&warp_args_)))) return false;
+    }
+    if (!dispatch_sig_) {
+        D3D12_INDIRECT_ARGUMENT_DESC arg{}; arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+        D3D12_COMMAND_SIGNATURE_DESC sd{}; sd.ByteStride = sizeof(D3D12_DISPATCH_ARGUMENTS); sd.NumArgumentDescs = 1; sd.pArgumentDescs = &arg;
+        if (FAILED(device_->CreateCommandSignature(&sd, nullptr, IID_PPV_ARGS(&dispatch_sig_)))) return false;
+    }
+    return true;
 }
 
 void Renderer::x_dispatch(ID3D12PipelineState* pso, const void* constants, UINT srv_table, UINT uav_table, UINT groups_x, UINT groups_y) {
@@ -4147,7 +4303,31 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
     }
     set_x_uav(kWUav(kWWarp) + 0, kPOutput); set_x_uav(kWUav(kWWarp) + 1, kPOutput);
     transition(private_[kPOutput], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    w_dispatch(cs_own_warp_.Get(), &c, wc, kWWarp, (ow + 7) / 8, (oh + 7) / 8);
+    // (forward splat: the plain pixels first, the rest packed for the full warp - see cs_own_warp_lean)
+    if ((c.flags & 4096) && warp_blocks_ && !moving && ensure_warp_list(ow, oh)) {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC raw{};
+        raw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; raw.Format = DXGI_FORMAT_R32_TYPELESS; raw.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        raw.Buffer.NumElements = UINT(warp_list_->GetDesc().Width / 4);
+        device_->CreateUnorderedAccessView(warp_list_.Get(), nullptr, &raw, cpu(kWUav(kWWarp) + 1));
+        for (UINT i = 0; i < kWSrvCount; ++i) set_x_srv(kWSrv(kWWarpArgs) + i, kPDepth, true);
+        device_->CreateUnorderedAccessView(warp_list_.Get(), nullptr, &raw, cpu(kWUav(kWWarpArgs) + 1));
+        raw.Buffer.NumElements = 4;
+        device_->CreateUnorderedAccessView(warp_args_.Get(), nullptr, &raw, cpu(kWUav(kWWarpArgs) + 0));
+        D3D12_RESOURCE_BARRIER lb{}; lb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; lb.UAV.pResource = warp_list_.Get();
+        w_dispatch(cs_own_warp_reset_.Get(), &c, wc, kWWarp, 1, 1);
+        list_->ResourceBarrier(1, &lb);
+        w_dispatch(cs_own_warp_lean_.Get(), &c, wc, kWWarp, ((ow + 1) / 2 + 7) / 8, ((oh + 1) / 2 + 7) / 8);
+        list_->ResourceBarrier(1, &lb);
+        w_dispatch(cs_own_warp_args_.Get(), &c, wc, kWWarpArgs, 1, 1);
+        auto to_args = transition_barrier(warp_args_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+        list_->ResourceBarrier(1, &to_args);
+        w_dispatch_indirect(cs_own_warp_rest_.Get(), &c, wc, kWWarp, warp_args_.Get());
+        std::swap(to_args.Transition.StateBefore, to_args.Transition.StateAfter);
+        list_->ResourceBarrier(1, &to_args);
+    } else {
+        w_dispatch(cs_own_warp_.Get(), &c, wc, kWWarp, (ow + 7) / 8, (oh + 7) / 8);
+    }
+
     if (moving) {
         // The pixels moving objects claimed or left, looked at again.
         D3D12_RESOURCE_BARRIER uav{}; uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; uav.UAV.pResource = private_[kPOutput].texture.Get();
@@ -4789,7 +4969,12 @@ bool Renderer::estimate_motion(DXGI_FORMAT colour, bool write_motion) {
     };
     // This frame's brightness pyramid and gradients.
     c.flags = tone;
-    run(cs_flow_luma_.Get(), table(kFlowLuma, kPBackbuffer, kPBackbuffer, kPBackbuffer, now), now, aw, ah);
+    {  // (one 16x16 group per pixel of level 4, see cs_flow_luma)
+        const UINT base = table(kFlowLuma, kPBackbuffer, kPBackbuffer, kPBackbuffer, now);
+        transition(private_[now], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        x_dispatch(cs_flow_luma_.Get(), &c, base, base + 6, (w0 + 15) / 16, (h0 + 15) / 16);
+        transition(private_[now], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
     c.flags = 0;
     run(cs_flow_feat_.Get(), table(kFlowFeat, now, now, now, kPFeat), kPFeat, aw, ah);
     const UINT motion = table(kFlowMotion, kPFeat, before, kPFlowA, kPMotion);  // (the filled displacements end in A)

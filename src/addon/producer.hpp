@@ -14,6 +14,12 @@
 namespace reshade::api { struct device; struct command_queue; }
 
 namespace fw {
+// While the producer records a tag's copy onto the game's command list (on_tag): the list as ReShade's own events name
+// it (addon.cpp's barrier / copy handlers set it). The game's D3D12 lists reach the hooks as ReShade's wrappers, and
+// ReShade names the list it wraps when the game hands it to the GPU (execute_command_list): a frame's list is matched by
+// that name (present_slot's newest submitted frame).
+extern thread_local bool tl_tagging;
+extern thread_local std::uint64_t tl_tag_list;
 class VkTransport;
 
 // Every setting at its default (producer.cpp).
@@ -68,11 +74,38 @@ public:
     void on_constants(std::uint64_t frame, const Camera& camera);
     void on_sim_start(std::uint64_t frame, std::int64_t qpc);
     void on_present_marker(std::uint64_t frame);
+    // A command list / buffer handed to the GPU (ExecuteCommandLists, vkQueueSubmit): frames whose data was recorded on
+    // it are submitted (see present_slot).
+    void on_execute(std::uint64_t list);
     // Highest frame id seen from the game (camera data or markers).
     std::uint64_t highest_frame() const { return highest_frame_.load(); }
     // The frame the game is rendering now (Reflex / PCL render-submit marker; 0 if the game sends none).
-    void on_render_submit(std::uint64_t frame) { rendering_frame_ = frame; note_frame(frame); }
+    void on_render_submit(std::uint64_t frame) {
+        rendering_frame_ = frame;
+        note_frame(frame);
+        std::lock_guard lock(open_mutex_);
+        if (open_frames_.empty() || frame > open_frames_.back()) {
+            open_frames_.push_back(frame);
+            if (open_frames_.size() > 8) open_frames_.erase(open_frames_.begin());
+        }
+    }
     std::uint64_t rendering_frame() const { return rendering_frame_.load(); }
+    // The frame an upscaler call now belongs to (markers only, 0 without): the oldest frame the game started rendering,
+    // not presented yet, with no upscaler data yet. A game rendering ahead (Unreal's render thread: Hi-Fi Rush) has
+    // already marked frame N+1 as being rendered when its upscaler runs for frame N - the newest marked frame would
+    // pair every presented picture with the previous frame's depth, motion and upscaler output. Without rendering
+    // ahead it is the frame being rendered, as before.
+    std::uint64_t upscaler_frame() {
+        std::lock_guard lock(open_mutex_);
+        for (const std::uint64_t f : open_frames_)
+            if (f > last_upscaled_) { last_upscaled_ = f; return f; }
+        return 0;
+    }
+    // Frames up to `frame` presented: no longer open.
+    void close_frames(std::uint64_t frame) {
+        std::lock_guard lock(open_mutex_);
+        while (!open_frames_.empty() && open_frames_.front() <= frame) open_frames_.erase(open_frames_.begin());
+    }
     // Records a copy of one tagged buffer for `frame` into the game's command list.
     void on_tag(std::uint64_t frame, Tex kind, ID3D12Resource* source, D3D12_RESOURCE_STATES state,
                 std::uint32_t ext_x, std::uint32_t ext_y, std::uint32_t ext_w, std::uint32_t ext_h,
@@ -150,6 +183,12 @@ private:
     void release_generated_if_idle();
     void publish(int slot, ID3D12CommandQueue* queue);  // signals the fence on `queue`, marks the slot ready
     std::atomic<std::uint64_t> highest_frame_{0}, rendering_frame_{0};
+    // Each slot's last tag's command list, and whether it was handed to the GPU since (under mutex_).
+    std::uint64_t slot_list_[kSlots] = {};
+    bool slot_submitted_[kSlots] = {};
+    std::mutex open_mutex_;                  // (markers come from the game's threads)
+    std::vector<std::uint64_t> open_frames_;  // started rendering, not presented, oldest first
+    std::uint64_t last_upscaled_ = 0;
     std::atomic<std::int64_t> game_depth_qpc_{0};
     std::atomic<std::int64_t> feed_qpc_{0};
     void note_frame(std::uint64_t f) { std::uint64_t h = highest_frame_.load(); while (f > h && !highest_frame_.compare_exchange_weak(h, f)) {} }
