@@ -152,6 +152,14 @@ struct Cap {
     // game only took frames away (Elden Ring: ~35 fps capped, ~45 uncapped). Windows in a row of each kind (see control).
     bool aside = false;
     int bound_windows = 0, free_windows = 0;
+    // ...and tried again now and then: with the cap off a GPU-bound game always queues, so "no queue" alone never brought
+    // it back (RE4: aside all session, 15-61% of frames queued - 2-3 frames of latency). A trial caps it again for a few
+    // windows and keeps the cap if the game loses little to it (the frame interval at most 8% longer than uncapped); stands
+    // aside again otherwise, the next trial twice as late (20 s, up to 5 min).
+    double uncapped_ms = 0;          // the frame interval while aside (median of the latest window)
+    std::int64_t next_trial = 0;     // (qpc)
+    double trial_wait_s = 20.0;
+    int trial_windows = 0;           // > 0: on trial, windows so far
     std::int64_t last_release = 0;
     int frames = 0;
     double wait_ms_sum = 0;
@@ -166,6 +174,7 @@ void release_queue() {
     g.native = nullptr; g.device = nullptr; g.failed = false;
     g.interval = 0; g.last_release = 0; g.frames = 0; g.wait_ms_sum = 0;
     g.aside = false; g.bound_windows = 0; g.free_windows = 0;
+    g.uncapped_ms = 0; g.next_trial = 0; g.trial_wait_s = 20.0; g.trial_windows = 0;
     g.reflex = false; g.reflex_checked = 0; g.reflex_off_since = 0;
     std::lock_guard<std::mutex> lock(g.status_mutex);
     g.status = {};
@@ -226,6 +235,25 @@ double median(std::vector<double>& v) {
     return v[v.size() / 2];
 }
 
+void log_trial(const char* what, double capped_ms, double uncapped_ms, double next_s) {
+    char text[200];
+    const double capped = capped_ms > 0 ? 1000.0 / capped_ms : 0.0, uncapped = uncapped_ms > 0 ? 1000.0 / uncapped_ms : 0.0;
+    if (next_s > 0)
+        std::snprintf(text, sizeof(text), "XPAR frame cap: %s (capped %.1f fps, uncapped %.1f fps) - next try in %.0f s", what, capped, uncapped, next_s);
+    else
+        std::snprintf(text, sizeof(text), "XPAR frame cap: %s (capped %.1f fps, uncapped %.1f fps)", what, capped, uncapped);
+    reshade::log::message(reshade::log::level::info, text);
+}
+
+// Stands aside (the GPU is the limit); the next trial after the current wait.
+void stand_aside() {
+    g.aside = true;
+    g.bound_windows = g.free_windows = 0;
+    g.interval = 0;
+    g.trial_windows = 0;
+    g.next_trial = qpc() + static_cast<std::int64_t>(g.trial_wait_s * qpc_frequency());
+}
+
 // Once 60 frames: the window's numbers (frames old enough for their GPU work to be done), then the cap.
 void control(bool capping) {
     const double ms = 1000.0 / qpc_frequency();
@@ -254,22 +282,38 @@ void control(bool capping) {
     const double queued_share = pairs ? double(queued) / pairs : 0.0;
     const double held_ms = g.wait_ms_sum / std::max(g.frames, 1);
     if (capping && g.aside) {
-        // Back once the GPU has room: three windows in a row without a queue (a lighter scene, a menu).
+        g.uncapped_ms = frame;
+        // Back once the GPU has room: three windows in a row without a queue (a lighter scene, a menu) - or on trial.
         g.free_windows = queued_share < 0.05 ? g.free_windows + 1 : 0;
         if (g.free_windows >= 3) {
             g.aside = false;
             g.free_windows = g.bound_windows = 0;
             g.interval = frame * 1.05e-3;
+            g.trial_wait_s = 20.0;
+        } else if (qpc() >= g.next_trial) {
+            g.aside = false;
+            g.free_windows = g.bound_windows = 0;
+            g.interval = frame * 1.05e-3;
+            g.trial_windows = 1;
         }
     } else if (capping) {
         // GPU-bound: frames keep queueing (over a quarter of them) although the cap holds the game back (a tenth of the cap
         // or more), three windows out of the last ones without a queue-free one in between - stand aside.
         if (queued_share > 0.25 && held_ms >= 0.1 * g.interval * 1e3) ++g.bound_windows;
         else if (queued_share < 0.05) g.bound_windows = 0;
-        if (g.bound_windows >= 3) {
-            g.aside = true;
-            g.bound_windows = g.free_windows = 0;
-            g.interval = 0;
+        if (g.trial_windows > 0 && (g.bound_windows >= 3 || ++g.trial_windows > 4)) {
+            // (the trial's verdict, after three windows capped: kept where the game keeps its rate within 8%)
+            if (g.bound_windows < 3 && frame <= 1.08 * g.uncapped_ms) {
+                g.trial_windows = 0;
+                g.trial_wait_s = 20.0;
+                log_trial("capped again - it costs the game little", frame, g.uncapped_ms, 0);
+            } else {
+                g.trial_wait_s = std::min(g.trial_wait_s * 2.0, 300.0);
+                log_trial("tried capping, standing aside again - it costs the game too much", frame, g.uncapped_ms, g.trial_wait_s);
+                stand_aside();
+            }
+        } else if (g.bound_windows >= 3) {
+            stand_aside();
         }
     }
     if (capping && !g.aside) {
