@@ -136,10 +136,15 @@
   camera's movement has a share of its own, learned only from movement across the frame's turn (an orbiting
   camera moves along its turn, and those frames teach it nothing) and never above the turn's share. The
   scenery's shares come from 24 depth bands fed by the spots the motion analysis finds the camera explains
-  (not what it carries); a spot that follows under half of its band's share is carried. All of it runs on
-  one spot per 2x2 block of render pixels (`cs_share_measure`, `cs_share_bins`, `cs_share_blur`,
-  `cs_share_final`), put back at render resolution by distance (`cs_share_up`), and goes into the warp mask
-  (RGBA16: x the input turn's share - 0.9 at none, 1 the HUD; y the rest's; z the movement's).
+  (not what it carries); a spot that follows well under half of its band's share is carried (little in
+  between: from 0.35 to 0.5 of it). Spots are spread over their surroundings at the same distance and of the
+  same kind - what the motion analysis finds attached to the camera or moving on its own is not mixed with
+  the scenery beside it - and then carried by region: where at least half of the surroundings are carried,
+  so a gun or a body is carried as one. All of it runs on one spot per 2x2 block of render pixels
+  (`cs_share_measure`, `cs_share_bins`, `cs_share_blur`, `cs_share_final`, `cs_share_vote_h`/`_v`), put
+  back at render resolution by distance (`cs_share_up`, RGBA16: x the input turn's share, y the rest's, z
+  the movement's), which the warp reads directly next to the R8 no-warp mask (HUD; 0.95 for what is held
+  with the share - an outline next to what it carries, a reticle inside a sight's window).
 * **No-warp mask** (R8, used by the warp), built once per game frame:
   * *character/weapon* (every game): pixels whose motion vectors the camera motion does not explain,
     close to the camera, or stuck to the screen while the camera moves further out;

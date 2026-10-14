@@ -1659,7 +1659,8 @@ void render_thread() {
                                               std::pair{15, L"prev2_frame"}, std::pair{16, L"prev2_hudless"}, std::pair{17, L"prev2_depth"},
                                               std::pair{18, L"prev2_motion"}, std::pair{19, L"hudless"}, std::pair{20, L"gen0"},
                                               std::pair{21, L"gen1"}, std::pair{22, L"gen2"}, std::pair{23, L"gen0_depth"},
-                                              std::pair{24, L"gen1_depth"}, std::pair{25, L"gen2_depth"}, std::pair{26, L"ui"}, std::pair{27, L"warp_mask"}, std::pair{28, L"layer"}}) {
+                                              std::pair{24, L"gen1_depth"}, std::pair{25, L"gen2_depth"}, std::pair{26, L"ui"}, std::pair{27, L"warp_mask"}, std::pair{28, L"layer"},
+                                              std::pair{35, L"share"}}) {
                 std::vector<std::uint16_t> px;
                 std::uint32_t cw = 0, ch = 0;
                 if (which == 2 && !source.has_scene) { logf("capture %d: no upscaler output this frame", n); continue; }

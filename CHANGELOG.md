@@ -1,5 +1,56 @@
 # Changelog
 
+## 2.0.5
+
+HOTFIX for 2.0's character/weapon holding: no more ghost outlines beside guns and characters while turning,
+no more doubled red dot in S.T.A.L.K.E.R. 2's sights, guns and bodies no longer torn into parts - and up to
+~290 MB less video memory at 4K, with nothing lost.
+As with every update, the settings remembered per game go back to the defaults (*Record detailed diagnostics*
+stays).
+
+### Character and weapon
+
+* **No ghost outline while turning.** The pixels along a gun's or a character's edge blend it with what is
+  behind and took the scenery's share of the turn: a copy of the outline slid off with the scenery
+  (Cyberpunk 2077's gun and hand, Resident Evil 2's character, a car's dashboard ornament). They are held
+  with what they outline again. Warp error against the game's next real frame, on the pixels that change:
+  Cyberpunk 2077 0.091 -> 0.025, Resident Evil 2 0.082 -> 0.020 (40-80% less).
+* **No doubled reticle when aiming down sights** (S.T.A.L.K.E.R. 2): a red dot drawn on the sight's glass
+  carries the gun's motion at its centre and the scenery's in its glow and ring; the ring and part of the
+  sight's frame moved with the turn, a second dot beside the real one. What is on the glass inside a
+  sight's window is held.
+* **Guns and bodies moved as one piece.** Parts of the same gun or body measured slightly different shares
+  of the turn (a gun's sway, flat cloth) and the step that decides "carried by the camera or not" stretched
+  the difference - 0.2 here and 0.35 there became 0.07 and 0.74 of the turn: lines broke them up while
+  turning (S.T.A.L.K.E.R. 2's rifle, Resident Evil 2's Claire). Now that decision is firm, taken by region
+  (what most of a thing does, all of it does), and a character is no longer mixed with the floor next to it
+  at the same distance. Warp error against the game's next real frame:
+
+  | Recorded frame | Before | 2.0.5 |
+  |---|---|---|
+  | DOOM Eternal, gun | 0.0067 | 0.0053 (-21%) |
+  | Resident Evil 2, three frames | 0.0221 / 0.0212 / 0.0174 | 0.0200 / 0.0206 / 0.0166 (-3 to -10%) |
+  | S.T.A.L.K.E.R. 2, rifle | 0.109 | 0.099 (-9%) |
+  | Resident Evil Requiem | 0.0136 | 0.0133 |
+  | Cyberpunk 2077 (five frames) | unchanged | unchanged |
+
+  Known: in Resident Evil 2 a seam can still show at the character's waist while turning in place - the
+  legs, planted on the floor, really move with it while the upper body follows the camera.
+
+### Video memory (lossless)
+
+Up to ~290 MB less at 4K, with identical output on every recorded frame tested:
+
+* The warp reads the shares of the turn directly instead of a full-resolution mask built from them:
+  128 MB less (the mask and its shown copy), same warp time.
+* Sight reticle layers (128 MB) are made only the first time a sight is used, in the background - no
+  hitch when aiming down sights (Resident Evil Requiem).
+* HUD detection's working texture packed into half the size: 32 MB less.
+
+### Diagnostics
+
+* Captures also save the shares of the turn each pixel follows (`capture_N_share.f16`).
+
 ## 2.0.0
 
 The two things that showed the most - the HUD and the character/weapon - rebuilt from the ground up, while

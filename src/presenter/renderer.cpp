@@ -627,7 +627,7 @@ uint4 share_pack(ShareSums a, float depth) {
 ShareSums share_unpack(uint4 v, out float depth) {
     ShareSums a;
     a.sI = f16tof32(v.x & 0xFFFF); a.II = f16tof32(v.x >> 16);
-    a.IX = f16tof32(v.y & 0xFFFF); depth = f16tof32(v.y >> 16);
+    a.IX = f16tof32(v.y & 0xFFFF); depth = abs(f16tof32(v.y >> 16));
     a.sX = f16tof32(v.z & 0xFFFF); a.XX = f16tof32(v.z >> 16);
     a.sT = f16tof32(v.w & 0xFFFF); a.TT = f16tof32(v.w >> 16);
     return a;
@@ -636,6 +636,11 @@ ShareSums share_scaled(ShareSums a, float k) {
     a.sI *= k; a.II *= k; a.IX *= k; a.sX *= k; a.XX *= k; a.sT *= k; a.TT *= k;
     return a;
 }
+// What the spot is (the depth's sign, see share_measure_at): not scenery - attached to the camera or moving on its own.
+bool share_own(uint4 v) { return (v.y >> 31) != 0; }
+// (the spread's weight between two spots: one of each kind - a character and the floor at its distance - counts as little
+// as a spot at another distance)
+float share_kind_w(bool a, bool b) { return a == b ? 1.0 : 0.02; }
 // (capped by information: the turn's sums and the movement's each on their own)
 ShareSums share_capped(ShareSums a) {
     const float info = a.II + a.XX, k = info > kShareMax ? kShareMax / info : 1.0;
@@ -684,24 +689,28 @@ int2 share_sample(uint2 cell) { return int2(rect.xy) + int2(min(cell * 2, rect.z
 // (bilinear; p in render px of the rect. Only from where the same surface was - within ~40% of this spot's distance: a spot
 // just uncovered from behind something nearer - the wall beside a gun or a character moving past it - took that one's sums
 // and stayed partly with it, a trail beside its outline; with none, it starts over)
-ShareSums sm_prev_at(float2 p, float depth) {
+ShareSums sm_prev_at(float2 p, float depth, out float own) {
     const float2 q = clamp((p - 0.5) * 0.5, float2(0, 0), float2(share_cells()) - 1.001);
     const int2 i = int2(floor(q));
     const float2 f = q - floor(q);
     const float l = log2(max(depth, 1e-9));
     ShareSums sum = (ShareSums)0;
     float w = 0;
+    own = 0;
     [unroll] for (int k = 0; k < 4; ++k) {
         const int2 o = int2(k & 1, k >> 1);
         float dz;
-        const ShareSums v = share_unpack(sm_prev_t.Load(int3(i + o, 0)), dz);
+        const uint4 packed = sm_prev_t.Load(int3(i + o, 0));
+        const ShareSums v = share_unpack(packed, dz);
         const float wk = (o.x ? f.x : 1.0 - f.x) * (o.y ? f.y : 1.0 - f.y);
         if (abs(log2(max(dz, 1e-9)) - l) < 0.5) {
             sum.sI += wk * v.sI; sum.II += wk * v.II; sum.IX += wk * v.IX; sum.sX += wk * v.sX; sum.XX += wk * v.XX;
             sum.sT += wk * v.sT; sum.TT += wk * v.TT;
             w += wk;
+            own += share_own(packed) ? wk : 0.0;
         }
     }
+    own = w > 1e-4 ? own / w : 0.0;
     if (w > 1e-4) return share_scaled(sum, 1.0 / w);
     return (ShareSums)0;
 }
@@ -725,12 +734,14 @@ void share_measure_at(uint2 id) {
     const float4 prev = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, d, 1), clip_to_prev);
     const float4 far = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, 0, 1), clip_to_prev);
     ShareSums acc = (ShareSums)0;
+    float was_own = 0;
+    bool told = false;  // (this frame tells scenery from the rest: a turn to measure)
     const bool diag = (flags & 128) && (flags & 16) && d > 1.0 / 64.0 && ((id.x | id.y) & 1) == 0 && prev.w > 0 && any(o != 0);
     if (diag) InterlockedAdd(sm_diag_gs[0], 1);
     if (prev.w > 0 && any(o != 0)) {
         const float2 cam_px = (float2(prev.x / prev.w * 0.5 + 0.5, 0.5 - prev.y / prev.w * 0.5) - uv) * float2(rect.zw);
         const float2 screen_px = o.xy + cam_px;  // (o.xy: its own motion against the camera's, cs_analyze)
-        if (!(flags & 8)) acc = sm_prev_at(float2(pr - int2(rect.xy)) + 0.5 + screen_px, d);
+        if (!(flags & 8)) acc = sm_prev_at(float2(pr - int2(rect.xy)) + 0.5 + screen_px, d, was_own);
         if ((flags & 1) && (flags & 16) && far.w > 0 && d > 1.0 / 4096.0) {
             bool trusted = true;
             if (flags & 2) trusted = sm_flow_t.Load(int3(min(uint2((float2(pr) + 0.5) * float2(out_size) / float2(grid)), out_size - 1), 0)).z > 0.5;
@@ -741,6 +752,7 @@ void share_measure_at(uint2 id) {
             const float unit = 1080.0 / float(rect.w);
             const float2 r = rest ? float2(0, 0) : whole_px * unit, x = rest ? whole_px * unit : float2(0, 0), s = screen_px * unit;
             const float rr = dot(r, r), xx = dot(x, x), all_r = rr + xx;
+            told = all_r > 0.25;
             // The camera's movement here (its motion minus its turn's). Its share is learned only from the movement the turn
             // does not explain: what the turn's known shares leave of the spot's motion, against the part of the movement
             // across the frame's turn. An orbiting camera moves as it turns - the movement along the turn, collinear with it:
@@ -819,7 +831,13 @@ void share_measure_at(uint2 id) {
         InterlockedAdd(sm_diag_gs[7], int(round(clamp(share_solve(acc, kSharePrior, (flags & 32) != 0).x, -4.0, 4.0) * 250.0)));
         InterlockedAdd(sm_diag_gs[10], int(round(min(info, kShareMax))));
     }
-    sm_acc_u[id] = share_pack(acc, d);
+    // What the spot is, in the depth's sign: what this frame's analysis finds attached to the camera or moving on its own
+    // (o.w; the bands leave it out too), or what it was where this frame can not tell - no turn: everything stands still
+    // against the camera's motion. The spread keeps the two apart (share_kind_w): spread by distance alone, a character took
+    // the floor's share where the floor beside it is at its distance - RE2's orbiting camera, the floor at Claire's distance
+    // following 0.23 of the turn: her head against the far wall carried, from the waist down 0.24, torn at the border.
+    const bool own = o.w > 0.5 || (!told && was_own > 0.5);
+    sm_acc_u[id] = share_pack(acc, own ? -d : d);
 }
 // The bands, once per game frame: this frame's sums carried on (capped by information, as the spots'), their shares, this
 // frame's cleared (layout: see sm_bins_u). flags 8: start over.
@@ -862,24 +880,29 @@ RWTexture2D<float4> sb_acc2_u : register(u1);
     const uint2 cells = share_cells();
     if (any(id.xy >= cells)) return;
     float d0;
-    share_unpack(sb_packed_t.Load(int3(id.xy, 0)), d0);
+    const uint4 packed0 = sb_packed_t.Load(int3(id.xy, 0));
+    share_unpack(packed0, d0);
+    const bool own0 = share_own(packed0);
     const float l0 = log2(max(d0, 1e-9));
     ShareSums sum = (ShareSums)0;
     float wsum = 0;
     [unroll] for (int k = -8; k <= 8; ++k) {
         const int2 q = clamp(int2(id.xy) + int2(int(groups_x), 0) * k, int2(0, 0), int2(cells) - 1);
         float dz;
-        const ShareSums v = share_unpack(sb_packed_t.Load(int3(q, 0)), dz);
+        const uint4 packed = sb_packed_t.Load(int3(q, 0));
+        const ShareSums v = share_unpack(packed, dz);
         const float rel = log2(max(dz, 1e-9)) - l0;
-        const float g = exp(-float(k * k) / 32.0 - rel * rel * 25.0);
+        const float g = exp(-float(k * k) / 32.0 - rel * rel * 25.0) * share_kind_w(own0, share_own(packed));
         sum.sI += g * v.sI; sum.II += g * v.II; sum.IX += g * v.IX; sum.sX += g * v.sX; sum.XX += g * v.XX;
         sum.sT += g * v.sT; sum.TT += g * v.TT;
         wsum += g;
     }
     sum = share_scaled(sum, 1.0 / wsum);
-    sb_acc_u[id.xy] = float4(sum.sI, sum.II, sum.IX, d0);  // (w: the cell's depth, for the pass down)
+    sb_acc_u[id.xy] = float4(sum.sI, sum.II, sum.IX, own0 ? -d0 : d0);  // (w: the cell's depth and kind, for the pass down)
     sb_acc2_u[id.xy] = float4(sum.sX, sum.XX, sum.sT, sum.TT);
 }
+// (a cell's depth and kind in one: the depth, negative where it is not scenery - share_own)
+bool share_own_w(float w) { return (asuint(w) >> 31) != 0; }
 Texture2D<float4> sf_acc_t : register(t0);
 Texture2D<float4> sf_acc2_t : register(t2);
 RWByteAddressBuffer sf_bins_u : register(u0);
@@ -896,15 +919,16 @@ float2 share_band(float d) {
 [numthreads(8, 8, 1)] void cs_share_final(uint3 id : SV_DispatchThreadID) {
     const uint2 cells = share_cells();
     if (any(id.xy >= cells)) return;
-    const float d0 = sf_acc_t.Load(int3(id.xy, 0)).w;
+    const float w0 = sf_acc_t.Load(int3(id.xy, 0)).w, d0 = abs(w0);
+    const bool own0 = share_own_w(w0);
     const float l0 = log2(max(d0, 1e-9));
     float4 sum = 0, sum2 = 0;
     float wsum = 0;
     [unroll] for (int k = -8; k <= 8; ++k) {
         const int2 q = clamp(int2(id.xy) + int2(0, int(groups_x)) * k, int2(0, 0), int2(cells) - 1);
         const float4 t = sf_acc_t.Load(int3(q, 0));
-        const float rel = log2(max(t.w, 1e-9)) - l0;
-        const float g = exp(-float(k * k) / 32.0 - rel * rel * 25.0);
+        const float rel = log2(max(abs(t.w), 1e-9)) - l0;
+        const float g = exp(-float(k * k) / 32.0 - rel * rel * 25.0) * share_kind_w(own0, share_own_w(t.w));
         sum += g * t;
         sum2 += g * sf_acc2_t.Load(int3(q, 0));
         wsum += g;
@@ -919,18 +943,68 @@ float2 share_band(float d) {
     // not the steering: held by the input's alone, the rest's took its band's 1 too and the steering moved the interior. Held
     // by its own alone, a character - frames without input rare, the rest's share near the prior's 1 - followed 0.3 of the
     // rest and of the movement, RE2: so held where either holds it)
-    const float kept = smoothstep(0.15, 0.45, spot.x / max(band.x, 0.05));
-    const float kept_rest = (flags & 32) ? min(kept, smoothstep(0.15, 0.45, spot.y / max(band.y, 0.05))) : kept;
-    sf_half_u[id.xy] = float4(kept, kept_rest, (flags & 16) ? smoothstep(0.15, 0.45, share_moved(a)) : 1.0, d0);
+    // (carried or not, little in between: under 0.35 of its band's share none, over 0.5 the band's. From 0.15 to 0.45 the
+    // ramp stretched what a character or a gun measures across itself - 0.2 here, 0.35 there: a gun's sway, a body's flat
+    // cloth - into 0.07 against 0.74 of the turn: it tore along the seams while turning, RE2's Claire, Stalker 2's rifle)
+    const float kept = smoothstep(0.35, 0.5, spot.x / max(band.x, 0.05));
+    const float kept_rest = (flags & 32) ? min(kept, smoothstep(0.35, 0.5, spot.y / max(band.y, 0.05))) : kept;
+    sf_half_u[id.xy] = float4(kept, kept_rest, (flags & 16) ? smoothstep(0.15, 0.45, share_moved(a)) : 1.0, w0);
+}
+// ...then carried by region: a cell is carried where at least half of its surroundings at its own distance are (as the
+// spread: across into T - the share carried, its depth in w - then down into T2, which cs_share_up reads; 0 under a
+// quarter). A thing the camera carries is carried as one: its parts the measurement left over the cut - the stock of a
+// gun nearest the camera, Stalker 2 - no longer moved with the scenery against the rest of it. What is at another
+// distance - the scenery around it - keeps its own.
+Texture2D<float4> sv_half_t : register(t0);
+RWTexture2D<float4> sv_across_u : register(u0);
+[numthreads(8, 8, 1)] void cs_share_vote_h(uint3 id : SV_DispatchThreadID) {
+    const uint2 cells = share_cells();
+    if (any(id.xy >= cells)) return;
+    const float w0 = sv_half_t.Load(int3(id.xy, 0)).w;
+    const bool own0 = share_own_w(w0);
+    const float l0 = log2(max(abs(w0), 1e-9));
+    float sum = 0, wsum = 0;
+    [unroll] for (int k = -8; k <= 8; ++k) {
+        const int2 q = clamp(int2(id.xy) + int2(int(groups_x), 0) * k, int2(0, 0), int2(cells) - 1);
+        const float4 v = sv_half_t.Load(int3(q, 0));
+        const float rel = log2(max(abs(v.w), 1e-9)) - l0;
+        const float g = exp(-float(k * k) / 32.0 - rel * rel * 25.0) * share_kind_w(own0, share_own_w(v.w));
+        sum += g * (v.x < 0.1 ? 1.0 : 0.0);
+        wsum += g;
+    }
+    sv_across_u[id.xy] = float4(sum / wsum, 0, 0, w0);
+}
+Texture2D<float4> sv_across_t : register(t0);
+Texture2D<float4> sv_own_t : register(t2);
+RWTexture2D<float4> sv_voted_u : register(u1);
+[numthreads(8, 8, 1)] void cs_share_vote_v(uint3 id : SV_DispatchThreadID) {
+    const uint2 cells = share_cells();
+    if (any(id.xy >= cells)) return;
+    const float4 own = sv_own_t.Load(int3(id.xy, 0));
+    const bool own0 = share_own_w(own.w);
+    const float l0 = log2(max(abs(own.w), 1e-9));
+    float sum = 0, wsum = 0;
+    [unroll] for (int k = -8; k <= 8; ++k) {
+        const int2 q = clamp(int2(id.xy) + int2(0, int(groups_x)) * k, int2(0, 0), int2(cells) - 1);
+        const float4 v = sv_across_t.Load(int3(q, 0));
+        const float rel = log2(max(abs(v.w), 1e-9)) - l0;
+        const float g = exp(-float(k * k) / 32.0 - rel * rel * 25.0) * share_kind_w(own0, share_own_w(v.w));
+        sum += g * v.x;
+        wsum += g;
+    }
+    const float carried = smoothstep(0.25, 0.5, sum / wsum);
+    sv_voted_u[id.xy] = float4(own.xy * (1.0 - carried), own.zw);
 }
 // ...at render resolution: each pixel from the four cells around it, by their distance against its own (as the spread; none
 // at its distance - a thin thing between cells: the nearest in distance), the bands by its own distance.
 Texture2D<float4> su_half_t : register(t0);
+Texture2D<float4> su_object_t : register(t3);  // (this frame's analysis: w the pixel's kind, as the cells')
 [numthreads(8, 8, 1)] void cs_share_up(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= rect.zw)) return;
     const int2 pr = int2(rect.xy + id.xy);
     const float d0 = sb_depth_t.Load(int3(pr, 0));
     const float l0 = log2(max(d0, 1e-9));
+    const bool own0 = su_object_t.Load(int3(pr, 0)).w > 0.5;
     const uint2 cells = share_cells();
     const float2 u = clamp(float2(id.xy) * 0.5, float2(0, 0), float2(cells) - 1.001);
     const int2 i = int2(floor(u));
@@ -940,8 +1014,8 @@ Texture2D<float4> su_half_t : register(t0);
     [unroll] for (int k = 0; k < 4; ++k) {
         const int2 o = int2(k & 1, k >> 1);
         const float4 v = su_half_t.Load(int3(min(i + o, int2(cells) - 1), 0));
-        const float rel = abs(log2(max(v.w, 1e-9)) - l0);
-        const float g = (o.x ? f.x : 1.0 - f.x) * (o.y ? f.y : 1.0 - f.y) * exp(-rel * rel * 25.0);
+        const float rel = abs(log2(max(abs(v.w), 1e-9)) - l0);
+        const float g = (o.x ? f.x : 1.0 - f.x) * (o.y ? f.y : 1.0 - f.y) * exp(-rel * rel * 25.0) * share_kind_w(own0, share_own_w(v.w));
         kept += g * v.xyz; wsum += g;
         if (rel < best) { best = rel; nearest = v.xyz; }
     }
@@ -1289,19 +1363,23 @@ uint hud_classify(uint2 id, out float weight) {
     return 1;
 }
 [numthreads(1, 1, 1)] void cs_clear_counts(uint3 id : SV_DispatchThreadID) { hud_counts_u.Store2(0, uint2(0, 0)); }
-// The classification of each pixel, made once (cs_hud_count) for the passes after it: kind, weight.
-RWTexture2D<float2> hud_kind_u : register(u0);  // (cs_hud_count)
-Texture2D<float2> hud_kind_t : register(t5);     // (cs_hud, cs_hud_world)
+// The classification of each pixel, made once (cs_hud_count) for the passes after it: kind, weight - in one uint, exactly:
+// kind 1 (the only one with a weight, 0.1-0.45) as the weight's bits; any other kind as the top bit and the kind, weight 0.
+// (32 bits per pixel instead of 64: 32 MB less at 4K)
+RWTexture2D<uint> hud_kind_u : register(u0);  // (cs_hud_count)
+Texture2D<uint> hud_kind_t : register(t5);     // (cs_hud, cs_hud_world)
+uint hud_kind_pack(uint kind, float weight) { return kind == 1 ? asuint(weight) : (0x80000000u | kind); }
 uint hud_kind_of(uint2 id, out float weight) {
-    const float2 kw = hud_kind_t.Load(int3(id, 0));
-    weight = kw.y;
-    return uint(kw.x);
+    const uint v = hud_kind_t.Load(int3(id, 0));
+    if (v == 0 || (v & 0x80000000u)) { weight = 0; return v & 0xFFu; }  // (0: never written - kind 0, as the float pair read)
+    weight = asfloat(v);
+    return 1;
 }
 [numthreads(8, 8, 1)] void cs_hud_count(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= out_size) || !(flags & 2)) return;
     float weight;
     const uint kind = hud_classify(id.xy, weight);
-    hud_kind_u[id.xy] = float2(float(kind), weight);
+    hud_kind_u[id.xy] = hud_kind_pack(kind, weight);
     uint ignored;
     if (kind == 1) hud_counts_u.InterlockedAdd(0, 1, ignored);
     else if (kind == 2) hud_counts_u.InterlockedAdd(4, 1, ignored);
@@ -1867,11 +1945,42 @@ RWTexture2D<unorm float> ramp_u : register(u0);
 Texture2D<float> mask_score_t : register(t0);
 Texture2D<float> mask_attached_t : register(t1);
 Texture2D<float> mask_world_t : register(t2);  // combined HUD detection (flag 64): see cs_hud_world
-Texture2D<unorm float> mask_ramp_t : register(t3);
+// (t3: the stretch's distance share - flag 128, R8, in x - or, with the share, the sight windows - flag 2048, see mask_in_sight)
+Texture2D<float4> mask_ramp_t : register(t3);
 Texture2D<unorm float> mask_tiles_t : register(t4);  // (flag 256) tiles of HUD the learned map confirms (cs_hud_spread)
 // (flag 512: t5, the shares of the input's turn and of the rest each render pixel follows, Renderer::follow_share - bilinear
 // at uv)
 Texture2D<float4> mask_share_t : register(t5);
+// (flag 2048, with the share: t3 - mask_ramp_t - the sight windows found this frame, cs_ret_enclose, per cell of groups_x render px)
+// Inside a sight's window - within 2 cells of one - what this frame's analysis finds attached (widened by a render pixel,
+// t1): a reticle drawn small on the glass (S.T.A.L.K.E.R. 2's red dot: the gun's motion at its centre, the scenery's motion
+// and distance in its glow and ring) takes the scenery's share where the share is spread at that distance - it moved
+// with the turn, a second dot and ring and the frame's inner edge beside the real ones. Held there, as before the share.
+bool mask_in_sight(int2 pr) {
+    if (!(flags & 2048) || !(flags & 8) || mask_attached_t.Load(int3(pr, 0)) < 0.5) return false;
+    uint cw, ch;
+    mask_ramp_t.GetDimensions(cw, ch);
+    const int2 c = (pr - int2(rect.xy)) / int(max(groups_x, 1u));
+    [loop] for (int dy = -2; dy <= 2; ++dy)
+        [loop] for (int dx = -2; dx <= 2; ++dx) {
+            const int2 q = clamp(c + int2(dx, dy), int2(0, 0), int2(cw, ch) - 1);
+            if (mask_ramp_t.Load(int3(q, 0)).z > 0.5) return true;
+        }
+    return false;
+}
+// Next to what the share holds (a render pixel away, any of the 8): the outline. Its pixels blend the held thing's colour
+// with what is behind, and many carry what is behind's distance and motion - spread by distance, they took the scenery's
+// share and slid off with it, a ghost of the outline left in the scenery (Cyberpunk's gun and hand while turning, RE2's
+// character, a car's dashboard ornament). Held with it, as the widened attached mask held them before the share.
+bool mask_next_to_carried(int2 pr) {
+    const int2 lo = int2(rect.xy), hi = int2(rect.xy + rect.zw) - 1;
+    [unroll] for (int k = 0; k < 9; ++k) {
+        if (k == 4) continue;
+        const int2 q = clamp(pr + int2(k % 3 - 1, k / 3 - 1), lo, hi);
+        if (mask_share_t.Load(int3(q, 0)).x < 0.1) return true;
+    }
+    return false;
+}
 float4 mask_share(float2 uv) {
     const float2 p = clamp(uv * float2(rect.zw) - 0.5, 0, float2(rect.zw) - 1.001);
     const int2 i = int2(rect.xy) + int2(floor(p));
@@ -1915,15 +2024,20 @@ groupshared uint mask_hud_gs[10 * 10];  // the group's pixels and a 1 px border:
         // where held, under 0.1, 0.7 where it follows a little: the mask view shows only what is held, see cs_tint. Elden
         // Ring's ground at the orbited character's distance follows 0.12-0.16 of the turn, as it moves, and showed as held)
         const float4 share = mask_share(uv);
-        mask_u[id.xy] = hud ? 1.0 : share.x < 0.1 ? 0.75 : share.x < 0.5 ? 0.7 : 0.0;
-        warp_mask_u[id.xy] = hud ? float4(1, 0, 0, 0) : float4(0.9 * (1.0 - share.x), share.y, share.z, 0);
+        // (held in a sight: 0.95 - held like the HUD by the warp, which reads > 0.9 from this mask - see ow_mask_at)
+        const bool sight = !hud && mask_in_sight(pr);
+        // (the outline: not where the share holds already - only where it would slide off)
+        const bool outline = !hud && !sight && share.x >= 0.1 && mask_next_to_carried(pr);
+        const bool held = sight || outline;
+        mask_u[id.xy] = hud ? 1.0 : held ? 0.95 : share.x < 0.1 ? 0.75 : share.x < 0.5 ? 0.7 : 0.0;
+        if (!(flags & 1024)) warp_mask_u[id.xy] = (hud || held) ? float4(1, 0, 0, 0) : float4(0.9 * (1.0 - share.x), share.y, share.z, 0);
         return;
     }
     if (!keep && (flags & 8)) keep = mask_attached_t.Load(int3(pr, 0)) > 0.5;
     // (1 the HUD, 0.75 the character/weapon: held alike - above 0.5 - except by XPAR frame generation, which keeps
     // only the HUD where it is)
     mask_u[id.xy] = hud ? 1.0 : keep ? 0.75 : 0.0;
-    const float follow = (flags & 128) ? mask_ramp_t.Load(int3(pr, 0)) : 1.0;
+    const float follow = (flags & 128) ? mask_ramp_t.Load(int3(pr, 0)).x : 1.0;
     warp_mask_u[id.xy] = keep ? float4(1, 0, 0, 0) : float4(0.9 * (1.0 - follow), follow, follow, 0);
 }
 
@@ -2285,9 +2399,32 @@ float4 ow_bilinear(float2 uv) { return ow_color_t.SampleLevel(ow_linear, uv, 0);
 // (held: the HUD - 1 - and, with the follow share, what follows none of the turn - 0.9: shown as the frame has it and never
 // taken as scenery for what the turn uncovers beside it, as when it was held; following any of it, the mask is at most
 // 0.9 * (1 - 1/64))
-bool ow_held(int3 p) { return ow_mask_t.Load(p).x > 0.885; }
+// (flag 16384, the follow share: no warp mask at output resolution - t2 is the no-warp mask, R8: 1 the HUD; t14 the shares at
+// render resolution, as cs_share_up wrote them. The same values the warp mask held - 0.9 * (1 - the input's share), the
+// rest's, the movement's; 1, 0, 0 on the HUD - with the shares interpolated once instead of twice: 64 MB less at 4K, and
+// as much again for the shown copy)
+Texture2D<float4> ow_share_t : register(t14);
+float4 ow_mask_at(float2 s) {
+    if (!(flags & 16384)) return ow_mask_t.SampleLevel(ow_linear, s, 0);
+    uint sw, sh;
+    ow_share_t.GetDimensions(sw, sh);
+    const float2 size = float2(sw, sh);
+    const float2 su = clamp((float2(rect.xy) + s * float2(rect.zw)) / size, (float2(rect.xy) + 0.5) / size, (float2(rect.xy + rect.zw) - 0.5) / size);
+    const float4 share = ow_share_t.SampleLevel(ow_linear, su, 0);
+    // (the HUD, bilinear as the mask had it: the four output pixels around, gathered - w top-left, z top-right, x and y below)
+    const float2 p = s * float2(out_size) - 0.5;
+    const float2 f = p - floor(p);
+    const float4 g = ow_mask_t.GatherRed(ow_linear, (floor(p) + 1.0) / float2(out_size));
+    const float4 hud = float4(g > 0.9);
+    const float h = lerp(lerp(hud.w, hud.z, f.x), lerp(hud.x, hud.y, f.x), f.y);
+    return float4(lerp(0.9 * (1.0 - share.x), 1.0, h), share.y * (1.0 - h), share.z * (1.0 - h), 0);
+}
+bool ow_held(int3 p) {
+    if (flags & 16384) return ow_mask_at((float2(p.xy) + 0.5) / float2(out_size)).x > 0.885;
+    return ow_mask_t.Load(p).x > 0.885;
+}
 // The share of the warp's motion applied at this spot (the stretch).
-float ow_follow(float2 uv) { return saturate(1.0 - ow_mask_t.SampleLevel(ow_linear, uv, 0).x / 0.9); }
+float ow_follow(float2 uv) { return saturate(1.0 - ow_mask_at(uv).x / 0.9); }
 float ow_depth(float2 uv) {
     if (flags & 32) return 0;  // the warp does not depend on depth (the camera only turns): no reads
     const uint2 p = rect.xy + min(uint2(saturate(uv) * float2(rect.zw)), rect.zw - 1);
@@ -2431,7 +2568,7 @@ float2 ow_lands_by(float2 s, float3 f, float input_share, float rest_share, floa
 }
 float2 ow_lands(float2 s, float3 f) {
     if (!(flags & 128)) return f.xy;
-    const float4 m = ow_mask_t.SampleLevel(ow_linear, s, 0);
+    const float4 m = ow_mask_at(s);
     return ow_lands_by(s, f, saturate(1.0 - m.x / 0.9), m.y, m.z);
 }
 // The rendered pixel that lands on uv, searched from it; false: none (behind the displayed camera). Where several
@@ -2493,7 +2630,7 @@ int2 ow_claimant(int2 cell, uint key) { return cell + int2(int((key >> 11) & 204
 bool ow_refine(float2 uv, int2 p, float nk, out float2 s) {
     s = (float2(p) + 0.5) / float2(rect.zw);
     const float dp = ow_depth(s);
-    const float4 m = (flags & 128) ? ow_mask_t.SampleLevel(ow_linear, s, 0) : float4(0, 1, 1, 0);
+    const float4 m = (flags & 128) ? ow_mask_at(s) : float4(0, 1, 1, 0);
     const float fo = (flags & 128) ? saturate(1.0 - m.x / 0.9) : 1.0, fr = (flags & 128) ? m.y : 1.0, fm = (flags & 128) ? m.z : 1.0;
     [loop] for (int it = 0; it < 6; ++it) {
         const float3 f = ow_forward_at(s, dp);
@@ -3336,7 +3473,7 @@ constexpr UINT kXFlow = kX + 146;
 enum FlowTable : UINT { kFlowLuma, kFlowFeat, kFlowSearch, kFlowMedianAB, kFlowMedianBA, kFlowLkAB, kFlowLkBA, kFlowMotion, kFlowFillAB, kFlowFillBA, kFlowTables };
 // Passes on the second root signature (the XPAR warp and the moving objects): 12 SRVs t0-t11 and 2 UAVs
 // per table.
-constexpr UINT kWSrvCount = 14, kWTableSize = kWSrvCount + 2;
+constexpr UINT kWSrvCount = 15, kWTableSize = kWSrvCount + 2;
 // Combined HUD detection: the learned score kept alongside (cs_hud: u0 the score, u1 the counts) and its tiles (6 + 2).
 constexpr UINT kXLearnedUav = kXFlow + kFlowTables * 8, kXTilesSrv = kXLearnedUav + 2, kXTilesUav = kXTilesSrv + 6;
 // HUD learning (score_hud_probe): the probe into tiles, the sums cleared, the score (6 + 2 each).
@@ -3348,7 +3485,7 @@ constexpr UINT kW = kXCoverUav + 2;
 enum WTable : UINT { kWWarp, kWShown, kWClear, kWSplat, kWMove, kWCopyColour, kWCopyDepth, kWJoinInit, kWJoinAB, kWJoinBA, kWJoinFinal,
                      kWGenDepth0, kWGenDepth1, kWGenDepth2, kWGenUi0, kWGenUi1, kWGenUi2, kWFgMotion, kWFgInverse, kWClaim,
                      kWStill, kWHoldInit, kWHoldAB, kWHoldBA, kWHoldFinal, kWHoldFill, kWHoldFillFinal, kWGrowInit, kWGrowAB, kWGrowBA,
-                     kWGrowFinal, kWWarpArgs, kWShareMeasure, kWShareH, kWShareV, kWShareBins, kWShareUp, kWFgImages,
+                     kWGrowFinal, kWWarpArgs, kWShareMeasure, kWShareH, kWShareV, kWShareBins, kWShareUp, kWShareVoteH, kWShareVoteV, kWFgImages,
                      kWTables = kWFgImages + 5 * 3 };
 // XPAR frame generation: each image's own tables (descriptors are read when the GPU runs the pass, so one set reused
 // for every image would have them all write the last one).
@@ -3677,7 +3814,7 @@ bool Renderer::create_pipelines(std::string& error) {
         error = "warp root signature"; return false;
     }
     struct { const char* entry; ComPtr<ID3D12PipelineState>* pso; } ws[] = {
-        {"cs_own_warp", &cs_own_warp_}, {"cs_own_warp_reset", &cs_own_warp_reset_}, {"cs_own_warp_lean", &cs_own_warp_lean_}, {"cs_own_warp_args", &cs_own_warp_args_}, {"cs_own_warp_rest", &cs_own_warp_rest_}, {"cs_warp_claims_clear", &cs_warp_claims_clear_}, {"cs_warp_claim", &cs_warp_claim_}, {"cs_obj_fix", &cs_obj_fix_}, {"cs_obj_move", &cs_obj_move_}, {"cs_gen_depth", &cs_gen_depth_}, {"cs_gen_unui", &cs_gen_unui_}, {"cs_obj_join_init", &cs_obj_join_init_}, {"cs_obj_join", &cs_obj_join_}, {"cs_obj_join_final", &cs_obj_join_final_}, {"cs_still", &cs_still_}, {"cs_hold_fill", &cs_hold_fill_}, {"cs_grow_init", &cs_grow_init_}, {"cs_grow_clear", &cs_grow_clear_}, {"cs_grow", &cs_grow_}, {"cs_grow_final", &cs_grow_final_}, {"cs_obj_clear", &cs_obj_clear_}, {"cs_obj_clear_tiles", &cs_obj_clear_tiles_}, {"cs_obj_splat", &cs_obj_splat_}, {"cs_share_measure", &cs_share_measure_}, {"cs_share_blur", &cs_share_blur_}, {"cs_share_bins", &cs_share_bins_}, {"cs_share_final", &cs_share_final_}, {"cs_share_up", &cs_share_up_},
+        {"cs_own_warp", &cs_own_warp_}, {"cs_own_warp_reset", &cs_own_warp_reset_}, {"cs_own_warp_lean", &cs_own_warp_lean_}, {"cs_own_warp_args", &cs_own_warp_args_}, {"cs_own_warp_rest", &cs_own_warp_rest_}, {"cs_warp_claims_clear", &cs_warp_claims_clear_}, {"cs_warp_claim", &cs_warp_claim_}, {"cs_obj_fix", &cs_obj_fix_}, {"cs_obj_move", &cs_obj_move_}, {"cs_gen_depth", &cs_gen_depth_}, {"cs_gen_unui", &cs_gen_unui_}, {"cs_obj_join_init", &cs_obj_join_init_}, {"cs_obj_join", &cs_obj_join_}, {"cs_obj_join_final", &cs_obj_join_final_}, {"cs_still", &cs_still_}, {"cs_hold_fill", &cs_hold_fill_}, {"cs_grow_init", &cs_grow_init_}, {"cs_grow_clear", &cs_grow_clear_}, {"cs_grow", &cs_grow_}, {"cs_grow_final", &cs_grow_final_}, {"cs_obj_clear", &cs_obj_clear_}, {"cs_obj_clear_tiles", &cs_obj_clear_tiles_}, {"cs_obj_splat", &cs_obj_splat_}, {"cs_share_measure", &cs_share_measure_}, {"cs_share_blur", &cs_share_blur_}, {"cs_share_bins", &cs_share_bins_}, {"cs_share_final", &cs_share_final_}, {"cs_share_up", &cs_share_up_}, {"cs_share_vote_h", &cs_share_vote_h_}, {"cs_share_vote_v", &cs_share_vote_v_},
         {"cs_copy4", &cs_copy4_}, {"cs_copy1", &cs_copy1_}, {"cs_fg_motion", &cs_fg_motion_}, {"cs_fg_inverse", &cs_fg_inverse_},
         {"cs_fg_clear", &cs_fg_clear_}, {"cs_fg_splat_cur", &cs_fg_splat_cur_}, {"cs_fg_splat_prev", &cs_fg_splat_prev_},
         {"cs_fg_resolve", &cs_fg_resolve_}, {"cs_fg_depth", &cs_fg_depth_}};
@@ -3756,6 +3893,10 @@ bool Renderer::create_pipelines(std::string& error) {
     bd.Width = kRing * 16;
     if (FAILED(device_->CreateCommittedResource(&rbh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&hud_readback_)))) {
         error = "HUD counter readback"; return false;
+    }
+    bd.Width = kRing * 32;
+    if (FAILED(device_->CreateCommittedResource(&rbh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&ret_args_readback_)))) {
+        error = "reticle dispatch readback"; return false;
     }
     bd.Width = kRing * kShareDiagBytes;
     if (FAILED(device_->CreateCommittedResource(&rbh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&share_readback_)))) {
@@ -4284,6 +4425,7 @@ void Renderer::follow_share(const IngestedSource& src, const float clip_to_prev_
     b.flags = 0;
     for (UINT i = 0; i < kWSrvCount; ++i) {
         set_x_srv(kWSrv(kWShareH) + i, kPDepth); set_x_srv(kWSrv(kWShareV) + i, kPDepth); set_x_srv(kWSrv(kWShareUp) + i, kPDepth);
+        set_x_srv(kWSrv(kWShareVoteH) + i, kPDepth); set_x_srv(kWSrv(kWShareVoteV) + i, kPDepth);
     }
     set_x_srv(kWSrv(kWShareH) + 0, to);
     set_x_uav(kWUav(kWShareH) + 0, kPShareT); set_x_uav(kWUav(kWShareH) + 1, kPShareT2);
@@ -4291,9 +4433,15 @@ void Renderer::follow_share(const IngestedSource& src, const float clip_to_prev_
     set_x_srv(kWSrv(kWShareV) + 2, kPShareT2);
     device_->CreateUnorderedAccessView(share_bins_.Get(), nullptr, &raw, cpu(kWUav(kWShareV) + 0));
     set_x_uav(kWUav(kWShareV) + 1, kPShareHalf);
-    set_x_srv(kWSrv(kWShareUp) + 0, kPShareHalf);
+    // (carried by region: the cells' verdicts across into T, down into T2 - free again after the spread)
+    set_x_srv(kWSrv(kWShareVoteH) + 0, kPShareHalf);
+    set_x_uav(kWUav(kWShareVoteH) + 0, kPShareT); set_x_uav(kWUav(kWShareVoteH) + 1, kPShareT2);
+    set_x_srv(kWSrv(kWShareVoteV) + 0, kPShareT); set_x_srv(kWSrv(kWShareVoteV) + 2, kPShareHalf);
+    set_x_uav(kWUav(kWShareVoteV) + 0, kPShareHalf); set_x_uav(kWUav(kWShareVoteV) + 1, kPShareT2);
+    set_x_srv(kWSrv(kWShareUp) + 0, kPShareT2);
     device_->CreateUnorderedAccessView(share_bins_.Get(), nullptr, &raw, cpu(kWUav(kWShareUp) + 0));
     set_x_uav(kWUav(kWShareUp) + 1, kPShare);
+    set_x_srv(kWSrv(kWShareUp) + 3, kPObject);  // (the pixels' kind, see cs_share_up)
     transition(private_[kPShareT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     transition(private_[kPShareT2], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     w_dispatch(cs_share_blur_.Get(), &b, wc, kWShareH, (cw + 7) / 8, (ch + 7) / 8);
@@ -4303,6 +4451,12 @@ void Renderer::follow_share(const IngestedSource& src, const float clip_to_prev_
     b.flags = (whole_motion ? 4u : 0u) | (depth_inverted ? 16u : 0u) | (share_mode ? 32u : 0u);
     w_dispatch(cs_share_final_.Get(), &b, wc, kWShareV, (cw + 7) / 8, (ch + 7) / 8);
     transition(private_[kPShareHalf], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    transition(private_[kPShareT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    w_dispatch(cs_share_vote_h_.Get(), &b, wc, kWShareVoteH, (cw + 7) / 8, (ch + 7) / 8);
+    transition(private_[kPShareT], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    transition(private_[kPShareT2], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    w_dispatch(cs_share_vote_v_.Get(), &b, wc, kWShareVoteV, (cw + 7) / 8, (ch + 7) / 8);
+    transition(private_[kPShareT2], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     transition(private_[kPShare], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     w_dispatch(cs_share_up_.Get(), &b, wc, kWShareUp, (c.rect[2] + 7) / 8, (c.rect[3] + 7) / 8);
     transition(private_[kPShare], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -4490,7 +4644,7 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
     // would have them made again and again, each time waiting for the GPU).
     if (hud && !from_hudless && !from_layer && !hidden) {
         detection_idle_ = 0;
-        if (!ensure_private(kPHudKind, ow, oh, DXGI_FORMAT_R32G32_FLOAT)) return nullptr;
+        if (!ensure_private(kPHudKind, ow, oh, DXGI_FORMAT_R32_UINT)) return nullptr;
     } else if (check) {
         detection_idle_ = 0;
     } else if (++detection_idle_ == 300) {
@@ -4717,6 +4871,7 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
     // Sight reticles drawn without depth (option, see cs_ret_layer): with the character/weapon held and the previous
     // game frame's picture to compare this one with (the HUD-less pictures when the previous one is HUD-less).
     bool reticle = false;
+    UINT sight_cell = 0;  // (the sight windows found this frame: their cells' size - 0, none looked for)
     if (reticles && keep_att && previous_valid_ && private_[kPPrevious].texture && private_[kPPrevious].width == ow &&
         private_[kPPrevious].height == oh) {
         const PrivateId current = previous_from_hudless_ ? kPHudless : kPBackbuffer;
@@ -4724,17 +4879,17 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
         const UINT cell = std::max(1u, static_cast<UINT>(std::lround(0.0055 * double(c.rect[3]))));
         const UINT cw = (c.rect[2] + cell - 1) / cell, ch = (c.rect[3] + cell - 1) / cell;
         ID3D12Resource* const history_before = private_[kPRetA].texture.Get();
+        const bool layers = ret_layers_ready(ow, oh);
         reticle = private_[current].texture && private_[current].width == ow && private_[current].height == oh &&
                   ensure_private(kPRetCells, cw, ch, DXGI_FORMAT_R16G16B16A16_FLOAT) &&
-                  ensure_private(kPRetEncl, cw, ch, DXGI_FORMAT_R16G16B16A16_FLOAT) &&
-                  ensure_private(kPRetA, ow, oh, DXGI_FORMAT_R16G16B16A16_FLOAT) && ensure_private(kPRetB, ow, oh, DXGI_FORMAT_R16G16B16A16_FLOAT);
+                  ensure_private(kPRetEncl, cw, ch, DXGI_FORMAT_R16G16B16A16_FLOAT);
         ID3D12Resource* const dirty_before = private_[kPRetDirtyA].texture.Get();
         reticle = reticle && ensure_private(kPRetDirtyA, cw, ch, DXGI_FORMAT_R32_UINT) && ensure_private(kPRetDirtyB, cw, ch, DXGI_FORMAT_R32_UINT);
         if (reticle) {
-            const bool fresh = private_[kPRetA].texture.Get() != history_before;
-            // (new cell maps: nothing known of what the layers hold - every cell taken as holding something, once each)
-            if (private_[kPRetDirtyA].texture.Get() != dirty_before) ret_written_[0] = ret_written_[1] = 0;
-            const PrivateId from = ret_flip_ ? kPRetB : kPRetA, to = ret_flip_ ? kPRetA : kPRetB;
+            sight_cell = cell;
+            const bool fresh = !layers || private_[kPRetA].texture.Get() != history_before;
+            // (new cell maps or new layers: nothing known of what the layers hold - every cell taken as holding something, once each)
+            if (private_[kPRetDirtyA].texture.Get() != dirty_before || fresh) ret_written_[0] = ret_written_[1] = 0;
             XConstants k = c;
             k.mv_size[0] = cw; k.mv_size[1] = ch;
             k.groups_x = cell;
@@ -4762,10 +4917,35 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
             raw.Buffer.NumElements = kRetTrackN + 8;
             device_->CreateUnorderedAccessView(ret_buf_.Get(), nullptr, &raw, cpu(kXRetArgsUav + 1));
             XConstants a = k;
-            a.flags = ret_ran_ ? 0u : 4u;
+            // (flag 4 - run the full-screen passes anyway - clears what old layers hold; without layers there is nothing to
+            // clear, and it would read back as a window seen: the layers made in every game)
+            a.flags = (ret_ran_ || !layers) ? 0u : 4u;
             x_dispatch(cs_ret_args_.Get(), &a, kXRetEnclSrv, kXRetArgsUav, 1, 1);
             ret_ran_ = true;
             list_->ResourceBarrier(1, &buf);
+            // (no layers yet: whether a sight's window shows, read back - the layers are made once it does, see ret_layers_ready)
+            if (!layers) {
+                auto to_copy = transition_barrier(ret_args_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                list_->ResourceBarrier(1, &to_copy);
+                list_->CopyBufferRegion(ret_args_readback_.Get(), UINT64(frame_index_) * 32, ret_args_.Get(), 0, 32);
+                std::swap(to_copy.Transition.StateBefore, to_copy.Transition.StateAfter);
+                list_->ResourceBarrier(1, &to_copy);
+                ret_args_pending_[frame_index_] = true;
+            }
+        }
+        reticle = reticle && layers;
+        if (reticle) {
+            const bool fresh = private_[kPRetA].texture.Get() != history_before;
+            const PrivateId from = ret_flip_ ? kPRetB : kPRetA, to = ret_flip_ ? kPRetA : kPRetB;
+            XConstants k = c;
+            k.mv_size[0] = cw; k.mv_size[1] = ch;
+            k.groups_x = cell;
+            k.threshold = std::ceil(0.25f * float(c.rect[3]) / float(cell));
+            k.flags = fresh ? 2u : 0u;
+            D3D12_UNORDERED_ACCESS_VIEW_DESC raw{};
+            raw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; raw.Format = DXGI_FORMAT_R32_TYPELESS;
+            raw.Buffer.NumElements = kRetTrackN + 8; raw.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+            D3D12_RESOURCE_BARRIER buf{}; buf.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; buf.UAV.pResource = ret_buf_.Get();
             auto to_args = transition_barrier(ret_args_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
             list_->ResourceBarrier(1, &to_args);
             // Where the reticle went since the previous frame (cs_ret_align, cs_ret_pick), into the cells (cs_ret_shift).
@@ -4826,24 +5006,32 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
         transition(private_[kPRamp], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
     pass_stamp(kPassCharacter);
-    // (16 bits: the follow share moves pixels by up to hundreds of px; x, y the turn's shares, z the movement's - see cs_mask)
-    if (!ensure_private(kPWarpMask, ow, oh, DXGI_FORMAT_R16G16B16A16_UNORM)) return nullptr;
+    // (16 bits: the follow share moves pixels by up to hundreds of px; x, y the turn's shares, z the movement's - see cs_mask.
+    // Not with the share: the warp reads the shares and the HUD themselves - see ow_mask_at)
+    if (shared) {
+        if (private_[kPWarpMask].texture) retire(kPWarpMask);
+    } else if (!ensure_private(kPWarpMask, ow, oh, DXGI_FORMAT_R16G16B16A16_UNORM)) {
+        return nullptr;
+    }
     set_x_srv(kXMaskSrv + 0, kPHudScore);
     set_x_srv(kXMaskSrv + 1, keep_att ? kPAttached : kPHudScore);
     set_x_srv(kXMaskSrv + 2, world ? kPWorld : kPHudScore);
-    set_x_srv(kXMaskSrv + 3, ramp ? kPRamp : kPHudScore);
+    set_x_srv(kXMaskSrv + 3, ramp ? kPRamp : shared && sight_cell ? kPRetEncl : kPHudScore);
     for (UINT i = 4; i < kXSrvCount; ++i) set_x_srv(kXMaskSrv + i, kPHudScore);
     if (confirmed_tiles) set_x_srv(kXMaskSrv + 4, kPHudTiles);
     if (shared) set_x_srv(kXMaskSrv + 5, kPShare);  // (t5: the two shares, see cs_mask)
-    set_x_uav(kXMaskUav + 0, kPMask); set_x_uav(kXMaskUav + 1, kPWarpMask);
+    set_x_uav(kXMaskUav + 0, kPMask); set_x_uav(kXMaskUav + 1, shared ? kPMask : kPWarpMask);
     c.flags = (hud ? 4u : 0u) | (keep_att ? 8u : 0u) | (world ? 64u : 0u) | (ramp ? 128u : 0u) | (confirmed_tiles ? 256u : 0u) |
-              (shared ? 512u : 0u);
+              (shared ? 512u | 1024u : 0u) | (shared && sight_cell ? 2048u : 0u);
+    c.groups_x = sight_cell;
+    if (shared && sight_cell) transition(private_[kPRetEncl], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);  // (no layers yet: left as written)
     stretch_built_ = ramp || shared;  // (the warp's follow share: flag 128)
+    share_mask_built_ = shared;
     transition(private_[kPMask], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    transition(private_[kPWarpMask], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (!shared) transition(private_[kPWarpMask], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     x_dispatch(cs_mask_.Get(), &c, kXMaskSrv, kXMaskUav, (ow + 7) / 8, (oh + 7) / 8);
     transition(private_[kPMask], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    transition(private_[kPWarpMask], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (!shared) transition(private_[kPWarpMask], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     mask_ready_ = true;
     built_mask_ = true;
     pass_stamp(kPassMask);
@@ -4933,9 +5121,14 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
     if (!src.valid || !src.has_depth || !private_[kPOutput].texture || !shown(kPDepth).texture) return false;
     const bool split = use_ui_tags && src.has_hudless && src.has_ui && shown(kPHudless).texture && shown(kPUi).texture;
     const bool mask_ready = split_ ? shown_mask_ : mask_ready_;
-    const bool mask = use_mask && mask_ready && shown(kPWarpMask).texture && shown(kPWarpMask).width == private_[kPOutput].width &&
-                      shown(kPWarpMask).height == private_[kPOutput].height;
     const UINT ow = private_[kPOutput].width, oh = private_[kPOutput].height;
+    // (with the follow share: the no-warp mask and the shares at render resolution - see ow_mask_at)
+    const bool share_mask = (split_ ? shown_share_mask_ : share_mask_built_) && shown(kPMask).texture && shown(kPMask).width == ow &&
+                            shown(kPMask).height == oh && shown(kPShare).texture && shown(kPShare).width == shown(kPDepth).width &&
+                            shown(kPShare).height == shown(kPDepth).height;
+    const bool mask = use_mask && mask_ready && (share_mask || (shown(kPWarpMask).texture && shown(kPWarpMask).width == ow &&
+                                                                shown(kPWarpMask).height == oh));
+    const PrivateId mask_id = share_mask ? kPMask : kPWarpMask;
     XConstants c{};
     std::memcpy(c.clip_to_prev, source_to_target, sizeof(c.clip_to_prev));
     c.out_size[0] = ow; c.out_size[1] = oh;
@@ -4957,7 +5150,8 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
     const bool remembered = memory && mask && mem_shown_ >= 0 && private_[kPMem0 + mem_shown_].texture;
     const bool stretched = mask && (split_ ? shown_stretch_ : stretch_built_);
     c.flags = (split ? 1u : 0u) | (mask ? 2u : 0u) | (fill ? 4u : 0u) | (depth_inverted ? 16u : 0u) | (no_depth ? 32u : 0u) |
-              (remembered ? 64u : 0u) | (stretched ? 128u : 0u) | (moving ? 256u : 0u) | (soft_edge ? 1024u : 0u);
+              (remembered ? 64u : 0u) | (stretched ? 128u : 0u) | (moving ? 256u : 0u) | (soft_edge ? 1024u : 0u) |
+              (mask && share_mask ? 16384u : 0u);
     float wc[20] = {};
     const UINT t = kWSrv(kWWarp);
     // Frame generation: one of the game's generated images, with its own depth (prepare_generated).
@@ -4965,7 +5159,8 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
                      shown(static_cast<PrivateId>(kPGenZ0 + generated)).width == dw;
     set_x_srv(t + 0, gen ? static_cast<PrivateId>(kPGen0 + generated) : split ? kPHudless : kPBackbuffer, true);
     set_x_srv(t + 1, split ? kPUi : kPBackbuffer, true);  // (only read with a UI layer)
-    set_x_srv(t + 2, mask ? kPWarpMask : kPDepth, true);
+    set_x_srv(t + 2, mask ? mask_id : kPDepth, true);
+    set_x_srv(t + 14, mask && share_mask ? kPShare : kPDepth, true);
     set_x_srv(t + 3, gen ? static_cast<PrivateId>(kPGenZ0 + generated) : kPDepth, true);
     if (remembered) set_x_srv(t + 4, static_cast<PrivateId>(kPMem0 + mem_shown_));
     else set_x_srv(t + 4, kPDepth, true);
@@ -4993,7 +5188,8 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
         list_->ResourceBarrier(2, uav);
         const UINT st = kWSrv(kWSplat);
         for (UINT i = 0; i < kWSrvCount; ++i) set_x_srv(st + i, kPDepth, true);
-        set_x_srv(st + 2, mask ? kPWarpMask : kPDepth, true);
+        set_x_srv(st + 2, mask ? mask_id : kPDepth, true);
+        set_x_srv(st + 14, mask && share_mask ? kPShare : kPDepth, true);
         set_x_srv(st + 6, kPObjMove, true);
         set_x_srv(st + 11, kPObjTiles, true);
         set_x_uav(kWUav(kWSplat) + 0, kPObjKeys); set_x_uav(kWUav(kWSplat) + 1, kPObjOutTiles);
@@ -5007,7 +5203,7 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
         set_x_srv(t + 10, kPObjOutTiles);
         set_x_srv(t + 11, kPDepth, true);
     } else {
-        for (UINT i = 6; i < kWSrvCount; ++i) set_x_srv(t + i, kPDepth, true);
+        for (UINT i = 6; i < 14; ++i) set_x_srv(t + i, kPDepth, true);
     }
     // Two shares (follow_share with the input's turn): the input's part of the turn on its own (wmat - free without moving
     // objects), each part by its share (ow_lands).
@@ -5029,7 +5225,8 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
     if (warp_splat_ && !no_depth && ensure_private(kPWarpClaims, dw, dh, DXGI_FORMAT_R32_UINT)) {
         const UINT ct = kWSrv(kWClaim);
         for (UINT i = 0; i < kWSrvCount; ++i) set_x_srv(ct + i, kPDepth, true);
-        set_x_srv(ct + 2, mask ? kPWarpMask : kPDepth, true);
+        set_x_srv(ct + 2, mask ? mask_id : kPDepth, true);
+        set_x_srv(ct + 14, mask && share_mask ? kPShare : kPDepth, true);
         set_x_srv(ct + 3, gen ? static_cast<PrivateId>(kPGenZ0 + generated) : kPDepth, true);
         set_x_uav(kWUav(kWClaim) + 0, kPWarpClaims); set_x_uav(kWUav(kWClaim) + 1, kPWarpClaims);
         transition(private_[kPWarpClaims], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -5255,7 +5452,7 @@ bool Renderer::set_split(bool on) {
     // Turning on: what was taken in so far becomes the shown set. Turning off: the shown set goes back to
     // where the single queue reads everything.
     swap_shown();
-    if (on) { shown_mask_ = mask_ready_; shown_fill_ = fill_ready_; shown_stretch_ = stretch_built_; shown_layer_ = layer_built_; ret_shown_ = ret_latest_; }
+    if (on) { shown_mask_ = mask_ready_; shown_fill_ = fill_ready_; shown_stretch_ = stretch_built_; shown_share_mask_ = share_mask_built_; shown_layer_ = layer_built_; ret_shown_ = ret_latest_; }
     else { mask_ready_ = shown_mask_; fill_ready_ = shown_fill_; }
     private_[kPPrevious] = Private{};  // (with split queues an alias of a shown texture)
     previous_valid_ = false;
@@ -5280,6 +5477,7 @@ bool Renderer::show_intake() {
     shown_mask_ = built_mask_;
     shown_objects_ = objects_built_;
     shown_stretch_ = stretch_built_;
+    shown_share_mask_ = share_mask_built_;
     shown_layer_ = layer_built_;
     ret_shown_ = ret_latest_;
     shown_fill_ = fill_ready_;
@@ -5366,6 +5564,64 @@ DXGI_FORMAT Renderer::colour_format(DXGI_FORMAT source) {
         !(fs.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) || (fs.Support2 & kNeed2) != kNeed2)
         return DXGI_FORMAT_R16G16B16A16_FLOAT;
     return compact;
+}
+
+void Renderer::prepare_ret_layers(std::uint32_t w, std::uint32_t h) {
+    ret_window_seen_ = true;
+    ret_layers_ready(w, h);
+    while (ret_create_ && !ret_create_->done.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+}
+
+bool Renderer::ret_layers_ready(std::uint32_t w, std::uint32_t h) {
+    auto& a = private_[kPRetA];
+    if (a.texture && a.width == w && a.height == h && private_[kPRetB].texture) return true;
+    if (a.texture) { retire(kPRetA); retire(kPRetB); }  // (another output size: made again, in the background)
+    if (ret_create_ && ret_create_->done.load()) {
+        // (taken out under the job's lock, the job let go of after it: its lock must not outlive it)
+        ComPtr<ID3D12Resource> made[2];
+        bool fits = false;
+        {
+            std::lock_guard lock(ret_create_->mutex);
+            fits = !ret_create_->failed && ret_create_->w == w && ret_create_->h == h;
+            made[0] = ret_create_->a; made[1] = ret_create_->b;
+        }
+        ret_create_.reset();
+        if (fits) {
+            const PrivateId ids[2] = {kPRetA, kPRetB};
+            for (int i = 0; i < 2; ++i) {
+                auto& p = private_[ids[i]];
+                p = Private{};
+                p.texture = made[i]; p.width = w; p.height = h; p.format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+                p.state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                device_->CreateUnorderedAccessView(p.texture.Get(), nullptr, nullptr, cpu(kPrivUav + ids[i]));
+                device_->CreateShaderResourceView(p.texture.Get(), nullptr, cpu(kPrivSrv + ids[i]));
+            }
+            return true;
+        }
+    }
+    if (ret_window_seen_ && !ret_create_) {
+        auto job = std::make_shared<RetCreate>();
+        job->w = w; job->h = h;
+        ret_create_ = job;
+        ComPtr<ID3D12Device> device = device_;
+        std::thread([job, device]() {
+            D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC d{};
+            d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; d.Width = job->w; d.Height = job->h; d.DepthOrArraySize = 1; d.MipLevels = 1;
+            d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; d.SampleDesc.Count = 1; d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            ComPtr<ID3D12Resource> a, b;
+            const bool ok = SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                                                      nullptr, IID_PPV_ARGS(&a))) &&
+                            SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                                                      nullptr, IID_PPV_ARGS(&b)));
+            {
+                std::lock_guard lock(job->mutex);
+                job->a = a; job->b = b; job->failed = !ok;
+            }
+            job->done = true;
+        }).detach();
+    }
+    return false;
 }
 
 bool Renderer::ensure_private(PrivateId id, std::uint32_t w, std::uint32_t h, DXGI_FORMAT format) {
@@ -5653,6 +5909,17 @@ ID3D12GraphicsCommandList* Renderer::begin(int context) {
             }
             D3D12_RANGE none{0, 0};
             hud_readback_->Unmap(0, &none);
+        }
+    }
+    if (ret_args_pending_[frame_index_] && ret_args_readback_) {
+        ret_args_pending_[frame_index_] = false;
+        std::uint32_t* v = nullptr;
+        D3D12_RANGE range{SIZE_T(frame_index_) * 32, SIZE_T(frame_index_ + 1) * 32};
+        if (SUCCEEDED(ret_args_readback_->Map(0, &range, reinterpret_cast<void**>(&v)))) {
+            const std::uint32_t* a = v + frame_index_ * 8;
+            if (a[0] && a[1]) ret_window_seen_ = true;  // (the passes over the screen dispatched: a sight's window seen lately)
+            D3D12_RANGE none{0, 0};
+            ret_args_readback_->Unmap(0, &none);
         }
     }
     if (share_diag_pending_[frame_index_] && share_readback_) {
@@ -6277,7 +6544,7 @@ std::uint32_t Renderer::warp_rest_blocks() {
 bool Renderer::read_back(int which, std::vector<std::uint16_t>& pixels, std::uint32_t& w, std::uint32_t& h) {
     static const PrivateId kWhich[] = {kPBackbuffer, kPOutput, kPScene, kPDepth, kPMotion, kPObject, kPMask, kPHudScore, kPWorld, kPFill,
                                        kPStashColor, kPStashDepth, kPStashMotion, kPFlowB, kPStashHudless, kPStash2Color, kPStash2Hudless,
-                                       kPStash2Depth, kPStash2Motion, kPHudless, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPUi, kPWarpMask, kPRetLayer, kPFgMotion, kPFgK1, kPFgInv, kPHudLearned, kPHudTiles, kPHudKind, kPShare};
+                                       kPStash2Depth, kPStash2Motion, kPHudless, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPUi, kPWarpMask, kPRetLayer, kPFgMotion, kPFgK1, kPFgInv, kPHudLearned, kPHudTiles, kPHudKind, kPShare, kPRetEncl, kPAttached};
     if (which < 0 || which >= int(std::size(kWhich))) return false;
     // (the sight reticles' layer: the history texture written last)
     auto& p = kWhich[which] == kPRetLayer ? private_[ret_latest_] : split_ && shown_id(kWhich[which]) ? front_[kWhich[which]] : private_[kWhich[which]];

@@ -12,6 +12,9 @@
 #include <string>
 #include <functional>
 #include <vector>
+#include <mutex>
+#include <atomic>
+#include <memory>
 
 namespace fw {
 using Microsoft::WRL::ComPtr;
@@ -215,6 +218,8 @@ public:
     void follow_share(const IngestedSource& src, const float clip_to_prev_clip[16], bool scale_valid, bool depth_inverted, bool whole_motion,
                       int share_mode = 0);
     void reset_share() { share_reset_ = true; }
+    // (replay: the sight reticle layers made up front, as once a sight's window has been seen - see ret_layers_ready)
+    void prepare_ret_layers(std::uint32_t w, std::uint32_t h);
     // Diagnostics (recorded diagnostics: share.csv): per game frame, what the near-camera spots (first-person weapon, a car's
     // interior) learn their share from - see cs_share_measure's [288, 300). frame: the game frame being measured.
     struct ShareDiag { std::uint64_t frame = 0; int mode = 0; std::int32_t v[12] = {}; float band_a[12] = {}, band_b[12] = {}; };
@@ -322,7 +327,7 @@ private:
     bool ensure_private(PrivateId id, std::uint32_t w, std::uint32_t h, DXGI_FORMAT format);
     // The textures the warp reads, kept twice with split queues (front_: the shown set).
     static bool shown_id(PrivateId id) {
-        return id == kPBackbuffer || id == kPHudless || id == kPUi || id == kPDepth || id == kPMask || id == kPFill || id == kPWarpMask ||
+        return id == kPBackbuffer || id == kPHudless || id == kPUi || id == kPDepth || id == kPMask || id == kPFill || id == kPWarpMask || id == kPShare ||
                id == kPObjMove || id == kPObjTiles || id == kPPrevColour || id == kPPrevDepth || (id >= kPGen0 && id <= kPGenZ2) ||
                id == kPRetLayer;
     }
@@ -363,6 +368,7 @@ private:
     std::uint64_t pending_show_ = 0;   // intake fence value after which the written set can be shown
     std::uint64_t release_wait_ = 0;   // realtime fence value the intake waits for before rewriting (swap)
     bool built_mask_ = false, shown_mask_ = false, shown_fill_ = false, stretch_built_ = false, shown_stretch_ = false;
+    bool share_mask_built_ = false, shown_share_mask_ = false;  // (the warp reads the shares and the HUD mask, no warp mask - ow_mask_at)
     // Own motion estimation (games that give depth but no motion vectors): fills the motion texture from
     // the picture of this game frame and the previous one. Called by ingest, between the depth and the
     // motion samples.
@@ -409,7 +415,7 @@ private:
     bool learning_stalled_ = true;
     std::uint32_t detection_idle_ = 0;  // game frames since the HUD was last detected (build_no_warp_mask)
     std::uint32_t scene_idle_ = 0;      // game frames since the upscaler's output last came (ingest)
-    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_own_warp_reset_, cs_own_warp_lean_, cs_own_warp_args_, cs_own_warp_rest_, cs_warp_claims_clear_, cs_warp_claim_, cs_memory_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_, cs_probe_tiles_, cs_probe_clear_, cs_probe_score_, cs_share_measure_, cs_share_blur_, cs_share_bins_, cs_share_final_, cs_share_up_;
+    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_own_warp_reset_, cs_own_warp_lean_, cs_own_warp_args_, cs_own_warp_rest_, cs_warp_claims_clear_, cs_warp_claim_, cs_memory_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_, cs_probe_tiles_, cs_probe_clear_, cs_probe_score_, cs_share_measure_, cs_share_blur_, cs_share_bins_, cs_share_final_, cs_share_up_, cs_share_vote_h_, cs_share_vote_v_;
     // Sight reticles (option): the passes, which history texture holds the latest layer, and whether the layer was
     // built for the frame taken in last / the shown one (see cs_ret_layer).
     ComPtr<ID3D12PipelineState> cs_ret_cells_, cs_ret_enclose_, cs_ret_layer_, cs_ret_align_, cs_ret_pick_, cs_ret_args_, cs_ret_shift_;
@@ -448,6 +454,15 @@ private:
     ShareDiag share_diag_meta_[kRing];
     std::vector<ShareDiag> share_diags_;  // (sight reticles: the dispatches of the passes over the whole screen, cs_ret_args)
     bool ret_ran_ = false;             // (...the reticle passes ran last game frame)
+    // The sight reticle layers (kPRetA/B, 64 MB each at 4K) only once a sight's window has been seen (cs_ret_args' dispatch
+    // read back), created on a thread of their own - never on the intake or the refresh - and kept from then on. 128 MB
+    // less in a session without sights.
+    struct RetCreate { std::mutex mutex; ComPtr<ID3D12Resource> a, b; std::uint32_t w = 0, h = 0; std::atomic<bool> done{false}; bool failed = false; };
+    std::shared_ptr<RetCreate> ret_create_;
+    ComPtr<ID3D12Resource> ret_args_readback_;
+    bool ret_args_pending_[kRing] = {};
+    bool ret_window_seen_ = false;
+    bool ret_layers_ready(std::uint32_t w, std::uint32_t h);
     // (...their game frames counted, and the one each layer texture - A, B - was last written in: see cs_ret_layer)
     std::uint32_t ret_frame_ = 0, ret_written_[2] = {};
     bool layer_pending_[kRing] = {};
