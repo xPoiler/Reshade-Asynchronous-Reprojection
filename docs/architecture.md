@@ -38,6 +38,9 @@
 | `src/addon/reshade_feed.cpp` | Games without DLSS or FSR: ReShade's depth (through `shaders/XPAR.fx`) published as the frame's depth. |
 | `src/addon/depth_choice.cpp` | Which of the game's depth buffers is the scene's, which way round its depth is stored, and whether ReShade has to copy it before the game clears it. |
 | `src/addon/depth_probe_score.hpp` | Does a depth buffer belong to the picture: brightness changes across its depth edges. |
+| `src/addon/ui_layer.cpp` | The game's own HUD step: a HUD layer it blends onto the picture, or a HUD-less copy of the picture taken right before the HUD's draws (DirectX 12, DirectX 11, Vulkan). |
+| `src/addon/hud_learn.cpp` | HUD learning: where the game draws its HUD, for games no pattern of `ui_layer.cpp` catches - candidate steps copied, scored by the presenter, the best one kept per game. |
+| `src/addon/frame_cap.cpp` | *Prevent GPU queueing*: holds the game's frame starts just below the rate its GPU sustains; stands aside for Reflex, frame generation and a GPU-bound game, with trials to come back. |
 | `shaders/XPAR.fx` | ReShade effect the add-on enables itself: ReShade's depth, oriented near = 1, and a small probe of depth and brightness. |
 
 ## Game side (add-on)
@@ -78,6 +81,15 @@
 * **Upscaler output.** Unless *Find the HUD* is set to *Learned from camera motion*: copied right after the
   upscaler writes it (after `slEvaluateFeature` for Streamline games, after the NGX evaluation or the
   FSR dispatch otherwise).
+* **The game's HUD step** (`ui_layer.cpp`, option *Use the game's own HUD layer when found*). Found by what the
+  game does, not per game: a screen-sized texture cleared to transparent, drawn into and read at the end of the
+  frame (a draw onto the back buffer, or a compute pass that composes the final picture) is a HUD layer, handed
+  over as the frame's UI layer (its coverage, 8 bits); a HUD drawn straight onto the final picture after the
+  picture is copied there, or onto the back buffer itself, is caught by a copy taken right before the HUD's
+  draws (the frame's HUD-less picture). Nothing is copied inside an open Direct3D 12 render pass. Where no
+  pattern applies, *HUD learning* (`hud_learn.cpp`) records candidate steps, copies one at a time and lets the
+  presenter score it against the picture; the best is kept per game and paused while the game hands its HUD
+  over another way.
 * **Counters.** Presented images and rendered frames are counted for frame-generation detection.
 * **Frame generation (the game's own).** ReShade sits below frame generation's swapchain, so it sees every
   presented image, from frame generation's own thread and order. The images are therefore taken where they
@@ -114,6 +126,20 @@
   motion analysis) stays on the intake side, and the previous frame the HUD checks compare against is
   the shown set itself. The several ms of HUD/mask work of a new frame at 4K therefore never delay a
   refresh. Latewarp and the unpaced path keep a single queue.
+* **Follow share** (default; option *Character/weapon by how much it follows the turn*). Instead of a held /
+  not-held mask for the character/weapon, every spot learns how much of the camera's turn it follows on screen:
+  a per-spot least-squares fit of its motion against the turn over its recent frames, carried along the spot's
+  own motion from the same surface only and capped by information (a spot keeps its share while the camera
+  rests). Frames that disagree with what a spot has followed so far count less (a weapon's own animation, head
+  bob). Two parts of the turn (*...measured against the turn from your input*): a frame's turn counts as the
+  input's if the mouse or stick moved shortly before it, otherwise as the rest's (a car's steering). The
+  camera's movement has a share of its own, learned only from movement across the frame's turn (an orbiting
+  camera moves along its turn, and those frames teach it nothing) and never above the turn's share. The
+  scenery's shares come from 24 depth bands fed by the spots the motion analysis finds the camera explains
+  (not what it carries); a spot that follows under half of its band's share is carried. All of it runs on
+  one spot per 2x2 block of render pixels (`cs_share_measure`, `cs_share_bins`, `cs_share_blur`,
+  `cs_share_final`), put back at render resolution by distance (`cs_share_up`), and goes into the warp mask
+  (RGBA16: x the input turn's share - 0.9 at none, 1 the HUD; y the rest's; z the movement's).
 * **No-warp mask** (R8, used by the warp), built once per game frame:
   * *character/weapon* (every game): pixels whose motion vectors the camera motion does not explain,
     close to the camera, or stuck to the screen while the camera moves further out;
@@ -151,7 +177,12 @@
   interval the warp shows image i of n at (i + 1) / (n + 1) of it, then the frame, each from the camera of
   its moment: the game's clipToPrevClip C blended, (1 - b) I + b C for an image b of the way back (exact at
   both ends, whatever the engine's units and projection), then warped to the displayed camera.
-* **Warp engines.** The own engine (default, any D3D12 GPU): for each output pixel a short fixed-point
+* **Warp engines.** The own engine (default, any D3D12 GPU). Forward splat (default): every rendered pixel
+  claims the output spot it lands on (its share of each part of the predicted motion, see *Follow share*), the
+  nearest claim winning; each output pixel then refines the nearest claimant's surface onto itself, and what
+  no surface reaches is the scenery behind, continued up to the edge of what is in front (or background
+  memory). The plain pixels go through a small shader first; the rest is packed for the full warp. Without
+  forward splat, for each output pixel a short fixed-point
   search finds the rendered pixel that lands there at its own depth; masked pixels stay put and are
   never used as a source for others; revealed screen edges are filled with a short inward blend; no
   work while the camera has not moved. Around the character/weapon the scenery follows the warp less
@@ -183,6 +214,12 @@
   on a new game frame a throwaway `IsRenderedFrame=1` evaluation registers it, followed by the real
   evaluation with the predicted camera. View matrices are built relative to the source camera
   position for precision.
+* **Frame cap** (*Prevent GPU queueing*, add-on side, `frame_cap.cpp`). A fence per present tells when the
+  game's GPU work for each frame is done; once a window of 60 frames, the cap moves towards just under the
+  rate the GPU sustains (no frame waiting in the GPU's queue). It stands aside while the game's Reflex is on,
+  during frame generation, and when frames keep queueing although it holds the game back (GPU-bound); from
+  there it tries again after 20 s (doubling up to 5 minutes while tries fail) and keeps the cap if the game's
+  frame interval grows by 8% or less.
 * **Pacing.** A vblank clock: its period is the refresh rate of the display the game is on, from the display's
   current mode (`QueryDisplayConfig`, read by the window thread once a second and when the game moves to
   another display); its phase comes from our swapchain's DXGI frame statistics (measured from them alone when

@@ -1,5 +1,136 @@
 # Changelog
 
+## 2.0.0
+
+The two things that showed the most - the HUD and the character/weapon - rebuilt from the ground up, while
+spending less GPU time than before. The HUD now comes from where the game draws it in most tested games,
+exact from the first frame; characters, weapons and car interiors are moved by how much of the camera's turn
+they really follow, instead of being cut out and held. Four more games tested.
+
+### HUD
+
+* **Taken from where the game draws it** (new, on by default: *Use the game's own HUD layer when found*).
+  Instead of guessing which pixels are HUD, XPAR finds the step where the game puts its HUD on the picture,
+  by what the game does rather than per game, and takes the HUD from there: exact from the first frame,
+  and lights, neon or glare next to it are never mistaken for HUD.
+  * A HUD layer of its own, blended onto the picture at the end: Cyberpunk 2077, Resident Evil Requiem,
+    Assassin's Creed Black Flag Resynced (DirectX 12), DOOM Eternal (Vulkan).
+  * A HUD drawn straight onto the final picture: a copy taken right before the HUD's draws is the HUD-less
+    picture - S.T.A.L.K.E.R. 2, Hi-Fi Rush (DirectX 12), Resident Evil 2 and Dark Souls Remastered
+    (DirectX 11).
+* **Learn where the game draws its HUD** (new, on by default): for a game none of the above catches, XPAR
+  tries the candidate steps, scores them against the picture and keeps the one that holds the HUD - learned
+  once, saved per game (a *Relearn* button in the panel).
+* **Checked before it is trusted**: a HUD layer is compared with the upscaler's output (everything of a
+  HUD, world-anchored markers too, is drawn over the finished picture; full-screen menus do not count).
+  Once it passes, a frame without it is a frame where the game hides its HUD (Requiem). A layer that
+  fails is ignored; one that cannot be checked is not used in frames where it covers 90% of the screen or
+  more (Resident Evil 4 Remake: the whole picture was held as HUD).
+* **No HUD detection where the game hands its HUD over**: up to ~2.4 ms of GPU time per game frame saved
+  at 4K.
+* Hi-Fi Rush: the HUD no longer warps and judders on fast turns.
+
+### Character and weapon
+
+* **Moved by how much of the turn it follows** (new, on by default: *Character/weapon by how much it
+  follows the turn*). Every spot learns, frame after frame, how much of the camera's turn it follows on
+  screen, and the warp moves it by exactly that: a third-person character the camera circles not at all,
+  the scenery all of it, the ground around the character part of it. There is no held/not-held edge any
+  more for a character to split along, and no outline left behind: much steadier characters in Elden
+  Ring, Resident Evil 2, Dark Souls Remastered and Requiem's third-person view.
+* **Your turns and the rest apart** (new, on by default: *...measured against the turn from your input*):
+  a turn from your mouse or stick and a turn the camera makes by itself (a car's steering) are learned
+  separately. Cyberpunk 2077: the car's interior stays put while you steer and follows when you look
+  around.
+* **The camera's movement has a share of its own**: what follows the turn but not walking or driving is no
+  longer pushed by them - a gun right after a weapon switch, a car's interior while driving. In recorded
+  frames, the warp's error against the game's next real frame:
+
+  | Recorded frame | Before | 2.0 |
+  |---|---|---|
+  | Cyberpunk 2077, driving | 0.108 | 0.012 (9x less) |
+  | Cyberpunk 2077, walking | 0.020 | 0.014 |
+  | Cyberpunk 2077, after a weapon switch | 0.020 | 0.016 |
+  | DOOM Eternal, at a wall | 0.040 | 0.034 |
+  | Elden Ring, Dark Souls, Requiem | unchanged | unchanged |
+
+* **First-person weapons**: Cyberpunk 2077's guns no longer warp (what a gun learned was mixed up with the
+  scenery at its distance, a patchwork of 0 and 0.13-0.5 of the turn; now held whole), and DOOM Eternal's gun
+  no longer tears after it moves aside at a wall.
+* **Hold the whole character** (option): with the share above off, a character the camera follows is held
+  as one piece.
+* **Wait for the camera model** (new, on by default): the game's own frames are shown until XPAR has learned
+  how the camera turns (the first moments of turning; 5 s at most where the camera is estimated), instead of
+  a wild camera at the start.
+* *Show the mask* tints only what is actually held.
+
+### Performance
+
+Measured on the presenter's GPU (an RX 6600 driving the screen, the game on an RTX 3060 Ti):
+
+* **Character/weapon**: about 4x cheaper than the whole-character passes it replaces, and now worked out at
+  half resolution. Motion analysis + share per game frame, first version -> 2.0:
+
+  | Game | First version | 2.0 |
+  |---|---|---|
+  | Hi-Fi Rush | 1.74 ms | 0.67 ms |
+  | Elden Ring | 1.57 ms | 0.61 ms |
+  | Dark Souls Remastered | 1.40 ms | 0.53 ms |
+  | Resident Evil 2 | 1.35 ms | 0.56 ms |
+  | Resident Evil 4 Remake | 1.27 ms | 0.46 ms |
+  | DOOM Eternal | 1.24 ms | 0.42 ms |
+  | Cyberpunk 2077 | 0.80 ms | 0.44 ms |
+  | Resident Evil Requiem | 0.57 ms | 0.21 ms |
+  | Expedition 33 | 0.53 ms | 0.21 ms |
+
+* **Warp**: 6-21% less GPU time per refresh at 4K (the plain pixels in a small shader, the rest in the full
+  one; same output).
+* **Games without DLSS or FSR**: motion worked out from the picture in 1.05 ms per game frame at 4K instead
+  of 1.9 ms.
+* **Video memory**: Cyberpunk 2077 at 4K, presenter 1.6 GB -> 0.9 GB (textures no longer needed are
+  released once the GPU is past them, the HUD layer kept as its 8-bit coverage, no copies the frame does
+  not use).
+* **Prevent GPU queueing stands aside when the GPU is the limit**: holding a GPU-bound game back only cost
+  frames (Elden Ring: ~35 fps with it, ~45 without). It now steps aside by itself, tries again after 20 s
+  (twice as long after each try that fails, up to 5 minutes) and comes back if it costs the game 8% of its
+  frame rate or less. It also drops straight to the game's own rate when frames queue above it.
+* Sight reticles: the full-screen passes run only near a sight's window.
+
+### Warp
+
+* **Forward-splat warp** (new default): every point of the game's frame is placed where the camera now sees
+  it, the nearest one winning; what nothing reaches is filled from the scenery behind, continued up to the
+  edge of what is in front. Near objects keep their shape and are no longer doubled when strafing.
+* **Background memory** also keeps what is behind things that pass in front of the camera (a person walking
+  by, a pole), and fills the gaps the warp uncovers with it.
+
+### XPAR frame generation (still not recommended)
+
+* Reworked: whole images between the game's frames, fed through the same path as a game's own frame
+  generation (renamed from *Move objects at the display rate*). Still experimental and off by default - not
+  recommended yet; the game's own DLSS or FSR 3.1 frame generation remains the way to go where it exists.
+
+### Fixes
+
+* Resident Evil 4 Remake: the depth buffer is found right away (it took about a minute).
+* Cyberpunk 2077 no longer hangs while loading with HUD learning on.
+* Upscaler data is matched to the right frame in games that render ahead or send no Reflex markers.
+
+### Games
+
+* Newly tested: **Elden Ring**, **Dark Souls Remastered**, **Hi-Fi Rush** and **Resident Evil 4 Remake**, all
+  without DLSS or FSR (see the README).
+
+### Diagnostics
+
+* UI probe (Ctrl+Shift+D with *Record detailed diagnostics*): how a game composes its HUD.
+* `logs\share.csv` with *Record detailed diagnostics*: what the character/weapon share learns near the camera.
+* presenter.log: where the HUD comes from, how the HUD layer check went, the frame cap's tries
+  (ReShade.log).
+
+As with every update, the settings remembered per game go back to the defaults (*Record detailed
+diagnostics* stays).
+
 ## 1.9.1
 
 Red dot and holographic sight reticles stay on the gun, and third-person orbit cameras keep the ground right.
