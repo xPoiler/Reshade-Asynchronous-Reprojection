@@ -612,6 +612,11 @@ void render_thread() {
     // it (Renderer::show_intake): until then the warp keeps the previous one, textures and camera together.
     struct Incoming { IngestedSource s; Camera cam{}; CameraBasis basis{}; bool masked = false; } incoming;
     std::uint32_t last_reset = sh.settings.reset_calibration;
+    // The camera model trusted (Settings::wait_for_model): both axes explain at least kMinFitQuality of the camera's
+    // motion - until then the game's own frames, unwarped, while it learns (an unlearned model turned the view wildly);
+    // then for the session (a dip - a menu with a cursor - does not switch it back), until the model is reset.
+    bool model_ready = false;
+    double wait_start = 0;  // (when the wait began: at most 5 s - see below)
     double stat_start = now_seconds(), last_source_present = 0, last_profile_save = stat_start;
     std::uint32_t stat_frames = 0, stat_sources = 0;
     double source_interval = 0;
@@ -647,7 +652,7 @@ void render_thread() {
     double last_mv_log = 0, last_usage_log = 0;
     bool game_has_hud_layers = false, mask_logged = false, source_masked = false, hudless_hud_logged = false, reticles_logged = false;
     bool layer_hud_logged = false;
-    std::uint32_t hud_source_counts[7] = {}, hud_source_frames = 0, hud_with_ui = 0, hud_with_hudless = 0;
+    std::uint32_t hud_source_counts[8] = {}, hud_source_frames = 0, hud_with_ui = 0, hud_with_hudless = 0;
     CameraEstimator estimator;
     // Whether the estimated camera can be learned from: the frame itself was explained, and so were most of the last 60.
     std::deque<bool> estimate_rejects;
@@ -969,10 +974,23 @@ void render_thread() {
                 renderer.analyze_motion(s, cam.clip_to_prev_clip, float(mv_scale.scale(0, s.depth_rect.w)),
                                         float(mv_scale.scale(1, s.depth_rect.h)), mv_scale.valid, cam.depth_inverted != 0,
                                         settings.near_camera_rule != 0, settings.turn_rule != 0, m.frame_id, floor_pivot_depth);
+                renderer.score_hud_probe(s, cam.clip_to_prev_clip);  // (HUD learning: see hud_learn.hpp)
+                sh.presenter.hud_learn_pick = renderer.hud_learn_pick();
+                sh.presenter.hud_learn_fail = renderer.hud_learn_fail();
                 // Whole characters held (option): before the mask and the moving objects, which both read the analysis.
                 {
-                    static bool was_holding = false;
-                    const bool holding = settings.hold_characters != 0 && attached_mask && mv_scale.valid;
+                    static bool was_holding = false, was_sharing = false;
+                    // (or by the share of the turn each spot follows, Settings::follow_share: against the camera's whole motion
+                    // when the warp turns around an orbit, as it does then)
+                    const bool sharing = settings.follow_share != 0 && attached_mask;
+                    if (sharing) {
+                        if (!was_sharing) renderer.reset_share();
+                        const bool orbit_warp = settings.orbit_mode == 2 ||
+                                                (settings.orbit_mode == 0 && source_was_estimated && !source_motion_estimated && g_app.model.orbit() > 0);
+                        renderer.follow_share(s, cam.clip_to_prev_clip, mv_scale.valid, cam.depth_inverted != 0, orbit_warp);
+                    }
+                    was_sharing = sharing;
+                    const bool holding = !sharing && settings.hold_characters != 0 && attached_mask && mv_scale.valid;
                     if (holding) {
                         if (!was_holding) renderer.reset_still();
                         renderer.hold_characters(s, cam.clip_to_prev_clip, cam.view_to_clip, mv_scale.valid, cam.depth_inverted != 0);
@@ -1002,7 +1020,7 @@ void render_thread() {
                                                 cam.depth_inverted != 0, settings.hud_from_scene == 2,
                                                 settings.hud_fill != 0 && (settings.warp_engine == 1 || !latewarp.ready()),
                                                 settings.warp_engine == 1 || !latewarp.ready() ? static_cast<int>(settings.stretch_width) : 0,
-                                                settings.hold_reticles != 0);
+                                                settings.hold_reticles != 0, settings.follow_share != 0);
                     // Background memory (option, XPAR engine): the scenery last seen behind held pixels and just
                     // beyond the frame, for what the warp uncovers there.
                     if (settings.background_memory && (settings.warp_engine == 1 || !latewarp.ready())) {
@@ -1059,13 +1077,14 @@ void render_thread() {
                     }
                     // (for the panel: where the HUD comes from - a checked layer the game hides counts as its HUD layer)
                     const bool own_layer = (s.has_ui && !s.has_hudless && trust != 2) || (!s.has_ui && !s.has_hudless && trust == 1);
-                    sh.presenter.hud_source = !hud_mask ? (game_has_hud_layers ? 1u : 0u) : s.has_hudless && !s.has_ui ? 2u : own_layer ? 3u
+                    sh.presenter.hud_source = !hud_mask ? (game_has_hud_layers ? 1u : 0u) : s.has_hudless && !s.has_ui ? 2u
+                                              : own_layer ? (s.hud_learned ? 7u : 3u)
                                               : settings.hud_from_scene && s.has_scene ? (settings.hud_from_scene == 2 ? 5u : 4u) : 6u;
                     // (every 600 frames: how many had the game's own HUD layer, how many fell back to detecting it)
-                    ++hud_source_counts[std::min<std::uint32_t>(sh.presenter.hud_source, 6)];
+                    ++hud_source_counts[std::min<std::uint32_t>(sh.presenter.hud_source, 7)];
                     if (++hud_source_frames >= 600) {
-                        logf("HUD source over %u frames: game's HUD layers %u, HUD-less picture %u, game's own HUD layer %u, detected %u (frames with a UI layer %u, with a HUD-less picture %u)",
-                             hud_source_frames, hud_source_counts[1], hud_source_counts[2], hud_source_counts[3],
+                        logf("HUD source over %u frames: game's HUD layers %u, HUD-less picture %u, game's own HUD layer %u, learned HUD point %u, detected %u (frames with a UI layer %u, with a HUD-less picture %u)",
+                             hud_source_frames, hud_source_counts[1], hud_source_counts[2], hud_source_counts[3], hud_source_counts[7],
                              hud_source_counts[4] + hud_source_counts[5] + hud_source_counts[6], hud_with_ui, hud_with_hudless);
                         hud_source_frames = hud_with_ui = hud_with_hudless = 0;
                         for (auto& n : hud_source_counts) n = 0;
@@ -1298,6 +1317,8 @@ void render_thread() {
         g_app.model.set_mouse_gate(!cursor_visible);
         if (settings.reset_calibration != last_reset) {
             last_reset = settings.reset_calibration;
+            model_ready = false;
+            wait_start = 0;
             g_app.model.reset_fit();
             std::error_code ec; std::filesystem::remove(g_app.profile_path, ec);
             logf("calibration reset");
@@ -1392,7 +1413,28 @@ void render_thread() {
         Prediction applied{};
         // FrameWarp's own warp engine when chosen, or when Latewarp is not available.
         const bool own_engine = settings.warp_engine == 1 || !latewarp.ready();
-        if (source.valid && settings.enabled && !settings.show_original && !sh.overlay_open && source.has_depth) {
+        // (the camera model alone: an estimated camera's field of view is not waited for - in Elden Ring its measurement
+        // almost never passes, and the wait never ended; it keeps learning while warping, as before)
+        if (!model_ready && g_app.model.params(0).quality >= kMinFitQuality && g_app.model.params(1).quality >= kMinFitQuality) {
+            model_ready = true;
+            logf("camera model trusted (yaw quality %.2f, pitch %.2f): warping", g_app.model.params(0).quality, g_app.model.params(1).quality);
+        }
+        // (the wait lasts 5 s at most from the game's first frames - then warped whatever the model, as long as an estimated
+        // camera explains at least a fifth of the last frames: one that fails four in five would turn the view wildly)
+        if (!model_ready && source.valid) {
+            if (wait_start == 0) wait_start = now;
+            int rejected = 0;
+            for (const bool r : estimate_rejects) rejected += r;
+            const bool estimate_ok = !source_was_estimated ||
+                                     (estimate_rejects.size() >= 10 && double(rejected) <= 0.8 * double(estimate_rejects.size()));
+            if (now - wait_start >= 5.0 && estimate_ok) {
+                model_ready = true;
+                logf("camera model wait over after 5 s (yaw quality %.2f, pitch %.2f): warping", g_app.model.params(0).quality, g_app.model.params(1).quality);
+            }
+        }
+        const bool waiting = settings.wait_for_model && !model_ready;
+        sh.presenter.waiting_for_model = waiting ? 1u : 0u;
+        if (source.valid && settings.enabled && !settings.show_original && !waiting && !sh.overlay_open && source.has_depth) {
             // (paced: the camera as of the planned wake-up, a fixed time before the refresh it is meant for - not
             // the moment the loop got there, which varies by a fraction of a millisecond and would jitter the motion)
             const double t_camera = frame_tick && seconds(frame_tick) <= now ? seconds(frame_tick) : now;
@@ -1817,6 +1859,7 @@ void render_thread() {
                     // (what the presenter's video memory holds, once a minute)
                     static int memory_reports = 0;
                     if (memory_reports++ % 6 == 0) logf("presenter memory: %s", renderer.memory_report().c_str());
+                    if (const std::string learn = renderer.hud_learn_report(); !learn.empty()) logf("HUD learning: %s", learn.c_str());
                 }
             }
             {
@@ -1882,6 +1925,9 @@ void render_thread() {
                     {
                         const auto& hk = sh.hooks;
                         if (sh.settings.frame_cap && hk.cap_reflex) logf("prevent GPU queueing: standing aside, the game's NVIDIA Reflex is on");
+                        else if (sh.settings.frame_cap && hk.cap_gpu_bound)
+                            logf("prevent GPU queueing: standing aside, the GPU is the limit (frames queued even when held) | game %.1f fps | GPU done %.1f ms after the game's present | queued %.0f%%",
+                                 hk.cap_game_fps, hk.cap_present_to_done_ms, hk.cap_queued_pct);
                         else if (hk.cap_active)
                             logf("prevent GPU queueing: game held to %.1f fps (now %.1f fps) | GPU done %.1f ms after the game's present, %.1f ms after its frame start | held %.1f ms per frame | queued %.0f%%",
                                  hk.cap_fps, hk.cap_game_fps, hk.cap_present_to_done_ms, hk.cap_start_to_done_ms, hk.cap_wait_ms, hk.cap_queued_pct);

@@ -12,6 +12,7 @@
 #include <thread>
 
 namespace fw {
+static DXGI_FORMAT typed_format(DXGI_FORMAT f);
 thread_local bool tl_tagging = false;
 thread_local std::uint64_t tl_tag_list = 0;
 using Microsoft::WRL::ComPtr;
@@ -47,6 +48,9 @@ void default_settings(Settings& s) {
     s.game_hud_layers = 1;  // the HUD from the game's own HUD layer / final picture where found
     s.warp_splat = 1;  // the XPAR warp by forward splat
     s.hold_characters = 1;  // whole characters held
+    s.hud_learn = 1;  // learn where the game draws its HUD
+    s.wait_for_model = 1;  // the game's own frames until the camera model is learned
+    s.follow_share = 1;  // the character/weapon by the share of the turn it follows
     s.edge_limit_pct = 0.0f;  // camera as of now: no more of the edge uncovered than Auto's
     s.edge_fill = 1;  // soft edge (blur along the edge); extended edge pixels are the option
     s.no_warp_mask = 1;   // HUD detection in games without HUD layers
@@ -141,6 +145,7 @@ int Producer::slot_for_frame(std::uint64_t frame, bool create) {
         m.camera.valid = 0;
         for (auto& t : m.tex) t.valid = 0;
         m.generated = m.per_frame = m.gen_last = 0;
+        m.hud_candidate = 0; m.hud_learned = 0;
         return true;
     };
     for (int i = 0; i < kSlots; ++i) if (shared_->slots[i].state == kFree && claim(i, kFree)) return i;
@@ -494,6 +499,183 @@ void Producer::on_hudless_copy(ID3D12Resource* source, D3D12_RESOURCE_STATES sta
     ++shared_->hooks.hudless_copies;
 }
 
+// HUD learning, Direct3D 12: the copy at the candidate point (see hud_learn.hpp).
+void Producer::on_hud_probe(ID3D12Resource* picture, D3D12_RESOURCE_STATES state, ID3D12GraphicsCommandList* list, std::uint32_t candidate,
+                            bool end, bool use) {
+    std::lock_guard lock(mutex_);
+    if (!ready() || !picture || !list || !device_ || !candidate) return;
+    const bool needs_end = (state & 0x80000000u) != 0;  // (see hud_learn.hpp)
+    state = static_cast<D3D12_RESOURCE_STATES>(state & ~0x80000000u);
+    const auto desc = picture->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1) return;
+    const DXGI_FORMAT format = copy_format(desc.Format);
+    auto& target = end ? probe_end_ : probe_pending_;
+    if (!target || target->GetDesc().Width != desc.Width || target->GetDesc().Height != desc.Height || target->GetDesc().Format != format) {
+        if (target) retired_.push_back({target, nullptr, fence_value_ + 1, {}, nullptr});
+        target.Reset();
+        (end ? probe_end_age_ : probe_age_) = 2;
+        collect_retired();
+        D3D12_RESOURCE_DESC d{};
+        d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        d.Width = desc.Width; d.Height = desc.Height; d.DepthOrArraySize = 1; d.MipLevels = 1;
+        d.Format = format; d.SampleDesc.Count = 1; d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&target)))) return;
+    }
+    copy_into(list, picture, state, target.Get());
+    if (end) { probe_end_age_ = 0; return; }
+    probe_age_ = 0;
+    probe_candidate_ = candidate;
+    probe_use_ = use;
+    probe_needs_end_ = needs_end;
+    ++shared_->hooks.learn_probes;
+}
+// ...at the present: where the frame's final picture (its back buffer copy) differs from it, into the probe slot.
+static const char kProbeShader[] = R"(
+Texture2D<float4> before_t : register(t0);
+Texture2D<float4> now_t : register(t1);
+RWTexture2D<unorm float> cover : register(u0);
+[numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
+    uint w, h;
+    cover.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    const float3 a = now_t.Load(int3(id.xy, 0)).rgb, b = before_t.Load(int3(id.xy, 0)).rgb;
+    cover[id.xy] = any(abs(a - b) > 0.004 + 0.03 * max(abs(a), abs(b))) ? 1.0 : 0.0;
+}
+)";
+constexpr UINT kProbeRing = 8;
+bool Producer::ensure_probe_pass() {
+    if (probe_pso_) return true;
+    if (probe_failed_ || !device_) return false;
+    probe_failed_ = true;
+    ComPtr<ID3DBlob> code, errors, blob;
+    if (FAILED(D3DCompile(kProbeShader, sizeof(kProbeShader) - 1, "hud_probe", nullptr, nullptr, "main", "cs_5_0", 0, 0, &code, &errors))) return false;
+    D3D12_DESCRIPTOR_RANGE ranges[2]{};
+    ranges[0] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0};
+    ranges[1] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 2};
+    D3D12_ROOT_PARAMETER param{};
+    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    param.DescriptorTable = {2, ranges};
+    param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rd{1, &param, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors)) ||
+        FAILED(device_->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&probe_root_))))
+        return false;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = probe_root_.Get();
+    pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3 * kProbeRing, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    if (FAILED(device_->CreateComputePipelineState(&pd, IID_PPV_ARGS(&probe_pso_))) || FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&probe_heap_)))) {
+        probe_pso_.Reset();
+        return false;
+    }
+    probe_failed_ = false;
+    return true;
+}
+void Producer::d3d12_probe(ID3D12GraphicsCommandList* list, int slot) {
+    if (!probe_pending_ || probe_age_ > 1 || !probe_candidate_) return;
+    probe_age_ = 2;  // (handed over once)
+    auto& bbt = textures_[slot][kBackbuffer];
+    const auto pd = probe_pending_->GetDesc();
+    // (the final picture as the back buffer's draw read it when there is one - a candidate in the final picture - else
+    // the back buffer)
+    const bool end = probe_end_ && probe_end_age_ <= 1 && probe_end_->GetDesc().Width == pd.Width && probe_end_->GetDesc().Height == pd.Height;
+    probe_end_age_ = 2;
+    if (probe_needs_end_ && !end) return;  // (a copy in the final picture without the end copy: not compared with the back buffer)
+    ID3D12Resource* const now = end ? probe_end_.Get() : bbt.resource.Get();
+    const DXGI_FORMAT now_format = end ? probe_end_->GetDesc().Format : bbt.desc.Format;
+    if (!now || (!end && (bbt.desc.Width != pd.Width || bbt.desc.Height != pd.Height)) || !ensure_probe_pass()) return;
+    if (!probe_cov_ || probe_cov_->GetDesc().Width != pd.Width || probe_cov_->GetDesc().Height != pd.Height) {
+        if (probe_cov_) retired_.push_back({probe_cov_, nullptr, fence_value_ + 1, {}, nullptr});
+        probe_cov_.Reset();
+        D3D12_RESOURCE_DESC ad{};
+        ad.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        ad.Width = pd.Width; ad.Height = pd.Height; ad.DepthOrArraySize = 1; ad.MipLevels = 1;
+        ad.Format = DXGI_FORMAT_R8_UNORM; ad.SampleDesc.Count = 1; ad.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &ad, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&probe_cov_)))) return;
+    }
+    if (!ensure_texture(slot, kHudProbe, probe_cov_->GetDesc())) return;
+    const UINT step = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const UINT base = (probe_ring_++ % kProbeRing) * 3;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = probe_heap_->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += SIZE_T(base) * step;
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Texture2D.MipLevels = 1;
+    sv.Format = typed_format(pd.Format);
+    device_->CreateShaderResourceView(probe_pending_.Get(), &sv, cpu);
+    cpu.ptr += step;
+    sv.Format = typed_format(now_format);
+    device_->CreateShaderResourceView(now, &sv, cpu);
+    cpu.ptr += step;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+    uv.Format = DXGI_FORMAT_R8_UNORM;
+    uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    device_->CreateUnorderedAccessView(probe_cov_.Get(), nullptr, &uv, cpu);
+    D3D12_RESOURCE_BARRIER b[3]{};
+    for (auto& x : b) x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b[0].Transition = {probe_pending_.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+    b[1].Transition = {now, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+    b[2].Transition = {probe_cov_.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+    list->ResourceBarrier(3, b);
+    ID3D12DescriptorHeap* heaps[] = {probe_heap_.Get()};
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetComputeRootSignature(probe_root_.Get());
+    list->SetPipelineState(probe_pso_.Get());
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = probe_heap_->GetGPUDescriptorHandleForHeapStart();
+    gpu.ptr += UINT64(base) * step;
+    list->SetComputeRootDescriptorTable(0, gpu);
+    list->Dispatch(UINT((pd.Width + 7) / 8), (pd.Height + 7) / 8, 1);
+    for (auto& x : b) std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+    list->ResourceBarrier(3, b);
+    auto& t = textures_[slot][kHudProbe];
+    copy_into(list, probe_cov_.Get(), D3D12_RESOURCE_STATE_COMMON, t.resource.Get());
+    auto& m = shared_->slots[slot];
+    auto& info = m.tex[kHudProbe];
+    info.width = static_cast<std::uint32_t>(t.desc.Width); info.height = t.desc.Height; info.format = t.desc.Format;
+    info.generation = t.generation; info.ext_x = info.ext_y = 0; info.ext_w = info.width; info.ext_h = info.height;
+    info.valid = 1;
+    m.hud_candidate = probe_candidate_;
+    probe_used_ = probe_use_;
+}
+// The learned point (see hud_learn.hpp): its comparison this frame as the frame's HUD - or, if it did not draw, an empty
+// one - where nothing else gave the HUD (the game's HUD layers / HUD-less picture, ui_layer's patterns come first).
+void Producer::d3d12_learned(ID3D12GraphicsCommandList* list, int slot) {
+    auto& m = shared_->slots[slot];
+    const bool used = probe_used_, none = probe_none_ && !probe_used_;
+    probe_used_ = probe_none_ = false;
+    if ((!used && !none) || m.tex[kUi].valid || m.tex[kHudless].valid) return;
+    const auto& bb = m.tex[kBackbuffer];
+    if (!bb.valid) return;
+    ID3D12Resource* source = nullptr;
+    if (used && probe_cov_ && probe_cov_->GetDesc().Width == bb.width && probe_cov_->GetDesc().Height == bb.height) {
+        source = probe_cov_.Get();
+    } else if (none) {
+        if (!probe_zero_ || probe_zero_->GetDesc().Width != bb.width || probe_zero_->GetDesc().Height != bb.height) {
+            if (probe_zero_) retired_.push_back({probe_zero_, nullptr, fence_value_ + 1, {}, nullptr});
+            probe_zero_.Reset();
+            D3D12_RESOURCE_DESC zd{};
+            zd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            zd.Width = bb.width; zd.Height = bb.height; zd.DepthOrArraySize = 1; zd.MipLevels = 1;
+            zd.Format = DXGI_FORMAT_R8_UNORM; zd.SampleDesc.Count = 1;
+            D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;  // (created zeroed)
+            if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &zd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&probe_zero_)))) return;
+        }
+        source = probe_zero_.Get();
+    }
+    if (!source || !ensure_texture(slot, kUi, source->GetDesc())) return;
+    auto& t = textures_[slot][kUi];
+    copy_into(list, source, D3D12_RESOURCE_STATE_COMMON, t.resource.Get());
+    auto& info = m.tex[kUi];
+    info.width = static_cast<std::uint32_t>(t.desc.Width); info.height = t.desc.Height; info.format = t.desc.Format;
+    info.generation = t.generation; info.ext_x = info.ext_y = 0; info.ext_w = info.width; info.ext_h = info.height;
+    info.valid = 1;
+    m.hud_learned = used ? 1 : 2;
+    ++shared_->hooks.learn_used;
+}
+
 bool Producer::ensure_own(Texture& t, const D3D12_RESOURCE_DESC& source) {
     const DXGI_FORMAT format = copy_format(source.Format);
     if (t.resource && t.desc.Width == source.Width && t.desc.Height == source.Height && t.desc.Format == format && (!vk_ || t.vk.image)) return true;
@@ -601,6 +783,149 @@ static DXGI_FORMAT d11_srv_format(DXGI_FORMAT f) {
         default: return f;
     }
 }
+bool Producer::ensure_d11_cover_cs(ID3D11Device* device) {
+    if (!d11_cover_cs_ && !d11_cs_failed_ && device) {
+        ComPtr<ID3DBlob> code, errors;
+        d11_cs_failed_ = true;
+        if (SUCCEEDED(D3DCompile(kD11CoverShader, sizeof(kD11CoverShader) - 1, "hud_cover", nullptr, nullptr, "main", "cs_5_0", 0, 0, &code, &errors)) &&
+            SUCCEEDED(device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &d11_cover_cs_)))
+            d11_cs_failed_ = false;
+        else set_message("HUD (Direct3D 11): shader failed");
+    }
+    return d11_cover_cs_ != nullptr;
+}
+
+// HUD learning, Direct3D 11: the copy at the candidate point (see hud_learn.hpp).
+void Producer::on_hud_probe_d3d11(ID3D11Resource* picture, ID3D11DeviceContext* context, std::uint32_t candidate, bool use) {
+    std::lock_guard lock(mutex_);
+    if (!ready() || !d11_ || !picture || !context || !candidate) return;
+    ComPtr<ID3D11Texture2D> texture;
+    D3D11_TEXTURE2D_DESC pd{};
+    if (FAILED(picture->QueryInterface(IID_PPV_ARGS(&texture)))) return;
+    texture->GetDesc(&pd);
+    if (pd.SampleDesc.Count != 1) return;
+    D3D11_TEXTURE2D_DESC bd{};
+    if (d11_probe_before_) d11_probe_before_->GetDesc(&bd);
+    if (!d11_probe_before_ || bd.Width != pd.Width || bd.Height != pd.Height || bd.Format != pd.Format) {
+        ComPtr<ID3D11Device> device;
+        context->GetDevice(&device);
+        D3D11_TEXTURE2D_DESC d = pd;
+        d.MipLevels = 1; d.ArraySize = 1; d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE; d.CPUAccessFlags = 0; d.MiscFlags = 0;
+        d11_probe_before_.Reset();
+        if (!device || FAILED(device->CreateTexture2D(&d, nullptr, &d11_probe_before_))) return;
+    }
+    if (pd.MipLevels == 1 && pd.ArraySize == 1) context->CopyResource(d11_probe_before_.Get(), picture);
+    else context->CopySubresourceRegion(d11_probe_before_.Get(), 0, 0, 0, 0, picture, 0, nullptr);
+    d11_probe_picture_ = picture;
+    d11_probe_taken_ = true;
+    d11_probe_use_ = use;
+    probe_candidate_ = candidate;
+    ++shared_->hooks.learn_probes;
+}
+// ...at the present: where the picture now differs from that copy, into the frame's probe slot.
+void Producer::d3d11_probe(ID3D11DeviceContext* context, int slot) {
+    if (!d11_probe_taken_) return;
+    d11_probe_taken_ = false;
+    ComPtr<ID3D11Resource> picture = std::move(d11_probe_picture_);
+    ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    if (!picture || !d11_probe_before_ || !device || !ensure_d11_cover_cs(device.Get())) return;
+    D3D11_TEXTURE2D_DESC bd{};
+    d11_probe_before_->GetDesc(&bd);
+    D3D11_TEXTURE2D_DESC cd{};
+    if (d11_probe_cov_) d11_probe_cov_->GetDesc(&cd);
+    if (!d11_probe_cov_ || cd.Width != bd.Width || cd.Height != bd.Height) {
+        D3D11_TEXTURE2D_DESC d{};
+        d.Width = bd.Width; d.Height = bd.Height; d.MipLevels = 1; d.ArraySize = 1; d.Format = DXGI_FORMAT_R8_UNORM;
+        d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+        d11_probe_cov_.Reset();
+        if (FAILED(device->CreateTexture2D(&d, nullptr, &d11_probe_cov_))) return;
+    }
+    ComPtr<ID3D11ShaderResourceView> now_view, before_view;
+    ComPtr<ID3D11UnorderedAccessView> cover_view;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = d11_srv_format(bd.Format); sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels = 1;
+    if (FAILED(device->CreateShaderResourceView(picture.Get(), &sv, &now_view)) ||
+        FAILED(device->CreateShaderResourceView(d11_probe_before_.Get(), &sv, &before_view)) ||
+        FAILED(device->CreateUnorderedAccessView(d11_probe_cov_.Get(), nullptr, &cover_view)))
+        return;
+    ComPtr<ID3D11ComputeShader> old_cs;
+    ID3D11ClassInstance* raw_instances[256] = {};
+    UINT instance_count = 256;
+    context->CSGetShader(&old_cs, raw_instances, &instance_count);
+    ID3D11ShaderResourceView* old_srv[2] = {};
+    ID3D11UnorderedAccessView* old_uav[1] = {};
+    context->CSGetShaderResources(0, 2, old_srv);
+    context->CSGetUnorderedAccessViews(0, 1, old_uav);
+    ID3D11ShaderResourceView* srvs[2] = {now_view.Get(), before_view.Get()};
+    ID3D11UnorderedAccessView* uavs[1] = {cover_view.Get()};
+    context->CSSetShader(d11_cover_cs_.Get(), nullptr, 0);
+    context->CSSetShaderResources(0, 2, srvs);
+    context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+    context->Dispatch((bd.Width + 7) / 8, (bd.Height + 7) / 8, 1);
+    ID3D11ShaderResourceView* none_srv[2] = {};
+    context->CSSetShaderResources(0, 2, none_srv);
+    context->CSSetShader(old_cs.Get(), raw_instances, instance_count);
+    context->CSSetShaderResources(0, 2, old_srv);
+    context->CSSetUnorderedAccessViews(0, 1, old_uav, nullptr);
+    for (UINT i = 0; i < instance_count; ++i) if (raw_instances[i]) raw_instances[i]->Release();
+    for (auto* v : old_srv) if (v) v->Release();
+    for (auto* v : old_uav) if (v) v->Release();
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = bd.Width; desc.Height = bd.Height; desc.Format = DXGI_FORMAT_R8_UNORM;
+    if (!ensure_texture(slot, kHudProbe, desc)) return;
+    auto& t = textures_[slot][kHudProbe];
+    context->CopyResource(t.d11.Get(), d11_probe_cov_.Get());
+    auto& m = shared_->slots[slot];
+    auto& info = m.tex[kHudProbe];
+    info.width = bd.Width; info.height = bd.Height; info.format = t.desc.Format;
+    info.generation = t.generation; info.ext_x = info.ext_y = 0; info.ext_w = bd.Width; info.ext_h = bd.Height;
+    info.valid = 1;
+    m.hud_candidate = probe_candidate_;
+    d11_probe_used_ = d11_probe_use_;
+}
+// Direct3D 11: as d3d12_learned.
+void Producer::d3d11_learned(ID3D11DeviceContext* context, int slot) {
+    auto& m = shared_->slots[slot];
+    const bool used = d11_probe_used_, none = probe_none_ && !d11_probe_used_;
+    d11_probe_used_ = probe_none_ = false;
+    if ((!used && !none) || m.tex[kUi].valid || m.tex[kHudless].valid) return;
+    const auto& bb = m.tex[kBackbuffer];
+    if (!bb.valid) return;
+    ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    if (!device) return;
+    D3D11_TEXTURE2D_DESC cd{};
+    if (d11_probe_cov_) d11_probe_cov_->GetDesc(&cd);
+    if (!d11_probe_cov_ || cd.Width != bb.width || cd.Height != bb.height) {
+        if (used) return;
+        D3D11_TEXTURE2D_DESC d{};
+        d.Width = bb.width; d.Height = bb.height; d.MipLevels = 1; d.ArraySize = 1; d.Format = DXGI_FORMAT_R8_UNORM;
+        d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+        d11_probe_cov_.Reset();
+        if (FAILED(device->CreateTexture2D(&d, nullptr, &d11_probe_cov_))) return;
+    }
+    if (none) {  // (the comparison's texture is free this frame: cleared)
+        ComPtr<ID3D11UnorderedAccessView> view;
+        if (FAILED(device->CreateUnorderedAccessView(d11_probe_cov_.Get(), nullptr, &view))) return;
+        const float zero[4] = {};
+        context->ClearUnorderedAccessViewFloat(view.Get(), zero);
+    }
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = bb.width; desc.Height = bb.height; desc.Format = DXGI_FORMAT_R8_UNORM;
+    if (!ensure_texture(slot, kUi, desc)) return;
+    auto& t = textures_[slot][kUi];
+    context->CopyResource(t.d11.Get(), d11_probe_cov_.Get());
+    auto& info = m.tex[kUi];
+    info.width = bb.width; info.height = bb.height; info.format = t.desc.Format;
+    info.generation = t.generation; info.ext_x = info.ext_y = 0; info.ext_w = bb.width; info.ext_h = bb.height;
+    info.valid = 1;
+    m.hud_learned = used ? 1 : 2;
+    ++shared_->hooks.learn_used;
+}
+
 void Producer::d3d11_cover(ID3D11DeviceContext* context, int slot) {
     // (under the lock; the game's compute stage is restored after)
     const bool none = d11_none_ && !d11_before_taken_;
@@ -646,15 +971,7 @@ void Producer::d3d11_cover(ID3D11DeviceContext* context, int slot) {
         ++shared_->hooks.ui_layer_handed;
         return;
     }
-    if (!d11_cover_cs_ && !d11_cs_failed_) {
-        ComPtr<ID3DBlob> code, errors;
-        d11_cs_failed_ = true;
-        if (SUCCEEDED(D3DCompile(kD11CoverShader, sizeof(kD11CoverShader) - 1, "hud_cover", nullptr, nullptr, "main", "cs_5_0", 0, 0, &code, &errors)) &&
-            SUCCEEDED(device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &d11_cover_cs_)))
-            d11_cs_failed_ = false;
-        else set_message("HUD (Direct3D 11): shader failed");
-    }
-    if (!d11_cover_cs_) return;
+    if (!ensure_d11_cover_cs(device.Get())) return;
     D3D11_TEXTURE2D_DESC bd{};
     d11_before_->GetDesc(&bd);
     D3D11_TEXTURE2D_DESC cd{};
@@ -791,10 +1108,20 @@ std::uint64_t Producer::begin_present(ID3D12Resource* backbuffer, ID3D12Graphics
         info.width = static_cast<std::uint32_t>(t.desc.Width); info.height = t.desc.Height; info.format = t.desc.Format;
         info.generation = t.generation; info.ext_x = info.ext_y = 0; info.ext_w = info.width; info.ext_h = info.height;
         info.valid = 1;
+        d3d12_probe(list, slot);  // (HUD learning: the copy at this frame's candidate point, against this picture)
     }
+    if (probe_age_ < 2) ++probe_age_;
+    if (probe_end_age_ < 2) ++probe_end_age_;
+    // A HUD layer and a HUD-less copy both taken this frame: the layer, unless it comes and goes - there on under 95% of the
+    // frames lately, while the HUD-less copy is there - and the presenter has not checked it is the HUD (that needs the
+    // upscaler's output). Hi-Fi Rush draws its HUD onto the back buffer (the copy before it gives all of it), and in some
+    // places also blends a layer without its HUD (on 6-70% of the frames): the HUD warped on those, juddering on fast turns.
+    const bool hudless_now = hudless_pending_ && hudless_age_ <= 1;
+    if (ui_pending_valid_ || hudless_now) ui_layer_share_ += ((ui_pending_valid_ ? 1.0 : 0.0) - ui_layer_share_) / 300.0;
+    const bool layer_not_kept = ui_pending_valid_ && hudless_now && shared_->presenter.layer_trust != 1 && ui_layer_share_ < 0.95;
     // (the HUD layer taken this frame, see on_ui_layer: its coverage into the frame's UI slot - on this list, ReShade's,
     // submitted right after: the descriptor heap bound here disturbs nothing of the game's)
-    if (ui_pending_valid_ && !m.tex[kUi].valid && ensure_ui_pass()) {
+    if (ui_pending_valid_ && !layer_not_kept && !m.tex[kUi].valid && ensure_ui_pass()) {
         const auto pd = ui_pending_->GetDesc();
         if (!ui_alpha_ || ui_alpha_->GetDesc().Width != pd.Width || ui_alpha_->GetDesc().Height != pd.Height) {
             if (ui_alpha_) retired_.push_back({ui_alpha_, nullptr, fence_value_ + 1, {}, nullptr});
@@ -861,6 +1188,7 @@ std::uint64_t Producer::begin_present(ID3D12Resource* backbuffer, ID3D12Graphics
         ++shared_->hooks.hudless_handed;
     }
     if (hudless_age_ < 2) ++hudless_age_;
+    d3d12_learned(list, slot);  // (HUD learning: the learned point, where nothing else gave the HUD)
     // Frames in a row the game handed its HUD over (a HUD-less picture, a UI layer it tags, or the HUD layer the add-on takes
     // once the presenter has checked it - until then the check needs the upscaler's output; and then a frame without it is
     // one where the game hides its HUD): past 60 the upscaler's output is no longer copied (on_tag); at 300 its slot
@@ -1290,6 +1618,8 @@ std::uint64_t Producer::begin_present_d3d11(ID3D11Resource* backbuffer, ID3D11De
         info.valid = 1;
     }
     d3d11_cover(context, slot);  // (third pattern: the HUD, if a copy before it was taken this frame)
+    d3d11_probe(context, slot);  // (HUD learning: the copy at this frame's candidate point)
+    d3d11_learned(context, slot);  // (...the learned point, where nothing else gave the HUD)
     m.qpc_present = qpc_now();
     return m.frame_id + 1;  // 0 means "nothing to finish"
 }

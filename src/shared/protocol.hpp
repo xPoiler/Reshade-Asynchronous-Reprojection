@@ -10,17 +10,19 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 60;
+constexpr std::uint32_t kVersion = 65;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
 // kScene: the upscaler's output (games without Streamline): the scene before post-processing and HUD.
 // kGen0..2: the game's frame generation (DLSS / FSR), the images it generated between the previous frame
 // and this one, in order (SlotMeta::generated).
-enum Tex : int { kBackbuffer = 0, kHudless, kUi, kDepth, kMotion, kScene, kGen0, kGen1, kGen2, kTexCount };
+// kHudProbe: HUD learning (hud_learn.hpp) - where the final picture differs from a copy of it taken at one candidate point
+// of the frame (R8, 1 differs), for scoring only (SlotMeta::hud_candidate).
+enum Tex : int { kBackbuffer = 0, kHudless, kUi, kDepth, kMotion, kScene, kGen0, kGen1, kGen2, kHudProbe, kTexCount };
 constexpr int kMaxGenerated = 3;
 inline const char* tex_name(int t) {
-    static const char* n[] = {"backbuffer", "hudless", "ui", "depth", "motion", "scene", "gen0", "gen1", "gen2"};
+    static const char* n[] = {"backbuffer", "hudless", "ui", "depth", "motion", "scene", "gen0", "gen1", "gen2", "hudprobe"};
     return t >= 0 && t < kTexCount ? n[t] : "?";
 }
 
@@ -66,6 +68,8 @@ struct SlotMeta {
     // image number seen so far (all seen: gen_last == per_frame). 0: none (no frame generation).
     std::uint32_t generated, per_frame, gen_last;
     std::uint32_t gen_index[kMaxGenerated];
+    std::uint32_t hud_candidate;  // HUD learning: the candidate kHudProbe was taken at (the fingerprint of the drawing that follows it)
+    std::uint32_t hud_learned;    // ...kUi is the learned point's coverage (1), or empty: that point did not draw this frame (2)
 };
 
 // Settings are written by the add-on UI and read by the presenter.
@@ -123,6 +127,12 @@ struct Settings {
                                        // winning) instead of the search from each displayed pixel alone (saved per game)
     std::uint32_t hold_characters;     // default on: what stays in place on screen over several frames while the camera moves is
                                        // held, and the character's limbs with it (Renderer::hold_characters; saved per game)
+    std::uint32_t hud_learn;           // default on: learn where the game draws its HUD (hud_learn.hpp) and take the HUD from there
+    std::uint32_t hud_relearn;         // incremented by the panel: learn again
+    std::uint32_t wait_for_model;      // default on: the game's own frames until the camera model explains a fifth of the camera's
+                                       // motion on both axes (then warped for the session; saved per game)
+    std::uint32_t follow_share;        // default on: the character/weapon by how much of the camera's turn each spot follows
+                                       // (Renderer::follow_share) instead of held whole (hold_characters, the stretch; saved per game)
 };
 
 // Presenter status, displayed by the add-on UI.
@@ -170,12 +180,17 @@ struct PresenterStatus {
     std::uint32_t orbit_in_use;  // turns are predicted around the measured orbit pivot right now (Orbit pivot: Measured, consistent)
     // Where the HUD of the frames taken in comes from (the panel says it): 0 none (not kept still, or not known yet),
     // 1 the game's HUD layers (HUD-less picture + UI layer), 2 the game's HUD-less picture, 3 the game's own HUD layer
-    // (found by the add-on), 4 the upscaler's output, 5 the upscaler's output + camera motion check, 6 learned.
+    // (found by the add-on), 4 the upscaler's output, 5 the upscaler's output + camera motion check, 6 learned, 7 the HUD point
+    // learned (hud_learn.hpp).
     std::uint32_t hud_source;
     // The game's HUD layer (found by the add-on) checked: 0 not yet, 1 drawn over the finished picture - a HUD (a frame
     // without it shows none; the add-on stops copying the upscaler's output), 2 not a HUD (ignored, the HUD is detected).
     std::uint32_t layer_trust;
     char message[256];
+    // HUD learning: the presenter's pick of the candidates scored so far (0: none yet), and the learned point that stopped
+    // behaving like a HUD (0: none) - the add-on learns again.
+    std::uint32_t hud_learn_pick, hud_learn_fail;
+    std::uint32_t waiting_for_model;  // 1: the game's own frames shown while the camera model learns (Settings::wait_for_model)
 };
 
 struct HookStats {
@@ -198,6 +213,7 @@ struct HookStats {
     // Prevent GPU queueing (frame_cap.hpp), for the presenter's log: 1 capping; the cap and the game's rate
     // (fps); the GPU done after the present / after the frame's start (medians, ms); held back per frame (ms).
     std::uint32_t cap_active, cap_reflex;  // (cap_reflex: the game's Reflex is on, the cap stands aside)
+    std::uint32_t cap_gpu_bound;          // (the cap stands aside: the GPU is the limit, see frame_cap.hpp)
     float cap_fps, cap_game_fps, cap_present_to_done_ms, cap_start_to_done_ms, cap_wait_ms, cap_queued_pct;
     // The game's own HUD layer (ui_layer.hpp), for the panel: the last one found (size, DXGI format; 0: none), how many
     // frames it was taken on and how many of them reached a frame handed over; its coverage pass: 0 not built yet, 1
@@ -205,6 +221,8 @@ struct HookStats {
     std::uint32_t ui_layer_w, ui_layer_h, ui_layer_format, ui_layer_taken, ui_layer_handed, ui_layer_pass;
     // ...and the HUD-less copies of its final picture (second pattern): taken, handed over with a frame.
     std::uint32_t hudless_copies, hudless_handed;
+    std::uint32_t learn_candidates, learn_active, learn_probes;  // HUD learning: candidates known, the one being tried, copies taken
+    std::uint32_t learn_locked, learn_used;  // ...the learned point in use (0: learning), frames it gave the HUD
 };
 
 // Game-side event log (lock-free ring) written by the add-on, dumped to CSV by the presenter.

@@ -148,6 +148,10 @@ struct Cap {
     // The cap: the time between two frame starts (s, 0: not set). Started 5% above the uncapped interval; every
     // 60 frames it backs off 3% when frames wait in the GPU's queue, and otherwise moves faster (see control).
     double interval = 0;
+    // Standing aside: the game is held to the GPU's rate and frames queue anyway - the GPU is the limit, and holding the
+    // game only took frames away (Elden Ring: ~35 fps capped, ~45 uncapped). Windows in a row of each kind (see control).
+    bool aside = false;
+    int bound_windows = 0, free_windows = 0;
     std::int64_t last_release = 0;
     int frames = 0;
     double wait_ms_sum = 0;
@@ -161,6 +165,7 @@ void release_queue() {
     g.queue12.Reset(); g.context11.Reset();
     g.native = nullptr; g.device = nullptr; g.failed = false;
     g.interval = 0; g.last_release = 0; g.frames = 0; g.wait_ms_sum = 0;
+    g.aside = false; g.bound_windows = 0; g.free_windows = 0;
     g.reflex = false; g.reflex_checked = 0; g.reflex_off_since = 0;
     std::lock_guard<std::mutex> lock(g.status_mutex);
     g.status = {};
@@ -247,28 +252,57 @@ void control(bool capping) {
     const double l = median(after_present), frame = median(intervals);
     const double e = after_start.empty() ? 0.0 : median(after_start);
     const double queued_share = pairs ? double(queued) / pairs : 0.0;
-    if (capping) {
+    const double held_ms = g.wait_ms_sum / std::max(g.frames, 1);
+    if (capping && g.aside) {
+        // Back once the GPU has room: three windows in a row without a queue (a lighter scene, a menu).
+        g.free_windows = queued_share < 0.05 ? g.free_windows + 1 : 0;
+        if (g.free_windows >= 3) {
+            g.aside = false;
+            g.free_windows = g.bound_windows = 0;
+            g.interval = frame * 1.05e-3;
+        }
+    } else if (capping) {
+        // GPU-bound: frames keep queueing (over a quarter of them) although the cap holds the game back (a tenth of the cap
+        // or more), three windows out of the last ones without a queue-free one in between - stand aside.
+        if (queued_share > 0.25 && held_ms >= 0.1 * g.interval * 1e3) ++g.bound_windows;
+        else if (queued_share < 0.05) g.bound_windows = 0;
+        if (g.bound_windows >= 3) {
+            g.aside = true;
+            g.bound_windows = g.free_windows = 0;
+            g.interval = 0;
+        }
+    }
+    if (capping && !g.aside) {
         if (g.interval <= 0) {
             g.interval = frame * 1.05e-3;  // (5% under the uncapped rate: the queue it had drains within a second)
-        } else if (queued_share >= 0.05 && g.interval < frame * 1e-3) {
-            // Frames queue while the cap is above the rate the game reaches - it holds nothing back (RE4: cap 110 fps,
-            // game 43-70, 10-20% queued, the GPU 2-3 frames behind, most frames overwritten before the presenter could
-            // take them): 5% under the game's own rate at once, as at the start.
+        } else if (queued_share >= 0.05 && g.interval * 1.2 < frame * 1e-3) {
+            // Frames queue while the cap is far above the rate the game reaches - 20% or more: it holds nothing back (RE4:
+            // cap 110 fps, game 43-70, 10-20% queued, the GPU 2-3 frames behind, most frames overwritten before the
+            // presenter could take them): 5% under the game's own rate at once, as at the start. Not near the game's rate:
+            // a cap catching up that ran a little ahead was knocked down to the rate of the moment again and again
+            // (Elden Ring, GPU-bound: 35-45 fps instead of a steady ~45).
             g.interval = frame * 1.05e-3;
         } else if (queued_share > 0.25) {
             g.interval *= 1.03;  // frames wait in the GPU's queue: slower
         } else if (queued_share < 0.05) {
             // No queue. A frame done well before the next one is due (its start to its GPU work done, under 3/4 of
             // the cap): the GPU idles part of every frame - much faster at once (loading screens leave the cap low).
-            // Otherwise creep 0.5% faster, until a queue forms.
-            g.interval = e > 0 && e < 0.75 * frame ? std::max(g.interval * 0.85, e * 1.1e-3) : g.interval * 0.995;
+            // Held for a tenth of the cap or more with no queue: the cap is what slows the game - 3% faster (Elden Ring:
+            // a stutter's queue took it to 34 fps, held 17.7 ms per frame; its frame start to GPU done spans more than a
+            // frame - a game heavy on the CPU - so the idle-GPU rule never applied, and 0.5% a second took minutes back
+            // to its own 60). Otherwise creep 0.5% faster, until a queue forms.
+            if (e > 0 && e < 0.75 * frame) g.interval = std::max(g.interval * 0.85, e * 1.1e-3);
+            else if (held_ms >= 0.1 * g.interval * 1e3) g.interval *= 0.97;  // (3% a second: no overshoot into a queue)
+            else g.interval *= 0.995;
         }
         g.interval = std::clamp(g.interval, 1.0 / 500.0, 0.05);  // (never below 20 fps)
-    } else {
+    } else if (!capping) {
         g.interval = 0;
+        g.aside = false; g.bound_windows = g.free_windows = 0;
     }
     std::lock_guard<std::mutex> lock(g.status_mutex);
     g.status.active = capping && g.interval > 0;
+    g.status.gpu_bound = capping && g.aside;
     g.status.cap_fps = g.interval > 0 ? float(1.0 / g.interval) : 0.0f;
     g.status.game_fps = frame > 0 ? float(1000.0 / frame) : 0.0f;
     g.status.present_to_done_ms = float(l);
@@ -323,6 +357,14 @@ void frame_cap_after_present(command_queue* queue, bool enabled, bool generation
         g.frames = 0;
         g.wait_ms_sum = 0;
     }
+}
+
+std::uint64_t frame_cap_presents() { return g.next; }
+bool frame_cap_gpu_done(std::uint64_t present) {
+    if (!g.waiter || g.failed) return true;
+    if (g.waiter->fence12) return g.waiter->fence12->GetCompletedValue() >= present;
+    if (g.waiter->fence11) return g.waiter->fence11->GetCompletedValue() >= present;
+    return true;
 }
 
 FrameCapStatus frame_cap_status() {

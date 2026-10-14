@@ -8,6 +8,7 @@
 #include <dcomp.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
+#include <map>
 #include <string>
 #include <functional>
 #include <vector>
@@ -27,6 +28,10 @@ struct IngestedSource {
     // moment gen_index[i] / (per_frame + 1) of the way from the previous frame.
     int generated = 0, per_frame = 0;
     int gen_index[kMaxGenerated] = {};
+    // HUD learning (the add-on's hud_learn): where the final picture differs from a copy taken at a candidate point.
+    bool has_probe = false;
+    std::uint32_t hud_candidate = 0;
+    std::uint32_t hud_learned = 0;  // the UI coverage is the learned point's (1), or empty: it did not draw (2)
 };
 
 // HUD detection frames: learned from, skipped for too few telling pixels, or held back by the
@@ -202,6 +207,15 @@ public:
     void set_rig_check(bool on) { rig_check_ = on; }
     // Forward splat in two passes (cs_own_warp_lean / _rest; default on): off runs the full warp on every pixel (A/B).
     void set_warp_blocks(bool on) { warp_blocks_ = on; }
+    void set_warp_stop(int stage) { warp_stop_ = stage; }
+    // The character/weapon by how much of the camera's turn each spot follows (Settings::follow_share): measured on every
+    // game frame with depth and motion, before the mask (build_no_warp_mask with share). whole_motion: against the camera's
+    // whole motion (the warp turns around an orbit), otherwise its turn alone. reset_share: start over.
+    void follow_share(const IngestedSource& src, const float clip_to_prev_clip[16], bool scale_valid, bool depth_inverted, bool whole_motion);
+    void reset_share() { share_reset_ = true; }
+    std::uint32_t warp_rest_blocks();  // (replay: the blocks the last warp left for the full warp)  // (replay timing: the warp stopped after stage 1 claims, 2 lean)
+    std::uint32_t grow_cells() const { return grow_cells_; }
+    void set_grow_cells(std::uint32_t n) { grow_cells_ = n; }  // (replay: no frame ring to read the count back)
     bool learning_stalled() const { return learning_stalled_; }
     // Whole characters held (option), once per game frame after analyze_motion: what has stayed in place on screen lately
     // while the camera moved (cs_still) is attached, and so is what moves on its own, touches it at about the same distance
@@ -226,6 +240,14 @@ public:
     // Moving objects: the motion seen in the picture between the previous game frame and this one (XPAR's own
     // motion estimation, without replacing the game's motion vectors). False: none this frame (no previous picture).
     bool picture_motion();
+    // HUD learning: this game frame's probe scored against the previous one of the same candidate (tiles of 16 px:
+    // the same spot on the screen, and where the camera's motion brings the scenery from); the scores so far, per
+    // candidate, for the log.
+    void score_hud_probe(const IngestedSource& src, const float clip_to_prev_clip[16]);
+    std::string hud_learn_report() const;
+    // The pick of the candidates scored so far (0: none), and the learned point that stopped behaving like a HUD (0: none).
+    std::uint32_t hud_learn_pick() const;
+    std::uint32_t hud_learn_fail() const { return probe_fail_; }
     // Keep a copy of the previous game frame's colour at each ingest (background for uncovered areas).
     void set_keep_previous_colour(bool on) { keep_previous_ = on; if (!on) previous_valid_ = false; }
     bool take_motion_fit(MotionFit& fit);
@@ -243,7 +265,7 @@ public:
     ID3D12Resource* build_no_warp_mask(const IngestedSource& src, const float clip_to_prev_clip[16], bool hud, bool attached,
                                        bool keep_attached, bool depth_inverted = true, bool combined = false, bool fill = false,
                                        int stretch = 0,  // render px the scenery around the character/weapon stretches over (0: off)
-                                       bool reticles = false);  // sight reticles drawn without depth: their layer for the warp (option, see cs_ret_layer)
+                                       bool reticles = false, bool share = false);  // sight reticles drawn without depth: their layer for the warp (option, see cs_ret_layer)
     // Camera estimation (games without a camera): motion vector (raw) and depth on a grid over the render
     // rect, 4 floats per sample (mv.x, mv.y, depth, valid). Submits the frame's work so far and waits.
     bool sample_motion(const IngestedSource& src, std::uint32_t grid_w, std::uint32_t grid_h, std::vector<float>& out);
@@ -283,7 +305,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     };
-    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKeys, kPObjMove, kPObjTiles, kPObjOutTiles, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevColour, kPPrevDepth, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPFgMotion, kPFgInv, kPFgK1, kPFgK0, kPHudLearned, kPHudTiles, kPWarpClaims, kPStill, kPGrowA, kPGrowB, kPCount };
+    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKeys, kPObjMove, kPObjTiles, kPObjOutTiles, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevColour, kPPrevDepth, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPFgMotion, kPFgInv, kPFgK1, kPFgK0, kPHudLearned, kPHudTiles, kPWarpClaims, kPStill, kPGrowA, kPGrowB, kPProbe, kPProbeTilesA, kPProbeTilesB, kPShareA, kPShareB, kPShareT, kPShare, kPRetDirtyA, kPRetDirtyB, kPCount };
 
     bool create_pipelines(std::string& error);
     // The format a private copy of a game colour image is kept in: the game's own 4-byte format when it
@@ -314,7 +336,9 @@ private:
     bool detect_hud_from_scene(const struct XConstants& base, bool fill, PrivateId out = kPHudScore);
     void set_x_srv(UINT index, PrivateId id, bool from_shown = false);
     void set_x_uav(UINT index, PrivateId id);
-    void x_dispatch(ID3D12PipelineState* pso, const void* constants, UINT srv_table, UINT uav_table, UINT groups_x, UINT groups_y);
+    // (args: dispatched from that buffer at args_offset instead, ExecuteIndirect)
+    void x_dispatch(ID3D12PipelineState* pso, const void* constants, UINT srv_table, UINT uav_table, UINT groups_x, UINT groups_y,
+                    ID3D12Resource* args = nullptr, UINT64 args_offset = 0);
 
     // Two recording contexts: 0 the realtime (direct) queue, 1 the intake (compute) queue with split
     // queues. Frame slots 0-2 belong to context 0 and 3-5 to context 1 (allocators, readbacks, timing).
@@ -373,13 +397,15 @@ private:
     // from of the last 300; stalled (fewer than a tenth, and before the first 300) - no confirmation.
     std::uint32_t learn_frames_ = 0, learn_learned_ = 0;
     bool warp_blocks_ = true;
+    bool share_flip_ = false, share_reset_ = false, share_built_ = false;
+    int warp_stop_ = 99;
     bool learning_stalled_ = true;
     std::uint32_t detection_idle_ = 0;  // game frames since the HUD was last detected (build_no_warp_mask)
     std::uint32_t scene_idle_ = 0;      // game frames since the upscaler's output last came (ingest)
-    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_own_warp_reset_, cs_own_warp_lean_, cs_own_warp_args_, cs_own_warp_rest_, cs_warp_claims_clear_, cs_warp_claim_, cs_memory_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_;
+    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_own_warp_reset_, cs_own_warp_lean_, cs_own_warp_args_, cs_own_warp_rest_, cs_warp_claims_clear_, cs_warp_claim_, cs_memory_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_, cs_probe_tiles_, cs_probe_clear_, cs_probe_score_, cs_share_measure_, cs_share_blur_, cs_share_bins_, cs_share_final_;
     // Sight reticles (option): the passes, which history texture holds the latest layer, and whether the layer was
     // built for the frame taken in last / the shown one (see cs_ret_layer).
-    ComPtr<ID3D12PipelineState> cs_ret_cells_, cs_ret_enclose_, cs_ret_layer_, cs_ret_align_, cs_ret_pick_, cs_ret_shift_;
+    ComPtr<ID3D12PipelineState> cs_ret_cells_, cs_ret_enclose_, cs_ret_layer_, cs_ret_align_, cs_ret_pick_, cs_ret_args_, cs_ret_shift_;
     ComPtr<ID3D12Resource> ret_buf_;  // the reticle's tracking sums and the shift chosen (cs_ret_align)
     bool ret_flip_ = false, layer_built_ = false, shown_layer_ = false;
     PrivateId ret_latest_ = kPRetA, ret_shown_ = kPRetA;  // the sight reticles' layer the intake wrote last / the shown frame's
@@ -392,8 +418,25 @@ private:
     // The game's HUD layer checked (cs_layer_check): 0 not yet, 1 a HUD (trusted: a frame without it shows no HUD), 2 not
     // a HUD (ignored, the HUD is detected). Counts every second pixel: covered, and of them drawn over the picture.
     ComPtr<ID3D12Resource> layer_counts_, layer_readback_;
+    ComPtr<ID3D12Resource> probe_sums_, probe_readback_;  // (score_hud_probe)
+    bool probe_pending_[kRing] = {};
+    std::uint32_t probe_pending_cand_[kRing] = {}, probe_pending_tiles_[kRing] = {};
+    std::uint32_t probe_prev_ = 0;  // the candidate of the probe the previous game frame brought (0: none)
+    bool probe_flip_ = false;
+    struct ProbeScore { std::uint32_t frames = 0, scored = 0; double area = 0, same_min = 0, same_max = 0, world_min = 0, world_max = 0; };
+    std::map<std::uint32_t, ProbeScore> probe_scores_;
+    bool probe_pending_locked_[kRing] = {};
+    // The learned point in use, checked: its recent scores (running averages), how many; failed: it is reported (see
+    // PresenterStatus::hud_learn_fail) and its scores so far dropped.
+    std::uint32_t probe_locked_ = 0, probe_fail_ = 0, probe_check_n_ = 0;
+    double probe_check_same_ = 1, probe_check_world_ = 0;
     ComPtr<ID3D12Resource> warp_list_, warp_args_, warp_list_old_;  // (see ensure_warp_list; the old one kept until the next resize)
     ComPtr<ID3D12CommandSignature> dispatch_sig_;
+    ComPtr<ID3D12Resource> ret_args_;
+    ComPtr<ID3D12Resource> share_bins_;  // (follow_share: the depth bands, see cs_share_bins)  // (sight reticles: the dispatches of the passes over the whole screen, cs_ret_args)
+    bool ret_ran_ = false;             // (...the reticle passes ran last game frame)
+    // (...their game frames counted, and the one each layer texture - A, B - was last written in: see cs_ret_layer)
+    std::uint32_t ret_frame_ = 0, ret_written_[2] = {};
     bool layer_pending_[kRing] = {};
     int layer_trust_ = 0;
     std::uint64_t layer_covered_ = 0, layer_drawn_over_ = 0, layer_frames_ = 0;

@@ -12,6 +12,7 @@
 #include "addon/ui_probe.hpp"
 #include "addon/ui_layer.hpp"
 #include "addon/shader_scan.hpp"
+#include "addon/hud_learn.hpp"
 #include "addon/reshade_feed.hpp"
 #include "addon/frame_cap.hpp"
 #include <d3d12.h>
@@ -111,6 +112,9 @@ constexpr Persisted kPersisted[] = {
     {"FloorRelease", &fw::Settings::floor_release, nullptr},
     {"HoldReticles", &fw::Settings::hold_reticles, nullptr},
     {"GameHudLayers", &fw::Settings::game_hud_layers, nullptr},
+    {"HudLearn", &fw::Settings::hud_learn, nullptr},
+    {"WaitForCameraModel", &fw::Settings::wait_for_model, nullptr},
+    {"FollowShare", &fw::Settings::follow_share, nullptr},
     {"ForwardSplatWarp", &fw::Settings::warp_splat, nullptr},
     {"HoldWholeCharacter", &fw::Settings::hold_characters, nullptr},
     {"MaxExtrapolation", nullptr, &fw::Settings::max_horizon_ms},
@@ -502,6 +506,14 @@ void on_present(command_queue*, swapchain* chain, const rect*, const rect*, uint
         // (diagnostics: the draws of one game frame, on Ctrl+Shift+D - see ui_probe.hpp)
         fw::ui_probe::on_present(chain, g_producer->shared()->settings.record_diagnostics != 0);
         fw::ui_layer::on_present(chain);
+        {
+            const auto& sh = *g_producer->shared();
+            fw::hud_learn::on_present(chain, sh.settings.hud_learn != 0, sh.presenter.hud_learn_pick, sh.presenter.hud_learn_fail, sh.settings.hud_relearn);
+        }
+        const auto learn = fw::hud_learn::status();
+        g_producer->shared()->hooks.learn_candidates = learn.candidates;
+        g_producer->shared()->hooks.learn_active = learn.active;
+        g_producer->shared()->hooks.learn_locked = learn.locked;
         std::uint32_t cs = 0;
         if (read_color_space(chain, cs) && g_producer->shared()->color_space != cs) {
             g_producer->shared()->color_space = cs;
@@ -519,7 +531,7 @@ void on_finish_present(command_queue* queue, swapchain*) {
         auto* sh = g_producer->shared();
         fw::frame_cap_after_present(queue, sh->settings.frame_cap != 0 && sh->settings.enabled != 0, g_producer->generation_active());
         const fw::FrameCapStatus cap = fw::frame_cap_status();
-        sh->hooks.cap_active = cap.active; sh->hooks.cap_reflex = cap.reflex;
+        sh->hooks.cap_active = cap.active; sh->hooks.cap_reflex = cap.reflex; sh->hooks.cap_gpu_bound = cap.gpu_bound;
         sh->hooks.cap_fps = cap.cap_fps; sh->hooks.cap_game_fps = cap.game_fps;
         sh->hooks.cap_present_to_done_ms = cap.present_to_done_ms; sh->hooks.cap_start_to_done_ms = cap.start_to_done_ms;
         sh->hooks.cap_wait_ms = cap.wait_ms; sh->hooks.cap_queued_pct = cap.queued_pct;
@@ -730,6 +742,12 @@ void draw_overlay(effect_runtime*) {
                     p.calibrated_x ? "fitted" : "learning", p.gain_x * 1000.0f, p.tau_x_ms, p.fit_quality_x);
         ImGui::Text("            pitch: %s gain %.3g mrad/count, smoothing %.0f ms, quality %.2f",
                     p.calibrated_y ? "fitted" : "learning", p.gain_y * 1000.0f, p.tau_y_ms, p.fit_quality_y);
+        {
+            bool wait = s.wait_for_model != 0;
+            if (ImGui::Checkbox("Wait for the camera model (the game's own frames until it is learned)", &wait)) s.wait_for_model = wait;
+            if (p.waiting_for_model)
+                ImGui::TextDisabled("Waiting for the camera model: warping after the first moments of turning the camera (5 s at most)");
+        }
         ImGui::Text("Input delay %.0f ms | game latency %.1f ms | measured orbit %s", p.delay_ms, p.latency_ms,
                     p.orbit_cm > 0.0f ? std::to_string(static_cast<int>(p.orbit_cm + 0.5f)).c_str() : "none (no consistent orbit)");
         if (!p.controller)
@@ -763,12 +781,16 @@ void draw_overlay(effect_runtime*) {
         if (ImGui::Checkbox("Prevent GPU queueing", &cap)) s.frame_cap = cap;
         hint("Not a frame rate limit you set: XPAR finds by itself the rate the game's GPU sustains and holds the game just "
              "below it, so no frame waits in the GPU's queue and the game reads input later (what NVIDIA Reflex does). Stands "
-             "aside by itself while the game's Reflex is on. Remembered per game.");
+             "aside by itself while the game's Reflex is on, and while the GPU is the limit (holding the game back would only "
+             "cost frames). Remembered per game.");
         if (cap) {
             const fw::FrameCapStatus st = fw::frame_cap_status();
             ImGui::SameLine();
             if (st.reflex)
                 ImGui::TextDisabled("(off: the game's Reflex is on)");
+            else if (st.gpu_bound)
+                ImGui::TextDisabled("(standing aside: the GPU is the limit - frames queued even when held | game %.1f fps, %.0f%% queued)",
+                                    st.game_fps, st.queued_pct);
             else if (st.active && st.game_fps < 0.97f * st.cap_fps)  // (the cap rises while no queue forms: a game locked lower never reaches it)
                 ImGui::TextDisabled("(cap %.1f fps, not reached: the game runs at %.1f | GPU done %.1f ms after present | held %.1f ms)", st.cap_fps,
                                     st.game_fps, st.present_to_done_ms, st.wait_ms);
@@ -846,6 +868,12 @@ void draw_overlay(effect_runtime*) {
                 reshade::set_config_value(nullptr, "FrameWarp", "NearCameraRule", near_rule ? "1" : "0");
             }
             hint("Turn off if the floor near the camera is kept still while strafing.");
+            bool share = s.follow_share != 0;
+            if (ImGui::Checkbox("Character/weapon by how much it follows the turn (new)", &share)) s.follow_share = share;
+            hint("Each spot is moved by the share of the camera's turn it has followed on screen lately (the character the camera "
+                 "orbits or follows: none; the scenery: all of it; the ground around the character: part of it) instead of being "
+                 "held or not. No edge for it to split along, and much lighter. The stretch, the orbit rule and holding the whole "
+                 "character are not used with it. Remembered per game.");
             int stretch = static_cast<int>(std::min(s.stretch_width, 32u));
             if (ImGui::SliderInt("Stretch around character/weapon (render px, XPAR engine)", &stretch, 0, 32, stretch ? "%d" : "off")) {
                 s.stretch_width = static_cast<std::uint32_t>(stretch);
@@ -883,6 +911,18 @@ void draw_overlay(effect_runtime*) {
             }
             bool layers = s.game_hud_layers != 0;
             if (ImGui::Checkbox("Use the game's own HUD layer when found", &layers)) s.game_hud_layers = layers;
+            bool learn = s.hud_learn != 0;
+            if (ImGui::Checkbox("Learn where the game draws its HUD (where nothing above gives it)", &learn)) s.hud_learn = learn;
+            if (s.hud_learn && g_producer && g_producer->shared()) {
+                const auto& lh = g_producer->shared()->hooks;
+                if (lh.learn_locked)
+                    ImGui::TextDisabled("HUD learning: learned (%08x), the HUD taken from there on %u frames", lh.learn_locked, lh.learn_used);
+                else
+                    ImGui::TextDisabled("HUD learning: learning - %u candidates, trying %08x, %u copies taken", lh.learn_candidates, lh.learn_active,
+                                        lh.learn_probes);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Relearn")) ++s.hud_relearn;
+            }
             hint("Where the game draws its HUD into a layer of its own, or onto its final picture after a step XPAR can catch, the HUD "
                  "is taken from there: exact, nothing to detect. Off: the HUD is always detected (as chosen above) - for a game "
                  "where the wrong layer is taken. Direct3D 12 games. Remembered per game.");
@@ -892,8 +932,8 @@ void draw_overlay(effect_runtime*) {
                 const auto& hs = g_producer->shared()->hooks;
                 static const char* const kSources[] = {"-", "the game's HUD layers (HUD-less picture + UI layer)", "the game's HUD-less picture",
                                                        "the game's own HUD layer (exact)", "the upscaler output", "the upscaler output + camera motion check",
-                                                       "learned from camera motion"};
-                if (ps.hud_source > 0 && ps.hud_source < 7) ImGui::TextDisabled("HUD in use: from %s", kSources[ps.hud_source]);
+                                                       "learned from camera motion", "the game's HUD point (learned)"};
+                if (ps.hud_source > 0 && ps.hud_source < 8) ImGui::TextDisabled("HUD in use: from %s", kSources[ps.hud_source]);
                 if (!s.game_hud_layers)
                     ImGui::TextDisabled("Game's HUD layer: not used (the HUD is detected)");
                 // (a game may use both: Hi-Fi Rush has a layer in its splash screens, draws its HUD straight onto the
@@ -1030,6 +1070,14 @@ void register_callbacks() {
     fw::register_depth_choice_events();
     fw::ui_probe::init();
     fw::shader_scan::init();
+    fw::hud_learn::init(
+        [](std::uint64_t picture, bool d3d11, std::uint32_t state, std::uint64_t list, std::uint32_t candidate, bool end, bool use) {
+            if (!g_producer || !g_producer->shared() || !g_producer->shared()->settings.hud_learn) return;
+            if (d3d11) g_producer->on_hud_probe_d3d11(reinterpret_cast<ID3D11Resource*>(picture), reinterpret_cast<ID3D11DeviceContext*>(list), candidate, use);
+            else g_producer->on_hud_probe(reinterpret_cast<ID3D12Resource*>(picture), static_cast<D3D12_RESOURCE_STATES>(state),
+                                          reinterpret_cast<ID3D12GraphicsCommandList*>(list), candidate, end, use);
+        },
+        [] { if (g_producer && g_producer->shared() && g_producer->shared()->settings.hud_learn) g_producer->on_hud_none(); });
     fw::ui_layer::init(
         [](std::uint64_t layer, std::uint32_t state, std::uint64_t list) {
             if (g_producer && g_producer->shared() && g_producer->shared()->settings.game_hud_layers)
@@ -1089,6 +1137,7 @@ void unregister_callbacks() {
     fw::ui_probe::shutdown();
     fw::ui_layer::shutdown();
     fw::shader_scan::shutdown();
+    fw::hud_learn::shutdown();
     reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(fw::on_reshade_reloaded_effects);
     reshade::unregister_event<reshade::addon_event::reshade_finish_effects>(fw::on_reshade_finish_effects);
     reshade::unregister_event<reshade::addon_event::reshade_present>(on_reshade_present);
@@ -1136,6 +1185,8 @@ __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE reshade_modul
     std::wstring dir = path;
     dir = dir.substr(0, dir.find_last_of(L"\\/"));
     g_presenter_path = dir + L"\\FrameWarp\\FrameWarpPresenter.exe";
+    CreateDirectoryW((dir + L"\\FrameWarp\\profiles").c_str(), nullptr);
+    fw::hud_learn::set_profile(dir + L"\\FrameWarp\\profiles\\hud_point.txt");
     if (!g_producer) g_producer = std::make_unique<fw::Producer>();
     fw::install_streamline_hooks(g_producer.get());
     fw::install_ngx_hooks(g_producer.get());

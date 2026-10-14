@@ -328,6 +328,8 @@ static void controller_stick() {
     EXPECT(std::fabs(x.stick_gain / g.stick_gain_x - 1.0) < 0.2 && x.stick_power == g.stick_power, "yaw stick gain and curve learned");
     EXPECT(std::fabs(y.stick_gain / g.stick_gain_y - 1.0) < 0.25, "pitch stick gain learned (sign included)");
     EXPECT(x.gain == 0, "no mouse gain from stick-only play (%g)", x.gain);
+    // (the presenter warps once both axes reach kMinFitQuality - Settings::wait_for_model: controller play alone must get there)
+    EXPECT(x.quality >= kMinFitQuality && y.quality >= kMinFitQuality, "stick-only play trusted for warping (quality yaw %.2f, pitch %.2f)", x.quality, y.quality);
     // Tracking with the latency the presenter uses in games without HUD layers (1/4 frame behind): two
     // identical sessions (the patterns are deterministic), with the controller option on and off.
     auto track = [&](bool use_stick) {

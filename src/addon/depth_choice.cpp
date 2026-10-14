@@ -1,4 +1,5 @@
 #include "addon/depth_choice.hpp"
+#include "addon/frame_cap.hpp"
 #include <reshade.hpp>
 #include <d3d11.h>
 #include <d3d12.h>
@@ -79,9 +80,12 @@ void on_destroy(device*, resource res) {
 }
 
 constexpr int kSettleFrames = 4;    // after an override: Generic Depth switches, copies, the effects render
-constexpr int kReadbackFrames = 5;  // after the probe's copy: the GPU has done it
+constexpr int kReadbackFrames = 5;  // after the probe's copy, at least (and the GPU done with it: probe_ready)
 constexpr int kRounds = 2;
-constexpr double kMinScore = 0.5;   // brightness changes 1.5x stronger across the depth edges than elsewhere, at least
+constexpr double kMinScore = 0.5;   // brightness changes 1.5x stronger across the depth edges than elsewhere: clearly the picture's
+// ...or, below that, at least 1.25x - a picture whose depth edges show only faintly (Elden Ring's fog and soft light: its scene depth
+// scored 0.32-0.49 and was never taken, the warp had no depth); buffers unrelated to the picture score near 0 (0.00-0.08)
+constexpr double kAcceptScore = 0.25;
 
 // Reads XPAR.fx's probe back to the CPU (a few frames after the copy).
 struct ProbeReader {
@@ -89,8 +93,17 @@ struct ProbeReader {
     ComPtr<ID3D11Texture2D> staging;  // (Direct3D 11)
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
     std::uint64_t readback_bytes = 0;
+    std::uint64_t present = 0;  // the present the copy was recorded for (frame_cap_gpu_done)
+    int waited = 0;
     void reset() { readback.Reset(); staging.Reset(); }
 };
+// The copy done on the GPU: a fixed few frames were not enough with frames queued on the GPU (RE4 uncapped, 2-3 frames
+// behind) - the probe was read before the GPU had written it, every buffer scored as nothing, no depth was ever chosen
+// and the camera estimate, without depth, failed a third of the frames. (Read anyway after 120 frames: never stuck.)
+bool probe_ready(ProbeReader& r) {
+    if (frame_cap_gpu_done(r.present) || ++r.waited > 120) return true;
+    return false;
+}
 
 struct Chooser {
     enum Phase { kIdle, kProbe, kSettled } phase = kIdle;
@@ -130,6 +143,8 @@ bool fits_picture(const Candidate& k, std::uint32_t fw_, std::uint32_t fh) {
 }
 
 bool copy_probe(ProbeReader& r, device* dev, command_list* cmd_list, resource_view probe) {
+    r.present = frame_cap_presents() + 1;  // (recorded during this frame: done once its present is)
+    r.waited = 0;
     if (dev->get_api() == device_api::d3d11) {
         auto* tex = reinterpret_cast<ID3D11Texture2D*>(dev->get_resource_from_view(probe).handle);
         auto* context = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
@@ -279,18 +294,21 @@ void settle(generic_depth_data* gd, std::uint64_t frame) {
         for (const auto& k : c.cand)
             if (k.probes && k.sum / k.probes >= 0.85 * (best->sum / best->probes) && k.binds > best->binds) best = &k;
     char text[240];
-    if (best && best->sum / best->probes >= kMinScore) {
+    if (best && best->sum / best->probes >= kAcceptScore) {
         gd->override_depth_stencil = best->res;
         c.chosen = best->res; c.ours = true; c.retry_after = 120;
-        std::snprintf(text, sizeof(text), "XPAR: depth buffer chosen: %ux%u, format %u (score %.2f, of %zu tried)", best->w, best->h,
-                      unsigned(best->fmt), best->sum / best->probes, std::max(c.tried.size(), c.cand.size()));
+        std::snprintf(text, sizeof(text), "XPAR: depth buffer chosen: %ux%u, format %u (score %.2f%s, of %zu tried)", best->w, best->h,
+                      unsigned(best->fmt), best->sum / best->probes, best->sum / best->probes < kMinScore ? ": faint, the best there is" : "",
+                      std::max(c.tried.size(), c.cand.size()));
     } else {
         // Nothing stands out (a menu, a loading screen, a dark or blurred picture): ReShade's own choice for now.
         gd->override_depth_stencil = {0};
         c.chosen = {0}; c.ours = false;
-        // (asked again later, each time after twice as long: every question is a second without reprojection)
+        // (asked again later, each time after twice as long: every question is a second without reprojection - but not
+        // longer after an empty depth: a menu or a loading screen, nothing drawn yet. RE4 spends its first minute there,
+        // and the gaps had grown to a minute by the time its game began: depth chosen a minute into the game)
         c.retry_at = frame + c.retry_after;
-        c.retry_after = std::min<std::uint64_t>(c.retry_after * 2, 3600);
+        if (!c.all_flat) c.retry_after = std::min<std::uint64_t>(c.retry_after * 2, 3600);
         std::snprintf(text, sizeof(text), "XPAR: no depth buffer stands out among %zu (best score %.2f): ReShade's own choice for now", std::max(c.tried.size(), c.cand.size()),
                       best ? best->sum / best->probes : 0.0);
     }
@@ -366,12 +384,14 @@ DepthChoice choose_depth_buffer(effect_runtime* runtime, command_list* cmd_list,
             if (!c.verify_copied) {
                 if (probe.handle && copy_probe(c.reader, dev, cmd_list, probe)) { c.verify_copied = true; c.verify_wait = kReadbackFrames; }
                 else c.verifying = false;
+            } else if (!probe_ready(c.reader)) {
+                c.verify_wait = 1;
             } else {
                 std::vector<float> px;
                 std::uint32_t w = 0, h = 0;
                 const DepthProbeScore s = read_probe(c.reader, px, w, h) ? score_depth_probe(px.data(), w, h) : DepthProbeScore{};
                 char text[200];
-                if (s.score >= kMinScore) {
+                if (s.score >= kAcceptScore) {
                     std::snprintf(text, sizeof(text), "XPAR: another depth buffer came into use; the chosen one still fits the picture (score %.2f)", s.score);
                     say(text);
                     c.verifying = false;
@@ -467,6 +487,7 @@ DepthChoice choose_depth_buffer(effect_runtime* runtime, command_list* cmd_list,
             c.copied = true; c.wait = kReadbackFrames;
             return DepthChoice::kChoosing;
         }
+        if (!probe_ready(c.reader)) { c.wait = 1; return DepthChoice::kChoosing; }
         std::vector<float> px;
         std::uint32_t w = 0, h = 0;
         Candidate& k = c.cand[c.at];
@@ -515,6 +536,7 @@ bool depth_orientation_ready(effect_runtime* runtime, command_list* cmd_list, re
         o.copied = true; o.wait = kReadbackFrames;
         return o.decided;
     }
+    if (!probe_ready(o.reader)) { o.wait = 1; return o.decided; }
     o.copied = false;
     // (first quickly, then once in a while: a game can change it between its menu and the game)
     o.wait = o.decided ? 120 : 2;

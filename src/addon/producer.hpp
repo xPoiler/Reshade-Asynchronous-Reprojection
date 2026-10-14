@@ -128,6 +128,15 @@ public:
     // kind (ui_layer.hpp): 0 copy, 1 no HUD this frame (an empty HUD handed over), 2 the copy confirmed (only a confirmed
     // one is handed over), 3 the copy given up.
     void on_hud_before_d3d11(ID3D11Resource* picture, std::uint32_t kind, ID3D11DeviceContext* context);
+    // HUD learning (hud_learn.hpp): a copy of the picture at a candidate point (the game's list / immediate context);
+    // at the present compared with the final picture, into the frame's probe slot (kHudProbe) with the candidate.
+    // end: the final picture as the back buffer's draw reads it - compared with instead of the back buffer.
+    // use: the learned point's - its comparison is also the frame's HUD (kUi, where nothing else gave the HUD).
+    void on_hud_probe(ID3D12Resource* picture, D3D12_RESOURCE_STATES state, ID3D12GraphicsCommandList* list, std::uint32_t candidate, bool end,
+                      bool use);
+    void on_hud_probe_d3d11(ID3D11Resource* picture, ID3D11DeviceContext* context, std::uint32_t candidate, bool use);
+    // The learned point did not draw this frame: an empty HUD (where nothing else gave the HUD).
+    void on_hud_none() { std::lock_guard lock(mutex_); probe_none_ = true; }
     // At the game's present: copies the backbuffer via `list`, then the caller must submit `list`
     // on `queue`; finish_present() signals the fence afterwards.
     std::uint64_t begin_present(ID3D12Resource* backbuffer, ID3D12GraphicsCommandList* list);
@@ -231,7 +240,27 @@ private:
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> d11_cover_cs_;
     bool d11_before_taken_ = false, d11_cs_failed_ = false, d11_none_ = false, d11_confirmed_ = false;
     void d3d11_cover(ID3D11DeviceContext* context, int slot);
+    bool ensure_d11_cover_cs(ID3D11Device* device);
+    // HUD learning: the copy at the candidate point (Direct3D 12 / 11), its candidate, presents since; the comparison.
+    Microsoft::WRL::ComPtr<ID3D12Resource> probe_pending_, probe_cov_, probe_end_;
+    std::uint32_t probe_age_ = 2, probe_candidate_ = 0, probe_end_age_ = 2;
+    bool probe_use_ = false, probe_used_ = false, probe_none_ = false, probe_needs_end_ = false;  // (the copy is the learned point's / its comparison done this frame / none)
+    Microsoft::WRL::ComPtr<ID3D12Resource> probe_zero_;  // (an empty coverage: never written)
+    void d3d12_learned(ID3D12GraphicsCommandList* list, int slot);
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> probe_root_;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> probe_pso_;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> probe_heap_;
+    UINT probe_ring_ = 0;
+    bool probe_failed_ = false;
+    bool ensure_probe_pass();
+    void d3d12_probe(ID3D12GraphicsCommandList* list, int slot);
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> d11_probe_before_, d11_probe_cov_;
+    Microsoft::WRL::ComPtr<ID3D11Resource> d11_probe_picture_;
+    bool d11_probe_taken_ = false, d11_probe_use_ = false, d11_probe_used_ = false;
+    void d3d11_learned(ID3D11DeviceContext* context, int slot);
+    void d3d11_probe(ID3D11DeviceContext* context, int slot);
     bool ui_pending_valid_ = false;
+    double ui_layer_share_ = 1.0;  // (of the frames with a HUD layer or a HUD-less copy taken: the share with a layer, lately)
     Microsoft::WRL::ComPtr<ID3D12Resource> hudless_pending_;  // the HUD-less copy taken this frame (on_hudless_copy)
     std::uint32_t hudless_age_ = 2;  // presents since the last one (handed over while at most 1)
     std::uint32_t hud_given_ = 0;    // frames in a row with the game's HUD handed over (begin_present)

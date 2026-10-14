@@ -423,6 +423,8 @@ public:
 
     double vertical_fov() const { return fov_; }
     bool fov_locked() const { return fov_locked_; }
+    // Frames the field of view was measured on so far (a turn clear enough to measure it).
+    std::size_t fov_votes() const { return fov_votes_.size(); }
     double last_residual() const { return last_residual_; }
     // Frames whose motion no camera move explained (the camera then held still for that frame); read and cleared.
     bool last_rejected() const { return last_rejected_; }

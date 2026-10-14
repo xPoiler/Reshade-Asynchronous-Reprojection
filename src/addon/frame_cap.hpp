@@ -12,6 +12,7 @@ namespace fw {
 struct FrameCapStatus {
     bool active = false;      // capping now (on, frames measured, no frame generation, no Reflex)
     bool reflex = false;      // the game's NVIDIA Reflex low-latency mode is on (the cap stands aside)
+    bool gpu_bound = false;   // the cap stands aside: frames queued although it held the game back (the GPU is the limit)
     float cap_fps = 0;        // the cap
     float game_fps = 0;       // the game's presents per second
     float present_to_done_ms = 0;  // the GPU finishes a frame this long after its present (median)
@@ -25,6 +26,11 @@ struct FrameCapStatus {
 // Never capped either while the game's own NVIDIA Reflex is on (it does the same).
 void frame_cap_after_present(reshade::api::command_queue* queue, bool enabled, bool generation);
 FrameCapStatus frame_cap_status();
+// The game's presents so far, and whether the GPU has done everything submitted up to present n (its fence, signalled after
+// every present): for readbacks of work recorded during a frame - done once that frame's present is (n = the count when
+// recorded + 1). Without the fence (Vulkan, or not set up): true.
+std::uint64_t frame_cap_presents();
+bool frame_cap_gpu_done(std::uint64_t present);
 void frame_cap_shutdown();
 
 }  // namespace fw
