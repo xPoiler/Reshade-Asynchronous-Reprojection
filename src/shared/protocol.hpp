@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 65;
+constexpr std::uint32_t kVersion = 68;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -133,6 +133,8 @@ struct Settings {
                                        // motion on both axes (then warped for the session; saved per game)
     std::uint32_t follow_share;        // default on: the character/weapon by how much of the camera's turn each spot follows
                                        // (Renderer::follow_share) instead of held whole (hold_characters, the stretch; saved per game)
+    std::uint32_t share_from_input;    // default on: ...measured against the turn the input explains (what the warp applies), not
+                                       // the game camera's whole turn (a car's steering, a gun's own animation; saved per game)
 };
 
 // Presenter status, displayed by the add-on UI.

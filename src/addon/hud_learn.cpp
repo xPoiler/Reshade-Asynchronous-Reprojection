@@ -24,6 +24,9 @@ std::unordered_map<std::uint64_t, Pipe> g_pipes;
 // What the recording thread has bound (draws are many: checked without the lock - a list is recorded on one thread at
 // a time).
 thread_local std::uint64_t tl_list = 0, tl_target = 0;
+// (the list a render pass is open on, Direct3D 12: no copy or barrier may be recorded inside one - Cyberpunk draws its
+// loading screen in render passes, and a copy taken at a draw there hung the GPU)
+thread_local std::uint64_t tl_pass_list = 0;
 thread_local bool tl_full = false, tl_watched = false;
 thread_local std::uint64_t tl_fp_list = 0, tl_blend_list = 0;
 thread_local std::uint32_t tl_fp = 0;
@@ -160,11 +163,16 @@ void target(command_list* cmd, resource_view first) {
     tl_full = d.texture.width == g_w && d.texture.height == g_h && d.texture.samples <= 1;
     tl_watched = watched(r.handle);
 }
-void on_bind(command_list* cmd, uint32_t n, const resource_view* rtvs, resource_view) { target(cmd, n && rtvs ? rtvs[0] : resource_view{0}); }
+void on_bind(command_list* cmd, uint32_t n, const resource_view* rtvs, resource_view) {
+    if (cmd && tl_pass_list == cmd->get_native()) tl_pass_list = 0;
+    target(cmd, n && rtvs ? rtvs[0] : resource_view{0});
+}
 bool on_begin_pass(command_list* cmd, uint32_t n, const render_pass_render_target_desc* rts, const render_pass_depth_stencil_desc*, render_pass_flags) {
     target(cmd, n && rts ? rts[0].view : resource_view{0});
+    if (cmd) tl_pass_list = cmd->get_native();
     return false;
 }
+bool on_end_pass(command_list* cmd) { if (cmd && tl_pass_list == cmd->get_native()) tl_pass_list = 0; return false; }
 void drawn(command_list* cmd) {
     if (!cmd || !g_probe) return;
     const std::uint64_t list = cmd->get_native();
@@ -207,9 +215,10 @@ void drawn(command_list* cmd) {
             const std::uint64_t from = g_taken_res ? g_taken_res : g_taken_res_last;
             if (c != g_cands.end() && c->second.role == 0 && from && !is_bb(from) &&
                 std::any_of(g_finals.begin(), g_finals.end(), [&](const Final& f) { return f.res == from; })) {
+                // (only with its state known: a guessed one - shader resource - was wrong while Cyberpunk loaded, and the copy's
+                // transition hung the GPU)
                 const auto st = g_fstate.find(from);
-                end_res = from;
-                end_state = st != g_fstate.end() ? st->second : 0xC0u;  // (pixel and non-pixel shader resource)
+                if (st != g_fstate.end()) { end_res = from; end_state = st->second; }
             }
         }
         if (bb && !g_bb_drawn) {
@@ -227,6 +236,7 @@ void drawn(command_list* cmd) {
         }
     }
     const bool use = g_locked && fp == g_locked;
+    if (tl_pass_list == list) return;  // (inside a render pass: nothing copied - see tl_pass_list)
     if (end_res) g_probe(end_res, false, end_state, list, g_active, true, false);
     // (in the final picture, Direct3D 12: compared only with the final picture as the back buffer's draw reads it - see end)
     if (take) g_probe(res, g_api == device_api::d3d11, 0x4u /* D3D12_RESOURCE_STATE_RENDER_TARGET */ | (in_final ? 0x80000000u : 0u), list, fp, false, use);
@@ -309,6 +319,7 @@ void init(Probe probe, std::function<void()> none) {
     reshade::register_event<reshade::addon_event::bind_pipeline>(on_bind_pipeline);
     reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(on_bind);
     reshade::register_event<reshade::addon_event::begin_render_pass>(on_begin_pass);
+    reshade::register_event<reshade::addon_event::end_render_pass>(on_end_pass);
     reshade::register_event<reshade::addon_event::draw>(on_draw);
     reshade::register_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
     reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(on_draw_indirect);
@@ -325,6 +336,7 @@ void shutdown() {
     reshade::unregister_event<reshade::addon_event::bind_pipeline>(on_bind_pipeline);
     reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(on_bind);
     reshade::unregister_event<reshade::addon_event::begin_render_pass>(on_begin_pass);
+    reshade::unregister_event<reshade::addon_event::end_render_pass>(on_end_pass);
     reshade::unregister_event<reshade::addon_event::draw>(on_draw);
     reshade::unregister_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
     reshade::unregister_event<reshade::addon_event::draw_or_dispatch_indirect>(on_draw_indirect);
@@ -338,7 +350,7 @@ void shutdown() {
     g_none = nullptr;
 }
 
-void on_present(swapchain* chain, bool learning, std::uint32_t pick, std::uint32_t fail, std::uint32_t relearn) {
+void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick, std::uint32_t fail, std::uint32_t relearn) {
     if (!chain) return;
     device* dev = chain->get_device();
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -416,72 +428,79 @@ void on_present(swapchain* chain, bool learning, std::uint32_t pick, std::uint32
             std::fclose(f);
         }
     }
-    // Learned again: from the panel (the profile forgotten too), or the presenter found the learned point no longer behaving
-    // like a HUD (the same), or - not proven yet (a minute of frames with the HUD from it) - it has not drawn for 600 frames
-    // (a point locked on a title screen with the camera moving behind its menu: Elden Ring). A proven point (saved, or from
-    // the profile) waits through menus and a HUD hidden for any length of time.
-    const bool drew = g_final || g_bb_frame;  // (the game drew its picture this frame: not a loading screen)
-    const bool forget = relearn != g_relearn_seen || (g_locked && fail == g_locked);
-    if (forget || (g_locked && !g_saved && g_since_drawn > 600) || !learning) {
-        if (g_locked && learning) {
+    // Paused while the game gives its HUD itself (its HUD layer, a HUD-less picture): nothing copied, nothing learned or
+    // forgotten meanwhile - the copies were of no use there, and in Cyberpunk, whose saved point is in its final picture, they
+    // hung the GPU while it loaded (the picture's state not known, guessed).
+    if (paused) {
+        g_active = 0;
+    } else {
+        // Learned again: from the panel (the profile forgotten too), or the presenter found the learned point no longer behaving
+        // like a HUD (the same), or - not proven yet (a minute of frames with the HUD from it) - it has not drawn for 600 frames
+        // (a point locked on a title screen with the camera moving behind its menu: Elden Ring). A proven point (saved, or from
+        // the profile) waits through menus and a HUD hidden for any length of time.
+        const bool drew = g_final || g_bb_frame;  // (the game drew its picture this frame: not a loading screen)
+        const bool forget = relearn != g_relearn_seen || (g_locked && fail == g_locked);
+        if (forget || (g_locked && !g_saved && g_since_drawn > 600) || !learning) {
+            if (g_locked && learning) {
+                char text[128];
+                std::snprintf(text, sizeof(text), "XPAR HUD learning: %08x dropped (%s) - learning again", g_locked,
+                              relearn != g_relearn_seen ? "Relearn" : fail == g_locked ? "it no longer behaves like a HUD" : "it has not drawn lately");
+                reshade::log::message(reshade::log::level::info, text);
+            }
+            if (forget && learning && !g_profile.empty()) _wremove(g_profile.c_str());
+            if (forget) g_saved = false;
+            g_relearn_seen = relearn;
+            g_locked = 0;
+            g_since_drawn = 0;
+            g_used = 0;
+            g_from_profile = false;
+            g_tried.clear();
+        }
+        // The learned point: locked once every candidate has been tried and the presenter picks one of them.
+        if (learning && !g_locked && pick && g_cands.count(pick) &&
+            std::all_of(g_cands.begin(), g_cands.end(), [](const auto& c) { return std::find(g_tried.begin(), g_tried.end(), c.first) != g_tried.end(); })) {
+            g_locked = pick;
+            g_locked_role = g_cands[pick].role;
+            g_since_drawn = 0;
+            g_used = 0;
             char text[128];
-            std::snprintf(text, sizeof(text), "XPAR HUD learning: %08x dropped (%s) - learning again", g_locked,
-                          relearn != g_relearn_seen ? "Relearn" : fail == g_locked ? "it no longer behaves like a HUD" : "it has not drawn lately");
+            std::snprintf(text, sizeof(text), "XPAR HUD learning: %08x learned (in the %s) - the HUD taken from there", pick,
+                          g_locked_role ? "back buffer" : "final picture");
             reshade::log::message(reshade::log::level::info, text);
         }
-        if (forget && learning && !g_profile.empty()) _wremove(g_profile.c_str());
-        if (forget) g_saved = false;
-        g_relearn_seen = relearn;
-        g_locked = 0;
-        g_since_drawn = 0;
-        g_used = 0;
-        g_from_profile = false;
-        g_tried.clear();
-    }
-    // The learned point: locked once every candidate has been tried and the presenter picks one of them.
-    if (learning && !g_locked && pick && g_cands.count(pick) &&
-        std::all_of(g_cands.begin(), g_cands.end(), [](const auto& c) { return std::find(g_tried.begin(), g_tried.end(), c.first) != g_tried.end(); })) {
-        g_locked = pick;
-        g_locked_role = g_cands[pick].role;
-        g_since_drawn = 0;
-        g_used = 0;
-        char text[128];
-        std::snprintf(text, sizeof(text), "XPAR HUD learning: %08x learned (in the %s) - the HUD taken from there", pick,
-                      g_locked_role ? "back buffer" : "final picture");
-        reshade::log::message(reshade::log::level::info, text);
-    }
-    if (g_locked) {
-        // A frame the game drew where the learned point did not: no HUD (the game hides it - for as long as it does).
-        if (g_taken) {
-            g_since_drawn = 0;
-            // (proven in gameplay - a minute of frames with the HUD from it: saved for the next launch)
-            if (++g_used >= 3600 && !g_saved && !g_profile.empty()) {
-                g_saved = true;
-                FILE* f = nullptr;
-                if (_wfopen_s(&f, g_profile.c_str(), L"w") == 0 && f) {
-                    std::fprintf(f, "%08x %u\n", g_locked, unsigned(g_locked_role));
-                    std::fclose(f);
-                    char text[128];
-                    std::snprintf(text, sizeof(text), "XPAR HUD learning: %08x saved to the profile", g_locked);
-                    reshade::log::message(reshade::log::level::info, text);
+        if (g_locked) {
+            // A frame the game drew where the learned point did not: no HUD (the game hides it - for as long as it does).
+            if (g_taken) {
+                g_since_drawn = 0;
+                // (proven in gameplay - a minute of frames with the HUD from it: saved for the next launch)
+                if (++g_used >= 3600 && !g_saved && !g_profile.empty()) {
+                    g_saved = true;
+                    FILE* f = nullptr;
+                    if (_wfopen_s(&f, g_profile.c_str(), L"w") == 0 && f) {
+                        std::fprintf(f, "%08x %u\n", g_locked, unsigned(g_locked_role));
+                        std::fclose(f);
+                        char text[128];
+                        std::snprintf(text, sizeof(text), "XPAR HUD learning: %08x saved to the profile", g_locked);
+                        reshade::log::message(reshade::log::level::info, text);
+                    }
                 }
+            } else if (drew) {
+                ++g_since_drawn;
+                if (g_none) g_none();
             }
-        } else if (drew) {
-            ++g_since_drawn;
-            if (g_none) g_none();
+            g_active = g_locked;
+        } else if (!learning) {
+            g_active = 0;
+        } else if (g_run == 0 || !g_cands.count(g_active)) {
+            // The next candidate after a run (in fingerprint order, round and round).
+            auto it = g_cands.upper_bound(g_active);
+            if (it == g_cands.end()) it = g_cands.begin();
+            g_active = it == g_cands.end() ? 0 : it->first;
+            g_run = kRun;
+            if (g_active && std::find(g_tried.begin(), g_tried.end(), g_active) == g_tried.end()) g_tried.push_back(g_active);
+        } else {
+            --g_run;
         }
-        g_active = g_locked;
-    } else if (!learning) {
-        g_active = 0;
-    } else if (g_run == 0 || !g_cands.count(g_active)) {
-        // The next candidate after a run (in fingerprint order, round and round).
-        auto it = g_cands.upper_bound(g_active);
-        if (it == g_cands.end()) it = g_cands.begin();
-        g_active = it == g_cands.end() ? 0 : it->first;
-        g_run = kRun;
-        if (g_active && std::find(g_tried.begin(), g_tried.end(), g_active) == g_tried.end()) g_tried.push_back(g_active);
-    } else {
-        --g_run;
     }
     g_status_cands = static_cast<std::uint32_t>(g_cands.size());
     g_status_active = g_active;

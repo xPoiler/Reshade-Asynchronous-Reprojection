@@ -65,6 +65,7 @@ struct App {
     FILE* csv_motion = nullptr;   // per game frame: agreement of the motion vectors with depth + camera
     FILE* csv_sources = nullptr;  // ingested frames + camera
     FILE* csv_outputs = nullptr;  // presented frames + applied warp
+    FILE* csv_share = nullptr;    // per game frame: what the near-camera spots learn their follow share from (Renderer::ShareDiag)
     std::int64_t events_read = 0;
     bool mark_was_down = false, dump_was_down = false;
 };
@@ -172,6 +173,13 @@ void open_recordings() {
             "frame,qpc_sim,qpc_constants,qpc_present,qpc_ingest,px,py,pz,fx,fy,fz,ux,uy,uz,rx,ry,rz,fov,aspect,reset,mouse_gate,has_depth,has_hudless,"
             "p00,p01,p02,p03,p10,p11,p12,p13,p20,p21,p22,p23,p30,p31,p32,p33,"
             "c00,c01,c02,c03,c10,c11,c12,c13,c20,c21,c22,c23,c30,c31,c32,c33");
+        {
+            std::string header = "frame,mode,near_spots,measured,turn2,motion_dot_turn,w_turn2,w_motion_dot_turn,w_sum_x1000,share_sum_x250,"
+                                 "motion_len_x10,turn_len_x10,info_sum,motion_over_2turn";
+            for (int b = 12; b < 24; ++b) header += ",band_a" + std::to_string(b);
+            for (int b = 12; b < 24; ++b) header += ",band_b" + std::to_string(b);
+            g_app.csv_share = open_csv(L"share.csv", header.c_str());
+        }
         g_app.csv_outputs = open_csv(L"outputs.csv",
             "qpc,source_frame,warped,yaw,pitch,horizon_ms,gpu_ms,mark,t_submit,t_gpu_start,t_gpu_end,last_present,present_count,present_refresh,"
             "sync_refresh,sync_qpc,stats_hr,t_wake,cam_x,cam_y,cam_z,cam_fx,cam_fy,cam_fz");
@@ -987,7 +995,29 @@ void render_thread() {
                         if (!was_sharing) renderer.reset_share();
                         const bool orbit_warp = settings.orbit_mode == 2 ||
                                                 (settings.orbit_mode == 0 && source_was_estimated && !source_motion_estimated && g_app.model.orbit() > 0);
-                        renderer.follow_share(s, cam.clip_to_prev_clip, mv_scale.valid, cam.depth_inverted != 0, orbit_warp);
+                        // (two shares, Settings::share_from_input: this frame's turn the input's if there was any input since a
+                        // little before the frame the motion is measured from - the game's previous frame for its own motion
+                        // vectors, the previous one taken for XPAR's estimate - otherwise the rest's: a car's steering, a camera
+                        // turning by itself)
+                        int share_mode = 0;
+                        if (settings.share_from_input && frame_times.size() >= 2) {
+                            const auto& prev = frame_times[frame_times.size() - 2];
+                            double prev_t = prev.second;
+                            if (!s.motion_estimated && prev.first + 1 != m.frame_id && g_app.model.frame_interval() > 0)
+                                prev_t = source_time - g_app.model.frame_interval();
+                            share_mode = g_app.model.input_active(prev_t - PoseModel::kInputLately, source_time) ? 1 : 2;
+                        }
+                        renderer.set_share_diag(rec(g_app.csv_share) != nullptr, m.frame_id);
+                        renderer.follow_share(s, cam.clip_to_prev_clip, mv_scale.valid, cam.depth_inverted != 0, orbit_warp, share_mode);
+                    }
+                    // (diagnostics read back from earlier game frames)
+                    for (const auto& d : renderer.take_share_diags()) {
+                        if (!rec(g_app.csv_share)) continue;
+                        wr(g_app.csv_share, "%llu,%d", static_cast<unsigned long long>(d.frame), d.mode);
+                        for (int k = 0; k < 12; ++k) wr(g_app.csv_share, ",%d", d.v[k]);
+                        for (int b = 0; b < 12; ++b) wr(g_app.csv_share, ",%.4f", d.band_a[b]);
+                        for (int b = 0; b < 12; ++b) wr(g_app.csv_share, ",%.4f", d.band_b[b]);
+                        wr(g_app.csv_share, "\n");
                     }
                     was_sharing = sharing;
                     const bool holding = !sharing && settings.hold_characters != 0 && attached_mask && mv_scale.valid;
@@ -1537,9 +1567,18 @@ void render_thread() {
                 unmoved = !settings.show_mask && generated < 0;
                 for (int i = 0; i < 16 && unmoved; ++i) unmoved = std::fabs(m.data()[i] - (i % 5 == 0 ? 1.0f : 0.0f)) < 2e-6f;
                 renderer.set_warp_splat(settings.warp_splat != 0);
+                // (two shares, Settings::share_from_input: the input's part of the predicted turn on its own - the frame's
+                // camera turned by it - for the warp to move each spot by its share of each part; not around an orbit)
+                Mat4 m_input{};
+                const bool input_part = settings.follow_share && settings.share_from_input && generated < 0 && !settings.invert_warp &&
+                                        g_app.model.orbit() <= 0;
+                if (input_part) {
+                    const CameraBasis turned = apply_rotation(source_basis, g_app.model.world_up(), p.input_yaw, p.input_pitch, source_basis.pos);
+                    m_input = clip_source_to_target(projection, view_matrix(source_basis, origin, z_sign), view_matrix(turned, origin, z_sign));
+                }
                 warped = unmoved || renderer.own_warp(source, settings.use_ui_tags != 0, inputs.no_warp_mask != nullptr, m.data(), inputs.depth_inverted,
                                                      settings.background_memory != 0, nullptr, generated,
-                                                     settings.edge_fill != 0);
+                                                     settings.edge_fill != 0, input_part ? m_input.data() : nullptr);
             } else {
                 warped = latewarp.evaluate(list, inputs, first_eval, view_matrix(p.camera, origin, z_sign),
                                            view_matrix(source_basis, origin, z_sign), projection);
@@ -2161,7 +2200,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (g_app.shared) g_app.shared->presenter.pid = 0;
     logf("exit");
     g_files.stop();
-    for (FILE* csv : {g_app.csv_events, g_app.csv_mouse, g_app.csv_sources, g_app.csv_outputs, g_app.csv_motion, g_app.csv_stick, g_app.csv_hooks, g_app.csv_upscaler}) if (csv) std::fclose(csv);
+    for (FILE* csv : {g_app.csv_events, g_app.csv_mouse, g_app.csv_sources, g_app.csv_outputs, g_app.csv_motion, g_app.csv_stick, g_app.csv_hooks, g_app.csv_upscaler, g_app.csv_share}) if (csv) std::fclose(csv);
     if (g_app.log) std::fclose(g_app.log);
     if (single) CloseHandle(single);
     return 0;

@@ -42,6 +42,8 @@ std::unordered_map<std::uint64_t, std::uint64_t> g_bb_picture_pipeline;  // (the
 bool g_bb_seen = false;
 thread_local std::uint64_t tl_list = 0, tl_back_buffer = 0, tl_pipe_list = 0, tl_pipeline = 0;
 thread_local bool tl_depth = false;
+// (the list a render pass is open on, Direct3D 12: no copy may be recorded inside one - see drawn_back_buffer)
+thread_local std::uint64_t tl_pass_list = 0;
 std::uint32_t g_width = 0, g_height = 0;
 // This frame (since the last present): the layers cleared to transparent, and when each was last drawn into (0: not).
 std::unordered_map<std::uint64_t, std::uint64_t> g_cleared;  // resource -> draw order
@@ -343,12 +345,17 @@ void end_of_frame(device* dev, command_list* cmd, const char* at) {
         g_take(layer, state, cmd->get_native());
     }
 }
-void on_bind(command_list* cmd, uint32_t n, const resource_view* rtvs, resource_view dsv) { if (n && rtvs) target(cmd, rtvs[0], dsv.handle != 0); }
+void on_bind(command_list* cmd, uint32_t n, const resource_view* rtvs, resource_view dsv) {
+    if (cmd && tl_pass_list == cmd->get_native()) tl_pass_list = 0;
+    if (n && rtvs) target(cmd, rtvs[0], dsv.handle != 0);
+}
+bool on_end_pass(command_list* cmd) { if (cmd && tl_pass_list == cmd->get_native()) tl_pass_list = 0; return false; }
 bool on_begin_pass(command_list* cmd, uint32_t n, const render_pass_render_target_desc* rts, const render_pass_depth_stencil_desc* ds, render_pass_flags) {
     if (n && rts && rts[0].load_op == render_pass_load_op::clear && rts[0].view.handle && rts[0].clear_color[0] == 0 &&
         rts[0].clear_color[1] == 0 && rts[0].clear_color[2] == 0 && rts[0].clear_color[3] == 0 && cmd && layer_api(cmd->get_device()))
         cleared_to_transparent(cmd->get_device(), rts[0].view);
     if (n && rts) target(cmd, rts[0].view, ds && ds->view.handle);
+    if (cmd) tl_pass_list = cmd->get_native();
     return false;
 }
 // Third pattern (Direct3D 11; Resident Evil 2): the HUD drawn into the game's picture after its post-processing, then one
@@ -441,6 +448,7 @@ void drawn_back_buffer(command_list* cmd) {
         }
     }
     if (!g_take_hudless) return;
+    if (take && tl_pass_list == list) return;  // (inside a render pass: no copy - the frame has none, as if not found)
     if (take) g_take_hudless(bb, 0x4u /* D3D12_RESOURCE_STATE_RENDER_TARGET */, list);
     if (give_up) g_take_hudless(0, 0, list);
 }
@@ -535,11 +543,13 @@ void init(std::function<void(std::uint64_t, std::uint32_t, std::uint64_t)> take,
     reshade::register_event<reshade::addon_event::barrier>(on_barrier);
     reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(on_bind);
     reshade::register_event<reshade::addon_event::begin_render_pass>(on_begin_pass);
+    reshade::register_event<reshade::addon_event::end_render_pass>(on_end_pass);
     reshade::register_event<reshade::addon_event::reset_command_list>(on_reset);
 }
 void shutdown() {
     reshade::unregister_event<reshade::addon_event::reset_command_list>(on_reset);
     reshade::unregister_event<reshade::addon_event::begin_render_pass>(on_begin_pass);
+    reshade::unregister_event<reshade::addon_event::end_render_pass>(on_end_pass);
     reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(on_bind);
     reshade::unregister_event<reshade::addon_event::barrier>(on_barrier);
     reshade::unregister_event<reshade::addon_event::clear_render_target_view>(on_clear);

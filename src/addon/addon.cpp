@@ -115,6 +115,7 @@ constexpr Persisted kPersisted[] = {
     {"HudLearn", &fw::Settings::hud_learn, nullptr},
     {"WaitForCameraModel", &fw::Settings::wait_for_model, nullptr},
     {"FollowShare", &fw::Settings::follow_share, nullptr},
+    {"ShareFromInput", &fw::Settings::share_from_input, nullptr},
     {"ForwardSplatWarp", &fw::Settings::warp_splat, nullptr},
     {"HoldWholeCharacter", &fw::Settings::hold_characters, nullptr},
     {"MaxExtrapolation", nullptr, &fw::Settings::max_horizon_ms},
@@ -508,7 +509,8 @@ void on_present(command_queue*, swapchain* chain, const rect*, const rect*, uint
         fw::ui_layer::on_present(chain);
         {
             const auto& sh = *g_producer->shared();
-            fw::hud_learn::on_present(chain, sh.settings.hud_learn != 0, sh.presenter.hud_learn_pick, sh.presenter.hud_learn_fail, sh.settings.hud_relearn);
+            fw::hud_learn::on_present(chain, sh.settings.hud_learn != 0, g_producer->game_gives_hud(), sh.presenter.hud_learn_pick,
+                                      sh.presenter.hud_learn_fail, sh.settings.hud_relearn);
         }
         const auto learn = fw::hud_learn::status();
         g_producer->shared()->hooks.learn_candidates = learn.candidates;
@@ -874,6 +876,13 @@ void draw_overlay(effect_runtime*) {
                  "orbits or follows: none; the scenery: all of it; the ground around the character: part of it) instead of being "
                  "held or not. No edge for it to split along, and much lighter. The stretch, the orbit rule and holding the whole "
                  "character are not used with it. Remembered per game.");
+            if (share) {
+                bool from_input = s.share_from_input != 0;
+                if (ImGui::Checkbox("  ...measured against the turn from your input", &from_input)) s.share_from_input = from_input;
+                hint("Measured against the part of the camera's turn your mouse or stick explains - what the warp applies - instead "
+                     "of the camera's whole turn: a car's steering or a gun's own animation no longer counts. A spot whose motion "
+                     "suddenly disagrees with what it has followed so far counts less. Remembered per game.");
+            }
             int stretch = static_cast<int>(std::min(s.stretch_width, 32u));
             if (ImGui::SliderInt("Stretch around character/weapon (render px, XPAR engine)", &stretch, 0, 32, stretch ? "%d" : "off")) {
                 s.stretch_width = static_cast<std::uint32_t>(stretch);

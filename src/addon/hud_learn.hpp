@@ -33,7 +33,8 @@ void init(Probe probe, std::function<void()> none);
 void shutdown();
 // Every present of the game's swapchain: its back buffers; one frame ends. pick / fail: the presenter's (see
 // PresenterStatus); relearn: the panel's counter.
-void on_present(reshade::api::swapchain* chain, bool learning, std::uint32_t pick, std::uint32_t fail, std::uint32_t relearn);
+// paused: the game gives its HUD itself lately (nothing taken meanwhile)
+void on_present(reshade::api::swapchain* chain, bool learning, bool paused, std::uint32_t pick, std::uint32_t fail, std::uint32_t relearn);
 struct Status { std::uint32_t candidates = 0, active = 0, locked = 0; };
 // The learned point is saved once it has given the HUD for a minute of frames, and locked from the start on the next
 // launch (the panel's Relearn forgets it).

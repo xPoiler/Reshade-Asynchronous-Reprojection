@@ -77,6 +77,7 @@ struct Game {
     // Controller: the right stick (sx, sy) turns the camera at stick_gain * |s|^stick_power rad/s; the
     // presenter reads it every 4 ms.
     double stick_gain_x = 0, stick_gain_y = 0, stick_power = 2.0, sx = 0, sy = 0;
+    double self_turn = 0;  // the camera turning by itself, rad/s (a car's steering): no input
     double cam[2] = {0, 0}, target[2] = {0, 0};
     double t = 0, next_frame = 0.0, last_sim = 0;
     std::uint64_t frame = 0;
@@ -92,6 +93,7 @@ struct Game {
         if (dx || dy) model->mouse.add(t, dx, dy);
         if (!menu) { target[0] += gain_x * dx; target[1] += gain_y * dy; }
         target[0] += stick_gain_x * StickHistory::curve(sx, stick_power) * 0.001;
+        target[0] += self_turn * 0.001;
         target[1] += stick_gain_y * StickHistory::curve(sy, stick_power) * 0.001;
         if ((stick_gain_x != 0 || stick_gain_y != 0) && (static_cast<long>(std::lround(t * 1000.0)) % 4) == 0)
             model->stick.add(t, std::round(sx * 1000.0) / 1000.0, std::round(sy * 1000.0) / 1000.0);
@@ -110,10 +112,11 @@ struct Game {
             const auto f = in_flight.front();
             in_flight.erase(in_flight.begin());
             last_sim = f.t;
-            if (feed_model) model->add_source(++frame, f.t, t, camera_at(f.yaw, f.pitch), false, t);
+            if (feed_model) { model->add_source(++frame, f.t, t, camera_at(f.yaw, f.pitch), false, t); fed.push_back(f); }
         }
     }
     std::vector<Out> in_flight;
+    std::vector<Out> fed;  // the frames handed to the model (their simulation time and camera)
     struct T3 { double t, x, y; };
     std::vector<T3> history_target;
     double target_at_delay(int axis) const {
@@ -180,6 +183,66 @@ static void prediction_is_accurate_and_continuous() {
                 worst_step * 1000, worst_true_step * 1000);
     EXPECT(rms < hold_rms * 0.3, "prediction must beat holding the frame by a wide margin");
     EXPECT(worst_step < worst_true_step * 2.0 + 0.002, "no snaps at frame handoffs");
+}
+
+// The turn the input explains between two frames (the follow share's reference, Settings::share_from_input) is the camera's
+// turn between them when only the mouse turns it; and the camera turned back by it gives the same clip-space turn as the true
+// previous camera (signs and axes as main.cpp builds it).
+static void input_turn_matches_camera() {
+    PoseModel model;
+    Game g; g.model = &model;
+    for (int i = 0; i < 20000; ++i) g.step(pattern_x(g.t), pattern_y(g.t));
+    model.fit();
+    g.fed.clear();
+    for (int i = 0; i < 3000; ++i) g.step(pattern_x(g.t), pattern_y(g.t));
+    double err = 0, ref = 0, along = 0;
+    int n = 0;
+    for (std::size_t i = 1; i < g.fed.size(); ++i) {
+        double turn[2];
+        if (!model.input_turn(g.fed[i - 1].t, g.fed[i].t, turn)) continue;
+        const double d[2] = {g.fed[i].yaw - g.fed[i - 1].yaw, g.fed[i].pitch - g.fed[i - 1].pitch};
+        for (int k = 0; k < 2; ++k) { err += (turn[k] - d[k]) * (turn[k] - d[k]); ref += d[k] * d[k]; along += turn[k] * d[k]; }
+        ++n;
+    }
+    // (the share is a least-squares fit against it: what matters most is its scale - the slope - not the scatter)
+    const double slope = along / std::max(ref, 1e-30);
+    std::printf("  input turn vs the camera's, per frame: rms %.0f%% of it, slope %.2f, over %d frames\n",
+                100.0 * std::sqrt(err / std::max(ref, 1e-30)), slope, n);
+    EXPECT(std::fabs(slope - 1.0) < 0.1, "the input turn has the camera's scale (slope %.2f)", slope);
+    EXPECT(n > 50 && err < 0.1 * ref, "the input turn follows the camera's turn (rms %.2f of it)", std::sqrt(err / std::max(ref, 1e-30)));
+    const float ue[16] = {0.98f, 0, 0, 0, 0, 1.73f, 0, 0, 0, 0, 0, 1, 0, 0, 10.0f, 0};
+    Mat4 proj;
+    for (int i = 0; i < 16; ++i) proj[i] = ue[i];
+    const double z_sign = view_z_sign(ue);
+    const CameraBasis cur = camera_at(0.4, 0.1), prev = camera_at(0.37, 0.12);
+    const CameraBasis back = apply_rotation(cur, kUp, -(0.4 - 0.37), -(0.1 - 0.12), cur.pos);
+    const Mat4 truth = clip_to_source_rotation(proj, view_matrix(cur, cur.pos, z_sign), view_matrix(prev, cur.pos, z_sign));
+    const Mat4 built = clip_to_source_rotation(proj, view_matrix(cur, cur.pos, z_sign), view_matrix(back, cur.pos, z_sign));
+    double worst = 0;
+    for (int i = 0; i < 16; ++i) worst = std::max(worst, std::fabs(double(truth[i]) - double(built[i])));
+    EXPECT(worst < 1e-4, "the camera turned back by the input turn matches the previous camera (worst %.2e)", worst);
+}
+
+// Driving: stretches where the camera turns by itself (steering, no input) between ones turned by the mouse. The fit keeps
+// the mouse's gain (the steering frames are left out of it), and the prediction counts the camera's own turn going on as
+// the rest - not the input's - once the input is a while past.
+static void driving_keeps_gain() {
+    PoseModel model;
+    Game g; g.model = &model;
+    for (int i = 0; i < 30000; ++i) {
+        const bool steering = std::fmod(g.t, 4.0) > 2.0;
+        g.self_turn = steering ? 0.8 * std::sin(g.t * 1.3) : 0.0;
+        g.step(steering ? 0 : pattern_x(g.t), steering ? 0 : pattern_y(g.t));
+    }
+    model.fit();
+    const auto& x = model.params(0);
+    std::printf("  driving: yaw gain %g (true %g), quality %.2f\n", x.gain, g.gain_x, x.quality);
+    EXPECT(std::fabs(x.gain / g.gain_x - 1.0) < 0.2, "yaw gain kept while driving: %g (true %g)", x.gain, g.gain_x);
+    // Steering alone for a while: the input's part of the prediction is none of the turn going on.
+    for (int i = 0; i < 1500; ++i) { g.self_turn = 1.0; g.step(0, 0); }
+    const Prediction p = model.predict(g.t);
+    std::printf("  driving: predicted turn %.4f rad, of it the input's %.4f\n", p.yaw, p.input_yaw);
+    EXPECT(std::fabs(p.input_yaw) < 1e-6, "steering alone: no input part (%.5f of %.5f)", p.input_yaw, p.yaw);
 }
 
 static void cursor_gate_blocks_mouse() {
@@ -388,6 +451,8 @@ int main() {
     right_handed_projection();
     fit_recovers_smoothed_camera();
     prediction_is_accurate_and_continuous();
+    input_turn_matches_camera();
+    driving_keeps_gain();
     cursor_gate_blocks_mouse();
     auto_latency_tracks_frame_interval();
     world_up_detection();

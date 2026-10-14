@@ -264,6 +264,11 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> hudless_pending_;  // the HUD-less copy taken this frame (on_hudless_copy)
     std::uint32_t hudless_age_ = 2;  // presents since the last one (handed over while at most 1)
     std::uint32_t hud_given_ = 0;    // frames in a row with the game's HUD handed over (begin_present)
+    std::uint32_t game_hud_frames_ = 0, game_hud_missing_ = 0;
+public:
+    std::uint32_t hud_given() const { return hud_given_; }
+    bool game_gives_hud() const { return game_hud_frames_ >= 60; }  // (HUD learning paused, see begin_present)
+private:
     // ...handed over as its coverage only (alpha, 8-bit, one channel - made at the present on ReShade's list): a few MB a
     // frame whatever the game's format, and the frames' textures never change when a menu brings a layer of another one.
     Microsoft::WRL::ComPtr<ID3D12Resource> ui_alpha_;

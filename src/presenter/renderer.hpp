@@ -149,7 +149,7 @@ public:
     // generated: show the game's generated image of that index (frame generation, see prepare_generated)
     // instead of the frame; source_to_target is then that image's camera's.
     bool own_warp(const IngestedSource& src, bool use_ui_tags, bool use_mask, const float source_to_target[16], bool depth_inverted,
-                  bool memory = false, const ObjectWarp* objects = nullptr, int generated = -1, bool soft_edge = false);
+                  bool memory = false, const ObjectWarp* objects = nullptr, int generated = -1, bool soft_edge = false, const float* input_to_target = nullptr);
     // Frame generation, once per game frame (after the motion analysis): the generated images taken in with
     // the frame made ready for the warp - each one's depth (this frame's, moved back along the motion vectors
     // to the image's moment) and, with the HUD-less picture and UI layer, the UI they show taken back out
@@ -211,8 +211,15 @@ public:
     // The character/weapon by how much of the camera's turn each spot follows (Settings::follow_share): measured on every
     // game frame with depth and motion, before the mask (build_no_warp_mask with share). whole_motion: against the camera's
     // whole motion (the warp turns around an orbit), otherwise its turn alone. reset_share: start over.
-    void follow_share(const IngestedSource& src, const float clip_to_prev_clip[16], bool scale_valid, bool depth_inverted, bool whole_motion);
+    // share_mode: 0 one share; two shares (Settings::share_from_input) - 1 this frame's turn was the input's, 2 the rest's.
+    void follow_share(const IngestedSource& src, const float clip_to_prev_clip[16], bool scale_valid, bool depth_inverted, bool whole_motion,
+                      int share_mode = 0);
     void reset_share() { share_reset_ = true; }
+    // Diagnostics (recorded diagnostics: share.csv): per game frame, what the near-camera spots (first-person weapon, a car's
+    // interior) learn their share from - see cs_share_measure's [288, 300). frame: the game frame being measured.
+    struct ShareDiag { std::uint64_t frame = 0; int mode = 0; std::int32_t v[12] = {}; float band_a[12] = {}, band_b[12] = {}; };
+    void set_share_diag(bool on, std::uint64_t frame) { share_diag_ = on; share_diag_frame_ = frame; }
+    std::vector<ShareDiag> take_share_diags() { std::vector<ShareDiag> d; d.swap(share_diags_); return d; }
     std::uint32_t warp_rest_blocks();  // (replay: the blocks the last warp left for the full warp)  // (replay timing: the warp stopped after stage 1 claims, 2 lean)
     std::uint32_t grow_cells() const { return grow_cells_; }
     void set_grow_cells(std::uint32_t n) { grow_cells_ = n; }  // (replay: no frame ring to read the count back)
@@ -305,7 +312,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     };
-    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKeys, kPObjMove, kPObjTiles, kPObjOutTiles, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevColour, kPPrevDepth, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPFgMotion, kPFgInv, kPFgK1, kPFgK0, kPHudLearned, kPHudTiles, kPWarpClaims, kPStill, kPGrowA, kPGrowB, kPProbe, kPProbeTilesA, kPProbeTilesB, kPShareA, kPShareB, kPShareT, kPShare, kPRetDirtyA, kPRetDirtyB, kPCount };
+    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKeys, kPObjMove, kPObjTiles, kPObjOutTiles, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevColour, kPPrevDepth, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPFgMotion, kPFgInv, kPFgK1, kPFgK0, kPHudLearned, kPHudTiles, kPWarpClaims, kPStill, kPGrowA, kPGrowB, kPProbe, kPProbeTilesA, kPProbeTilesB, kPShareA, kPShareB, kPShareT, kPShare, kPRetDirtyA, kPRetDirtyB, kPShareT2, kPCount };
 
     bool create_pipelines(std::string& error);
     // The format a private copy of a game colour image is kept in: the game's own 4-byte format when it
@@ -433,12 +440,20 @@ private:
     ComPtr<ID3D12Resource> warp_list_, warp_args_, warp_list_old_;  // (see ensure_warp_list; the old one kept until the next resize)
     ComPtr<ID3D12CommandSignature> dispatch_sig_;
     ComPtr<ID3D12Resource> ret_args_;
-    ComPtr<ID3D12Resource> share_bins_;  // (follow_share: the depth bands, see cs_share_bins)  // (sight reticles: the dispatches of the passes over the whole screen, cs_ret_args)
+    ComPtr<ID3D12Resource> share_bins_;  // (follow_share: the depth bands, see cs_share_bins)
+    static constexpr UINT kShareDiagBytes = 60 * 4;  // (share_bins_ from [240]: the bands' shares, then the diagnostics)
+    ComPtr<ID3D12Resource> share_readback_;
+    bool share_diag_ = false, share_diag_pending_[kRing] = {};
+    std::uint64_t share_diag_frame_ = 0;
+    ShareDiag share_diag_meta_[kRing];
+    std::vector<ShareDiag> share_diags_;  // (sight reticles: the dispatches of the passes over the whole screen, cs_ret_args)
     bool ret_ran_ = false;             // (...the reticle passes ran last game frame)
     // (...their game frames counted, and the one each layer texture - A, B - was last written in: see cs_ret_layer)
     std::uint32_t ret_frame_ = 0, ret_written_[2] = {};
     bool layer_pending_[kRing] = {};
     int layer_trust_ = 0;
+    bool layer_cover_only_[kRing] = {};  // (that readback: the coverage alone - see build_no_warp_mask)
+    bool layer_full_ = false;            // ...the latest one read back: 90% of the screen or more
     std::uint64_t layer_covered_ = 0, layer_drawn_over_ = 0, layer_frames_ = 0;
     double layer_frame_samples_ = 0;  // samples per frame (every second pixel each way)
     // Textures released once the GPU is past them (no waiting: no hitch), see retire.

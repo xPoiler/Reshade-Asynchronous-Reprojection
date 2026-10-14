@@ -51,6 +51,7 @@ void default_settings(Settings& s) {
     s.hud_learn = 1;  // learn where the game draws its HUD
     s.wait_for_model = 1;  // the game's own frames until the camera model is learned
     s.follow_share = 1;  // the character/weapon by the share of the turn it follows
+    s.share_from_input = 1;  // ...of the turn the input explains
     s.edge_limit_pct = 0.0f;  // camera as of now: no more of the edge uncovered than Auto's
     s.edge_fill = 1;  // soft edge (blur along the edge); extended edge pixels are the option
     s.no_warp_mask = 1;   // HUD detection in games without HUD layers
@@ -1188,6 +1189,10 @@ std::uint64_t Producer::begin_present(ID3D12Resource* backbuffer, ID3D12Graphics
         ++shared_->hooks.hudless_handed;
     }
     if (hudless_age_ < 2) ++hudless_age_;
+    // (HUD learning paused while the game gives its HUD - any HUD layer or HUD-less picture, the ones the add-on finds too:
+    // after 60 frames with one, until 600 frames without - a loading screen does not start it again)
+    if (m.tex[kUi].valid || m.tex[kHudless].valid) { game_hud_frames_ = std::min(game_hud_frames_ + 1, 60u); game_hud_missing_ = 0; }
+    else if (++game_hud_missing_ >= 600) game_hud_frames_ = 0;
     d3d12_learned(list, slot);  // (HUD learning: the learned point, where nothing else gave the HUD)
     // Frames in a row the game handed its HUD over (a HUD-less picture, a UI layer it tags, or the HUD layer the add-on takes
     // once the presenter has checked it - until then the check needs the upscaler's output; and then a frame without it is

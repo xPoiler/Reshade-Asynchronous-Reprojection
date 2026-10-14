@@ -173,6 +173,13 @@ public:
         return total;
     }
     double counts(int axis, double t0, double t1) const { return filtered(axis, t0, t1, t1, 0.0); }
+    // Any movement with t0 < t_i <= t1.
+    bool moved(double t0, double t1) const {
+        std::lock_guard lock(mutex_);
+        auto it = std::upper_bound(samples_.begin(), samples_.end(), t0, [](double v, const Sample& s) { return v < s.t; });
+        for (; it != samples_.end() && it->t <= t1; ++it) if (it->dx || it->dy) return true;
+        return false;
+    }
     void reset() { std::lock_guard lock(mutex_); samples_.clear(); }
     // The events after `from`, for the fit (which works on its own copy, without the lock).
     void copy_since(double from, std::vector<double>& t, std::vector<double>& dx, std::vector<double>& dy) const {
@@ -228,6 +235,15 @@ public:
         if (b <= a || c == 0.0) return 0.0;
         if (tau <= 0) return c * (b - a);
         return c * ((b - a) - tau * (std::exp(-(t_end - b) / tau) - std::exp(-(t_end - a) / tau)));
+    }
+    // ...turned by the stick past a small deflection at any time in [t0, t1] (the value held at t0 included).
+    bool deflected(double t0, double t1, double at_least = 0.15) const {
+        std::lock_guard lock(mutex_);
+        if (samples_.empty()) return false;
+        auto it = std::upper_bound(samples_.begin(), samples_.end(), t0, [](double v, const Sample& x) { return v < x.t; });
+        if (it != samples_.begin()) { const auto& p = *std::prev(it); if (std::fabs(p.x) > at_least || std::fabs(p.y) > at_least) return true; }
+        for (; it != samples_.end() && it->t <= t1; ++it) if (std::fabs(it->x) > at_least || std::fabs(it->y) > at_least) return true;
+        return false;
     }
     void copy_since(double from, std::vector<double>& t, std::vector<double>& x, std::vector<double>& y) const {
         std::lock_guard lock(mutex_);
@@ -377,6 +393,7 @@ struct PoseSettings {
 struct Prediction {
     CameraBasis camera;
     double yaw = 0, pitch = 0;  // applied deltas relative to the source (radians)
+    double input_yaw = 0, input_pitch = 0;  // ...of which the input's (mouse, stick, the handoff blend: not the camera's own turn going on)
     double horizon = 0;          // seconds predicted past the source
 };
 
@@ -593,12 +610,20 @@ public:
             out.camera = apply_rotation(src_.basis, up_.get(), delta[0], delta[1], pivot);
             out.camera.pos = pos + blend_pos_ * fade;
             out.yaw = delta[0]; out.pitch = delta[1]; out.horizon = reached - src_.t;
+            // (the input's part, as below: the camera's own history the input's if there was input lately; never the blend)
+            const bool lately = input_active(src_.t - kInputLately, now);
+            out.input_yaw = lately ? delta[0] - blend_[0] * fade : 0.0;
+            out.input_pitch = lately ? delta[1] - blend_[1] * fade : 0.0;
             return out;
         }
+        // (the camera's own turn carried on - a smoothed camera finishing the input's turn, or one turning by itself; and the
+        // handoff blend - what the last prediction missed)
+        double going_on[2] = {0, 0}, blended[2] = {0, 0};
         for (int k = 0; k < 2; ++k) {
             const AxisParams& p = params_[k];
             const double tau = p.tau;
-            delta[k] = velocity_term(tau, src_.w[k], h) * settings_.rotation_extrapolation;
+            going_on[k] = velocity_term(tau, src_.w[k], h) * settings_.rotation_extrapolation;
+            delta[k] = going_on[k];
             const double g = gain(k);
             if (settings_.use_mouse && gate_ && follows_ && g != 0.0) {
                 const double d = settings_.manual_gain ? settings_.manual_delay : p.delay;
@@ -612,7 +637,8 @@ public:
                 delta[k] += p.stick_gain * stick.filtered(k, src_.t + p.delay, end, end, tau, p.stick_power);
             }
             const double fade = std::exp(-(now - blend_t_) / std::max(settings_.blend_tau, 1e-4));
-            delta[k] += blend_[k] * fade;
+            blended[k] = blend_[k] * fade;
+            delta[k] += blended[k];
         }
         const Vec3 world_up = up_.get();
         const Vec3 pivot = src_.basis.pos + src_.basis.fwd * orbit();
@@ -620,6 +646,12 @@ public:
         out.camera.pos = out.camera.pos + velocity_ * (h * settings_.translation_extrapolation) +
                          blend_pos_ * std::exp(-(now - blend_t_) / std::max(settings_.blend_tau, 1e-4));
         out.yaw = delta[0]; out.pitch = delta[1]; out.horizon = h;
+        // The input's part (the follow share's two parts, see Settings::share_from_input): the mouse and the stick, and the
+        // camera's own turn going on while there was input lately (a smoothed camera finishing it) - not without (a car's
+        // steering, a camera turning by itself); never the handoff blend.
+        const bool lately = input_active(src_.t - kInputLately, now);
+        out.input_yaw = delta[0] - blended[0] - (lately ? 0.0 : going_on[0]);
+        out.input_pitch = delta[1] - blended[1] - (lately ? 0.0 : going_on[1]);
         return out;
     }
 
@@ -657,6 +689,38 @@ public:
     double gain(int axis) const {
         if (settings_.manual_gain) return axis ? settings_.manual_gain_y : settings_.manual_gain_x;
         return params_[axis].gain;
+    }
+    // Input in [a, b] (any mouse movement, the stick past a small deflection) - the camera's turn there counts as the input's
+    // (the follow share's two parts); kInputLately: how far back input still counts (a smoothed camera finishing its turn).
+    static constexpr double kInputLately = 0.25;
+    bool input_active(double a, double b) const {
+        return (settings_.use_mouse && mouse.moved(a, b)) || (settings_.use_stick && stick.deflected(a, b));
+    }
+    // The camera's turn between frame times a and b (yaw, pitch; radians) that the input explains, as predict applies it:
+    // the camera at time t takes the input up to t + delay, smoothed - the difference of that at b and at a. false: no
+    // input model (no gain fitted, the input not followed - a menu - or not used).
+    bool input_turn(double a, double b, double out[2]) const {
+        out[0] = out[1] = 0;
+        bool any = false;
+        for (int k = 0; k < 2; ++k) {
+            const AxisParams& p = params_[k];
+            const double tau = p.tau;
+            const double settled = std::max(10.0 * tau, 0.05);  // (input older than this counts in full at both)
+            const double g = gain(k);
+            if (settings_.use_mouse && gate_ && follows_ && g != 0.0) {
+                const double d = settings_.manual_gain ? settings_.manual_delay : p.delay;
+                const double lo = a + d - settled;
+                out[k] += g * (mouse.filtered(k, lo, b + d, b + d, tau) - mouse.filtered(k, lo, a + d, a + d, tau));
+                any = true;
+            }
+            if (settings_.use_stick && gate_ && p.stick_gain != 0.0) {
+                const double lo = a + p.delay - settled;
+                out[k] += p.stick_gain * (stick.filtered(k, lo, b + p.delay, b + p.delay, tau, p.stick_power) -
+                                          stick.filtered(k, lo, a + p.delay, a + p.delay, tau, p.stick_power));
+                any = true;
+            }
+        }
+        return any;
     }
     const CameraBasis& source_basis() const { return src_.basis; }
     double source_theta(int axis) const { return src_.theta[axis]; }
@@ -774,6 +838,27 @@ private:
                         for (std::size_t i = s; i <= e; ++i) frames[i].gate = false;
                 }
                 s = e + 1;
+            }
+        }
+        // Frames where the camera turned with no input at all for half a second before (a car's steering, a camera turning by
+        // itself) are left out too: no input explains them, and they pulled the smoothing and delay - and with them the gain -
+        // off (Cyberpunk while driving: yaw gain 10x too small, pitch to 0). A smoothed camera finishing the input's turn is
+        // within half a second of it.
+        if (!frames.empty()) {
+            std::size_t mi = 0, si = 0;
+            for (std::size_t i = 1; i < frames.size(); ++i) {
+                FitFrame& f = frames[i];
+                const double from = f.t - 0.5;
+                while (mi < job.mouse_t.size() && job.mouse_t[mi] <= from) ++mi;
+                bool input = mi < job.mouse_t.size() && job.mouse_t[mi] <= f.t;
+                while (si < job.stick_t.size() && job.stick_t[si] <= from) ++si;
+                if (!input && !job.stick_t.empty()) {
+                    if (si > 0 && (std::fabs(job.stick_v[0][si - 1]) > 0.15 || std::fabs(job.stick_v[1][si - 1]) > 0.15)) input = true;
+                    for (std::size_t j = si; !input && j < job.stick_t.size() && job.stick_t[j] <= f.t; ++j)
+                        if (std::fabs(job.stick_v[0][j]) > 0.15 || std::fabs(job.stick_v[1][j]) > 0.15) input = true;
+                }
+                const double turned = std::fabs(f.theta[0] - frames[i - 1].theta[0]) + std::fabs(f.theta[1] - frames[i - 1].theta[1]);
+                if (!input && turned > 1e-3) f.gate = false;
             }
         }
         // Too little left to fit on (most of the history left out): a model already learned stays as it is.
