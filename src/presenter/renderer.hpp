@@ -37,6 +37,15 @@ struct IngestedSource {
     std::uint32_t hud_learned = 0;  // the UI coverage is the learned point's (1), or empty: it did not draw (2)
 };
 
+// A recorded frame (Renderer::record_frame), tight rows: the picture shrunk to about 1080 lines (R11G11B10_FLOAT), depth
+// (R32_FLOAT) and motion vectors (R16G16_FLOAT) at render resolution, the HUD layer's coverage (R8, the picture's size; empty
+// without one).
+struct RecordedFrame {
+    std::uint64_t tag = 0;
+    std::uint32_t cw = 0, ch = 0, dw = 0, dh = 0;
+    std::vector<std::uint8_t> colour, depth, motion, ui;
+};
+
 // HUD detection frames: learned from, skipped for too few telling pixels, or held back by the
 // whole-frame guard (too many pixels looked like HUD).
 struct HudStats {
@@ -210,6 +219,24 @@ public:
     void set_rig_check(bool on) { rig_check_ = on; }
     // Forward splat in two passes (cs_own_warp_lean / _rest; default on): off runs the full warp on every pixel (A/B).
     void set_warp_blocks(bool on) { warp_blocks_ = on; }
+    void set_warp_paths(bool on) { warp_paths_ = on; }
+    // Characters carried on along their own motion (see cs_share_resid / ow_own): game frames past the shown frame the warp
+    // shows (0: not carried on)
+    void set_warp_ahead(float frames) { warp_ahead_ = frames; }
+    void set_own_smooth(int cells) { own_smooth_ = cells; }  // (the own motion spread over each character: taps this many cells apart; 0 not - 3 by default)
+    void set_chars_carried(bool on) { chars_carried_ = on; }  // (characters carried as one by the turn - see cs_share_final)
+    void set_splat_turns(bool on) { splat_turns_ = on; }  // (the forward splat on pure turns too, with the follow share)
+    void set_own_carried_only(bool on) { own_carried_only_ = on; }  // (own motion only where the share carries)
+    void set_outline_scenery(bool on) { outline_scenery_ = on; }  // (outlines held only on what the share counts as scenery)
+    void set_carried_edge(bool on) { carried_edge_ = on; }  // (held carried pixels beside a slightly moving carried one: not held)
+    void set_carried_free(bool on) { carried_free_ = on; }  // (dev: carried pixels - share ~0 - not held by the warp)
+    void set_outlines_held(bool on) { outlines_held_ = on; }  // (the mask's outlines and sights, 0.95: held, or warped as carried)
+    void set_own_depth_blind(bool on) { own_depth_blind_ = on; }  // (own motion spread over a character at any distance)
+    // Sequence recording (development, see record_frame): queue the frame just taken in; collect finished ones.
+    static constexpr int kRecSlots = 6;
+    bool record_frame(std::uint64_t tag, bool ui);
+    bool take_recorded(RecordedFrame& out);
+    bool recording_in_flight() const { for (const auto& r : rec_) if (r.state.load() != 0) return true; return false; }  // (debug: the warp writes the way it found each pixel - see ow_path)
     void set_warp_stop(int stage) { warp_stop_ = stage; }
     // The character/weapon by how much of the camera's turn each spot follows (Settings::follow_share): measured on every
     // game frame with depth and motion, before the mask (build_no_warp_mask with share). whole_motion: against the camera's
@@ -317,7 +344,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     };
-    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKeys, kPObjMove, kPObjTiles, kPObjOutTiles, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevColour, kPPrevDepth, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPFgMotion, kPFgInv, kPFgK1, kPFgK0, kPHudLearned, kPHudTiles, kPWarpClaims, kPStill, kPGrowA, kPGrowB, kPProbe, kPProbeTilesA, kPProbeTilesB, kPShareA, kPShareB, kPShareT, kPShare, kPRetDirtyA, kPRetDirtyB, kPShareT2, kPShareHalf, kPCount };
+    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKeys, kPObjMove, kPObjTiles, kPObjOutTiles, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevColour, kPPrevDepth, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPFgMotion, kPFgInv, kPFgK1, kPFgK0, kPHudLearned, kPHudTiles, kPWarpClaims, kPStill, kPGrowA, kPGrowB, kPProbe, kPProbeTilesA, kPProbeTilesB, kPShareA, kPShareB, kPShareT, kPShare, kPRetDirtyA, kPRetDirtyB, kPShareT2, kPShareHalf, kPRecColour, kPRecUi, kPShareResid, kPOwnMove, kPCount };
 
     bool create_pipelines(std::string& error);
     // The format a private copy of a game colour image is kept in: the game's own 4-byte format when it
@@ -327,7 +354,7 @@ private:
     bool ensure_private(PrivateId id, std::uint32_t w, std::uint32_t h, DXGI_FORMAT format);
     // The textures the warp reads, kept twice with split queues (front_: the shown set).
     static bool shown_id(PrivateId id) {
-        return id == kPBackbuffer || id == kPHudless || id == kPUi || id == kPDepth || id == kPMask || id == kPFill || id == kPWarpMask || id == kPShare ||
+        return id == kPBackbuffer || id == kPHudless || id == kPUi || id == kPDepth || id == kPMask || id == kPFill || id == kPWarpMask || id == kPShare || id == kPOwnMove ||
                id == kPObjMove || id == kPObjTiles || id == kPPrevColour || id == kPPrevDepth || (id >= kPGen0 && id <= kPGenZ2) ||
                id == kPRetLayer;
     }
@@ -410,12 +437,28 @@ private:
     // from of the last 300; stalled (fewer than a tenth, and before the first 300) - no confirmation.
     std::uint32_t learn_frames_ = 0, learn_learned_ = 0;
     bool warp_blocks_ = true;
+    bool warp_paths_ = false;
+    float warp_ahead_ = 0;
+    int own_smooth_ = 3;
+    bool chars_carried_ = false, splat_turns_ = true, own_carried_only_ = false, own_depth_blind_ = false, outlines_held_ = true, outline_scenery_ = false, carried_free_ = false, carried_edge_ = true;
+    bool share_resid_built_ = false, shown_share_resid_ = false;
+    struct RecSlot {
+        ComPtr<ID3D12Resource> buffer[4];  // colour, depth, motion, coverage
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT foot[4] = {};
+        std::uint32_t width[4] = {}, height[4] = {};
+        std::uint64_t tag = 0, fence = 0;
+        int context = 0;
+        bool has_ui = false;
+        std::atomic<int> state{0};  // 0 free, 1 queued on a list, 2 submitted (its fence known) - see take_recorded
+    };
+    RecSlot rec_[kRecSlots];
+    int rec_next_ = 0;
     bool share_flip_ = false, share_reset_ = false, share_built_ = false;
     int warp_stop_ = 99;
     bool learning_stalled_ = true;
     std::uint32_t detection_idle_ = 0;  // game frames since the HUD was last detected (build_no_warp_mask)
     std::uint32_t scene_idle_ = 0;      // game frames since the upscaler's output last came (ingest)
-    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_own_warp_reset_, cs_own_warp_lean_, cs_own_warp_args_, cs_own_warp_rest_, cs_warp_claims_clear_, cs_warp_claim_, cs_memory_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_, cs_probe_tiles_, cs_probe_clear_, cs_probe_score_, cs_share_measure_, cs_share_blur_, cs_share_bins_, cs_share_final_, cs_share_up_, cs_share_vote_h_, cs_share_vote_v_;
+    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_own_warp_reset_, cs_own_warp_lean_, cs_own_warp_args_, cs_own_warp_rest_, cs_warp_claims_clear_, cs_warp_claim_, cs_memory_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_, cs_probe_tiles_, cs_probe_clear_, cs_probe_score_, cs_share_measure_, cs_share_blur_, cs_share_bins_, cs_share_final_, cs_share_up_, cs_rec_down_, cs_share_resid_, cs_resid_blur_, cs_own_up_;
     // Sight reticles (option): the passes, which history texture holds the latest layer, and whether the layer was
     // built for the frame taken in last / the shown one (see cs_ret_layer).
     ComPtr<ID3D12PipelineState> cs_ret_cells_, cs_ret_enclose_, cs_ret_layer_, cs_ret_align_, cs_ret_pick_, cs_ret_args_, cs_ret_shift_;

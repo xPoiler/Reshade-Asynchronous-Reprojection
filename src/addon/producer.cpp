@@ -440,7 +440,7 @@ int Producer::present_slot() {
     return slot;
 }
 
-void Producer::on_ui_layer(ID3D12Resource* source, D3D12_RESOURCE_STATES state, ID3D12GraphicsCommandList* list) {
+void Producer::on_ui_layer(ID3D12Resource* source, D3D12_RESOURCE_STATES state, ID3D12GraphicsCommandList* list, bool inverted) {
     std::lock_guard lock(mutex_);
     if (!ready() || !source || !list || !device_) return;
     const auto desc = source->GetDesc();
@@ -467,6 +467,7 @@ void Producer::on_ui_layer(ID3D12Resource* source, D3D12_RESOURCE_STATES state, 
     }
     copy_into(list, source, state, ui_pending_.Get());
     ui_pending_valid_ = true;
+    ui_pending_inverted_ = inverted;
     shared_->hooks.ui_layer_w = static_cast<std::uint32_t>(desc.Width); shared_->hooks.ui_layer_h = desc.Height;
     shared_->hooks.ui_layer_format = desc.Format;
     ++shared_->hooks.ui_layer_taken;
@@ -1033,14 +1034,19 @@ void Producer::d3d11_cover(ID3D11DeviceContext* context, int slot) {
     ++shared_->hooks.ui_layer_handed;
 }
 
-// The HUD layer's coverage pass (see begin_present): alpha into an 8-bit one-channel texture.
+// The HUD layer's coverage pass (see begin_present): alpha into an 8-bit one-channel texture - 1 - alpha for a layer
+// cleared to opaque black (INVERTED: its alpha is how much of the picture shows through, Armored Core VI).
 static const char kUiAlphaShader[] = R"(
 Texture2D<float4> layer : register(t0);
 RWTexture2D<unorm float> coverage : register(u0);
 [numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
     uint w, h;
     coverage.GetDimensions(w, h);
+#ifdef INVERTED
+    if (id.x < w && id.y < h) coverage[id.xy] = 1.0 - layer.Load(int3(id.xy, 0)).a;
+#else
     if (id.x < w && id.y < h) coverage[id.xy] = layer.Load(int3(id.xy, 0)).a;
+#endif
 }
 )";
 constexpr UINT kUiRing = 8;
@@ -1048,8 +1054,10 @@ bool Producer::ensure_ui_pass() {
     if (ui_pso_) return true;
     if (ui_pass_failed_ || !device_) return false;
     ui_pass_failed_ = true;  // (until it succeeds: tried once)
-    ComPtr<ID3DBlob> code, errors;
-    if (FAILED(D3DCompile(kUiAlphaShader, sizeof(kUiAlphaShader) - 1, "ui_alpha", nullptr, nullptr, "main", "cs_5_0", 0, 0, &code, &errors))) {
+    ComPtr<ID3DBlob> code, code_inverted, errors;
+    const D3D_SHADER_MACRO inverted[] = {{"INVERTED", "1"}, {nullptr, nullptr}};
+    if (FAILED(D3DCompile(kUiAlphaShader, sizeof(kUiAlphaShader) - 1, "ui_alpha", nullptr, nullptr, "main", "cs_5_0", 0, 0, &code, &errors)) ||
+        FAILED(D3DCompile(kUiAlphaShader, sizeof(kUiAlphaShader) - 1, "ui_alpha", inverted, nullptr, "main", "cs_5_0", 0, 0, &code_inverted, &errors))) {
         set_message("HUD layer: shader failed");
         shared_->hooks.ui_layer_pass = 2;
         return false;
@@ -1073,7 +1081,10 @@ bool Producer::ensure_ui_pass() {
     pd.pRootSignature = ui_root_.Get();
     pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2 * kUiRing, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
-    if (FAILED(device_->CreateComputePipelineState(&pd, IID_PPV_ARGS(&ui_pso_))) || FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&ui_heap_)))) {
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pi = pd;
+    pi.CS = {code_inverted->GetBufferPointer(), code_inverted->GetBufferSize()};
+    if (FAILED(device_->CreateComputePipelineState(&pd, IID_PPV_ARGS(&ui_pso_))) || FAILED(device_->CreateComputePipelineState(&pi, IID_PPV_ARGS(&ui_pso_inverted_))) ||
+        FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&ui_heap_)))) {
         ui_pso_.Reset();
         set_message("HUD layer: pipeline failed");
         shared_->hooks.ui_layer_pass = 2;
@@ -1158,7 +1169,7 @@ std::uint64_t Producer::begin_present(ID3D12Resource* backbuffer, ID3D12Graphics
             ID3D12DescriptorHeap* heaps[] = {ui_heap_.Get()};
             list->SetDescriptorHeaps(1, heaps);
             list->SetComputeRootSignature(ui_root_.Get());
-            list->SetPipelineState(ui_pso_.Get());
+            list->SetPipelineState(ui_pending_inverted_ ? ui_pso_inverted_.Get() : ui_pso_.Get());
             D3D12_GPU_DESCRIPTOR_HANDLE gpu = ui_heap_->GetGPUDescriptorHandleForHeapStart();
             gpu.ptr += UINT64(base) * ui_heap_step_;
             list->SetComputeRootDescriptorTable(0, gpu);

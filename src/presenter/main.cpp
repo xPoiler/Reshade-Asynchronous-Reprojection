@@ -6,6 +6,7 @@
 #include "presenter/renderer.hpp"
 #include "shared/camera_check.hpp"
 #include <shellapi.h>
+#include <compressapi.h>
 #include <winternl.h>  // NTSTATUS for d3dkmthk.h
 #include <d3dkmthk.h>
 #include <dxgi1_4.h>
@@ -67,9 +68,118 @@ struct App {
     FILE* csv_outputs = nullptr;  // presented frames + applied warp
     FILE* csv_share = nullptr;    // per game frame: what the near-camera spots learn their follow share from (Renderer::ShareDiag)
     std::int64_t events_read = 0;
-    bool mark_was_down = false, dump_was_down = false;
+    bool mark_was_down = false, dump_was_down = false, record_was_down = false;
 };
 App g_app;
+
+// Sequence recording (development, Ctrl+Shift+F8 with "Record detailed diagnostics" ticked): every game frame the presenter
+// takes in - its picture shrunk to about 1080 lines, depth, motion vectors, the HUD layer's coverage - and per frame the
+// camera and what the presenter decided (frames.txt), for dev/seq_replay.cpp: the pipeline run over the whole clip as in
+// the game, each frame's warp scored against the game's next real frame. The render thread only queues the GPU's copies
+// (Renderer::record_frame); a collector thread at a low priority takes them into memory as they finish - nothing is
+// written while the game runs the clip (compressing and writing alongside, at the presenter's high priority, took the
+// game's CPU: Armored Core VI at 9 fps) - and once the clip ends, writes them out at the lowest priority, uncompressed
+// (XPRESS saved 17%), to %LOCALAPPDATA%\FrameWarp\recordings\<game exe>\seq_N. A clip ends when the key is pressed
+// again, after kRecMaxSeconds, or when kRecMaxBytes are held (~27 MB a frame: ~4 s at 50 fps).
+void logf(const char* format, ...);
+struct SequenceRecorder {
+    static constexpr double kRecMaxSeconds = 10.0;
+    static constexpr std::size_t kRecMaxBytes = std::size_t(6) << 30;
+    std::atomic<bool> active{false};      // frames being recorded
+    std::atomic<bool> collecting{false};  // the collector still takes frames from the renderer
+    std::atomic<bool> busy{false};        // a clip being collected or written
+    std::filesystem::path dir;
+    double started = 0;
+    std::atomic<std::uint64_t> dropped{0};
+    std::mutex mu;
+    std::map<std::uint64_t, std::string> lines;  // per game frame: its frames.txt line, until the frame comes back
+    std::string header;
+
+    void note(std::uint64_t frame, std::string line) {
+        std::lock_guard<std::mutex> lock(mu);
+        lines[frame] = std::move(line);
+    }
+    void start(Renderer& renderer, const std::filesystem::path& root, const std::string& settings_line) {
+        std::error_code ec;
+        std::filesystem::create_directories(root, ec);
+        int n = 0;
+        for (const auto& e : std::filesystem::directory_iterator(root, ec)) {
+            const std::wstring name = e.path().filename().wstring();
+            if (name.rfind(L"seq_", 0) == 0) n = std::max(n, _wtoi(name.c_str() + 4));
+        }
+        dir = root / (L"seq_" + std::to_wstring(n + 1));
+        header = settings_line;
+        dropped = 0;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            lines.clear();
+        }
+        started = now_seconds();
+        busy = true; collecting = true; active = true;
+        std::thread([this, &renderer]() { run(renderer); }).detach();
+    }
+    void run(Renderer& renderer) {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+        std::vector<std::pair<std::string, RecordedFrame>> clip;
+        std::size_t bytes = 0;
+        for (;;) {
+            RecordedFrame f;
+            if (renderer.take_recorded(f)) {
+                std::string line;
+                {
+                    std::lock_guard<std::mutex> lock(mu);
+                    const auto it = lines.find(f.tag);
+                    if (it != lines.end()) { line = std::move(it->second); lines.erase(lines.begin(), std::next(it)); }
+                }
+                if (line.empty()) continue;
+                bytes += f.colour.size() + f.depth.size() + f.motion.size() + f.ui.size();
+                clip.emplace_back(std::move(line), std::move(f));
+                if (bytes > kRecMaxBytes) active = false;
+                continue;
+            }
+            if (!active && !renderer.recording_in_flight()) break;
+            Sleep(1);
+        }
+        collecting = false;
+        const double secs = now_seconds() - started;
+        // Written out once the clip is over, in Windows' background mode: the lowest CPU, disk and memory priority. (At the
+        // lowest CPU priority alone the 6 GB going to the game's own SSD still took Armored Core VI from 30 to 16-18 fps for
+        // ~15 s: its own reads waited, and the file cache filled with the clip pushed the game's data out.)
+        SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        FILE* index = nullptr;
+        if (_wfopen_s(&index, (dir / L"frames.txt").c_str(), L"w") == 0 && index) {
+            std::fprintf(index, "%s", header.c_str());
+            for (std::size_t i = 0; i < clip.size(); ++i) std::fprintf(index, "index %zu %s\n", i, clip[i].first.c_str());
+            std::fclose(index);
+        }
+        std::uint64_t written = 0;
+        for (std::size_t i = 0; i < clip.size(); ++i) {
+            const RecordedFrame& f = clip[i].second;
+            FILE* out = nullptr;
+            if (_wfopen_s(&out, (dir / (L"frame_" + std::to_wstring(i) + L".bin")).c_str(), L"wb") == 0 && out) {
+                // header: "FWRF", version 1, tag (2 words), cw, ch, dw, dh, then per block (colour, depth, motion, coverage) its
+                // size twice (stored as it is), then the blocks
+                const std::uint32_t head[8] = {0x46525746u, 1u, std::uint32_t(f.tag), std::uint32_t(f.tag >> 32), f.cw, f.ch, f.dw, f.dh};
+                const std::vector<std::uint8_t>* blocks[4] = {&f.colour, &f.depth, &f.motion, &f.ui};
+                std::uint64_t sizes[8];
+                for (int k = 0; k < 4; ++k) sizes[k * 2] = sizes[k * 2 + 1] = blocks[k]->size();
+                std::fwrite(head, sizeof(head), 1, out);
+                std::fwrite(sizes, sizeof(sizes), 1, out);
+                for (int k = 0; k < 4; ++k) if (!blocks[k]->empty()) std::fwrite(blocks[k]->data(), 1, blocks[k]->size(), out);
+                std::fclose(out);
+                written += sizeof(head) + sizeof(sizes) + sizes[0] + sizes[2] + sizes[4] + sizes[6];
+            }
+            clip[i].second = RecordedFrame{};  // (its memory back as soon as it is written)
+        }
+        SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+        logf("sequence recording written: %zu frames over %.1f s (%llu not recorded: slots full - the clip has gaps there), %.2f GB in %.0f s: %ls",
+             clip.size(), secs, static_cast<unsigned long long>(dropped.load()), double(written) / 1e9, now_seconds() - started - secs, dir.c_str());
+        busy = false;
+    }
+};
+SequenceRecorder g_rec;
 
 // Files (the log and the recordings) are written by a background thread. A disk write can take several
 // ms (a slow or busy drive, antivirus), and the refresh loop must never wait for one: written in place, a
@@ -986,8 +1096,11 @@ void render_thread() {
                 sh.presenter.hud_learn_pick = renderer.hud_learn_pick();
                 sh.presenter.hud_learn_fail = renderer.hud_learn_fail();
                 // Whole characters held (option): before the mask and the moving objects, which both read the analysis.
+                int rec_share_mode = -1;  // (for the sequence recording: the share step's mode this frame, -1 not run)
+                bool rec_orbit = false;
                 {
                     static bool was_holding = false, was_sharing = false;
+                    rec_share_mode = -1; rec_orbit = false;
                     // (or by the share of the turn each spot follows, Settings::follow_share: against the camera's whole motion
                     // when the warp turns around an orbit, as it does then)
                     const bool sharing = settings.follow_share != 0 && attached_mask;
@@ -1007,6 +1120,7 @@ void render_thread() {
                                 prev_t = source_time - g_app.model.frame_interval();
                             share_mode = g_app.model.input_active(prev_t - PoseModel::kInputLately, source_time) ? 1 : 2;
                         }
+                        rec_share_mode = share_mode; rec_orbit = orbit_warp;
                         renderer.set_share_diag(rec(g_app.csv_share) != nullptr, m.frame_id);
                         renderer.follow_share(s, cam.clip_to_prev_clip, mv_scale.valid, cam.depth_inverted != 0, orbit_warp, share_mode);
                     }
@@ -1125,6 +1239,22 @@ void render_thread() {
                         logf("HUD: taken from the game's own HUD layer (the add-on found it where the game blends it onto the picture)");
                         layer_hud_logged = true;
                     }
+                }
+                // Sequence recording: this frame, as taken in, and its line in frames.txt.
+                if (g_rec.active && renderer.record_frame(m.frame_id, s.has_ui)) {
+                    char line[1600];
+                    int len = std::snprintf(line, sizeof(line),
+                        "frame %llu time %.6f color_rect %u %u %u %u depth_rect %u %u %u %u mv_scale %.9g %.9g %d depth_inverted %u estimated %u "
+                        "ui %d hudless %d share_mode %d orbit %d motion_estimated %d view_to_clip", static_cast<unsigned long long>(m.frame_id), source_time,
+                        s.color_rect.x, s.color_rect.y, s.color_rect.w, s.color_rect.h, s.depth_rect.x, s.depth_rect.y, s.depth_rect.w,
+                        s.depth_rect.h, mv_scale.scale(0, s.depth_rect.w), mv_scale.scale(1, s.depth_rect.h), int(mv_scale.valid),
+                        cam.depth_inverted, cam.estimated, int(s.has_ui), int(s.has_hudless), rec_share_mode, int(rec_orbit), int(s.motion_estimated));
+                    for (float v : cam.view_to_clip) len += std::snprintf(line + len, sizeof(line) - len, " %.9g", v);
+                    len += std::snprintf(line + len, sizeof(line) - len, " clip_to_prev_clip");
+                    for (float v : cam.clip_to_prev_clip) len += std::snprintf(line + len, sizeof(line) - len, " %.9g", v);
+                    g_rec.note(m.frame_id, line);
+                } else if (g_rec.active) {
+                    ++g_rec.dropped;
                 }
                 // XPAR frame generation (option, XPAR engine, without the game's own): the images between the previous
                 // frame and this one, as many as fit the refreshes of a game frame (at most kMaxGenerated), shown as the
@@ -1576,6 +1706,10 @@ void render_thread() {
                     const CameraBasis turned = apply_rotation(source_basis, g_app.model.world_up(), p.input_yaw, p.input_pitch, source_basis.pos);
                     m_input = clip_source_to_target(projection, view_matrix(source_basis, origin, z_sign), view_matrix(turned, origin, z_sign));
                 }
+                // (characters carried on along their own motion - Renderer::set_warp_ahead - off: scored against the real frames
+                // between the ones taken in (seq_replay FW_STRIDE), it tore characters apart - RE2 Claire's hair and hands cut by
+                // blocks of the floor behind, false edges on her +36-53%; the next-frame score alone had shown it better)
+                renderer.set_warp_ahead(0.0f);
                 warped = unmoved || renderer.own_warp(source, settings.use_ui_tags != 0, inputs.no_warp_mask != nullptr, m.data(), inputs.depth_inverted,
                                                      settings.background_memory != 0, nullptr, generated,
                                                      settings.edge_fill != 0, input_part ? m_input.data() : nullptr);
@@ -1594,10 +1728,11 @@ void render_thread() {
         // The same picture as the one presented last - this frame shown as it is again (the camera has not
         // moved, or nothing is warped), nothing drawn on it that changes: nothing to draw or present. With a still
         // camera the GPU does nothing at all between game frames.
-        const bool as_is = !(warped && !unmoved) && !settings.overlay_debug && !settings.show_mask && g_app.has_frames;
+        const bool as_is = !(warped && !unmoved) && !settings.overlay_debug && !settings.show_mask && g_app.has_frames && !g_rec.busy;
         const bool same_picture = as_is && shown_frame && as_is_frame == shown_frame && as_is_w == renderer.width() && as_is_h == renderer.height();
         if (same_picture) renderer.skip_frame();
-        else renderer.finish_frame(warped && !unmoved, settings.overlay_debug ? (warped ? 1 : 2) : 0, paced_last);
+        // (the recording's dot: red while it records, amber while it is written out - see the blit shader)
+        else renderer.finish_frame(warped && !unmoved, (settings.overlay_debug ? (warped ? 1 : 2) : 0) | (g_rec.active ? 4 : g_rec.busy ? 8 : 0), paced_last);
         presented_last = !same_picture;
         as_is_frame = as_is ? shown_frame : 0;
         as_is_w = renderer.width(); as_is_h = renderer.height();
@@ -1702,6 +1837,32 @@ void render_thread() {
             renderer.release_stash();  // (its copies of the earlier frames: written, not kept in video memory)
         }
         g_app.dump_was_down = dump_down;
+        // Ctrl+Shift+F8 (development): starts / stops a sequence recording (see SequenceRecorder). (Not R: AMD's recording key; not P: RE2 pauses.)
+        const bool record_down = keys_on && (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000) && (GetAsyncKeyState(VK_F8) & 0x8000);
+        if (record_down && !g_app.record_was_down) {
+            if (!g_rec.busy) {
+                wchar_t local[MAX_PATH] = {}, exe[MAX_PATH] = {};
+                DWORD len = MAX_PATH;
+                const std::wstring game = g_app.game_process && QueryFullProcessImageNameW(g_app.game_process, 0, exe, &len)
+                                              ? std::filesystem::path(exe).stem().wstring() : g_app.base_dir.parent_path().filename().wstring();
+                std::filesystem::path root = g_app.data_dir / L"recordings";
+                if (GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH)) root = std::filesystem::path(local) / L"FrameWarp" / L"recordings" / game;
+                char header[512];
+                std::snprintf(header, sizeof(header),
+                              "settings follow_share %d share_from_input %d keep_attached %d no_warp_mask %d game_hud_layers %d use_ui_tags %d "
+                              "background_memory %d hold_reticles %d stretch_width %d orbit_mode %d warp_engine %d warp_splat %d edge_fill %d\n",
+                              int(settings.follow_share), int(settings.share_from_input), int(settings.keep_attached), int(settings.no_warp_mask),
+                              int(settings.game_hud_layers), int(settings.use_ui_tags), int(settings.background_memory), int(settings.hold_reticles),
+                              int(settings.stretch_width), int(settings.orbit_mode), int(settings.warp_engine), int(settings.warp_splat), int(settings.edge_fill));
+                g_rec.start(renderer, root, header);
+                logf("sequence recording started: %ls", g_rec.dir.c_str());
+            } else if (g_rec.active) {
+                g_rec.active = false;
+                logf("sequence recording stopped (key): writing it out");
+            }
+        }
+        g_app.record_was_down = record_down;
+        if (g_rec.active && now_seconds() - g_rec.started > SequenceRecorder::kRecMaxSeconds) g_rec.active = false;
         if (rec(g_app.csv_outputs)) {
             const auto tm = renderer.last_timing();
             const auto pstats = renderer.present_stats();
@@ -1987,6 +2148,9 @@ void render_thread() {
         }
     }
     renderer.wait_idle();
+    // (a recording's collector reads the renderer: done with it before the renderer goes - the clip is still written out)
+    g_rec.active = false;
+    for (int i = 0; i < 2000 && g_rec.collecting; ++i) Sleep(1);
     for (const auto& entry : held) InterlockedCompareExchange(&sh.slots[entry.slot].state, kFree, kReading);
     save_profile();
     latewarp.shutdown();

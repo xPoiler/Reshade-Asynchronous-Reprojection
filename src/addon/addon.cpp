@@ -1088,10 +1088,10 @@ void register_callbacks() {
         },
         [] { if (g_producer && g_producer->shared() && g_producer->shared()->settings.hud_learn) g_producer->on_hud_none(); });
     fw::ui_layer::init(
-        [](std::uint64_t layer, std::uint32_t state, std::uint64_t list) {
+        [](std::uint64_t layer, std::uint32_t state, std::uint64_t list, bool inverted) {
             if (g_producer && g_producer->shared() && g_producer->shared()->settings.game_hud_layers)
                 g_producer->on_ui_layer(reinterpret_cast<ID3D12Resource*>(layer), static_cast<D3D12_RESOURCE_STATES>(state),
-                                        reinterpret_cast<ID3D12GraphicsCommandList*>(list));
+                                        reinterpret_cast<ID3D12GraphicsCommandList*>(list), inverted);
         },
         [](std::uint64_t picture, std::uint32_t state, std::uint64_t list) {
             if (g_producer && g_producer->shared() && g_producer->shared()->settings.game_hud_layers)

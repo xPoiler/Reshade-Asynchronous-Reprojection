@@ -14,7 +14,8 @@ namespace fw::ui_layer {
 namespace {
 using namespace reshade::api;
 
-std::function<void(std::uint64_t, std::uint32_t, std::uint64_t)> g_take, g_take_hudless;
+std::function<void(std::uint64_t, std::uint32_t, std::uint64_t, bool)> g_take;  // (bool: alpha inverted - see cleared_to_transparent)
+std::function<void(std::uint64_t, std::uint32_t, std::uint64_t)> g_take_hudless;
 std::function<void(std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint64_t)> g_take_vk;
 std::function<void(std::uint64_t, std::uint32_t, std::uint64_t)> g_take_before;
 std::mutex g_mutex;
@@ -42,11 +43,15 @@ std::unordered_map<std::uint64_t, std::uint64_t> g_bb_picture_pipeline;  // (the
 bool g_bb_seen = false;
 thread_local std::uint64_t tl_list = 0, tl_back_buffer = 0, tl_pipe_list = 0, tl_pipeline = 0;
 thread_local bool tl_depth = false;
+thread_local std::uint64_t tl_inverted = 0;  // (Direct3D 12: the render target bound on tl_list, if a candidate cleared to opaque black)
 // (the list a render pass is open on, Direct3D 12: no copy may be recorded inside one - see drawn_back_buffer)
 thread_local std::uint64_t tl_pass_list = 0;
 std::uint32_t g_width = 0, g_height = 0;
 // This frame (since the last present): the layers cleared to transparent, and when each was last drawn into (0: not).
 std::unordered_map<std::uint64_t, std::uint64_t> g_cleared;  // resource -> draw order
+std::unordered_set<std::uint64_t> g_inverted;  // ...of them, cleared to opaque black: alpha 1 is nothing (see cleared_to_transparent)
+// ...their draws since cleared: alpha-blended, all with known blending (a HUD is blended in; a picture drawn over is not)
+std::unordered_map<std::uint64_t, std::pair<std::uint32_t, std::uint32_t>> g_inverted_draws;
 std::unordered_set<std::uint64_t> g_with_depth;               // ...of them, drawn with a depth buffer bound since cleared
 std::uint64_t g_order = 0;
 bool g_taken = false;
@@ -96,9 +101,13 @@ std::uint32_t d3d12_state(resource_usage u) {
 // The first pattern's bookkeeping runs in Direct3D 12 and Vulkan (the add-on can hand a layer over in both).
 bool layer_api(device* dev) { return dev && (dev->get_api() == device_api::d3d12 || dev->get_api() == device_api::vulkan); }
 // A texture the size of the back buffer cleared to transparent: a candidate layer (a clear command, or a render pass that
-// starts by clearing it - Vulkan's way, DOOM Eternal).
-void cleared_to_transparent(device* dev, resource_view rtv) {
+// starts by clearing it - Vulkan's way, DOOM Eternal). Or cleared to opaque black (inverted, Direct3D 12): a layer whose alpha
+// says how much of the picture shows through - Armored Core VI clears its HUD layer to (0, 0, 0, 1) and blends its HUD in;
+// its coverage is 1 - alpha (Producer::on_ui_layer). Only textures cleared to transparent counted: the HUD layer was never a
+// candidate, the game's own targets of the screen's size cleared to transparent were taken instead.
+void cleared_to_transparent(device* dev, resource_view rtv, bool inverted = false) {
     const resource r = dev->get_resource_from_view(rtv);
+    if (inverted && dev->get_api() != device_api::d3d12) return;
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!r.handle || !g_width || is_back_buffer(r.handle)) return;
     const resource_desc d = dev->get_resource_desc(r);
@@ -106,15 +115,17 @@ void cleared_to_transparent(device* dev, resource_view rtv) {
     if (g_end_pending) {  // (the next frame's layers start: the frame that waited is not taken)
         g_end_pending = false;
         ++g_frames; ++g_not_read;
-        g_cleared.clear(); g_with_depth.clear(); g_last_state.clear(); g_order = 0; g_taken = false;
+        g_cleared.clear(); g_with_depth.clear(); g_inverted.clear(); g_inverted_draws.clear(); g_last_state.clear(); g_order = 0; g_taken = false;
     }
     g_cleared[r.handle] = 0;
     g_with_depth.erase(r.handle);
+    if (inverted) g_inverted.insert(r.handle); else g_inverted.erase(r.handle);
+    g_inverted_draws.erase(r.handle);
 }
 bool on_clear(command_list* cmd, resource_view rtv, const float color[4], uint32_t, const rect*) {
-    if (!cmd || !rtv.handle || !color || color[0] != 0 || color[1] != 0 || color[2] != 0 || color[3] != 0) return false;
+    if (!cmd || !rtv.handle || !color || color[0] != 0 || color[1] != 0 || color[2] != 0 || (color[3] != 0 && color[3] != 1)) return false;
     device* dev = cmd->get_device();
-    if (layer_api(dev)) cleared_to_transparent(dev, rtv);
+    if (layer_api(dev)) cleared_to_transparent(dev, rtv, color[3] == 1);
     return false;
 }
 void on_barrier(command_list* cmd, uint32_t count, const resource* resources, const resource_usage*, const resource_usage* new_states) {
@@ -172,17 +183,25 @@ void on_barrier(command_list* cmd, uint32_t count, const resource* resources, co
 // the HUD layer, the HUD that is not in it warped). Layers drawn with depth only in a frame with no layer drawn without.
 // (under the lock; true: layer/state set)
 // may_wait: none readable yet - nothing counted or taken, false returned with `waits` set (see g_end_pending).
-bool pick(device* dev, command_list* cmd, const char* at, std::uint64_t& layer, std::uint32_t& state, bool may_wait, bool& waits) {
+bool pick(device* dev, command_list* cmd, const char* at, std::uint64_t& layer, std::uint32_t& state, bool may_wait, bool wait_inverted,
+          bool& waits) {
     const bool at_copy = at[0] == 'a' && at[2] == 'c';  // ("a copy onto the back buffer")
     waits = false;
     const auto states = g_states.find(cmd->get_native());
     bool any_plain = false;
     for (const auto& [res, order] : g_cleared)
         if (order && !g_with_depth.count(res)) any_plain = true;
-    std::uint64_t best_order = 0;
+    std::uint64_t best_order = 0, unread_inverted = 0;
     bool any_state = false, same_list = false;
     for (const auto& [res, order] : g_cleared) {
         if (!order || (any_plain && g_with_depth.count(res))) continue;
+        // (cleared to opaque black: a HUD layer only if what was drawn into it is mostly alpha-blended - at least 4 draws, 60%
+        // of them. A picture of the screen's size cleared so and drawn over - a scene, its parts, a post-processing pass -
+        // with alpha left below 1 here and there would otherwise be taken, and held there as HUD)
+        if (g_inverted.count(res)) {
+            const auto n = g_inverted_draws.find(res);
+            if (n == g_inverted_draws.end() || n->second.second < 4 || n->second.first * 10 < n->second.second * 6) continue;
+        }
         std::uint32_t st = 0;
         bool here = false;
         if (states != g_states.end() && states->second.count(res)) { st = states->second.at(res); here = true; }
@@ -190,10 +209,16 @@ bool pick(device* dev, command_list* cmd, const char* at, std::uint64_t& layer, 
         else continue;
         any_state = true;
         // (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | NON_PIXEL_SHADER_RESOURCE)
+        if (!(st & 0xC0u) && g_inverted.count(res)) unread_inverted = std::max(unread_inverted, order);
         if (!(st & 0xC0u) || order <= best_order) continue;
         best_order = order; layer = res; state = st; same_list = here;
     }
     if (!layer && any_state && may_wait) { waits = true; return false; }
+    // (a layer cleared to opaque black, drawn after every readable one, not readable yet: waited for - Armored Core VI makes
+    // its HUD layer readable on the final list after the back buffer is bound there, and a texture of its 3D rendering read
+    // earlier was taken in its place, nearly every frame. Only these: Requiem's second layer, cleared to transparent and still
+    // a render target at the end, stays left out as before)
+    if (wait_inverted && unread_inverted > best_order) { layer = 0; waits = true; return false; }
     g_taken = true;
     ++g_frames;
     if (!layer) { ++(any_state ? g_not_read : g_skipped); return false; }
@@ -204,9 +229,9 @@ bool pick(device* dev, command_list* cmd, const char* at, std::uint64_t& layer, 
     if (layer != g_logged) {
         g_logged = layer;
         char text[224];
-        std::snprintf(text, sizeof(text), "XPAR: the game's HUD layer found (%ux%u, format %u, state 0x%x%s, at %s) - taken as the frame's UI layer",
+        std::snprintf(text, sizeof(text), "XPAR: the game's HUD layer found (%ux%u, format %u, state 0x%x%s%s, at %s) - taken as the frame's UI layer",
                       g_width, g_height, static_cast<unsigned>(dev->get_resource_desc(resource{layer}).texture.format), state,
-                      with_depth ? ", drawn with depth" : "", at);
+                      with_depth ? ", drawn with depth" : "", g_inverted.count(layer) ? ", cleared to opaque black: alpha inverted" : "", at);
         reshade::log::message(reshade::log::level::info, text);
     }
     return true;
@@ -251,6 +276,7 @@ void target(command_list* cmd, resource_view first, bool depth) {
         tl_depth = depth;
         std::lock_guard<std::mutex> lock(g_mutex);
         tl_back_buffer = is_back_buffer(r.handle) ? r.handle : 0;
+        tl_inverted = g_inverted.count(r.handle) ? r.handle : 0;
     }
     if (dev->get_api() == device_api::d3d11) {  // (third pattern: what each draw goes into)
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -315,13 +341,16 @@ void target(command_list* cmd, resource_view first, bool depth) {
 void end_of_frame(device* dev, command_list* cmd, const char* at) {
     std::uint64_t layer = 0;
     std::uint32_t state = 0;
+    bool inverted = false;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (!g_order || g_taken) return;
         // (Vulkan, at a compute pass writing the back buffer: a layer not readable yet is waited for, once)
         const bool may_wait = !g_end_pending && dev->get_api() == device_api::vulkan && std::strcmp(at, kComputeEnd) == 0;
+        const bool wait_inverted = !g_end_pending && dev->get_api() == device_api::d3d12;
         bool waits = false;
-        const bool picked = pick(dev, cmd, at, layer, state, may_wait, waits);
+        const bool picked = pick(dev, cmd, at, layer, state, may_wait, wait_inverted, waits);
+        inverted = picked && g_inverted.count(layer) != 0;
         g_triggered = true;
         if (waits) {
             g_end_pending = true;
@@ -331,7 +360,7 @@ void end_of_frame(device* dev, command_list* cmd, const char* at) {
         }
         g_end_pending = false;
         g_cleared.clear();
-        g_with_depth.clear();
+        g_with_depth.clear(); g_inverted.clear(); g_inverted_draws.clear();
         g_last_state.clear();
         g_order = 0;
         g_taken = false;
@@ -342,7 +371,7 @@ void end_of_frame(device* dev, command_list* cmd, const char* at) {
         const resource_desc d = dev->get_resource_desc(resource{layer});
         g_take_vk(layer, static_cast<std::uint32_t>(d.texture.format), d.texture.width, d.texture.height, state, cmd->get_native());
     } else if (g_take) {
-        g_take(layer, state, cmd->get_native());
+        g_take(layer, state, cmd->get_native(), inverted);
     }
 }
 void on_bind(command_list* cmd, uint32_t n, const resource_view* rtvs, resource_view dsv) {
@@ -352,8 +381,9 @@ void on_bind(command_list* cmd, uint32_t n, const resource_view* rtvs, resource_
 bool on_end_pass(command_list* cmd) { if (cmd && tl_pass_list == cmd->get_native()) tl_pass_list = 0; return false; }
 bool on_begin_pass(command_list* cmd, uint32_t n, const render_pass_render_target_desc* rts, const render_pass_depth_stencil_desc* ds, render_pass_flags) {
     if (n && rts && rts[0].load_op == render_pass_load_op::clear && rts[0].view.handle && rts[0].clear_color[0] == 0 &&
-        rts[0].clear_color[1] == 0 && rts[0].clear_color[2] == 0 && rts[0].clear_color[3] == 0 && cmd && layer_api(cmd->get_device()))
-        cleared_to_transparent(cmd->get_device(), rts[0].view);
+        rts[0].clear_color[1] == 0 && rts[0].clear_color[2] == 0 && (rts[0].clear_color[3] == 0 || rts[0].clear_color[3] == 1) && cmd &&
+        layer_api(cmd->get_device()))
+        cleared_to_transparent(cmd->get_device(), rts[0].view, rts[0].clear_color[3] == 1);
     if (n && rts) target(cmd, rts[0].view, ds && ds->view.handle);
     if (cmd) tl_pass_list = cmd->get_native();
     return false;
@@ -453,7 +483,20 @@ void drawn_back_buffer(command_list* cmd) {
     if (give_up) g_take_hudless(0, 0, list);
 }
 void drawn(command_list* cmd) {
-    if (g_api == device_api::d3d12 && cmd) { drawn_back_buffer(cmd); return; }
+    if (g_api == device_api::d3d12 && cmd) {
+        // (a draw into a candidate cleared to opaque black: counted by its blending - see pick)
+        if (tl_inverted && tl_list == cmd->get_native()) {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            const auto it = tl_pipe_list == tl_list ? g_blend.find(tl_pipeline) : g_blend.end();
+            if (it != g_blend.end()) {
+                auto& n = g_inverted_draws[tl_inverted];
+                n.first += it->second == 1 ? 1u : 0u;
+                ++n.second;
+            }
+        }
+        drawn_back_buffer(cmd);
+        return;
+    }
     if (g_api != device_api::d3d11 || !cmd) return;
     std::uint64_t picture = 0, given_up = 0;
     std::uint32_t kind = 0;
@@ -524,7 +567,7 @@ void on_reset(command_list* cmd) {
 }
 }  // namespace
 
-void init(std::function<void(std::uint64_t, std::uint32_t, std::uint64_t)> take,
+void init(std::function<void(std::uint64_t, std::uint32_t, std::uint64_t, bool)> take,
           std::function<void(std::uint64_t, std::uint32_t, std::uint64_t)> take_hudless,
           std::function<void(std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint64_t)> take_vk,
           std::function<void(std::uint64_t, std::uint32_t, std::uint64_t)> take_before) {
@@ -583,7 +626,7 @@ void on_present(swapchain* chain) {
     if (g_end_pending && ++g_pending_presents >= 2) {  // (never made readable: not taken)
         g_end_pending = false;
         ++g_frames; ++g_not_read;
-        g_cleared.clear(); g_with_depth.clear(); g_last_state.clear(); g_order = 0; g_taken = false;
+        g_cleared.clear(); g_with_depth.clear(); g_inverted.clear(); g_inverted_draws.clear(); g_last_state.clear(); g_order = 0; g_taken = false;
     }
     // (every 600 frames, how often the layer could not be taken)
     if (g_frames >= 600) {
@@ -613,7 +656,7 @@ void on_present(swapchain* chain) {
     // (the frame's layers start over at its end - end_of_frame; here only when no end was seen since the last present)
     if (!g_triggered && !g_end_pending) {
         g_cleared.clear();
-        g_with_depth.clear();
+        g_with_depth.clear(); g_inverted.clear(); g_inverted_draws.clear();
         g_last_state.clear();
         g_order = 0;
         g_taken = false;
