@@ -443,8 +443,9 @@ struct VramMonitor {
             if (_wcsnicmp(items[i].szName, luid_tag, wcslen(luid_tag)) == 0) total += items[i].FmtValue.doubleValue;
         return total / (1024.0 * 1024.0);
     }
-    void poll(double now, const char* reason = nullptr) {
-        if (!reason && now - last_poll < 2.0) return;
+    // (fast: every 0.25 s instead of 2 - while the memory guard has let something go, so it comes back as soon as there is room)
+    void poll(double now, const char* reason = nullptr, bool fast = false) {
+        if (!reason && now - last_poll < (fast ? 0.25 : 2.0)) return;
         last_poll = now;
         const double total = adapter_total_mb();
         DXGI_QUERY_VIDEO_MEMORY_INFO own{};
@@ -466,6 +467,61 @@ struct VramMonitor {
         logf("vram%s%s: adapter %.0f MB used (all processes) | presenter %.0f MB, budget %.0f MB", reason ? " at " : "", reason ? reason : "",
              total, own.CurrentUsage / 1048576.0, own.Budget / 1048576.0);
         logged_total = total; last_log = now;
+    }
+};
+
+// Video memory guard. Windows gives the presenter a budget of the GPU's memory, which shrinks as the game takes more;
+// past it, the presenter's textures are moved out to system memory and every pass - and the game with them - slows down
+// tenfold (Enshrouded on an 8 GB card at 4K output: 16 -> 0.3 game frames taken in per second, the game at 10 fps).
+// Close to the budget the parts that can go are let go of, a step every few seconds: 1 the sight reticle layers, 2 the
+// background memory, 3 XPAR steps aside (nothing drawn: the game as it is, as with reprojection off - its textures,
+// untouched, are the first Windows moves out) - only past 98% of the budget, an edge case (92% until 2026-10-21). Back once
+// what the presenter uses now and what the steps freed (measured at the reading after each) fit within 90% of the budget
+// again, for 5 s - every step that fits at once (until 2026-10-21: 80%, 20 s and one step at a time - a minute or more after
+// the game had freed the memory). When it has to step up again within 30 s of coming back it waits longer: 10, 20, 30 s;
+// 5 s again after two quiet minutes (the user, 2026-10-21). The HUD and the warp itself are never cut down: what is shown
+// is as good as before, or the game as it is.
+// (Until 2026-10-20 it waited for the use at the time of the step to fit: Cyberpunk on one 8 GB card at 4K let its memory
+// go at 1182 MB, then used 589 once the upscaler-output copies went - and the memory never came back: the screen's edge
+// and what the gun uncovers guessed for the rest of the session, as if the memory reset.)
+struct MemoryGuard {
+    int level = 0;
+    double changed = -1e9, roomy_since = -1, polled = -1, recovered = -1e9, hold = 5.0;
+    double before_mb[4] = {}, freed_mb[4] = {};  // (the use when it stepped up to each level, and what that step freed)
+    bool measuring = false;
+    static const char* what(int level) {
+        return level == 1 ? "the sight reticle layers" : level == 2 ? "the background memory" : "XPAR itself (stepped aside, the game as it is)";
+    }
+    // (on every new reading; true when the level changed)
+    bool update(const VramMonitor& v, double now) {
+        if (v.last_poll == polled || v.budget_mb <= 0) return false;
+        polled = v.last_poll;
+        if (measuring && level > 0 && now - changed >= 2.0) {  // (the step's textures retired by now)
+            freed_mb[level] = std::max(0.0, before_mb[level] - v.own_mb);
+            measuring = false;
+        }
+        if (now - recovered > 120.0 && now - changed > 120.0) hold = 5.0;  // (quiet for two minutes: back after 5 s again)
+        if (v.own_mb > 0.98 * v.budget_mb && level < 3 && now - changed >= 4.0) {
+            if (now - recovered < 30.0) hold = std::min(hold * 2.0, 30.0);  // (5, 10, 20, 30 s)
+            before_mb[++level] = v.own_mb; freed_mb[level] = 0; measuring = true; changed = now; roomy_since = -1;
+            logf("video memory short: presenter %.0f MB of a %.0f MB budget - %s let go of", v.own_mb, v.budget_mb, what(level));
+            return true;
+        }
+        if (level > 0 && !measuring && v.own_mb + freed_mb[level] < 0.9 * v.budget_mb) {
+            if (roomy_since < 0) roomy_since = now;
+            if (now - roomy_since >= hold) {
+                // (every step whose memory fits too, at once)
+                double back = 0;
+                while (level > 0 && v.own_mb + back + freed_mb[level] < 0.9 * v.budget_mb) {
+                    back += freed_mb[level];
+                    logf("video memory: room again (%.0f MB used + %.0f MB freed, a %.0f MB budget) - %s back", v.own_mb, back, v.budget_mb, what(level));
+                    --level;
+                }
+                changed = recovered = now; roomy_since = -1;
+                return true;
+            }
+        } else roomy_since = -1;
+        return false;
     }
 };
 
@@ -702,14 +758,16 @@ void render_thread() {
     Renderer renderer;
     std::string error;
     const std::uint32_t w = sh.backbuffer_width, h = sh.backbuffer_height;
+    Renderer::set_shader_cache((g_app.data_dir / L"shadercache").wstring());
     if (!renderer.init(sh.adapter, g_app.overlay, w, h, static_cast<DXGI_FORMAT>(sh.backbuffer_format), sh.color_space, error)) {
         set_status("Renderer init failed: %s", error.c_str()); logf("renderer init failed: %s", error.c_str());
         g_app.running = false; PostMessageW(g_app.overlay, WM_CLOSE, 0, 0); return;
     }
-    logf("renderer ready %ux%u, queue priority %s", w, h, renderer.queue_priority());
+    logf("renderer ready %ux%u, queue priority %s; %s", w, h, renderer.queue_priority(), renderer.shader_report().c_str());
     VramMonitor vram;
     vram.init(sh.adapter);
     vram.poll(now_seconds(), "start");
+    MemoryGuard memory_guard;
     Latewarp12 latewarp;
     if (!latewarp.initialize(renderer.device(), g_app.base_dir, g_app.data_dir / L"logs"))
         logf("latewarp unavailable: %s", latewarp.status().c_str());
@@ -838,7 +896,17 @@ void render_thread() {
         }
         else if (!paced_last) sleep_until(qpc_now() + g_qpc_frequency / 1000);
         if (!g_app.running) break;
-        const Settings settings = sh.settings;
+        Settings settings = sh.settings;
+        // (the memory guard: what it let go of stays off - see MemoryGuard)
+        vram.poll(now_seconds(), nullptr, memory_guard.level > 0);
+        if (memory_guard.update(vram, now_seconds())) {
+            if (memory_guard.level >= 1) renderer.release_reticle_layers();
+            if (memory_guard.level >= 2) renderer.release_memory();
+        }
+        if (memory_guard.level >= 1) settings.hold_reticles = 0;
+        if (memory_guard.level >= 2) settings.background_memory = 0;
+        const bool memory_aside = memory_guard.level >= 3;
+        sh.presenter.memory_guard = static_cast<std::uint32_t>(memory_guard.level);
         apply_gpu_priority(settings.gpu_priority);
         // XPAR frame generation (moving objects at the display rate): an option of the XPAR engine.
         // XPAR's own warp engine (chosen, or Latewarp not available): the one that moves objects and shows the
@@ -897,6 +965,8 @@ void render_thread() {
                                               (settings.hold_reticles != 0 && settings.keep_attached != 0));
             // Moving objects (option, XPAR engine): every frame keeps the previous one's picture and depth.
             renderer.set_object_history(moving_objects_on());
+            renderer.set_ui_from_hudless(settings.use_ui_tags != 0);
+            renderer.set_mem_resolution(settings.memory_resolution);
             intake = {};
             intake.slot = newest;
             const bool wants_samples = m.camera.estimated != 0;
@@ -1122,6 +1192,9 @@ void render_thread() {
                         }
                         rec_share_mode = share_mode; rec_orbit = orbit_warp;
                         renderer.set_share_diag(rec(g_app.csv_share) != nullptr, m.frame_id);
+                        // (the game's own camera and motion vectors: the share measured against the camera's whole motion - its
+                        // matrix explains the scenery, turn and movement alike; see Renderer::set_share_whole)
+                        renderer.set_share_whole(!cam.estimated && !s.motion_estimated);
                         renderer.follow_share(s, cam.clip_to_prev_clip, mv_scale.valid, cam.depth_inverted != 0, orbit_warp, share_mode);
                     }
                     // (diagnostics read back from earlier game frames)
@@ -1527,8 +1600,9 @@ void render_thread() {
             renderer.release_generated();
             logf("frame generation: its textures released (no generated images for 3 s)");
         }
-        if (!g_app.visible || aside) {  // game not in front / disabled / frame generation: don't compete with it for the GPU
-            if (aside) g_app.has_frames = false;
+        // (game not in front / disabled / frame generation / video memory short: don't compete with it for the GPU)
+        if (!g_app.visible || aside || memory_aside) {
+            if (aside || memory_aside) g_app.has_frames = false;
             record_timeline(sh, settings);
             record_hooks(sh, now_seconds());
             // (while paused, what keeps it so - every 5 s)
@@ -1537,8 +1611,8 @@ void render_thread() {
                 const auto latest = static_cast<std::uint64_t>(sh.latest_ready_frame);
                 int latest_generated = -1;
                 for (const auto& m : sh.slots) if (m.frame_id == latest && m.state != kFree) latest_generated = int(m.generated);
-                logf("paused: visible %d, stepped aside %d, reprojection %s, frame generation %d (last generated image %.1f s ago), newest frame %llu "
-                     "with %d generated images, ReShade menu %s", int(g_app.visible), int(aside), settings.enabled ? "on" : "off", int(frame_generation),
+                logf("paused: visible %d, stepped aside %d (video memory %d), reprojection %s, frame generation %d (last generated image %.1f s ago), newest frame %llu "
+                     "with %d generated images, ReShade menu %s", int(g_app.visible), int(aside), int(memory_aside), settings.enabled ? "on" : "off", int(frame_generation),
                      now_seconds() - last_generated, static_cast<unsigned long long>(latest), latest_generated, sh.overlay_open ? "open" : "closed");
             }
             source_frame = sh.latest_ready_frame;
@@ -1662,6 +1736,10 @@ void render_thread() {
             }
             g_app.model.set_display_ahead(now_ahead);
             if (settings.invert_warp) p.camera = apply_rotation(source_basis, g_app.model.world_up(), -p.yaw, -p.pitch, source_basis.pos);
+            // (option, Settings::turns_only: the predicted camera where the shown frame's stood - its turn, no movement. Not the
+            // shown frame's camera turned by p.yaw/p.pitch: those count from the model's newest frame, taken in a moment before
+            // it is shown - a frame's turn off once per game frame, judder)
+            else if (settings.turns_only) p.camera.pos = source_basis.pos;
             applied = p;
             const Vec3 origin = source_basis.pos;
             Mat4 projection;
@@ -1703,16 +1781,26 @@ void render_thread() {
                 const bool input_part = settings.follow_share && settings.share_from_input && generated < 0 && !settings.invert_warp &&
                                         g_app.model.orbit() <= 0;
                 if (input_part) {
-                    const CameraBasis turned = apply_rotation(source_basis, g_app.model.world_up(), p.input_yaw, p.input_pitch, source_basis.pos);
+                    // (counted from the shown frame: p.yaw/p.pitch and their input part count from the camera model's newest
+                    // frame, taken in a moment before it is shown (split queues) - the shown frame's camera turned by them was a
+                    // frame's turn off in that window, every game frame, and each spot moved by its share of a wrong input turn.
+                    // The predicted camera's turn from the shown frame, less what is not input - the camera's own turn going on,
+                    // the handoff blend - counted the same from either frame)
+                    const Vec3 up = g_app.model.world_up();
+                    const double shown_yaw = yaw_between(source_basis.fwd, p.camera.fwd, up);
+                    const double shown_pitch = elevation(p.camera.fwd, up) - elevation(source_basis.fwd, up);
+                    const CameraBasis turned = apply_rotation(source_basis, up, shown_yaw - (p.yaw - p.input_yaw),
+                                                              shown_pitch - (p.pitch - p.input_pitch), source_basis.pos);
                     m_input = clip_source_to_target(projection, view_matrix(source_basis, origin, z_sign), view_matrix(turned, origin, z_sign));
                 }
                 // (characters carried on along their own motion - Renderer::set_warp_ahead - off: scored against the real frames
                 // between the ones taken in (seq_replay FW_STRIDE), it tore characters apart - RE2 Claire's hair and hands cut by
                 // blocks of the floor behind, false edges on her +36-53%; the next-frame score alone had shown it better)
                 renderer.set_warp_ahead(0.0f);
+                renderer.set_edge_dither(settings.edge_fill == 2);
                 warped = unmoved || renderer.own_warp(source, settings.use_ui_tags != 0, inputs.no_warp_mask != nullptr, m.data(), inputs.depth_inverted,
                                                      settings.background_memory != 0, nullptr, generated,
-                                                     settings.edge_fill != 0, input_part ? m_input.data() : nullptr);
+                                                     settings.edge_fill == 1, input_part ? m_input.data() : nullptr);
             } else {
                 warped = latewarp.evaluate(list, inputs, first_eval, view_matrix(p.camera, origin, z_sign),
                                            view_matrix(source_basis, origin, z_sign), projection);
@@ -1772,6 +1860,7 @@ void render_thread() {
             renderer.stash_source(0, source.has_hudless);
             dump_frames[1] = dump_frame();
             dump_stage = 2; dump_after = shown_frame;
+            renderer.set_paths_capture(true);  // (the capture's refreshes: their warp paths too - see set_paths_capture)
         } else if (dump_stage == 2 && dump_now && shown_frame != dump_after) {
             dump_stage = 0;
             dump_frames[2] = dump_frame();
@@ -1795,13 +1884,14 @@ void render_thread() {
                                               std::pair{18, L"prev2_motion"}, std::pair{19, L"hudless"}, std::pair{20, L"gen0"},
                                               std::pair{21, L"gen1"}, std::pair{22, L"gen2"}, std::pair{23, L"gen0_depth"},
                                               std::pair{24, L"gen1_depth"}, std::pair{25, L"gen2_depth"}, std::pair{26, L"ui"}, std::pair{27, L"warp_mask"}, std::pair{28, L"layer"},
-                                              std::pair{35, L"share"}}) {
+                                              std::pair{35, L"share"}, std::pair{39, L"paths"}, std::pair{38, L"memory"}}) {
                 std::vector<std::uint16_t> px;
                 std::uint32_t cw = 0, ch = 0;
                 if (which == 2 && !source.has_scene) { logf("capture %d: no upscaler output this frame", n); continue; }
                 if (which == 19 && !source.has_hudless) continue;
                 if (which >= 20 && which <= 25 && (which - 20) % 3 >= source.generated) continue;  // (frame generation's images)
                 if (which == 26 && !source.has_ui) continue;
+                if (which == 38 && !settings.background_memory) { logf("capture %d: no background memory (off%s)", n, memory_guard.level >= 2 ? " - the video memory guard let it go" : ""); continue; }
                 if (!renderer.read_back(which, px, cw, ch)) continue;
                 const auto path = dir / (L"capture_" + std::to_wstring(n) + L"_" + name + L".f16");
                 FILE* f = nullptr;
@@ -1812,6 +1902,7 @@ void render_thread() {
                     std::fclose(f);
                 }
             }
+            renderer.set_paths_capture(false);
             // Per frame (prev2, prev, current): the frame, its time, the rectangles of the picture and the depth, the
             // motion vector scale (to uv), depth_inverted, then the projection and the game's reprojection to the
             // previous frame (row vector: prev = clip * M).
@@ -2049,6 +2140,13 @@ void render_thread() {
                          "character/weapon + stretch %.2f, mask %.2f, background memory %.2f", pt.frames, pt.ms[Renderer::kPassAnalyze] * k,
                          pt.ms[Renderer::kPassObjects] * k, pt.ms[Renderer::kPassHud] * k, pt.ms[Renderer::kPassCharacter] * k,
                          pt.ms[Renderer::kPassMask] * k, pt.ms[Renderer::kPassMemory] * k);
+                }
+                if (pt.warps) {
+                    const double k = 1.0 / pt.warps;
+                    logf("refresh warp GPU by pass (ms, %u refreshes): moving objects %.2f, claims %.2f, plain pixels (2x2) %.2f, "
+                         "the rest / full warp %.2f, moving objects' fix %.2f", pt.warps, pt.ms[Renderer::kPassWarpObjects] * k,
+                         pt.ms[Renderer::kPassWarpClaim] * k, pt.ms[Renderer::kPassWarpLean] * k, pt.ms[Renderer::kPassWarpRest] * k,
+                         pt.ms[Renderer::kPassWarpFix] * k);
                 }
                 if (span > 0 && (u.intakes || u.warps)) {
                     const double n = std::max<double>(1, u.split);

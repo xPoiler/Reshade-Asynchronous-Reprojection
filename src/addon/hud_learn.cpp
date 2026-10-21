@@ -67,6 +67,7 @@ std::uint32_t g_active = 0, g_run = 0;
 std::uint32_t g_locked = 0, g_since_drawn = 0, g_used = 0, g_relearn_seen = 0;
 // The profile: its path (set by the add-on), read yet, the locked point came from it, saved.
 std::wstring g_profile;
+std::string g_profile_build;  // (the add-on build the saved point must come from - see set_profile)
 bool g_profile_read = false, g_from_profile = false, g_saved = false;
 std::uint8_t g_locked_role = 0;
 std::vector<std::uint32_t> g_tried;
@@ -415,7 +416,19 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
         FILE* f = nullptr;
         if (_wfopen_s(&f, g_profile.c_str(), L"r") == 0 && f) {
             unsigned fp = 0, role = 0;
-            if (fscanf_s(f, "%x %u", &fp, &role) == 2 && fp && learning) {
+            char saved_build[64] = "";
+            // ("build <add-on build>" then "<point> <role>"; a file without the line - before 2026-10-20 - is another build's)
+            const bool ours = fscanf_s(f, "build %63s", saved_build, unsigned(sizeof(saved_build))) == 1 && g_profile_build == saved_build;
+            if (!ours) {
+                std::fclose(f);
+                f = nullptr;
+                _wremove(g_profile.c_str());
+                char text[160];
+                std::snprintf(text, sizeof(text), "XPAR HUD learning: the saved point is from another build (%s) - deleted, learned again",
+                              saved_build[0] ? saved_build : "before 2.1");
+                reshade::log::message(reshade::log::level::info, text);
+            }
+            if (ours && fscanf_s(f, "%x %u", &fp, &role) == 2 && fp && learning) {
                 g_locked = fp;
                 g_locked_role = static_cast<std::uint8_t>(role ? 1 : 0);
                 g_from_profile = g_saved = true;
@@ -425,7 +438,7 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
                 std::snprintf(text, sizeof(text), "XPAR HUD learning: %08x from the profile (in the %s)", fp, g_locked_role ? "back buffer" : "final picture");
                 reshade::log::message(reshade::log::level::info, text);
             }
-            std::fclose(f);
+            if (f) std::fclose(f);
         }
     }
     // Paused while the game gives its HUD itself (its HUD layer, a HUD-less picture): nothing copied, nothing learned or
@@ -477,7 +490,7 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
                     g_saved = true;
                     FILE* f = nullptr;
                     if (_wfopen_s(&f, g_profile.c_str(), L"w") == 0 && f) {
-                        std::fprintf(f, "%08x %u\n", g_locked, unsigned(g_locked_role));
+                        std::fprintf(f, "build %s\n%08x %u\n", g_profile_build.c_str(), g_locked, unsigned(g_locked_role));
                         std::fclose(f);
                         char text[128];
                         std::snprintf(text, sizeof(text), "XPAR HUD learning: %08x saved to the profile", g_locked);
@@ -514,6 +527,11 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
     g_taken = false;
 }
 
-void set_profile(const std::wstring& path) { std::lock_guard<std::mutex> lock(g_mutex); g_profile = path; g_profile_read = false; }
+void set_profile(const std::wstring& path, const char* build) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_profile = path;
+    g_profile_build = build ? build : "";
+    g_profile_read = false;
+}
 Status status() { return {g_status_cands.load(), g_status_active.load(), g_status_locked.load()}; }
 }  // namespace fw::hud_learn

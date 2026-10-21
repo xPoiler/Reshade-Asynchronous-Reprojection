@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 68;
+constexpr std::uint32_t kVersion = 71;
 constexpr int kSlots = 4;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
@@ -114,7 +114,7 @@ struct Settings {
     std::uint32_t near_camera_rule;    // character/weapon detection: near-camera pixels moving against the camera count (default on, saved per game)
     std::uint32_t use_controller;      // the controller's right stick drives rotation too (option, on by default, saved per game)
     std::uint32_t present_lead_auto;   // default on: the present lead follows the measured warp time (present_lead_ms unused)
-    std::uint32_t edge_fill;           // own warp, what a turn uncovers past the frame's edge: 0 extended edge pixels, 1 soft (default; saved per game)
+    std::uint32_t edge_fill;           // own warp, what a turn uncovers past the frame's edge: 0 extended edge pixels, 1 soft, 2 dithered (default; saved per game)
     std::uint32_t orbit_mode;          // turning around a pivot: 0 measured (default; camera estimated from the game's own motion vectors), 1 off,
                                        // 2 manual (orbit_distance); saved per game
     float edge_limit_pct;              // Auto latency "camera as of now": the most of the screen's width (percent) the warp may uncover
@@ -135,6 +135,10 @@ struct Settings {
                                        // (Renderer::follow_share) instead of held whole (hold_characters, the stretch; saved per game)
     std::uint32_t share_from_input;    // default on: ...measured against the turn the input explains (what the warp applies), not
                                        // the game camera's whole turn (a car's steering, a gun's own animation; saved per game)
+    std::uint32_t memory_resolution;   // background memory: 0 the picture's own resolution, 1 half (default), 2 a quarter - less
+                                       // video memory and GPU time, softer where it fills (saved per game)
+    std::uint32_t turns_only;          // option, off by default (saved per game): the warp applies the camera's predicted turn alone -
+                                       // its movement left to the game's own frames
 };
 
 // Presenter status, displayed by the add-on UI.
@@ -159,6 +163,9 @@ struct PresenterStatus {
     // processes, -1 unknown) and its size; the presenter's use and budget.
     std::uint32_t vram_pressure;
     float vram_adapter_mb, vram_adapter_size_mb, vram_own_mb, vram_budget_mb;
+    // The presenter's video memory guard (main.cpp, MemoryGuard): 0 everything in use; close to its budget, let go of -
+    // 1 the sight reticle layers, 2 the background memory too, 3 XPAR stepped aside (the game shown as it is).
+    std::uint32_t memory_guard;
     // Output held below the refresh rate by something outside XPAR (fps, 0: not seen): for 3 s the presents
     // themselves were held back while XPAR had little to do - a frame rate cap of the graphics driver, such as
     // NVIDIA's "Background Application Max Frame Rate" (the presenter's window is never the focused one).

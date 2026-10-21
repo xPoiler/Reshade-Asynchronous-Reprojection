@@ -403,6 +403,50 @@ void frame_cap_after_present(command_queue* queue, bool enabled, bool generation
     }
 }
 
+void present_ceiling(void* hwnd) {
+    const HWND window = static_cast<HWND>(hwnd);
+    static std::int64_t last_release = 0, checked = 0;
+    static double interval = 0, work = 0;  // (the ceiling's interval; the game's own time per frame, averaged)
+    static bool holding = false, logged = false;
+    static unsigned hz = 0;
+    const std::int64_t now = qpc();
+    const double f = qpc_frequency();
+    // (the refresh rate of the monitor the game's window is on, read again every 2 s: the window may move, the mode change)
+    if (!checked || now - checked > static_cast<std::int64_t>(2.0 * f)) {
+        checked = now;
+        MONITORINFOEXW mi{};
+        mi.cbSize = sizeof(mi);
+        DEVMODEW dm{};
+        dm.dmSize = sizeof(dm);
+        hz = 60;
+        if (window && GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &mi) &&
+            EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
+            hz = std::max<unsigned>(dm.dmDisplayFrequency, 30);
+        interval = 1.0 / (2.0 * hz);
+    }
+    // (held only while the game on its own runs faster than the ceiling - the time from one release to its next present,
+    // averaged: a fast frame now and then in a game near the ceiling is never delayed)
+    if (last_release) {
+        const double dt = double(now - last_release) / f;
+        work = work > 0 ? work + 0.1 * (dt - work) : dt;
+        if (!holding && work < interval) holding = true;
+        else if (holding && work > 1.1 * interval) holding = false;
+    }
+    if (holding && last_release) {
+        if (!logged) {
+            logged = true;
+            char text[192];
+            std::snprintf(text, sizeof(text), "XPAR: the game presents faster than twice the display's refresh (%u Hz) - held to %u presents a second "
+                          "(a menu, splash or loading screen without a frame cap)", hz, 2 * hz);
+            reshade::log::message(reshade::log::level::info, text);
+        }
+        if (!g.timer) g.timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        const std::int64_t target = last_release + static_cast<std::int64_t>(interval * f);
+        if (target > now) sleep_until(target);
+    }
+    last_release = qpc();
+}
+
 std::uint64_t frame_cap_presents() { return g.next; }
 bool frame_cap_gpu_done(std::uint64_t present) {
     if (!g.waiter || g.failed) return true;

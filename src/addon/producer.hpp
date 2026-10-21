@@ -122,6 +122,10 @@ public:
     // coverage).
     void on_ui_layer_vk(std::uint64_t image, DXGI_FORMAT format, std::uint32_t width, std::uint32_t height, std::uint32_t layout,
                         void* command_buffer);
+    // ...and the frame's HUD-less picture (ui_layer.hpp, fifth pattern: the back buffer before the HUD is drawn onto it), the
+    // same way into the presented frame's HUD-less slot - unless the frame has a HUD layer.
+    void on_hudless_vk(std::uint64_t image, DXGI_FORMAT format, std::uint32_t width, std::uint32_t height, std::uint32_t layout,
+                       void* command_buffer);
     // Direct3D 11 games, third pattern (ui_layer.hpp): the picture just before the game draws its HUD into it - copied;
     // at the present the picture with its HUD compared with that copy, and what differs (the HUD) goes into the frame's UI
     // slot as its coverage.
@@ -233,6 +237,10 @@ private:
     // takes the next frame's before this present - the GPU runs the copies in order, so this frame's is there)
     Texture ui_vk_;
     std::uint32_t ui_vk_age_ = 2;
+    // (the HUD-less picture, on_hudless_vk: handed over only at the first present after it was taken - a picture of
+    // another frame would differ from this one everywhere, all of it taken for HUD)
+    Texture hudless_vk_;
+    bool hudless_vk_fresh_ = false;
     bool ensure_own(Texture& t, const D3D12_RESOURCE_DESC& source);
     // Direct3D 11, third pattern: the copy before the HUD, the picture it was taken from, the comparison's pass and output
     Microsoft::WRL::ComPtr<ID3D11Texture2D> d11_before_, d11_cover_;

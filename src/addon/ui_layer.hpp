@@ -14,6 +14,10 @@
 // records the next frame's command lists before it presents the last one. A final picture the game draws itself (no copy
 // into it) is left alone. A frame with a HUD layer hands that over instead (both together would pass for a game's
 // HUD-less picture + UI layer).
+// Fifth pattern (Vulkan; Enshrouded): the game finishes its picture in the back buffer with compute shaders, then draws its
+// HUD onto it - from layers of its own of another size (Enshrouded's are 64 px bigger on every side) and straight onto it.
+// The back buffer made a render target after a compute pass wrote it this frame, with no HUD layer taken this frame: the
+// HUD's turn - a copy of it then is the frame's HUD-less picture (take_hudless_vk).
 // Direct3D 12.
 #pragma once
 #include <cstdint>
@@ -28,11 +32,13 @@ namespace fw::ui_layer {
 // take_vk (Vulkan games): the layer's VkImage, its format (ReShade's / DXGI), width, height, state (ReShade's usage) and
 // the VkCommandBuffer. take_before (Direct3D 11, third pattern): the picture (ID3D11Resource), what happened (0 the HUD
 // starts: copy it; 1 it reached the screen with no HUD this frame; 2 the copy confirmed: the final draw reads it; 3 the
-// copy given up) and the context.
+// copy given up) and the context. take_hudless_vk (fifth pattern): the back buffer's VkImage, its format, width, height,
+// VkImageLayout and the VkCommandBuffer.
 void init(std::function<void(std::uint64_t, std::uint32_t, std::uint64_t, bool)> take,
           std::function<void(std::uint64_t, std::uint32_t, std::uint64_t)> take_hudless,
           std::function<void(std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint64_t)> take_vk,
-          std::function<void(std::uint64_t, std::uint32_t, std::uint64_t)> take_before);
+          std::function<void(std::uint64_t, std::uint32_t, std::uint64_t)> take_before,
+          std::function<void(std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint64_t)> take_hudless_vk);
 void shutdown();
 // Every present of the game's swapchain: its back buffers and size; one frame ends.
 void on_present(reshade::api::swapchain* chain);

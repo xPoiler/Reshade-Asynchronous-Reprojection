@@ -53,7 +53,7 @@ void default_settings(Settings& s) {
     s.follow_share = 1;  // the character/weapon by the share of the turn it follows
     s.share_from_input = 1;  // ...of the turn the input explains
     s.edge_limit_pct = 0.0f;  // camera as of now: no more of the edge uncovered than Auto's
-    s.edge_fill = 1;  // soft edge (blur along the edge); extended edge pixels are the option
+    s.edge_fill = 2;  // dithered (the frame as it is past the edge, a dithered band inside it - user, 2026-10-21); soft and extended edge pixels are the options
     s.no_warp_mask = 1;   // HUD detection in games without HUD layers
     s.keep_attached = 1;  // character / first-person weapon detection, every game
     s.near_camera_rule = 1;
@@ -61,6 +61,8 @@ void default_settings(Settings& s) {
     s.turn_rule = 1;
     s.stretch_width = 1;
     s.background_memory = 1;  // what the warp uncovers comes from the scenery last seen there (XPAR engine)  // hold what stays nearly still on screen while the camera turns (orbit cameras)
+    s.memory_resolution = 1;  // (the background memory at half the picture's resolution: full fills seamlessly, ~4x the video memory)
+    s.turns_only = 0;  // (the camera's turn and its movement both reprojected)
     s.hud_from_scene = 2;  // HUD from the upscaler's output + camera-motion check (learned HUD without an upscaler output)
     s.auto_prediction = 6;     // default: the lowest latency without edge fill (now .. one game frame back); 3: Auto - 1/2 game frame, 1/4 in games
                                // without HUD layers (shorter warps hide mask misses), 1 without DLSS/FSR (XPAR's own motion); 1: full, 2: half, 4: quarter
@@ -94,6 +96,7 @@ Producer::~Producer() {
     for (auto& slot : textures_)
         for (auto& t : slot) if (t.handle) CloseHandle(t.handle);
     if (ui_vk_.handle) CloseHandle(ui_vk_.handle);
+    if (hudless_vk_.handle) CloseHandle(hudless_vk_.handle);
     for (auto& r : retired_) if (r.handle) CloseHandle(r.handle);
     if (fence_handle_) CloseHandle(fence_handle_);
     if (shared_) { shared_->magic = 0; UnmapViewOfFile(shared_); }
@@ -194,6 +197,10 @@ void Producer::release_textures() {
     if (ui_vk_.handle) CloseHandle(ui_vk_.handle);
     ui_vk_ = Texture{};
     ui_vk_age_ = 2;
+    if (vk_) vk_->destroy(hudless_vk_.vk);
+    if (hudless_vk_.handle) CloseHandle(hudless_vk_.handle);
+    hudless_vk_ = Texture{};
+    hudless_vk_fresh_ = false;
     d11_before_.Reset(); d11_cover_.Reset(); d11_picture_.Reset(); d11_cover_cs_.Reset();
     d11_before_taken_ = d11_cs_failed_ = d11_none_ = d11_confirmed_ = false;
     for (auto& r : retired_) {
@@ -719,6 +726,28 @@ void Producer::on_ui_layer_vk(std::uint64_t image, DXGI_FORMAT format, std::uint
     ui_vk_age_ = 0;
     shared_->hooks.ui_layer_w = width; shared_->hooks.ui_layer_h = height; shared_->hooks.ui_layer_format = format;
     ++shared_->hooks.ui_layer_taken;
+}
+
+void Producer::on_hudless_vk(std::uint64_t image, DXGI_FORMAT format, std::uint32_t width, std::uint32_t height, std::uint32_t layout,
+                             void* command_buffer) {
+    std::lock_guard lock(mutex_);
+    // (a swapchain made format-mutable is reported typeless: the plain format, as the back buffer's own copy - begin_present_vk)
+    switch (format) {
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS: format = DXGI_FORMAT_B8G8R8A8_UNORM; break;
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS: format = DXGI_FORMAT_R8G8B8A8_UNORM; break;
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS: format = DXGI_FORMAT_R10G10B10A2_UNORM; break;
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS: format = DXGI_FORMAT_R16G16B16A16_FLOAT; break;
+        default: break;
+    }
+    if (!ready() || !vk_ || !image || !command_buffer || !width || !height || vk_format_of(format) == VK_FORMAT_UNDEFINED) return;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width; desc.Height = height; desc.Format = format;
+    collect_retired();
+    if (!ensure_own(hudless_vk_, desc)) return;
+    vk_->copy(static_cast<VkCommandBuffer>(command_buffer), reinterpret_cast<VkImage>(image), VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
+              static_cast<VkImageLayout>(layout), hudless_vk_.vk, width, height);
+    hudless_vk_fresh_ = true;
 }
 
 // Direct3D 11, third pattern: the comparison of the picture with its HUD and the copy before it (see on_hud_before_d3d11).
@@ -1438,6 +1467,7 @@ void Producer::on_tag_vk(std::uint64_t frame, Tex kind, std::uint64_t image, std
                          std::uint32_t ext_y, std::uint32_t ext_w, std::uint32_t ext_h, void* command_buffer) {
     std::lock_guard lock(mutex_);
     if (!ready() || !vk_ || !image || !command_buffer || !width || !height) return;
+    if (kind == kScene && hud_given_ >= 60) return;  // (as on_tag: not while the game hands its HUD over)
     std::uint32_t depth_bytes = 0;
     const DXGI_FORMAT format = dxgi_format_of(static_cast<VkFormat>(vk_format), &depth_bytes);
     if (format == DXGI_FORMAT_UNKNOWN) {
@@ -1507,6 +1537,30 @@ std::uint64_t Producer::begin_present_vk(std::uint64_t image, DXGI_FORMAT format
         ++shared_->hooks.ui_layer_handed;
     }
     if (ui_vk_age_ < 2) ++ui_vk_age_;
+    // (the HUD-less picture taken this frame, see on_hudless_vk: into the frame's HUD-less slot, unless it has a HUD layer)
+    if (hudless_vk_fresh_ && !m.tex[kUi].valid && !m.tex[kHudless].valid && ensure_texture(slot, kHudless, hudless_vk_.desc)) {
+        auto& t = textures_[slot][kHudless];
+        vk_->copy(static_cast<VkCommandBuffer>(command_buffer), reinterpret_cast<VkImage>(hudless_vk_.vk.image), VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
+                  VK_IMAGE_LAYOUT_GENERAL, t.vk, static_cast<std::uint32_t>(hudless_vk_.desc.Width), hudless_vk_.desc.Height);
+        auto& info = m.tex[kHudless];
+        info.width = static_cast<std::uint32_t>(t.desc.Width); info.height = t.desc.Height; info.format = t.desc.Format;
+        info.generation = t.generation; info.ext_x = info.ext_y = 0; info.ext_w = info.width; info.ext_h = info.height;
+        info.valid = 1;
+    }
+    hudless_vk_fresh_ = false;
+    // (frames in a row with the HUD handed over, as in begin_present: the upscaler's output no longer copied past 60, its
+    // slot textures released at 300. The UI slot here only ever holds the layer the add-on took - its check against the
+    // upscaler's output needs that until the presenter trusts it: DOOM Eternal)
+    hud_given_ = m.tex[kHudless].valid || shared_->presenter.layer_trust == 1 ? hud_given_ + 1 : 0;
+    if (hud_given_ == 300)
+        for (int s = 0; s < kSlots; ++s) {
+            auto& t = textures_[s][kScene];
+            if (!t.resource) continue;
+            retired_.push_back({t.resource, t.handle, fence_value_ + 1, t.vk, t.d11});
+            const std::uint32_t generation = t.generation;
+            t = Texture{};
+            t.generation = generation;
+        }
     m.qpc_present = qpc_now();
     return m.frame_id + 1;  // 0 means "nothing to finish"
 }

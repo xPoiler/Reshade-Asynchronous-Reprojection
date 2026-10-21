@@ -4,6 +4,7 @@
 #include <imgui.h>
 #include <reshade.hpp>
 #include "addon/producer.hpp"
+#include "addon/fault_log.hpp"
 #include "addon/game_probe.hpp"
 #include "addon/streamline_hooks.hpp"
 #include "addon/ngx_hooks.hpp"
@@ -123,6 +124,8 @@ constexpr Persisted kPersisted[] = {
     {"PresentLeadAuto", &fw::Settings::present_lead_auto, nullptr},
     {"FrameCap", &fw::Settings::frame_cap, nullptr},
     {"EdgeFill", &fw::Settings::edge_fill, nullptr},
+    {"MemoryResolution", &fw::Settings::memory_resolution, nullptr},
+    {"CameraTurnsOnly", &fw::Settings::turns_only, nullptr},
     {"EdgeLimit", nullptr, &fw::Settings::edge_limit_pct},
     {"EdgeUnlimited", &fw::Settings::edge_unlimited, nullptr},
     {"WarpEngine", &fw::Settings::warp_engine, nullptr},
@@ -343,6 +346,24 @@ bool on_set_fullscreen_state(reshade::api::swapchain*, bool fullscreen, void*) {
     return true;
 }
 
+// This build of the add-on: the version and its own link time stamp (PE header) - the settings saved per game belong to
+// it (on_init_swapchain), so does the saved HUD point (hud_learn::set_profile).
+const char* addon_build() {
+    static char build[48] = "";
+    if (!build[0]) {
+        HMODULE self = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&load_persisted), &self);
+        unsigned stamp = 0;
+        if (self) {
+            const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(self);
+            stamp = reinterpret_cast<const IMAGE_NT_HEADERS*>(reinterpret_cast<const char*>(self) + dos->e_lfanew)->FileHeader.TimeDateStamp;
+        }
+        std::snprintf(build, sizeof(build), "%s+%08x", FW_VERSION, stamp);
+    }
+    return build;
+}
+
 void on_init_swapchain(swapchain* sc, bool) {
     report_fullscreen_for(sc);
     device* dev = sc->get_device();
@@ -369,18 +390,7 @@ void on_init_swapchain(swapchain* sc, bool) {
     // after an update - any new build, a test build of the same version too - they go back to the defaults,
     // so the improved defaults apply right after installing it. The build: the version and the add-on's own
     // link time stamp (PE header).
-    char build[48];
-    {
-        HMODULE self = nullptr;
-        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           reinterpret_cast<LPCWSTR>(&load_persisted), &self);
-        unsigned stamp = 0;
-        if (self) {
-            const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(self);
-            stamp = reinterpret_cast<const IMAGE_NT_HEADERS*>(reinterpret_cast<const char*>(self) + dos->e_lfanew)->FileHeader.TimeDateStamp;
-        }
-        std::snprintf(build, sizeof(build), "%s+%08x", FW_VERSION, stamp);
-    }
+    const char* const build = addon_build();
     char saved_version[48] = "";
     size_t size = sizeof(saved_version);
     bool settings_reset = false;
@@ -528,7 +538,10 @@ void on_present(command_queue*, swapchain* chain, const rect*, const rect*, uint
         fw::push_event(g_producer->shared(), fw::kEvSwapPresent, reinterpret_cast<std::uintptr_t>(chain), chain->get_current_back_buffer_index());
 }
 
-void on_finish_present(command_queue* queue, swapchain*) {
+void on_finish_present(command_queue* queue, swapchain* chain) {
+    if (chain && (!g_producer || !g_producer->shared() || !g_producer->shared()->game_hwnd ||
+                  reinterpret_cast<std::uint64_t>(chain->get_hwnd()) == g_producer->shared()->game_hwnd))
+        fw::present_ceiling(chain->get_hwnd());
     if (queue && g_producer && g_producer->shared()) {
         auto* sh = g_producer->shared();
         fw::frame_cap_after_present(queue, sh->settings.frame_cap != 0 && sh->settings.enabled != 0, g_producer->generation_active());
@@ -630,6 +643,9 @@ void draw_overlay(effect_runtime*) {
     auto& h = sh.hooks;
     auto& p = sh.presenter;
     ImGui::TextDisabled("XPAR (xPoiler's Asynchronous Reprojection) " FW_VERSION);
+    if (s.turns_only)
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
+                           "Camera turns only is ON: walking and strafing are not reprojected, only turning.");
 
     bool enabled = s.enabled != 0;
     // Label follows the refresh rate the presenter measures on the overlay's display.
@@ -640,6 +656,10 @@ void draw_overlay(effect_runtime*) {
     ImGui::SameLine();
     bool original = s.show_original != 0;
     if (ImGui::Checkbox("Show original (A/B)", &original)) s.show_original = original;
+    bool turns = s.turns_only != 0;
+    if (ImGui::Checkbox("Camera turns only", &turns)) s.turns_only = turns;
+    hint("Only how the camera turns is reprojected, as if it stood where the game's frame was rendered: walking and "
+         "strafing come from the game's own frames alone. Off by default. Remembered per game.");
 
     const bool alive = presenter_running();
     ImGui::Text("Presenter: %s", alive ? "running" : "not running");
@@ -653,7 +673,14 @@ void draw_overlay(effect_runtime*) {
                            "DLSS and FSR 3.1 frame generation with its own warp engine; otherwise turn frame generation off.");
     else if (alive && p.frame_generation == 2)
         ImGui::TextDisabled("Frame generation: XPAR shows the game's generated images, each moved to the current camera");
-    if (alive && p.vram_pressure) {
+    if (alive && p.memory_guard >= 3)
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
+                           "Not enough video memory for XPAR next to the game: XPAR is paused, the game is shown as it is.\n"
+                           "It starts again by itself once there is room. Lower the game's texture quality to make room.");
+    else if (alive && p.memory_guard)
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "Video memory is short: XPAR let go of %s to stay within it.",
+                           p.memory_guard >= 2 ? "the sight reticle layers and the background memory" : "the sight reticle layers");
+    if (alive && p.vram_pressure && p.memory_guard < 3) {
         if (p.vram_adapter_mb > 0 && p.vram_adapter_size_mb > 0)
             ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "Video memory is nearly full (%.1f of %.1f GB in use): the game and XPAR don't both fit,",
                                p.vram_adapter_mb / 1024.0f, p.vram_adapter_size_mb / 1024.0f);
@@ -832,12 +859,22 @@ void draw_overlay(effect_runtime*) {
             reshade::set_config_value(nullptr, "FrameWarp", "BackgroundMemory", memory ? "1" : "0");
         }
         hint("Beside the character/weapon and at the screen edges: the scenery as last seen there, when recent.");
-        static const char* const kEdgeFills[] = {"Extended edge pixels", "Soft (default)"};
-        int edge_fill = s.edge_fill ? 1 : 0;
-        if (ImGui::Combo("Uncovered screen edges (XPAR engine)", &edge_fill, kEdgeFills, 2)) s.edge_fill = static_cast<std::uint32_t>(edge_fill);
+        ImGui::BeginDisabled(!memory);
+        static const char* const kMemoryResolutions[] = {"Full", "1/2 (default)", "1/4"};
+        int memory_res = static_cast<int>(std::min<std::uint32_t>(s.memory_resolution, 2));
+        if (ImGui::Combo("Background memory resolution", &memory_res, kMemoryResolutions, 3)) s.memory_resolution = static_cast<std::uint32_t>(memory_res);
+        ImGui::EndDisabled();
+        hint("The resolution the background memory keeps the scenery at, against the game's picture: full fills behind the HUD, "
+             "the character and the screen edges as sharp as the scenery around them, for about 4x the video memory (about "
+             "415, 105 and 26 MB at 4K for full, 1/2 and 1/4) and more GPU time; 1/2 and 1/4 are softer where they fill. "
+             "Remembered per game.");
+        static const char* const kEdgeFills[] = {"Extended edge pixels", "Soft", "Dithered (default)"};
+        int edge_fill = static_cast<int>(std::min<std::uint32_t>(s.edge_fill, 2));
+        if (ImGui::Combo("Uncovered screen edges (XPAR engine)", &edge_fill, kEdgeFills, 3)) s.edge_fill = static_cast<std::uint32_t>(edge_fill);
         hint("What a fast turn uncovers past the edge of the game's frame, where background memory has nothing: soft blurs "
              "the scenery along the edge more the further out, slightly less saturated; extended edge pixels repeat the "
-             "edge (sharper close to it, streaks further out). Remembered per game.");
+             "edge (sharper close to it, streaks further out); dithered shows the game's frame as it is there, mixed into "
+             "the warped picture in a fine pattern near the edge - noisy, not smeared. Remembered per game.");
         bool moving = s.moving_objects != 0;
         if (ImGui::Checkbox("XPAR frame generation (XPAR engine, experimental)", &moving)) {
             s.moving_objects = moving;
@@ -1114,6 +1151,10 @@ void register_callbacks() {
         [](std::uint64_t picture, std::uint32_t kind, std::uint64_t context) {
             if (g_producer && g_producer->shared() && g_producer->shared()->settings.game_hud_layers)
                 g_producer->on_hud_before_d3d11(reinterpret_cast<ID3D11Resource*>(picture), kind, reinterpret_cast<ID3D11DeviceContext*>(context));
+        },
+        [](std::uint64_t image, std::uint32_t format, std::uint32_t width, std::uint32_t height, std::uint32_t layout, std::uint64_t cb) {
+            if (g_producer && g_producer->shared() && g_producer->shared()->settings.game_hud_layers)
+                g_producer->on_hudless_vk(image, static_cast<DXGI_FORMAT>(format), width, height, layout, reinterpret_cast<void*>(cb));
         });
     reshade::register_event<reshade::addon_event::finish_present>(on_finish_present);
     reshade::register_event<reshade::addon_event::present>(on_present);
@@ -1194,8 +1235,9 @@ __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE reshade_modul
     std::wstring dir = path;
     dir = dir.substr(0, dir.find_last_of(L"\\/"));
     g_presenter_path = dir + L"\\FrameWarp\\FrameWarpPresenter.exe";
+    fw::install_fault_log(dir + L"\\FrameWarp\\logs");  // (faults recorded - see fault_log.cpp)
     CreateDirectoryW((dir + L"\\FrameWarp\\profiles").c_str(), nullptr);
-    fw::hud_learn::set_profile(dir + L"\\FrameWarp\\profiles\\hud_point.txt");
+    fw::hud_learn::set_profile(dir + L"\\FrameWarp\\profiles\\hud_point.txt", addon_build());
     if (!g_producer) g_producer = std::make_unique<fw::Producer>();
     fw::install_streamline_hooks(g_producer.get());
     fw::install_ngx_hooks(g_producer.get());

@@ -37,7 +37,9 @@ void shutdown();
 void on_present(reshade::api::swapchain* chain, bool learning, bool paused, std::uint32_t pick, std::uint32_t fail, std::uint32_t relearn);
 struct Status { std::uint32_t candidates = 0, active = 0, locked = 0; };
 // The learned point is saved once it has given the HUD for a minute of frames, and locked from the start on the next
-// launch (the panel's Relearn forgets it).
-void set_profile(const std::wstring& path);
+// launch (the panel's Relearn forgets it). It belongs to the add-on build that saved it (`build`, written in the file): what
+// a point is made of - its fingerprint - may change from one build to the next, and a point saved by another build could
+// stand for another draw, or none - read by an updated add-on it is ignored and deleted, and learned again.
+void set_profile(const std::wstring& path, const char* build);
 Status status();
 }
