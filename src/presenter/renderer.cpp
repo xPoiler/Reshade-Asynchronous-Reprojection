@@ -6910,7 +6910,10 @@ bool Renderer::ret_layers_ready(std::uint32_t w, std::uint32_t h) {
 bool Renderer::ensure_private(PrivateId id, std::uint32_t w, std::uint32_t h, DXGI_FORMAT format) {
     auto& p = private_[id];
     if (p.texture && p.width == w && p.height == h && p.format == format) return true;
-    if (p.texture) wait_idle();
+    // (the old one kept until the GPU is past the next submission - see retire: what is being recorded may still use it.
+    // Freed at once, a copy recorded before it in the same list read freed memory and the GPU hung - device removed -
+    // when a texture changed format: the HUD-less picture's, a game's HUD-less frames and colour HUD layer in turn)
+    if (p.texture) { wait_idle(); retire(id); }
     p = Private{};
     D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC d{};

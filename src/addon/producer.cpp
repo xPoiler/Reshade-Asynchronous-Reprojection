@@ -145,7 +145,7 @@ int Producer::slot_for_frame(std::uint64_t frame, bool create) {
         if (InterlockedCompareExchange(&shared_->slots[i].state, kWriting, from) != from) return false;
         auto& m = shared_->slots[i];
         m.frame_id = frame; m.fence_value = 0; m.qpc_sim_start = 0; m.qpc_constants = 0; m.qpc_present = 0;
-        slot_list_[i] = 0; slot_submitted_[i] = false;
+        slot_list_[i] = 0; slot_submitted_[i] = false; ui_tagged_[i] = false;
         m.camera.valid = 0;
         for (auto& t : m.tex) t.valid = 0;
         m.generated = m.per_frame = m.gen_last = 0;
@@ -210,7 +210,7 @@ void Producer::release_textures() {
     retired_.clear();
 }
 
-bool Producer::ensure_texture(int slot, Tex kind, const D3D12_RESOURCE_DESC& source, std::uint32_t vk_depth_bytes) {
+bool Producer::ensure_texture(int slot, Tex kind, const D3D12_RESOURCE_DESC& source, std::uint32_t vk_depth_bytes, bool shader_written) {
     auto& t = textures_[slot][kind];
     const DXGI_FORMAT format = copy_format(source.Format);
     if (t.resource && t.desc.Width == source.Width && t.desc.Height == source.Height && t.desc.Format == format &&
@@ -228,8 +228,9 @@ bool Producer::ensure_texture(int slot, Tex kind, const D3D12_RESOURCE_DESC& sou
     // refuse the rest; R32F needs simultaneous access as well): what D3D11 games copy is colour or R32F.
     if (d11_) desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     // (Direct3D 12: the HUD layer's slot written by the add-on's pass itself - see begin_present - one 4K copy less a frame.
-    // Refused, the plain shared texture below: the pass writes its own texture and copies it, as before)
-    if (kind == kUi && !d11_ && !vk_) desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    // Refused, the plain shared texture below: the pass writes its own texture and copies it, as before. Only for that
+    // pass: a slot the other HUD steps copy into came out black in the presenter with the flag - the pipeline test's)
+    if (shader_written && !d11_ && !vk_) desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     HRESULT hr = device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&t.resource));
     if (FAILED(hr)) {  // depth families may refuse simultaneous access; retry as a plain shared texture
@@ -433,6 +434,7 @@ void Producer::on_tag(std::uint64_t frame, Tex kind, ID3D12Resource* source, D3D
     tl_tagging = false;
     slot_list_[slot] = tl_tag_list ? tl_tag_list : reinterpret_cast<std::uint64_t>(list);
     auto& info = shared_->slots[slot].tex[kind];
+    if (kind == kUi) ui_tagged_[slot] = true;
     info.width = static_cast<std::uint32_t>(t.desc.Width); info.height = t.desc.Height;
     info.format = t.desc.Format; info.generation = t.generation;
     if (!ext_w || !ext_h) { ext_x = ext_y = 0; ext_w = info.width; ext_h = info.height; }
@@ -1256,7 +1258,7 @@ std::uint64_t Producer::begin_present(ID3D12Resource* backbuffer, ID3D12Graphics
             if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &ad, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&ui_alpha_))))
                 ui_alpha_.Reset();
         }
-        if (ui_alpha_ && ensure_texture(slot, kUi, ui_alpha_->GetDesc())) {
+        if (ui_alpha_ && ensure_texture(slot, kUi, ui_alpha_->GetDesc(), 0, true)) {
             auto& t = textures_[slot][kUi];
             // (straight into the slot where it takes shader writes - see ensure_texture)
             const bool direct = (t.desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
@@ -1330,7 +1332,9 @@ std::uint64_t Producer::begin_present(ID3D12Resource* backbuffer, ID3D12Graphics
     // once the presenter has checked it - until then the check needs the upscaler's output; and then a frame without it is
     // one where the game hides its HUD): past 60 the upscaler's output is no longer copied (on_tag); at 300 its slot
     // textures are released (64 MB each at 4K).
-    const bool tagged_ui = m.tex[kUi].valid && m.tex[kUi].format != DXGI_FORMAT_R8_UNORM;  // (the add-on's is its coverage, R8)
+    // (by where it came from: the add-on's own layers have their colour too since 2.1 - told apart by format, they counted
+    // as tagged and the upscaler's output stopped after 60 frames, before a wrong layer could be rejected)
+    const bool tagged_ui = m.tex[kUi].valid && ui_tagged_[slot];
     hud_given_ = m.tex[kHudless].valid || tagged_ui || shared_->presenter.layer_trust == 1 ? hud_given_ + 1 : 0;
     if (hud_given_ == 300)
         for (int s = 0; s < kSlots; ++s) {

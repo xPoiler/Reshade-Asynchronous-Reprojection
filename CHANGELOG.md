@@ -67,6 +67,13 @@ stays).
   frame.
 * The video memory guard steps aside only near the limit and comes back after 5 s (up to 30 s if it keeps hitting it).
 
+### Fixes
+
+* **No more "device removed" crashes when a game's HUD source changes** (Resident Evil Requiem switching between its
+  HUD-less picture and its HUD layer): a working texture replaced in another format was freed while the GPU could
+  still use it.
+* A HUD layer the add-on finds can again be rejected when it turns out to be part of the 3D picture.
+
 ### Diagnostics
 
 * A crash recorder writes faults, stacks and loaded modules to `FrameWarp\logs\crash.txt`.

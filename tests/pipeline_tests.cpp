@@ -1502,7 +1502,7 @@ int main(int argc, char** argv) {
             const double hp_x1 = green_x(), hb_x1 = peak(px, w, h, true, 1);
             own_engine = false;
             std::printf("HUD from the HUD-less picture: patch x %.1f -> %.1f, bar x %.0f -> %.0f\n", hp_x0, hp_x1, hb_x0, hb_x1);
-            EXPECT(hl_src.has_hudless && !hl_src.has_ui, "the HUD-less picture is ingested without a UI layer");
+            EXPECT(hl_src.has_hudless && (!hl_src.has_ui || hl_src.ui_from_hudless), "the HUD-less picture is ingested, a UI layer only made from it");
             EXPECT(hp_x0 > 0 && std::fabs(hp_x1 - hp_x0) < 2.0, "HUD found from the HUD-less picture in one frame (%.1f -> %.1f)", hp_x0, hp_x1);
             EXPECT(std::fabs(hb_x1 - hb_x0) > 20.0, "the scene next to that HUD still warps (%.0f -> %.0f)", hb_x0, hb_x1);
         }
@@ -1541,7 +1541,7 @@ int main(int argc, char** argv) {
             with_ui_layer = false;
             hudless_copy = false;
             std::printf("HUD from a HUD-less copy: patch x %.1f -> %.1f, bar x %.0f -> %.0f\n", hp_x0, hp_x1, hb_x0, hb_x1);
-            EXPECT(hc_src.has_hudless && !hc_src.has_ui, "the HUD-less copy is ingested as the HUD-less picture");
+            EXPECT(hc_src.has_hudless && (!hc_src.has_ui || hc_src.ui_from_hudless), "the HUD-less copy is ingested as the HUD-less picture");
             EXPECT(hp_x0 > 0 && std::fabs(hp_x1 - hp_x0) < 2.0, "HUD taken from the HUD-less copy in one frame (%.1f -> %.1f)", hp_x0, hp_x1);
             EXPECT(std::fabs(hb_x1 - hb_x0) > 20.0, "the scene next to it warps (%.0f -> %.0f)", hb_x0, hb_x1);
             EXPECT(both_src.has_ui && !both_src.has_hudless, "with a HUD layer the HUD-less copy is dropped");

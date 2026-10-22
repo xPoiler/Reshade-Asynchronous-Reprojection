@@ -201,6 +201,7 @@ private:
     // Each slot's last tag's command list, and whether it was handed to the GPU since (under mutex_).
     std::uint64_t slot_list_[kSlots] = {};
     bool slot_submitted_[kSlots] = {};
+    bool ui_tagged_[kSlots] = {};  // (the slot's UI layer is one the game tags itself - on_tag - not one the add-on found)
     std::mutex open_mutex_;                  // (markers come from the game's threads)
     std::vector<std::uint64_t> open_frames_;  // started rendering, not presented, oldest first
     std::uint64_t last_upscaled_ = 0;
@@ -224,7 +225,8 @@ private:
     void copy_d3d11(ID3D11DeviceContext* context, ID3D11Resource* source, ID3D11Texture2D* target);
 
     int slot_for_frame(std::uint64_t frame, bool create);
-    bool ensure_texture(int slot, Tex kind, const D3D12_RESOURCE_DESC& source_desc, std::uint32_t vk_depth_bytes = 0);
+    // (shader_written: the HUD layer pass writes the slot itself - see begin_present)
+    bool ensure_texture(int slot, Tex kind, const D3D12_RESOURCE_DESC& source_desc, std::uint32_t vk_depth_bytes = 0, bool shader_written = false);
     int present_slot();  // the slot being presented (marks it, releases older ones); -1: none
     void release_textures();
     void copy_into(ID3D12GraphicsCommandList* list, ID3D12Resource* source, D3D12_RESOURCE_STATES state, ID3D12Resource* target);
