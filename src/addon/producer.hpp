@@ -154,6 +154,8 @@ public:
     void finish_present_vk(reshade::api::command_queue* queue, std::uint64_t token);
 
     void set_message(const char* text);
+    // (where informational lines go - ReShade's log, set by the add-on; none in the replay tools)
+    void (*log_line)(const char* text) = nullptr;
 
     // Frame generation (the game's DLSS / FSR frame generation): image number `index` (1 .. per_frame, 0: the
     // next one) of the `per_frame` it generates between the previous frame and `frame`, copied right where it is
@@ -226,6 +228,22 @@ private:
     int present_slot();  // the slot being presented (marks it, releases older ones); -1: none
     void release_textures();
     void copy_into(ID3D12GraphicsCommandList* list, ID3D12Resource* source, D3D12_RESOURCE_STATES state, ID3D12Resource* target);
+    // GPU timestamps around the add-on's own work in the game's frames (Direct3D 12): the copies into the slots, the HUD
+    // layer's pass, the HUD learning's - what they cost the game, logged every 600 presents. A ring of pairs, each read
+    // when it comes round again (long done).
+    enum TimeTag { kTBackbuffer, kTDepth, kTMotion, kTOtherTag, kTUiTake, kTUiPass, kTUiSlot, kTHudlessTake, kTHudlessSlot, kTProbe, kTCount };
+    int time_begin(ID3D12GraphicsCommandList* list, int tag);
+    void time_end(ID3D12GraphicsCommandList* list, int pair);
+    void time_report(ID3D12CommandQueue* queue);
+    static constexpr unsigned kTsPairs = 1024;
+    Microsoft::WRL::ComPtr<ID3D12QueryHeap> ts_heap_;
+    Microsoft::WRL::ComPtr<ID3D12Resource> ts_readback_;
+    std::uint64_t* ts_mapped_ = nullptr;
+    unsigned ts_next_ = 0;
+    int ts_tag_[kTsPairs] = {};
+    std::uint64_t ts_ticks_[kTCount] = {};
+    std::uint32_t ts_presents_ = 0;
+    bool ts_failed_ = false;
     void collect_retired();
 
     std::mutex mutex_;

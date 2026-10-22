@@ -235,6 +235,8 @@ groupshared float4 rs_a[256], rs_b[256];
 cbuffer W : register(b1) {
     row_major float4x4 wmat;  // cs_own_warp: the previous frame's clip -> the displayed camera's
     float4 wproj;             // the projection's depth terms (a, b, c, e): clip z = vz a + b, clip w = vz c + e
+    float4 wh0, wh1;          // (claims made for an earlier refresh of this frame - see ow_claims_uv: the homography from
+    float2 wh2;               // this refresh's NDC to theirs, rows h00 h01 h02 h10 / h11 h12 h20 h21 / h22; wh2.y 1 in use)
 };
 // View distance (clip w) of a point from its stored depth, whichever way round depth is stored.
 float view_w(float d) {
@@ -3256,11 +3258,27 @@ float2 ow_behind(float2 uv, int2 p, float far_near) {
 // claims around at all (false).
 static bool ow_first = false;  // (ow_claimed: the nearest claim around was the one taken)
 static float ow_hole_near = 1e9;  // (ow_claimed, a hole: the nearest claim around's nearness - see ow_mem_fill)
+// Where the claims for uv are: with claims made for an earlier refresh of the same game frame (wh2.y, see own_warp's
+// claims_reuse_), where uv's spot was for that refresh's camera - between two refreshes the camera mostly turns, which
+// moves every point alike (a homography, at any depth); the steps then find the spot for this refresh's camera as ever.
+float2 ow_claims_uv(float2 uv) {
+    if (wh2.y < 0.5) return uv;
+    const float3 p = float3(uv.x * 2 - 1, 1 - uv.y * 2, 1);
+    const float3 q = float3(dot(p, float3(wh0.x, wh0.w, wh1.z)), dot(p, float3(wh0.y, wh1.x, wh1.w)), dot(p, float3(wh0.z, wh1.y, wh2.x)));
+    if (q.z <= 1e-6) return uv;
+    const float2 n = q.xy / q.z;
+    // (...by its own share of the turn, as the warp moves it: what the camera carries - a gun, a held character - not at
+    // all, an orbited character's surroundings part of the way. Mapped by the camera's turn alone, their claimants were
+    // missed: the synthetic aim's gun error +10..18%, the orbits' character +12..42%. The share read at uv - where the
+    // spot is now, as the warp's own reads at the output)
+    const float f = (flags & 128) ? ow_follow(uv) : 1.0;
+    return lerp(uv, float2(n.x * 0.5 + 0.5, 0.5 - n.y * 0.5), f);
+}
 bool ow_claimed(float2 uv, out float2 src, out bool hole) {
     src = uv;
     hole = false;
     ow_first = false;
-    const int2 c0 = int2(uv * float2(rect.zw));
+    const int2 c0 = int2(ow_claims_uv(uv) * float2(rect.zw));
     uint keys[9];
     uint far_key = 0xFFFFFFFFu;
     int2 far_cell = c0;
@@ -3312,7 +3330,7 @@ bool ow_claimed(float2 uv, out float2 src, out bool hole) {
 // it reaches uv (stretched), else the scenery behind from the farthest.
 bool ow_ring(float2 uv, out float2 src) {
     src = uv;
-    const int2 c0 = int2(uv * float2(rect.zw));
+    const int2 c0 = int2(ow_claims_uv(uv) * float2(rect.zw));
     static const int kRadii[13] = {2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128};
     // (flag 4194304: out to 128 rendered pixels - a band a fast turn uncovers beside a held hand is wider than 32: with no
     // claim found it fell back on the search, which copied scenery from beside the hand into it)
@@ -3615,7 +3633,7 @@ RWByteAddressBuffer ow_args_u : register(u0);  // cs_own_warp_args: the full war
 // The nearest claim around uv, if its surface reaches uv (ow_claimed's first try: the same claim, the same steps).
 bool ow_lean_claim(float2 uv, out float2 src) {
     src = uv;
-    const int2 c0 = int2(uv * float2(rect.zw));
+    const int2 c0 = int2(ow_claims_uv(uv) * float2(rect.zw));
     uint best = 0;
     int bi = 0;
     [unroll] for (int k = 0; k < 9; ++k) {
@@ -4829,7 +4847,7 @@ bool Renderer::create_pipelines(std::string& error) {
     D3D12_DESCRIPTOR_RANGE wsrv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kWSrvCount, 0, 0, 0};
     D3D12_ROOT_PARAMETER wp[4]{};
     wp[0] = xp[0];
-    wp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; wp[1].Constants = {1, 0, 20};
+    wp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; wp[1].Constants = {1, 0, kWConstants};
     wp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; wp[2].DescriptorTable = {1, &wsrv};
     wp[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; wp[3].DescriptorTable = {1, &xuav};
     D3D12_ROOT_SIGNATURE_DESC wrs{4, wp, 1, &linear, D3D12_ROOT_SIGNATURE_FLAG_NONE};
@@ -4960,25 +4978,25 @@ void Renderer::set_x_uav(UINT index, PrivateId id) {
     device_->CreateUnorderedAccessView(p.texture.Get(), nullptr, &d, cpu(index));
 }
 
-void Renderer::w_dispatch(ID3D12PipelineState* pso, const void* constants, const float w[20], UINT table, UINT groups_x, UINT groups_y) {
+void Renderer::w_dispatch(ID3D12PipelineState* pso, const void* constants, const float w[kWConstants], UINT table, UINT groups_x, UINT groups_y) {
     ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
     list_->SetDescriptorHeaps(1, heaps);
     list_->SetComputeRootSignature(root_w_.Get());
     list_->SetPipelineState(pso);
     list_->SetComputeRoot32BitConstants(0, 32, constants, 0);
-    list_->SetComputeRoot32BitConstants(1, 20, w, 0);
+    list_->SetComputeRoot32BitConstants(1, kWConstants, w, 0);
     list_->SetComputeRootDescriptorTable(2, gpu(kWSrv(table)));
     list_->SetComputeRootDescriptorTable(3, gpu(kWUav(table)));
     list_->Dispatch(groups_x, groups_y, 1);
 }
 
-void Renderer::w_dispatch_indirect(ID3D12PipelineState* pso, const void* constants, const float w[20], UINT table, ID3D12Resource* args) {
+void Renderer::w_dispatch_indirect(ID3D12PipelineState* pso, const void* constants, const float w[kWConstants], UINT table, ID3D12Resource* args) {
     ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
     list_->SetDescriptorHeaps(1, heaps);
     list_->SetComputeRootSignature(root_w_.Get());
     list_->SetPipelineState(pso);
     list_->SetComputeRoot32BitConstants(0, 32, constants, 0);
-    list_->SetComputeRoot32BitConstants(1, 20, w, 0);
+    list_->SetComputeRoot32BitConstants(1, kWConstants, w, 0);
     list_->SetComputeRootDescriptorTable(2, gpu(kWSrv(table)));
     list_->SetComputeRootDescriptorTable(3, gpu(kWUav(table)));
     list_->ExecuteIndirect(dispatch_sig_.Get(), 1, args, 0, nullptr, 0);
@@ -5168,7 +5186,7 @@ int Renderer::generate_frames(const IngestedSource& src, int count, const float 
     const bool use_flow = flow && private_[kPFlowB].texture;
     const bool use_hud = hud && private_[kPMask].texture && private_[kPMask].width == ow && private_[kPMask].height == oh;
     c.flags = (use_flow ? 2u : 0u) | (use_hud ? 4u : 0u);
-    float wc[20] = {};
+    float wc[kWConstants] = {};
     std::memcpy(wc, from_prev.data(), sizeof(float) * 16);  // (the previous frame's clip space -> this frame's)
     projection_terms(view_to_clip, wc + 16);
     auto bind = [&](UINT t) {
@@ -5242,7 +5260,7 @@ void Renderer::prepare_generated(const IngestedSource& src, float scale_x, float
     c.mv_size[0] = motion ? private_[kPMotion].width : 1; c.mv_size[1] = motion ? private_[kPMotion].height : 1;
     c.mv_scale[0] = scale_x; c.mv_scale[1] = scale_y;
     c.flags = motion && scale_valid ? 1u : 0u;
-    float wc[20] = {};
+    float wc[kWConstants] = {};
     for (int i = 0; i < src.generated; ++i) {
         const auto z = static_cast<PrivateId>(kPGenZ0 + i), colour = static_cast<PrivateId>(kPGen0 + i);
         if (!ensure_private(z, w, h, DXGI_FORMAT_R32_FLOAT) || !private_[colour].texture) return;
@@ -5278,7 +5296,7 @@ void Renderer::hold_characters(const IngestedSource& src, const float clip_to_pr
     if (!ensure_private(kPStill, w, h, DXGI_FORMAT_R16_FLOAT) || !ensure_private(kPObjKindA, w, h, DXGI_FORMAT_R16_FLOAT) ||
         !ensure_private(kPObjKindB, w, h, DXGI_FORMAT_R16_FLOAT))
         return;
-    float wc[20] = {};
+    float wc[kWConstants] = {};
     projection_terms(view_to_clip, wc + 16);
     // How much each spot has stayed in place lately (cs_still).
     XConstants c{};
@@ -5414,7 +5432,7 @@ void Renderer::follow_share(const IngestedSource& src, const float clip_to_prev_
     if (!src.has_depth || !src.has_motion || !private_[kPObject].texture || !depth.texture) return;
     const UINT w = depth.width, h = depth.height;
     if (private_[kPObject].width != w || private_[kPObject].height != h) return;
-    float wc[20] = {};
+    float wc[kWConstants] = {};
     XConstants c{};
     std::memcpy(c.clip_to_prev, clip_to_prev_clip, sizeof(c.clip_to_prev));
     const Rect2 r = src.depth_rect.w ? src.depth_rect : Rect2{0, 0, w, h};
@@ -5608,7 +5626,7 @@ bool Renderer::object_motion(const IngestedSource& src, const float clip_to_prev
     const bool flow = picture && private_[kPFlowB].texture;
     c.flags = (held ? 1u : 0u) | (flow ? 2u : 0u);
     c.out_size[0] = std::max(1u, w / 2); c.out_size[1] = std::max(1u, h / 2);  // (level 0 of the picture's motion)
-    float wc[20] = {};
+    float wc[kWConstants] = {};
     projection_terms(view_to_clip, wc + 16);
     if (held && ensure_private(kPObjKindA, w, h, DXGI_FORMAT_R16_FLOAT) && ensure_private(kPObjKindB, w, h, DXGI_FORMAT_R16_FLOAT)) {
         // One object, one way of moving (cs_obj_join): written back into the analysis before the mask is built.
@@ -5681,7 +5699,7 @@ void Renderer::keep_history(PrivateId colour, std::uint32_t depth_w, std::uint32
         if (!ensure_private(to, from.width, from.height, from.format)) return false;
         XConstants k{};
         k.grid[0] = from.width; k.grid[1] = from.height;
-        const float wc[20] = {};
+        const float wc[kWConstants] = {};
         for (UINT i = 0; i < kWSrvCount; ++i) set_x_srv(kWSrv(table) + i, from_id, true);
         set_x_uav(kWUav(table) + 0, to); set_x_uav(kWUav(table) + 1, to);
         transition(private_[to], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -6308,7 +6326,7 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
     c.flags = (split ? 1u : 0u) | (mask ? 2u : 0u) | (fill ? 4u : 0u) | (depth_inverted ? 16u : 0u) | (no_depth ? 32u : 0u) |
               (remembered ? 64u : 0u) | (stretched ? 128u : 0u) | (moving ? 256u : 0u) | (soft_edge ? 1024u : 0u) |
               (mask && share_mask ? 16384u : 0u) | (warp_paths_ ? 32768u : 0u);
-    float wc[20] = {};
+    float wc[kWConstants] = {};
     // (the characters carried on along their own motion - see ow_own: the cells of the shown frame, this many game frames on)
     const bool own_motion = mask && share_mask && stretched && warp_ahead_ > 0 && !moving && shown(kPOwnMove).texture &&
                             shown(kPOwnMove).width == dw && shown(kPOwnMove).height == dh;
@@ -6391,7 +6409,7 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
     } else {
         for (UINT i = 6; i < 14; ++i) set_x_srv(t + i, kPDepth, true);
         // (t10 free: the HUD layer's tiles, when the layer is laid over - see ow_ui_at)
-        if ((c.flags & 1u) && shown(kPUiTiles).texture && shown(kPUiTiles).width == (ow + 7) / 8 && shown(kPUiTiles).height == (oh + 7) / 8 &&
+        if (!ui_tiles_off_ && (c.flags & 1u) && shown(kPUiTiles).texture && shown(kPUiTiles).width == (ow + 7) / 8 && shown(kPUiTiles).height == (oh + 7) / 8 &&
             shown(kPUi).texture && shown(kPUi).width == ow) {
             set_x_srv(t + 10, kPUiTiles, true);
             c.threshold = float(static_cast<std::uint32_t>(c.threshold + 0.5f) | 16u);
@@ -6415,7 +6433,39 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
     if (remembered) set_x_srv(t + 13, static_cast<PrivateId>(kPMemZ0 + mem_shown_));
     else set_x_srv(t + 13, kPDepth, true);
     if (moving) stamp(kPassWarpObjects);
-    if (warp_splat_ && !no_depth && ensure_private(kPWarpClaims, dw, dh, DXGI_FORMAT_R32_UINT)) {
+    // (claims_reuse_, development: the claims made for an earlier refresh of the same frame - nothing taken in since, same
+    // shown set - are used again, this refresh's NDC mapped onto theirs by the turn between the two cameras: see
+    // ow_claims_uv. Points at infinity: clip = (x, y, d_inf, 1) M - a 3x3 map from the source's NDC per camera)
+    const bool reuse_claims = claims_reuse_ && warp_splat_ && !no_depth && !moving && claims_valid_ && claims_serial_ == shown_serial_ &&
+                              private_[kPWarpClaims].texture && private_[kPWarpClaims].width == dw && private_[kPWarpClaims].height == dh;
+    if (reuse_claims) {
+        const float dinf = (c.flags & 16u) ? 0.0f : 1.0f;
+        auto plane = [&](const float* M, double A[9]) {
+            A[0] = M[0]; A[1] = M[1]; A[2] = M[3];
+            A[3] = M[4]; A[4] = M[5]; A[5] = M[7];
+            A[6] = dinf * M[8] + M[12]; A[7] = dinf * M[9] + M[13]; A[8] = dinf * M[11] + M[15];
+        };
+        double an[9], ac[9];
+        plane(source_to_target, an); plane(claims_matrix_, ac);
+        const double det = an[0] * (an[4] * an[8] - an[5] * an[7]) - an[1] * (an[3] * an[8] - an[5] * an[6]) + an[2] * (an[3] * an[7] - an[4] * an[6]);
+        if (std::fabs(det) > 1e-12) {
+            const double inv[9] = {(an[4] * an[8] - an[5] * an[7]) / det, (an[2] * an[7] - an[1] * an[8]) / det, (an[1] * an[5] - an[2] * an[4]) / det,
+                                   (an[5] * an[6] - an[3] * an[8]) / det, (an[0] * an[8] - an[2] * an[6]) / det, (an[2] * an[3] - an[0] * an[5]) / det,
+                                   (an[3] * an[7] - an[4] * an[6]) / det, (an[1] * an[6] - an[0] * an[7]) / det, (an[0] * an[4] - an[1] * an[3]) / det};
+            double h[9] = {};
+            for (int r = 0; r < 3; ++r)
+                for (int k = 0; k < 3; ++k) h[r * 3 + k] = inv[r * 3 + 0] * ac[0 * 3 + k] + inv[r * 3 + 1] * ac[1 * 3 + k] + inv[r * 3 + 2] * ac[2 * 3 + k];
+            for (int i = 0; i < 9; ++i) wc[20 + i] = float(h[i]);
+            wc[29] = 1.0f;
+            set_x_srv(t + 12, kPWarpClaims);
+            c.flags |= 4096u;
+            stamp(kPassWarpClaim);
+        }
+    }
+    if (!(c.flags & 4096u) && warp_splat_ && !no_depth && ensure_private(kPWarpClaims, dw, dh, DXGI_FORMAT_R32_UINT)) {
+        std::memcpy(claims_matrix_, source_to_target, sizeof(claims_matrix_));
+        claims_serial_ = shown_serial_;
+        claims_valid_ = true;
         const UINT ct = kWSrv(kWClaim);
         for (UINT i = 0; i < kWSrvCount; ++i) set_x_srv(ct + i, kPDepth, true);
         set_x_srv(ct + 2, mask ? mask_id : kPDepth, true);
@@ -6514,6 +6564,7 @@ void Renderer::execute() {
     if (context_ == 1 && release_wait_) q->Wait(fences_[0].Get(), release_wait_);
     ID3D12CommandList* lists[] = {list_.Get()};
     q->ExecuteCommandLists(1, lists);
+    ++submissions_[context_ == 1 ? 1 : 0];  // (counted for the log - each one a scheduling event, see take_submissions)
 }
 
 void Renderer::signal() {
@@ -6636,6 +6687,7 @@ void Renderer::wait_for_intake(std::uint64_t value) {
 
 // ---- split queues
 void Renderer::swap_shown() {
+    ++shown_serial_;  // (claims made before are not used again - see own_warp's reuse_claims)
     for (int i = 0; i < kPCount; ++i) {
         const auto id = static_cast<PrivateId>(i);
         if (!shown_id(id)) continue;
@@ -6766,7 +6818,7 @@ void Renderer::copy_shown_to_output() {
     if (!bb.texture || !private_[kPOutput].texture || bb.width != private_[kPOutput].width || bb.height != private_[kPOutput].height) return;
     XConstants c{};
     c.grid[0] = bb.width; c.grid[1] = bb.height;
-    const float wc[20] = {};
+    const float wc[kWConstants] = {};
     for (UINT i = 0; i < kWSrvCount; ++i) set_x_srv(kWSrv(kWShown) + i, kPBackbuffer, true);
     set_x_uav(kWUav(kWShown) + 0, kPOutput); set_x_uav(kWUav(kWShown) + 1, kPOutput);
     transition(private_[kPOutput], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -7107,7 +7159,11 @@ ID3D12GraphicsCommandList* Renderer::begin(int context) {
             if (s[5]) {
                 layer_raw_ = layer_raw_ * 0.98 + double(s[3]) / 1024.0;
                 layer_enc_ = layer_enc_ * 0.98 + double(s[4]) / 1024.0;
+                layer_opaque_ = layer_opaque_ * 0.98 + double(s[5]);
                 layer_linear_ = layer_enc_ < layer_raw_;
+                // (the colour path only where the layer's colour is what the game lays: where opaque, the frame within an
+                // 8-bit step a channel of the layer, one way or the other - see layer_fits_)
+                layer_fits_ = std::min(layer_raw_, layer_enc_) <= layer_opaque_ * 3.0 / 255.0;
             }
             D3D12_RANGE none{0, 0};
             seam_readback_->Unmap(0, &none);
@@ -7464,6 +7520,7 @@ bool Renderer::picture_motion() {
 }
 
 IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::function<void(const IngestedSource&)>& after_depth) {
+    ++shown_serial_;  // (see swap_shown)
     IngestedSource out;
     const auto& m = shared.slots[slot];
     const auto& bb = m.tex[kBackbuffer];
@@ -7604,7 +7661,7 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
             list_->ResourceBarrier(1, &to_copy);
             seam_pending_[frame_index_] = true;
         }
-        out.scene_derived = true;
+        out.scene_derived = layer_fits_;  // (measured above in any case - see layer_fits_)
     }
     // (its coverage kept from the frame before - cs_hudless_ui's flag 1 - only when that one made it, at this size)
     // (in 8 bits when the picture is kept in 8 bits - SDR: its colour, premultiplied, is at most the frame's own value, and

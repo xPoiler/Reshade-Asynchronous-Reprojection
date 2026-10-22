@@ -1231,7 +1231,10 @@ __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE reshade_modul
     fw::install_fault_log(dir + L"\\FrameWarp\\logs");  // (faults recorded - see fault_log.cpp)
     CreateDirectoryW((dir + L"\\FrameWarp\\profiles").c_str(), nullptr);
     fw::hud_learn::set_profile(dir + L"\\FrameWarp\\profiles\\hud_point.txt", addon_build());
-    if (!g_producer) g_producer = std::make_unique<fw::Producer>();
+    if (!g_producer) {
+        g_producer = std::make_unique<fw::Producer>();
+        g_producer->log_line = [](const char* text) { reshade::log::message(reshade::log::level::info, text); };
+    }
     fw::install_streamline_hooks(g_producer.get());
     fw::install_ngx_hooks(g_producer.get());
     fw::install_ffx_hooks(g_producer.get());

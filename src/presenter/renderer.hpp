@@ -8,6 +8,7 @@
 #include <dcomp.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
+#include <array>
 #include <map>
 #include <string>
 #include <functional>
@@ -18,6 +19,9 @@
 
 namespace fw {
 using Microsoft::WRL::ComPtr;
+
+// The warp passes' second block of root constants (cbuffer W): wmat 16, wproj 4, the claims homography 10.
+constexpr unsigned kWConstants = 30;
 
 struct IngestedSource {
     bool valid = false;
@@ -146,6 +150,9 @@ public:
         double intake_ms = 0, access_ms = 0, depth_ms = 0, colour_ms = 0, rest_ms = 0, warp_ms = 0;
     };
     GpuUsage take_gpu_usage() { const GpuUsage u = usage_; usage_ = {}; return u; }
+    // Submissions to the GPU since the last call: [0] the refresh queue's, [1] the intake queue's (split queues). At the
+    // realtime scheduling priority each one interrupts the game's work.
+    std::array<std::uint32_t, 2> take_submissions() { const auto s = submissions_; submissions_ = {}; return s; }
     // The work on each game frame after its textures are taken in, pass by pass (GPU timestamps): pass_stamp(p)
     // marks the end of pass p (kPassStart its beginning); each pass's time is from the stamp before it.
     // The warp of each refresh likewise (own_warp): kPassWarpStart its beginning, then moving objects' splat, the claims
@@ -260,6 +267,7 @@ public:
     void set_unblend_exact(bool on) { unblend_exact_ = on; }  // (dev: the scenery under a colour layer kept unclamped - see cs_layer_unblend)  // (dev: a colour UI layer as a coverage alone - see cs_layer_unblend)
     bool blend_linear() const { return blend_linear_; }
     bool layer_linear() const { return layer_linear_; }
+    bool layer_fits() const { return layer_fits_; }
     void set_mem_resolution(unsigned level) { mem_res_ = level > 2 ? 2 : level; }  // (the memory at the picture's resolution, half, a quarter)
     void set_mem_vis_off(bool on) { mem_vis_off_ = on; }
     void set_mem_pos(bool on) { mem_pos_ = on; }  // (dev: memory content carried with its own position, not sampled - see mem_off)
@@ -303,6 +311,9 @@ public:
     void set_ui8_force(bool on) { ui8_force_ = on; }  // (development: the HUD-less picture's layer in 8 bits whatever the picture)
     void set_orbit_kind(bool on) { orbit_kind_ = on; }  // (under the orbit, carried by the analysis too - on by default: see cs_share_up, flag 64)
     void set_orbit_centre_turn(bool on) { orbit_centre_turn_ = on; }  // (the orbit's centre measured against the turn: see share_measure_at, flag 512)
+    // (development: the claims of an earlier refresh of the same frame used again - see own_warp's reuse_claims)
+    void set_claims_reuse(bool on) { claims_reuse_ = on; }
+    void set_ui_tiles_off(bool on) { ui_tiles_off_ = on; }  // (development: the HUD layer read everywhere - see ow_ui_at)
     void set_rim_mode(int m) { rim_mode_ = m; }  // (scenery not stretched onto a nearer edge: see ow_rim; 2 by default)
     void set_outline_wide(bool on) { outline_wide_ = on; }  // (the held outline two render pixels wide)
     void set_carried_edge(bool on) { carried_edge_ = on; }  // (held carried pixels beside a slightly moving carried one: not held)
@@ -495,8 +506,8 @@ private:
 
     ComPtr<ID3D12RootSignature> root_, root_x_, root_w_;
     // Passes with the second constant block and 10 SRVs (the XPAR warp and the moving objects).
-    void w_dispatch(ID3D12PipelineState* pso, const void* constants, const float w[20], UINT table, UINT groups_x, UINT groups_y);
-    void w_dispatch_indirect(ID3D12PipelineState* pso, const void* constants, const float w[20], UINT table, ID3D12Resource* args);
+    void w_dispatch(ID3D12PipelineState* pso, const void* constants, const float w[kWConstants], UINT table, UINT groups_x, UINT groups_y);
+    void w_dispatch_indirect(ID3D12PipelineState* pso, const void* constants, const float w[kWConstants], UINT table, ID3D12Resource* args);
     bool ensure_warp_list(UINT ow, UINT oh);
     // Moving objects: the previous frame's picture and depth (ingest; the new frame's sizes and colour format).
     void keep_history(PrivateId colour, std::uint32_t depth_w, std::uint32_t depth_h, std::uint32_t colour_w, std::uint32_t colour_h,
@@ -526,6 +537,9 @@ private:
     bool ui_synth_last_ = false, colour_unblend_ = true, unblend_exact_ = false;  // (kPUi holds the layer cs_hudless_ui made from the last frame)
     bool share_whole_ = false, att_smooth_ = true, att_hist_valid_ = false, share_full_mask_ = false, mem_fringe_ = false, ui_from_hudless_ = true,  mem_vis_off_ = false, mem_pos_ = false, mem_nearest_ = false, share_seam_ = false, mem_age_old_ = false, ring_old_ = false, fill_inside_old_ = false, memory_scenery_ = false, attached_carried_ = true, chars_carried_ = false, splat_turns_ = true, own_carried_only_ = false, own_depth_blind_ = false, paths_capture_ = false, in_paths_ = false, outlines_held_ = true, outline_scenery_ = false, carried_free_ = false, carried_edge_ = true, outline_wide_ = false, memory_margin_ = true, infill_mirror_ = false, infill_memory_ = true, infill_wide_ = false, game_vectors_ = false, edge_dither_ = false, claim_rule_old_ = false;
     int rim_mode_ = 2;
+    bool claims_reuse_ = false, claims_valid_ = false, ui_tiles_off_ = false;
+    std::uint64_t shown_serial_ = 0, claims_serial_ = ~0ull;
+    float claims_matrix_[16] = {};
     bool orbit_centre_turn_ = false, orbit_kind_ = true, share_orbit_ = false, projection_changed_ = false, zoom_freeze_ = true, ui8_force_ = false, flow_stamps_ = false;
     bool behind_own_share_ = false;
     bool share_resid_built_ = false, shown_share_resid_ = false;
@@ -604,6 +618,12 @@ private:
     bool seam_pending_[kRing] = {};
     double seam_stored_ = 0, seam_linear_ = 0;  // (the blend space's misfit each way - see cs_layer_unblend)
     double layer_raw_ = 0, layer_enc_ = 0;      // (the layer's colour against the frame where opaque: as it is, encoded)
+    // Whether a colour layer is laid as it holds it (its opaque pixels, counted as the misfits are): Armored Core VI's frame
+    // matches its layer to 0.001 where opaque, Requiem's to 0.0012 - Cyberpunk 2077's lays its HUD twice as bright in linear
+    // light (0.34 either way), the scenery taken out under its minimap and menus came out wrong and they tinted while
+    // turning. Not fitting, or not measured yet: the layer's coverage alone, as before colour layers (ow_faint)
+    double layer_opaque_ = 0;
+    bool layer_fits_ = false;
     bool blend_linear_ = false, layer_linear_ = false;
     int layer_trust_ = 0;
     bool layer_cover_only_[kRing] = {};  // (that readback: the coverage alone - see build_no_warp_mask)
@@ -655,6 +675,7 @@ private:
     int stages_marked_ = 0;
     bool stage_valid_[kRing] = {};
     GpuUsage usage_;
+    std::array<std::uint32_t, 2> submissions_{};
     static constexpr int kPassStamps = 32;
     ComPtr<ID3D12QueryHeap> pass_stamps_;
     ComPtr<ID3D12Resource> pass_readback_;

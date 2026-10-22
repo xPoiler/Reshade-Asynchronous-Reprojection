@@ -1306,10 +1306,11 @@ void render_thread() {
                     // (every 600 frames: how many had the game's own HUD layer, how many fell back to detecting it)
                     ++hud_source_counts[std::min<std::uint32_t>(sh.presenter.hud_source, 7)];
                     if (++hud_source_frames >= 600) {
-                        logf("HUD source over %u frames: game's HUD layers %u, HUD-less picture %u, game's own HUD layer %u, learned HUD point %u, detected %u (frames with a UI layer %u, with a HUD-less picture %u); a colour layer's blend measured: %s, its colour %s",
+                        logf("HUD source over %u frames: game's HUD layers %u, HUD-less picture %u, game's own HUD layer %u, learned HUD point %u, detected %u (frames with a UI layer %u, with a HUD-less picture %u); a colour layer's blend measured: %s, its colour %s, %s",
                              hud_source_frames, hud_source_counts[1], hud_source_counts[2], hud_source_counts[3], hud_source_counts[7],
                              hud_source_counts[4] + hud_source_counts[5] + hud_source_counts[6], hud_with_ui, hud_with_hudless,
-                             renderer.blend_linear() ? "linear light" : "stored values", renderer.layer_linear() ? "linear" : "as stored");
+                             renderer.blend_linear() ? "linear light" : "stored values", renderer.layer_linear() ? "linear" : "as stored",
+                             renderer.layer_fits() ? "laid as it holds it - its colour used" : "not laid as it holds it - its coverage alone");
                         hud_source_frames = hud_with_ui = hud_with_hudless = 0;
                         for (auto& n : hud_source_counts) n = 0;
                     }
@@ -2157,6 +2158,8 @@ void render_thread() {
                          pt.ms[Renderer::kPassWarpClaim] * k, pt.ms[Renderer::kPassWarpLean] * k, pt.ms[Renderer::kPassWarpRest] * k,
                          pt.ms[Renderer::kPassWarpFix] * k);
                 }
+                const auto subs = renderer.take_submissions();
+                if (span > 0) logf("GPU submissions: %.1f/s on the refresh queue, %.1f/s on the intake queue", subs[0] / span, subs[1] / span);
                 if (span > 0 && (u.intakes || u.warps)) {
                     const double n = std::max<double>(1, u.split);
                     logf("presenter GPU: %.0f%% of the time | game frames %.1f/s, %.2f ms each (reaching the game's textures %.2f, depth+motion %.2f, "

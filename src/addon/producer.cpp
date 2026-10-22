@@ -227,6 +227,9 @@ bool Producer::ensure_texture(int slot, Tex kind, const D3D12_RESOURCE_DESC& sou
     // D3D11 opens a texture shared by D3D12 only if it could be a render target (both vendors' drivers
     // refuse the rest; R32F needs simultaneous access as well): what D3D11 games copy is colour or R32F.
     if (d11_) desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    // (Direct3D 12: the HUD layer's slot written by the add-on's pass itself - see begin_present - one 4K copy less a frame.
+    // Refused, the plain shared texture below: the pass writes its own texture and copies it, as before)
+    if (kind == kUi && !d11_ && !vk_) desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     HRESULT hr = device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&t.resource));
     if (FAILED(hr)) {  // depth families may refuse simultaneous access; retry as a plain shared texture
@@ -279,6 +282,60 @@ void Producer::copy_into(ID3D12GraphicsCommandList* list, ID3D12Resource* source
     list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     for (UINT i = 0; i < count; ++i) std::swap(b[i].Transition.StateBefore, b[i].Transition.StateAfter);
     list->ResourceBarrier(count, b);
+}
+
+int Producer::time_begin(ID3D12GraphicsCommandList* list, int tag) {
+    if (!device_ || !list || ts_failed_) return -1;
+    if (!ts_heap_) {
+        D3D12_QUERY_HEAP_DESC qd{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, kTsPairs * 2, 0};
+        D3D12_HEAP_PROPERTIES rb{}; rb.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = kTsPairs * 16; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        void* mapped = nullptr;
+        if (FAILED(device_->CreateQueryHeap(&qd, IID_PPV_ARGS(&ts_heap_))) ||
+            FAILED(device_->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&ts_readback_))) ||
+            FAILED(ts_readback_->Map(0, nullptr, &mapped))) {
+            ts_heap_.Reset(); ts_readback_.Reset(); ts_failed_ = true;
+            return -1;
+        }
+        ts_mapped_ = static_cast<std::uint64_t*>(mapped);
+        for (auto& g : ts_tag_) g = -1;
+    }
+    const unsigned pair = ts_next_++ % kTsPairs;
+    if (ts_tag_[pair] >= 0) {
+        const std::uint64_t a = ts_mapped_[pair * 2], b = ts_mapped_[pair * 2 + 1];
+        if (b > a && b - a < (1ull << 32)) ts_ticks_[ts_tag_[pair]] += b - a;
+    }
+    ts_tag_[pair] = tag;
+    list->EndQuery(ts_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, pair * 2);
+    return int(pair);
+}
+
+void Producer::time_end(ID3D12GraphicsCommandList* list, int pair) {
+    if (pair < 0 || !ts_heap_) return;
+    list->EndQuery(ts_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, UINT(pair) * 2 + 1);
+    list->ResolveQueryData(ts_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, UINT(pair) * 2, 2, ts_readback_.Get(), UINT64(pair) * 16);
+}
+
+void Producer::time_report(ID3D12CommandQueue* queue) {
+    if (!ts_heap_ || ++ts_presents_ < 600) return;
+    UINT64 frequency = 0;
+    if (FAILED(queue->GetTimestampFrequency(&frequency)) || !frequency) return;
+    static const char* const kNames[kTCount] = {"picture", "depth", "motion vectors", "other tags", "HUD layer taken", "HUD layer pass",
+                                                "HUD layer to slot", "HUD-less taken", "HUD-less to slot", "HUD learning"};
+    char text[512];
+    int n = std::snprintf(text, sizeof(text), "XPAR: the add-on's GPU work in the game's frames, ms per present (%u):", ts_presents_);
+    double total = 0;
+    for (int k = 0; k < kTCount; ++k) {
+        const double ms = double(ts_ticks_[k]) * 1000.0 / double(frequency) / double(ts_presents_);
+        total += ms;
+        if (ms > 0.0005 && n < int(sizeof(text)) - 40) n += std::snprintf(text + n, sizeof(text) - n, " %s %.3f,", kNames[k], ms);
+        ts_ticks_[k] = 0;
+    }
+    if (n < int(sizeof(text)) - 20) std::snprintf(text + n, sizeof(text) - n, " total %.3f", total);
+    if (log_line) log_line(text);
+    ts_presents_ = 0;
 }
 
 void Producer::on_constants(std::uint64_t frame, const Camera& camera) {
@@ -370,7 +427,9 @@ void Producer::on_tag(std::uint64_t frame, Tex kind, ID3D12Resource* source, D3D
     auto& t = textures_[slot][kind];
     // (the list as ReShade names it when the game hands it to the GPU - see tl_tag_list)
     tl_tagging = true; tl_tag_list = 0;
+    const int timed = time_begin(list, kind == kDepth ? kTDepth : kind == kMotion ? kTMotion : kTOtherTag);
     copy_into(list, source, state, t.resource.Get());
+    time_end(list, timed);
     tl_tagging = false;
     slot_list_[slot] = tl_tag_list ? tl_tag_list : reinterpret_cast<std::uint64_t>(list);
     auto& info = shared_->slots[slot].tex[kind];
@@ -477,7 +536,9 @@ void Producer::on_ui_layer(ID3D12Resource* source, D3D12_RESOURCE_STATES state, 
             return;
         }
     }
+    const int timed = time_begin(list, kTUiTake);
     copy_into(list, source, state, ui_pending_.Get());
+    time_end(list, timed);
     ui_pending_valid_ = true;
     ui_pending_inverted_ = inverted;
     shared_->hooks.ui_layer_w = static_cast<std::uint32_t>(desc.Width); shared_->hooks.ui_layer_h = desc.Height;
@@ -508,7 +569,9 @@ void Producer::on_hudless_copy(ID3D12Resource* source, D3D12_RESOURCE_STATES sta
             return;
         }
     }
+    const int timed = time_begin(list, kTHudlessTake);
     copy_into(list, source, state, hudless_pending_.Get());
+    time_end(list, timed);
     hudless_age_ = 0;
     ++shared_->hooks.hudless_copies;
 }
@@ -536,7 +599,9 @@ void Producer::on_hud_probe(ID3D12Resource* picture, D3D12_RESOURCE_STATES state
         D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
         if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&target)))) return;
     }
+    const int timed = time_begin(list, kTProbe);
     copy_into(list, picture, state, target.Get());
+    time_end(list, timed);
     if (end) { probe_end_age_ = 0; return; }
     probe_age_ = 0;
     probe_candidate_ = candidate;
@@ -1154,7 +1219,9 @@ std::uint64_t Producer::begin_present(ID3D12Resource* backbuffer, ID3D12Graphics
     const auto desc = backbuffer->GetDesc();
     if (ensure_texture(slot, kBackbuffer, desc)) {
         auto& t = textures_[slot][kBackbuffer];
+        const int timed = time_begin(list, kTBackbuffer);
         copy_into(list, backbuffer, D3D12_RESOURCE_STATE_PRESENT, t.resource.Get());
+        time_end(list, timed);
         auto& info = m.tex[kBackbuffer];
         info.width = static_cast<std::uint32_t>(t.desc.Width); info.height = t.desc.Height; info.format = t.desc.Format;
         info.generation = t.generation; info.ext_x = info.ext_y = 0; info.ext_w = info.width; info.ext_h = info.height;
@@ -1190,6 +1257,10 @@ std::uint64_t Producer::begin_present(ID3D12Resource* backbuffer, ID3D12Graphics
                 ui_alpha_.Reset();
         }
         if (ui_alpha_ && ensure_texture(slot, kUi, ui_alpha_->GetDesc())) {
+            auto& t = textures_[slot][kUi];
+            // (straight into the slot where it takes shader writes - see ensure_texture)
+            const bool direct = (t.desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
+            ID3D12Resource* written = direct ? t.resource.Get() : ui_alpha_.Get();
             const UINT base = (ui_ring_++ % kUiRing) * 2;
             D3D12_CPU_DESCRIPTOR_HANDLE cpu = ui_heap_->GetCPUDescriptorHandleForHeapStart();
             cpu.ptr += SIZE_T(base) * ui_heap_step_;
@@ -1203,11 +1274,11 @@ std::uint64_t Producer::begin_present(ID3D12Resource* backbuffer, ID3D12Graphics
             D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
             uv.Format = ui_format;
             uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-            device_->CreateUnorderedAccessView(ui_alpha_.Get(), nullptr, &uv, cpu);
+            device_->CreateUnorderedAccessView(written, nullptr, &uv, cpu);
             D3D12_RESOURCE_BARRIER b[2]{};
             b[0].Type = b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             b[0].Transition = {ui_pending_.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
-            b[1].Transition = {ui_alpha_.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+            b[1].Transition = {written, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
             list->ResourceBarrier(2, b);
             ID3D12DescriptorHeap* heaps[] = {ui_heap_.Get()};
             list->SetDescriptorHeaps(1, heaps);
@@ -1216,11 +1287,16 @@ std::uint64_t Producer::begin_present(ID3D12Resource* backbuffer, ID3D12Graphics
             D3D12_GPU_DESCRIPTOR_HANDLE gpu = ui_heap_->GetGPUDescriptorHandleForHeapStart();
             gpu.ptr += UINT64(base) * ui_heap_step_;
             list->SetComputeRootDescriptorTable(0, gpu);
+            const int timed_pass = time_begin(list, kTUiPass);
             list->Dispatch(UINT((pd.Width + 7) / 8), (pd.Height + 7) / 8, 1);
             for (auto& x : b) std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
             list->ResourceBarrier(2, b);
-            auto& t = textures_[slot][kUi];
-            copy_into(list, ui_alpha_.Get(), D3D12_RESOURCE_STATE_COMMON, t.resource.Get());
+            time_end(list, timed_pass);
+            if (!direct) {
+                const int timed_slot = time_begin(list, kTUiSlot);
+                copy_into(list, ui_alpha_.Get(), D3D12_RESOURCE_STATE_COMMON, t.resource.Get());
+                time_end(list, timed_slot);
+            }
             auto& info = m.tex[kUi];
             info.width = static_cast<std::uint32_t>(t.desc.Width); info.height = t.desc.Height; info.format = t.desc.Format;
             info.generation = t.generation; info.ext_x = info.ext_y = 0; info.ext_w = info.width; info.ext_h = info.height;
@@ -1235,7 +1311,9 @@ std::uint64_t Producer::begin_present(ID3D12Resource* backbuffer, ID3D12Graphics
     if (m.tex[kUi].valid) hudless_age_ = 2;
     if (hudless_pending_ && hudless_age_ <= 1 && !m.tex[kHudless].valid && ensure_texture(slot, kHudless, hudless_pending_->GetDesc())) {
         auto& t = textures_[slot][kHudless];
+        const int timed = time_begin(list, kTHudlessSlot);
         copy_into(list, hudless_pending_.Get(), D3D12_RESOURCE_STATE_COMMON, t.resource.Get());
+        time_end(list, timed);
         auto& info = m.tex[kHudless];
         info.width = static_cast<std::uint32_t>(t.desc.Width); info.height = t.desc.Height; info.format = t.desc.Format;
         info.generation = t.generation; info.ext_x = info.ext_y = 0; info.ext_w = info.width; info.ext_h = info.height;
@@ -1274,6 +1352,7 @@ void Producer::finish_present(ID3D12CommandQueue* queue, std::uint64_t token) {
     const int slot = slot_for_frame(frame, false);
     if (slot < 0) return;
     publish(slot, queue);
+    time_report(queue);
 }
 
 void Producer::publish(int slot, ID3D12CommandQueue* queue) {
@@ -1417,7 +1496,9 @@ void Producer::on_generated(std::uint64_t frame, std::uint32_t index, std::uint3
             const auto hd = hudless->GetDesc();
             if (hd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && hd.SampleDesc.Count == 1 && hd.Width == rd.Width && hd.Height == rd.Height &&
                 ensure_texture(slot, kHudless, hd)) {
+                const int timed = time_begin(list, kTHudlessSlot);
                 copy_into(list, hudless, hudless_state, textures_[slot][kHudless].resource.Get());
+                time_end(list, timed);
                 set_info(kHudless);
             }
         }
