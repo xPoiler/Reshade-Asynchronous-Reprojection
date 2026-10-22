@@ -1868,6 +1868,20 @@ RWTexture2D<float4> hk_hudless_u : register(u0);
     if (any(id.xy >= out_size) || hh_counts_u.Load(8) * 2 < out_size.x * out_size.y) return;
     hk_hudless_u[id.xy] = hh_frame_t.Load(int3(id.xy, 0));
 }
+// The HUD layer's 8x8 tiles with anything in them - coverage or colour (a glow laid over without coverage), any sign
+// (scRGB): 1, else 0. Once per game frame, so that each refresh's warp reads the layer only there (ow_ui_at): a 4K layer
+// in half floats is 64 MB, read whole by every refresh while the HUD covers a few percent of the screen. A group a tile, a
+// thread a pixel (a thread a tile, reading its 64 in turn, took ~0.25 ms of each game frame at 4K - most of what it saves)
+Texture2D<float4> ut_ui_t : register(t0);
+RWTexture2D<uint> ut_tiles_u : register(u0);
+groupshared uint ut_found_gs;
+[numthreads(8, 8, 1)] void cs_ui_tiles(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex, uint3 gid : SV_GroupID) {
+    if (gi == 0) ut_found_gs = 0;
+    GroupMemoryBarrierWithGroupSync();
+    if (all(id.xy < out_size) && any(ut_ui_t.Load(int3(id.xy, 0)) != 0)) InterlockedOr(ut_found_gs, 1u);
+    GroupMemoryBarrierWithGroupSync();
+    if (gi == 0) ut_tiles_u[gid.xy] = ut_found_gs;
+}
 // The scenery under a HUD layer that has its colour (the add-on's layers; not a coverage alone): the frame with the layer
 // taken back out - frame = scene (1 - a) + rgb solved for the scene - the picture the warp moves (as a game's own HUD-less
 // one), the layer laid over it again where the HUD is (ow_over). Nothing faint is held and nothing guessed: a thin white
@@ -2833,18 +2847,19 @@ float ow_near(float d) {
 static const float kMemMargin = 0.125;  // the memory covers the screen plus this much on every side
 static const float kMemForget = 60.0;   // game frames
 // Where a memory pixel's content lies: off its centre by up to a memory pixel each way, kept beside its depth as two 8-bit
-// steps of 1/127 (y of the depth texture; 127 127: on its centre). Carried from one memory pixel to another, the content
+// steps of 1/127 (y of the depth texture; 0: on its centre - so that the depth alone, one channel without y, reads as the
+// centre: the depth texture is R32 unless flag 512 keeps offsets, half its memory). Carried from one memory pixel to another, the content
 // went with the nearest one - a fraction of a pixel off every game frame, the same way all the while the camera moved
 // so: at the picture's resolution the scenery behind and beyond the frame drifted from where it was, edges in it out of
 // place (strafing, an orbit: false edges +12..22%). Its own position kept, nothing is lost to the rounding. (Kept only with
 // cs_memory's flag 512, a dev choice; by default the content is resampled onto the centres - see mem_carry - offsets 0.)
 float2 mem_off(float packed) {
-    const uint q = uint(packed + 0.5);
+    const uint q = uint(packed + 32639.5);  // (127 * 256 + 127: the centre)
     return (float2(q >> 8, q & 255u) - 127.0) / 127.0;
 }
 float mem_pack(float2 off) {
     const uint2 q = uint2(clamp(round(off * 127.0), -127.0, 127.0) + 127.0);
-    return float(q.x * 256u + q.y);
+    return float(q.x * 256u + q.y) - 32639.0;
 }
 Texture2D<float4> ow_mem_t : register(t4);
 // (the memory's uv mu -> where to read it: its content lies off its pixels' centres - see mem_off)
@@ -3524,6 +3539,12 @@ float4 ow_held_colour(int3 p) { return (flags & 1073741824) ? ow_fill_t.Load(p) 
 // scenery comes as cs_layer_unblend left it)
 float3 ow_slin(float3 c) { const float3 m = abs(c); return sign(c) * (m <= 0.04045 ? m / 12.92 : pow((m + 0.055) / 1.055, 2.4)); }
 float3 ow_senc(float3 c) { const float3 m = abs(c); return sign(c) * (m <= 0.0031308 ? m * 12.92 : 1.055 * pow(m, 1.0 / 2.4) - 0.055); }
+// The HUD layer at an output pixel - read only in a tile with anything in it (ow_dev 16: the tiles at t10, cs_ui_tiles - when
+// moving objects do not use t10): an empty layer leaves the picture as it is (ow_over)
+float4 ow_ui_at(int3 p) {
+    if ((ow_dev() & 16u) && ow_out_tiles_t.Load(int3(p.xy / 8, 0)) == 0) return float4(0, 0, 0, 0);
+    return ow_ui_t.Load(p);
+}
 float3 ow_over(float3 c, float4 ui) {
     if (!(flags & 536870912)) return c * (1.0 - ui.a) + ui.rgb;
     return ow_senc(ow_slin(c) * (1.0 - ui.a) + ((flags & 2147483648u) ? ui.rgb : ow_slin(ui.rgb)));
@@ -3565,7 +3586,7 @@ void ow_finish(uint2 pid, float2 uv, float2 src, bool valid) {
         }
         c.rgb = lerp(scene + here.rgb, ow_color_t.Load(int3(id.xy, 0)).rgb, ow_cover(here));
     }
-    if ((flags & 1) && !((flags & 1073741824) && held_here)) c.rgb = ow_over(c.rgb, ow_ui_t.Load(int3(id.xy, 0)));
+    if ((flags & 1) && !((flags & 1073741824) && held_here)) c.rgb = ow_over(c.rgb, ow_ui_at(int3(id.xy, 0)));
     if ((flags & 8388608) && valid && !((flags & 2) && ow_held(int3(id.xy, 0)))) c.rgb = ow_faint(c.rgb, int2(id.xy), src);
     // (the path / 16: the presenter's output is 8 or 10 bits per channel - whole numbers clamped to 1 there)
     if (flags & 32768) c = float4(float((flags & 2) && ow_held(int3(id.xy, 0)) ? 14 : ow_path) / 16.0, float(ow_why) / 16.0, 0, 1);
@@ -3628,7 +3649,7 @@ bool ow_lean(uint2 p) {
         }
         if (flags & 8388608) c.rgb = ow_faint(c.rgb, pi.xy, src);
     }
-    if ((flags & 1) && !((flags & 1073741824) && held_here)) c.rgb = ow_over(c.rgb, ow_ui_t.Load(pi));
+    if ((flags & 1) && !((flags & 1073741824) && held_here)) c.rgb = ow_over(c.rgb, ow_ui_at(pi));
     ow_out_u[p] = float4(c.rgb, 1);
     return true;
 }
@@ -4350,7 +4371,9 @@ constexpr UINT kXMemVisSrv = kXRec + Renderer::kRecSlots * 8, kXMemVisUav = kXMe
 constexpr UINT kXHudUiSrv = kXMemVisUav + 2, kXHudUiUav = kXHudUiSrv + 6, kXHudKeepSrv = kXHudUiUav + 2, kXHudKeepUav = kXHudKeepSrv + 6;
 // The scenery under a colour HUD layer (cs_layer_unblend; 6 + 2).
 constexpr UINT kXUnblendSrv = kXHudKeepUav + 2, kXUnblendUav = kXUnblendSrv + 6;
-constexpr UINT kW = kXUnblendUav + 2;
+// The HUD layer's tiles with anything in them (cs_ui_tiles at ingestion; 6 + 2).
+constexpr UINT kXUiTilesSrv = kXUnblendUav + 2, kXUiTilesUav = kXUiTilesSrv + 6;
+constexpr UINT kW = kXUiTilesUav + 2;
 enum WTable : UINT { kWWarp, kWShown, kWClear, kWSplat, kWMove, kWCopyColour, kWCopyDepth, kWJoinInit, kWJoinAB, kWJoinBA, kWJoinFinal,
                      kWGenDepth0, kWGenDepth1, kWGenDepth2, kWGenUi0, kWGenUi1, kWGenUi2, kWFgMotion, kWFgInverse, kWClaim,
                      kWStill, kWHoldInit, kWHoldAB, kWHoldBA, kWHoldFinal, kWHoldFill, kWHoldFillFinal, kWGrowInit, kWGrowAB, kWGrowBA,
@@ -4789,7 +4812,7 @@ bool Renderer::create_pipelines(std::string& error) {
         {"cs_scene_clear", &cs_scene_clear_}, {"cs_scene_accum", &cs_scene_accum_}, {"cs_scene_finish", &cs_scene_finish_},
         {"cs_scene_tiles", &cs_scene_tiles_}, {"cs_scene_hud", &cs_scene_hud_}, {"cs_scene_fill", &cs_scene_fill_}, {"cs_scene_grey", &cs_scene_grey_},
         {"cs_scene_grey_finish", &cs_scene_grey_finish_}, {"cs_scene_wash", &cs_scene_wash_}, {"cs_scene_wash_finish", &cs_scene_wash_finish_},
-        {"cs_attached", &cs_attached_}, {"cs_probe_tiles", &cs_probe_tiles_}, {"cs_probe_clear", &cs_probe_clear_}, {"cs_probe_score", &cs_probe_score_}, {"cs_memory", &cs_memory_}, {"cs_hudless_ui", &cs_hudless_ui_}, {"cs_hudless_keep", &cs_hudless_keep_}, {"cs_layer_unblend", &cs_layer_unblend_}, {"cs_layer_seam_clear", &cs_layer_seam_clear_}, {"cs_mem_vis", &cs_mem_vis_}, {"cs_ramp_rows", &cs_ramp_rows_}, {"cs_ramp", &cs_ramp_},
+        {"cs_attached", &cs_attached_}, {"cs_probe_tiles", &cs_probe_tiles_}, {"cs_probe_clear", &cs_probe_clear_}, {"cs_probe_score", &cs_probe_score_}, {"cs_memory", &cs_memory_}, {"cs_hudless_ui", &cs_hudless_ui_}, {"cs_hudless_keep", &cs_hudless_keep_}, {"cs_ui_tiles", &cs_ui_tiles_}, {"cs_layer_unblend", &cs_layer_unblend_}, {"cs_layer_seam_clear", &cs_layer_seam_clear_}, {"cs_mem_vis", &cs_mem_vis_}, {"cs_ramp_rows", &cs_ramp_rows_}, {"cs_ramp", &cs_ramp_},
         {"cs_flow_luma", &cs_flow_luma_}, {"cs_flow_feat", &cs_flow_feat_}, {"cs_flow_search", &cs_flow_search_}, {"cs_flow_lk", &cs_flow_lk_},
         {"cs_flow_median", &cs_flow_median_}, {"cs_flow_motion", &cs_flow_motion_}, {"cs_flow_fill", &cs_flow_fill_},
         {"cs_ret_cells", &cs_ret_cells_}, {"cs_ret_enclose", &cs_ret_enclose_}, {"cs_ret_layer", &cs_ret_layer_},
@@ -6367,6 +6390,12 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
         set_x_srv(t + 11, kPDepth, true);
     } else {
         for (UINT i = 6; i < 14; ++i) set_x_srv(t + i, kPDepth, true);
+        // (t10 free: the HUD layer's tiles, when the layer is laid over - see ow_ui_at)
+        if ((c.flags & 1u) && shown(kPUiTiles).texture && shown(kPUiTiles).width == (ow + 7) / 8 && shown(kPUiTiles).height == (oh + 7) / 8 &&
+            shown(kPUi).texture && shown(kPUi).width == ow) {
+            set_x_srv(t + 10, kPUiTiles, true);
+            c.threshold = float(static_cast<std::uint32_t>(c.threshold + 0.5f) | 16u);
+        }
     }
     // Two shares (follow_share with the input's turn): the input's part of the turn on its own (wmat - free without moving
     // objects), each part by its share (ow_lands).
@@ -6674,9 +6703,12 @@ bool Renderer::update_memory(const IngestedSource& src, const float clip_to_prev
     const UINT mh = static_cast<UINT>(std::ceil(oh * (1.0f + 2.0f * kMemMargin) * mem_scale));
     const int r = mem_last_, wi = r == 0 ? 1 : 0;
     const auto wc = static_cast<PrivateId>(kPMem0 + wi), wz = static_cast<PrivateId>(kPMemZ0 + wi);
-    if (!ensure_private(wc, mw, mh, DXGI_FORMAT_R16G16B16A16_FLOAT) || !ensure_private(wz, mw, mh, DXGI_FORMAT_R32G32_FLOAT)) return fail();
+    // (the depth alone unless the offsets are kept - flag 512, mem_pos_: see mem_off. ~13 MB less a texture at 4K and the default
+    // 1/2, ~52 at full - twice, written and read in turn)
+    const DXGI_FORMAT z_format = mem_pos_ ? DXGI_FORMAT_R32G32_FLOAT : DXGI_FORMAT_R32_FLOAT;
+    if (!ensure_private(wc, mw, mh, DXGI_FORMAT_R16G16B16A16_FLOAT) || !ensure_private(wz, mw, mh, z_format)) return fail();
     const bool prev = consecutive && r >= 0 && private_[kPMem0 + r].width == mw && private_[kPMem0 + r].height == mh &&
-                      private_[kPMemZ0 + r].width == mw && private_[kPMemZ0 + r].format == DXGI_FORMAT_R32G32_FLOAT;
+                      private_[kPMemZ0 + r].width == mw && private_[kPMemZ0 + r].format == z_format;
     XConstants c{};
     std::memcpy(c.clip_to_prev, clip_to_prev_clip, sizeof(c.clip_to_prev));
     c.out_size[0] = ow; c.out_size[1] = oh;
@@ -7262,6 +7294,7 @@ bool Renderer::estimate_motion(DXGI_FORMAT colour, bool write_motion) {
     };
     // This frame's brightness pyramid and gradients.
     c.flags = tone;
+    if (flow_stamps_) pass_stamp(kPassFlowStart);
     {  // (one 16x16 group per pixel of level 4, see cs_flow_luma)
         const UINT base = table(kFlowLuma, kPBackbuffer, kPBackbuffer, kPBackbuffer, now);
         transition(private_[now], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -7270,6 +7303,7 @@ bool Renderer::estimate_motion(DXGI_FORMAT colour, bool write_motion) {
     }
     c.flags = 0;
     run(cs_flow_feat_.Get(), table(kFlowFeat, now, now, now, kPFeat), kPFeat, aw, ah);
+    if (flow_stamps_) pass_stamp(kPassFlowPyramid);
     const UINT motion = table(kFlowMotion, kPFeat, before, kPFlowA, kPMotion);  // (the filled displacements end in A)
     if (flow_previous_) {
         const UINT lk_ab = table(kFlowLkAB, kPFeat, before, kPFlowA, kPFlowB), lk_ba = table(kFlowLkBA, kPFeat, before, kPFlowB, kPFlowA);
@@ -7304,6 +7338,7 @@ bool Renderer::estimate_motion(DXGI_FORMAT colour, bool write_motion) {
         }
         step(cs_flow_lk_.Get(), 0);
         c.flags = 0;
+        if (flow_stamps_) pass_stamp(kPassFlowSolve);
         // Filling in what is not known (see cs_flow_fill). A level's own displacements are in one texture
         // for even levels and in the other for odd ones; the filled level j is written into the texture
         // level j is not in, where the filled level j + 1 it needs also went. So every pass reads one
@@ -7323,6 +7358,7 @@ bool Renderer::estimate_motion(DXGI_FORMAT colour, bool write_motion) {
         for (UINT j = 1; j <= kTop; ++j) fill(j, 0, (j - 1) % 2 == 1);
         fill(kTop, 1, false);
         for (int j = int(kTop) - 1; j >= 0; --j) fill(static_cast<UINT>(j), 2, j % 2 == 1);
+        if (flow_stamps_) pass_stamp(kPassFlowFill);
         c.rect[0] = 0; c.rect[1] = 0;
     } else {
         // No previous frame: no motion, nothing known (a search that reaches nowhere writes zeros).
@@ -7332,6 +7368,7 @@ bool Renderer::estimate_motion(DXGI_FORMAT colour, bool write_motion) {
         c.flags = 4;
     }
     if (write_motion) run(cs_flow_motion_.Get(), motion, kPMotion, W, H);
+    if (flow_stamps_) pass_stamp(kPassFlowOut);
     flow_luma_ ^= 1;
     flow_previous_ = true;
     return had_previous;
@@ -7570,11 +7607,16 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
         out.scene_derived = true;
     }
     // (its coverage kept from the frame before - cs_hudless_ui's flag 1 - only when that one made it, at this size)
+    // (in 8 bits when the picture is kept in 8 bits - SDR: its colour, premultiplied, is at most the frame's own value, and
+    // laid back over the HUD-less picture it is the frame again within a step of it - half the memory and the warp's reads.
+    // HDR - 10-bit PQ, scRGB - in half floats)
+    const DXGI_FORMAT synth_format = private_[kPBackbuffer].format == DXGI_FORMAT_R8G8B8A8_UNORM || ui8_force_ ? DXGI_FORMAT_R8G8B8A8_UNORM
+                                                                                                             : DXGI_FORMAT_R16G16B16A16_FLOAT;
     const bool ui_before = ui_synth_last_ && private_[kPUi].texture && private_[kPUi].width == bb.width && private_[kPUi].height == bb.height &&
-                           private_[kPUi].format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+                           private_[kPUi].format == synth_format;
     ui_synth_last_ = false;
     if (out.has_hudless && !out.has_ui && ui_from_hudless_ && private_[kPBackbuffer].texture &&
-        ensure_private(kPUi, bb.width, bb.height, DXGI_FORMAT_R16G16B16A16_FLOAT)) {
+        ensure_private(kPUi, bb.width, bb.height, synth_format)) {
         XConstants h{};
         h.out_size[0] = bb.width; h.out_size[1] = bb.height;
         h.flags = ui_before ? 1u : 0u;
@@ -7639,6 +7681,20 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
     }
     if (out.generated) out.per_frame = std::max<int>(int(m.per_frame), out.gen_index[out.generated - 1]);
     ingested_ = true;
+    // (the layer's tiles with anything in them, for the warp - see cs_ui_tiles; none - a stale map - where it could not be made)
+    if (out.has_ui && private_[kPUi].texture && private_[kPUi].width == bb.width && private_[kPUi].height == bb.height &&
+        ensure_private(kPUiTiles, (bb.width + 7) / 8, (bb.height + 7) / 8, DXGI_FORMAT_R8_UINT)) {
+        XConstants u{};
+        u.out_size[0] = bb.width; u.out_size[1] = bb.height;
+        for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXUiTilesSrv + i, kPUi);
+        set_x_uav(kXUiTilesUav + 0, kPUiTiles); set_x_uav(kXUiTilesUav + 1, kPUiTiles);
+        transition(private_[kPUi], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        transition(private_[kPUiTiles], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        x_dispatch(cs_ui_tiles_.Get(), &u, kXUiTilesSrv, kXUiTilesUav, (bb.width + 7) / 8, (bb.height + 7) / 8);
+        transition(private_[kPUiTiles], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    } else if (out.has_ui && private_[kPUiTiles].texture) {
+        retire(kPUiTiles);
+    }
     last_had_hudless_ = out.has_hudless;
     mark_stage();
     barriers.clear();
@@ -7795,7 +7851,7 @@ void Renderer::release_stash() {
 }
 
 std::string Renderer::memory_report() {
-    static const char* const kNames[] = {"Backbuffer", "Hudless", "Ui", "Depth", "Motion", "ZeroUi", "Output", "Object", "ObjKeys", "ObjMove", "ObjTiles", "ObjOutTiles", "ObjKindA", "ObjKindB", "Gen0", "Gen1", "Gen2", "GenZ0", "GenZ1", "GenZ2", "PrevColour", "PrevDepth", "Previous", "HudScore", "Mask", "Scene", "Attached", "World", "Fill", "Mem0", "Mem1", "MemZ0", "MemZ1", "RampRows", "Ramp", "WarpMask", "HudKind", "StashColor", "StashDepth", "StashMotion", "StashHudless", "Stash2Color", "Stash2Hudless", "Stash2Depth", "Stash2Motion", "LumaA", "LumaB", "Feat", "FlowA", "FlowB", "RetCells", "RetEncl", "RetA", "RetB", "RetLayer", "FgMotion", "FgInv", "FgK1", "FgK0", "HudLearned", "HudTiles", "WarpClaims", "Still", "GrowA", "GrowB", "Probe", "ProbeTilesA", "ProbeTilesB", "ShareA", "ShareB", "ShareT", "Share", "RetDirtyA", "RetDirtyB", "ShareT2", "ShareHalf", "RecColour", "RecUi", "ShareResid", "OwnMove", "Paths", "ShareSeam", "AttHist", "MemVis"};
+    static const char* const kNames[] = {"Backbuffer", "Hudless", "Ui", "Depth", "Motion", "ZeroUi", "Output", "Object", "ObjKeys", "ObjMove", "ObjTiles", "ObjOutTiles", "ObjKindA", "ObjKindB", "Gen0", "Gen1", "Gen2", "GenZ0", "GenZ1", "GenZ2", "PrevColour", "PrevDepth", "Previous", "HudScore", "Mask", "Scene", "Attached", "World", "Fill", "Mem0", "Mem1", "MemZ0", "MemZ1", "RampRows", "Ramp", "WarpMask", "HudKind", "StashColor", "StashDepth", "StashMotion", "StashHudless", "Stash2Color", "Stash2Hudless", "Stash2Depth", "Stash2Motion", "LumaA", "LumaB", "Feat", "FlowA", "FlowB", "RetCells", "RetEncl", "RetA", "RetB", "RetLayer", "FgMotion", "FgInv", "FgK1", "FgK0", "HudLearned", "HudTiles", "WarpClaims", "Still", "GrowA", "GrowB", "Probe", "ProbeTilesA", "ProbeTilesB", "ShareA", "ShareB", "ShareT", "Share", "RetDirtyA", "RetDirtyB", "ShareT2", "ShareHalf", "RecColour", "RecUi", "ShareResid", "OwnMove", "Paths", "ShareSeam", "AttHist", "MemVis", "UiTiles"};
     static_assert(sizeof(kNames) / sizeof(kNames[0]) == kPCount, "a name for every private texture");
     struct Item { std::string name; double mb; };
     std::vector<Item> items;

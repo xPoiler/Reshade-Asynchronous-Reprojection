@@ -150,8 +150,11 @@ public:
     // marks the end of pass p (kPassStart its beginning); each pass's time is from the stamp before it.
     // The warp of each refresh likewise (own_warp): kPassWarpStart its beginning, then moving objects' splat, the claims
     // (forward splat), the lean 2x2 pass, the rest (or the full warp) and the moving objects' fix.
-    enum IntakePass { kPassStart, kPassAnalyze, kPassObjects, kPassHud, kPassCharacter, kPassMask, kPassMemory,
-                      kPassWarpStart, kPassWarpObjects, kPassWarpClaim, kPassWarpLean, kPassWarpRest, kPassWarpFix, kPassKinds };
+    // (kPassIngest: the intake itself - stamped by the replay only, dev/seq_replay FW_TIMES)
+    enum IntakePass { kPassStart, kPassIngest, kPassAnalyze, kPassObjects, kPassHud, kPassCharacter, kPassMask, kPassMemory,
+                      kPassWarpStart, kPassWarpObjects, kPassWarpClaim, kPassWarpLean, kPassWarpRest, kPassWarpFix,
+                      // (XPAR's own motion estimate by part - stamped only with set_flow_stamps, dev/warp_replay FW_FLOW_TIMES)
+                      kPassFlowStart, kPassFlowPyramid, kPassFlowSolve, kPassFlowFill, kPassFlowOut, kPassKinds };
     struct PassTimes { double ms[kPassKinds] = {}; std::uint32_t frames = 0, warps = 0; };
     void pass_stamp(IntakePass pass);
     PassTimes take_pass_times() { const PassTimes t = pass_times_; pass_times_ = {}; return t; }
@@ -296,6 +299,8 @@ public:
     // instead of torn, error -0.4%, false edges -1.2%)
     void set_projection_changed(bool on) { projection_changed_ = on; }
     void set_zoom_freeze(bool on) { zoom_freeze_ = on; }
+    void set_flow_stamps(bool on) { flow_stamps_ = on; }  // (development: see kPassFlowStart)
+    void set_ui8_force(bool on) { ui8_force_ = on; }  // (development: the HUD-less picture's layer in 8 bits whatever the picture)
     void set_orbit_kind(bool on) { orbit_kind_ = on; }  // (under the orbit, carried by the analysis too - on by default: see cs_share_up, flag 64)
     void set_orbit_centre_turn(bool on) { orbit_centre_turn_ = on; }  // (the orbit's centre measured against the turn: see share_measure_at, flag 512)
     void set_rim_mode(int m) { rim_mode_ = m; }  // (scenery not stretched onto a nearer edge: see ow_rim; 2 by default)
@@ -416,7 +421,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     };
-    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKeys, kPObjMove, kPObjTiles, kPObjOutTiles, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevColour, kPPrevDepth, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPFgMotion, kPFgInv, kPFgK1, kPFgK0, kPHudLearned, kPHudTiles, kPWarpClaims, kPStill, kPGrowA, kPGrowB, kPProbe, kPProbeTilesA, kPProbeTilesB, kPShareA, kPShareB, kPShareT, kPShare, kPRetDirtyA, kPRetDirtyB, kPShareT2, kPShareHalf, kPRecColour, kPRecUi, kPShareResid, kPOwnMove, kPPaths, kPShareSeam, kPAttHist, kPMemVis, kPCount };
+    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKeys, kPObjMove, kPObjTiles, kPObjOutTiles, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevColour, kPPrevDepth, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPFgMotion, kPFgInv, kPFgK1, kPFgK0, kPHudLearned, kPHudTiles, kPWarpClaims, kPStill, kPGrowA, kPGrowB, kPProbe, kPProbeTilesA, kPProbeTilesB, kPShareA, kPShareB, kPShareT, kPShare, kPRetDirtyA, kPRetDirtyB, kPShareT2, kPShareHalf, kPRecColour, kPRecUi, kPShareResid, kPOwnMove, kPPaths, kPShareSeam, kPAttHist, kPMemVis, kPUiTiles, kPCount };
 
     bool create_pipelines(std::string& error);
     std::string shader_report_;
@@ -429,7 +434,7 @@ private:
     static bool shown_id(PrivateId id) {
         return id == kPBackbuffer || id == kPHudless || id == kPUi || id == kPDepth || id == kPMask || id == kPFill || id == kPWarpMask || id == kPShare || id == kPOwnMove ||
                id == kPObjMove || id == kPObjTiles || id == kPPrevColour || id == kPPrevDepth || (id >= kPGen0 && id <= kPGenZ2) ||
-               id == kPRetLayer;
+               id == kPRetLayer || id == kPUiTiles;
     }
     const Private& shown(PrivateId id) const { return split_ && shown_id(id) ? front_[id] : private_[id]; }
     void swap_shown();  // exchanges the two sets (and the per-texture descriptors)
@@ -521,7 +526,7 @@ private:
     bool ui_synth_last_ = false, colour_unblend_ = true, unblend_exact_ = false;  // (kPUi holds the layer cs_hudless_ui made from the last frame)
     bool share_whole_ = false, att_smooth_ = true, att_hist_valid_ = false, share_full_mask_ = false, mem_fringe_ = false, ui_from_hudless_ = true,  mem_vis_off_ = false, mem_pos_ = false, mem_nearest_ = false, share_seam_ = false, mem_age_old_ = false, ring_old_ = false, fill_inside_old_ = false, memory_scenery_ = false, attached_carried_ = true, chars_carried_ = false, splat_turns_ = true, own_carried_only_ = false, own_depth_blind_ = false, paths_capture_ = false, in_paths_ = false, outlines_held_ = true, outline_scenery_ = false, carried_free_ = false, carried_edge_ = true, outline_wide_ = false, memory_margin_ = true, infill_mirror_ = false, infill_memory_ = true, infill_wide_ = false, game_vectors_ = false, edge_dither_ = false, claim_rule_old_ = false;
     int rim_mode_ = 2;
-    bool orbit_centre_turn_ = false, orbit_kind_ = true, share_orbit_ = false, projection_changed_ = false, zoom_freeze_ = true;
+    bool orbit_centre_turn_ = false, orbit_kind_ = true, share_orbit_ = false, projection_changed_ = false, zoom_freeze_ = true, ui8_force_ = false, flow_stamps_ = false;
     bool behind_own_share_ = false;
     bool share_resid_built_ = false, shown_share_resid_ = false;
     struct RecSlot {
@@ -540,7 +545,7 @@ private:
     bool learning_stalled_ = true;
     std::uint32_t detection_idle_ = 0;  // game frames since the HUD was last detected (build_no_warp_mask)
     std::uint32_t scene_idle_ = 0;      // game frames since the upscaler's output last came (ingest)
-    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_own_warp_reset_, cs_own_warp_lean_, cs_own_warp_args_, cs_own_warp_rest_, cs_warp_claims_clear_, cs_warp_claim_, cs_memory_, cs_mem_vis_, cs_hudless_ui_, cs_hudless_keep_, cs_layer_unblend_, cs_layer_seam_clear_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_, cs_probe_tiles_, cs_probe_clear_, cs_probe_score_, cs_share_measure_, cs_share_blur_, cs_share_bins_, cs_share_final_, cs_share_up_, cs_share_seam_, cs_att_hist_, cs_rec_down_, cs_share_resid_, cs_resid_blur_, cs_own_up_;
+    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_own_warp_reset_, cs_own_warp_lean_, cs_own_warp_args_, cs_own_warp_rest_, cs_warp_claims_clear_, cs_warp_claim_, cs_memory_, cs_mem_vis_, cs_hudless_ui_, cs_hudless_keep_, cs_ui_tiles_, cs_layer_unblend_, cs_layer_seam_clear_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_, cs_probe_tiles_, cs_probe_clear_, cs_probe_score_, cs_share_measure_, cs_share_blur_, cs_share_bins_, cs_share_final_, cs_share_up_, cs_share_seam_, cs_att_hist_, cs_rec_down_, cs_share_resid_, cs_resid_blur_, cs_own_up_;
     // Sight reticles (option): the passes, which history texture holds the latest layer, and whether the layer was
     // built for the frame taken in last / the shown one (see cs_ret_layer).
     ComPtr<ID3D12PipelineState> cs_ret_cells_, cs_ret_enclose_, cs_ret_layer_, cs_ret_align_, cs_ret_pick_, cs_ret_args_, cs_ret_shift_;
