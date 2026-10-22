@@ -1195,6 +1195,12 @@ void render_thread() {
                         // (the game's own camera and motion vectors: the share measured against the camera's whole motion - its
                         // matrix explains the scenery, turn and movement alike; see Renderer::set_share_whole)
                         renderer.set_share_whole(!cam.estimated && !s.motion_estimated);
+                        // (the projection against the frame before - a zoom, aiming's field of view: see Renderer::set_projection_changed)
+                        static float prev_sx = 0.0f, prev_sy = 0.0f;
+                        const float sx = cam.view_to_clip[0], sy = cam.view_to_clip[5];
+                        renderer.set_projection_changed(prev_sx != 0.0f && (std::fabs(sx - prev_sx) > 1e-5f * std::fabs(prev_sx) ||
+                                                                             std::fabs(sy - prev_sy) > 1e-5f * std::fabs(prev_sy)));
+                        prev_sx = sx; prev_sy = sy;
                         renderer.follow_share(s, cam.clip_to_prev_clip, mv_scale.valid, cam.depth_inverted != 0, orbit_warp, share_mode);
                     }
                     // (diagnostics read back from earlier game frames)

@@ -291,6 +291,11 @@ public:
     void set_infill_mirror(bool on) { infill_mirror_ = on; }  // (uncovered areas: the far surface mirrored at its edge)
     void set_memory_margin(bool on) { memory_margin_ = on; }  // (the memory takes nothing within 2 render px of what is held)
     void set_behind_own_share(bool on) { behind_own_share_ = on; }  // (ow_behind's steps at the far surface's own share: see ow_behind)
+    // (this frame's projection differs from the one before - a zoom: what the camera carries learns nothing from it, see
+    // share_measure_at's flag 1024; zoom_freeze on by default - Cyberpunk seq_2: the gun leaving aim while walking held whole
+    // instead of torn, error -0.4%, false edges -1.2%)
+    void set_projection_changed(bool on) { projection_changed_ = on; }
+    void set_zoom_freeze(bool on) { zoom_freeze_ = on; }
     void set_orbit_kind(bool on) { orbit_kind_ = on; }  // (under the orbit, carried by the analysis too - on by default: see cs_share_up, flag 64)
     void set_orbit_centre_turn(bool on) { orbit_centre_turn_ = on; }  // (the orbit's centre measured against the turn: see share_measure_at, flag 512)
     void set_rim_mode(int m) { rim_mode_ = m; }  // (scenery not stretched onto a nearer edge: see ow_rim; 2 by default)
@@ -516,7 +521,7 @@ private:
     bool ui_synth_last_ = false, colour_unblend_ = true, unblend_exact_ = false;  // (kPUi holds the layer cs_hudless_ui made from the last frame)
     bool share_whole_ = false, att_smooth_ = true, att_hist_valid_ = false, share_full_mask_ = false, mem_fringe_ = false, ui_from_hudless_ = true,  mem_vis_off_ = false, mem_pos_ = false, mem_nearest_ = false, share_seam_ = false, mem_age_old_ = false, ring_old_ = false, fill_inside_old_ = false, memory_scenery_ = false, attached_carried_ = true, chars_carried_ = false, splat_turns_ = true, own_carried_only_ = false, own_depth_blind_ = false, paths_capture_ = false, in_paths_ = false, outlines_held_ = true, outline_scenery_ = false, carried_free_ = false, carried_edge_ = true, outline_wide_ = false, memory_margin_ = true, infill_mirror_ = false, infill_memory_ = true, infill_wide_ = false, game_vectors_ = false, edge_dither_ = false, claim_rule_old_ = false;
     int rim_mode_ = 2;
-    bool orbit_centre_turn_ = false, orbit_kind_ = true, share_orbit_ = false;
+    bool orbit_centre_turn_ = false, orbit_kind_ = true, share_orbit_ = false, projection_changed_ = false, zoom_freeze_ = true;
     bool behind_own_share_ = false;
     bool share_resid_built_ = false, shown_share_resid_ = false;
     struct RecSlot {

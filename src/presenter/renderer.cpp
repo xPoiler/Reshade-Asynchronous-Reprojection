@@ -769,6 +769,15 @@ void share_measure_at(uint2 id) {
         if ((flags & 1) && (flags & 16) && far.w > 0 && d > 1.0 / 4096.0) {
             bool trusted = true;
             if (flags & 2) trusted = sm_flow_t.Load(int3(min(uint2((float2(pr) + 0.5) * float2(out_size) / float2(grid)), out_size - 1), 0)).z > 0.5;
+            // (flag 1024: the projection changed since the frame before - a zoom, the field of view of aiming: points at infinity
+            // move radially, so the zoom counts as turn, and what has a projection of its own - Cyberpunk's gun, drawn with its
+            // own field of view - does not follow it. Measured against it, leaving aim while walking, the gun lost its hold
+            // and tore into streaks of different shares: such a frame teaches it nothing - its share and kind stay as they were.
+            // Only what the camera carries so far - under half of the turn: the scenery follows a zoom, the camera's matrix has
+            // it. Frozen too - all of it, or all the analysis finds not scenery, 43% of Cyberpunk's screen - while Cyberpunk
+            // changes its projection in 40% of the frames: the scenery's false edges +10%)
+            const bool frozen = (flags & 1024) && share_solve(acc, kSharePrior, (flags & 32) != 0).x < 0.5;
+            if (frozen) trusted = false;
             const float2 turn_px = (float2(far.x / far.w * 0.5 + 0.5, 0.5 - far.y / far.w * 0.5) - uv) * float2(rect.zw);
             // (two shares: the frame's whole turn is the input's - flag 64 - or the rest's)
             // (flag 256 - the game's own camera, set_share_whole: against the camera's whole motion here - its turn and its
@@ -792,7 +801,7 @@ void share_measure_at(uint2 id) {
             const float unit = 1080.0 / float(rect.w);
             const float2 r = rest ? float2(0, 0) : whole_px * unit, x = rest ? whole_px * unit : float2(0, 0), s = screen_px * unit;
             const float rr = dot(r, r), xx = dot(x, x), all_r = rr + xx;
-            told = all_r > 0.25;
+            told = all_r > 0.25 && !frozen;
             // The camera's movement here (its motion minus its turn's). Its share is learned only from the movement the turn
             // does not explain: what the turn's known shares leave of the spot's motion, against the part of the movement
             // across the frame's turn. An orbiting camera moves as it turns - the movement along the turn, collinear with it:
@@ -5398,7 +5407,7 @@ void Renderer::follow_share(const IngestedSource& src, const float clip_to_prev_
     // (the game's own camera - set_share_whole: measured against its whole motion, see share_measure_at's flag 256)
     const bool auto_whole = share_whole_ && !whole_motion;
     c.flags = (scale_valid ? 1u : 0u) | (whole_motion ? 4u : 0u) | (depth_inverted ? 16u : 0u) | (fresh || share_reset_ ? 8u : 0u) |
-              (auto_whole ? 256u : 0u) | (whole_motion && orbit_centre_turn_ ? 512u : 0u);
+              (auto_whole ? 256u : 0u) | (whole_motion && orbit_centre_turn_ ? 512u : 0u) | (zoom_freeze_ && projection_changed_ ? 1024u : 0u);
     if (own_motion_ && private_[kPFlowB].texture) { c.flags |= 2u; c.out_size[0] = std::max(1u, w / 2); c.out_size[1] = std::max(1u, h / 2); }
     if (share_mode) c.flags |= 32u | (share_mode == 1 ? 64u : 0u);
     if (share_diag_ && share_readback_) c.flags |= 128u;
@@ -5477,10 +5486,13 @@ void Renderer::follow_share(const IngestedSource& src, const float clip_to_prev_
     transition(private_[kPShareHalf], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     if (att_hist) {
         XConstants ah = c;
+        // (not while the projection changes - see share_measure_at's flag 1024: the attached history stays as it was)
         ah.flags = att_hist_valid_ ? 0u : 1u;
-        transition(private_[kPAttHist], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        w_dispatch(cs_att_hist_.Get(), &ah, wc, kWAttHist, (c.rect[2] + 7) / 8, (c.rect[3] + 7) / 8);
-        transition(private_[kPAttHist], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (!(zoom_freeze_ && projection_changed_ && att_hist_valid_)) {
+            transition(private_[kPAttHist], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            w_dispatch(cs_att_hist_.Get(), &ah, wc, kWAttHist, (c.rect[2] + 7) / 8, (c.rect[3] + 7) / 8);
+            transition(private_[kPAttHist], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
         b.flags |= 8192u;
     }
     b.flags |= att_cut_ == 1 ? 16384u : att_cut_ == 2 ? 32768u : 0u;
