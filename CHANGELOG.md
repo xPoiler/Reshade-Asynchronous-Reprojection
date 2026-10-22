@@ -1,5 +1,80 @@
 # Changelog
 
+## 2.1.0
+
+The HUD now keeps its faint parts: thin lines, glows and see-through plates stay put while the scenery under them
+moves. Characters and guns hold together better while turning, DOOM Eternal runs again, Enshrouded uses its motion
+vectors, and the warp uses less video memory and GPU time. Three more games tested: Armored Core VI, Enshrouded and
+The Blood of Dawnwalker.
+As with every update, the settings remembered per game go back to the defaults (*Record detailed diagnostics*
+stays).
+
+### HUD
+
+* **HUD layers with their colour.** The add-on now hands the game's HUD layer over with its colour, not only how
+  much it covers. FrameWarp takes the HUD back out of the picture, moves the scenery under it and lays the HUD over
+  it again. Armored Core VI's ring and crosshair, DOOM Eternal's glow around the objective and Resident Evil
+  Requiem's ring HUD no longer slide with the scenery. How each game blends its HUD is measured from the picture
+  itself, and the colour is used only where the game's picture matches the layer exactly (Cyberpunk 2077 draws its
+  HUD brighter than its layer: there the layer's coverage is used, as before).
+* **HUD from a HUD-less picture.** Games that hand over a HUD-less picture without a HUD layer (The Blood of
+  Dawnwalker): the HUD is taken from the two pictures as a layer, instead of every pixel that differs being held. A
+  faint backdrop behind text no longer leaves boiling speckles over the scenery.
+* Faint HUD panels are seen through in games without motion vectors too.
+
+### Character and weapon
+
+* **No cracks across characters while turning** (Resident Evil 2's Claire, her hair and hands). What is held in a
+  sight is now only what is on its glass.
+* **Cyberpunk 2077's gun stays whole when leaving aim while walking.** A change of field of view (aiming) no longer
+  teaches the warp that the gun stopped following the camera.
+* **No bright copy of a character's edge** sliding opposite the turn in the scenery the turn uncovers beside it.
+* Resident Evil Requiem's lines across Leon are gone; the character/weapon's share of your turn is counted from the
+  frame on screen (no small jolt once per game frame).
+
+### Camera
+
+* **Orbit pivot is Off by default.** The measured pivot wandered whenever the camera did more than circle the
+  character; set it to *Measured* for games that circle a character and give DLSS or FSR no camera.
+* **Wait for the camera model** is gone from the panel (off).
+* **New option: Camera turns only** (off by default, remembered per game): only the camera's turns are reprojected;
+  walking and strafing come from the game's own frames.
+* Scenery is measured against the camera's whole motion while it moves.
+
+### Background memory and screen edges
+
+* **New option: Background memory resolution** - Full, 1/2 (default) or 1/4. It no longer drifts while carried with
+  the camera, and the edge of what it remembers no longer darkens (the black lines along the screen's edges
+  walking backwards in Cyberpunk 2077).
+* **Uncovered screen edges: Dithered** (new default) shows the game's frame as it is there, mixed into the warped
+  picture in a fine pattern near the edge - noisy, not smeared.
+
+### Games
+
+* **DOOM Eternal runs again.** It quit at its menu: its uncapped splash and menu ran at 1100-1700 frames a second.
+  While a game runs faster than twice the monitor's refresh rate by itself (menus, splash and loading screens), it
+  is held to that; play is never touched.
+* **Enshrouded's motion vectors are used.** Its DLSS motion vectors (Vulkan, R16G16_SNORM) were turned away and
+  FrameWarp worked the motion out from the picture instead.
+* **Armored Core VI**: its HUD layer (cleared to opaque black, alpha inverted) is found.
+
+### Performance and video memory
+
+* The warp reads the HUD layer only where it has something (about 10% less GPU time per refresh in Enshrouded).
+* About 90 MB less video memory at 4K: a layer made from a HUD-less picture is kept in 8 bits when the picture is
+  (HDR stays in half floats), and the background memory's depth in one channel.
+* Direct3D 12: the HUD layer is written straight into what the presenter reads - one full-screen copy less per game
+  frame.
+* The video memory guard steps aside only near the limit and comes back after 5 s (up to 30 s if it keeps hitting it).
+
+### Diagnostics
+
+* A crash recorder writes faults, stacks and loaded modules to `FrameWarp\logs\crash.txt`.
+* With *Record detailed diagnostics*, **Ctrl+Shift+F8** records a sequence of game frames (a red dot while
+  recording), for troubleshooting.
+* `ReShade.log` shows the add-on's GPU time per frame; `presenter.log` the GPU submissions per queue and how each
+  game's HUD layer is used.
+
 ## 2.0.5
 
 HOTFIX for 2.0's character/weapon holding: no more ghost outlines beside guns and characters while turning,
