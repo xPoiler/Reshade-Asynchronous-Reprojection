@@ -290,6 +290,10 @@ public:
     void set_claim_rule_old(bool on) { claim_rule_old_ = on; }  // (uncovered areas: the fill looks out to 128 render px)
     void set_infill_mirror(bool on) { infill_mirror_ = on; }  // (uncovered areas: the far surface mirrored at its edge)
     void set_memory_margin(bool on) { memory_margin_ = on; }  // (the memory takes nothing within 2 render px of what is held)
+    void set_behind_own_share(bool on) { behind_own_share_ = on; }  // (ow_behind's steps at the far surface's own share: see ow_behind)
+    void set_orbit_kind(bool on) { orbit_kind_ = on; }  // (under the orbit, carried by the analysis too - on by default: see cs_share_up, flag 64)
+    void set_orbit_centre_turn(bool on) { orbit_centre_turn_ = on; }  // (the orbit's centre measured against the turn: see share_measure_at, flag 512)
+    void set_rim_mode(int m) { rim_mode_ = m; }  // (scenery not stretched onto a nearer edge: see ow_rim; 2 by default)
     void set_outline_wide(bool on) { outline_wide_ = on; }  // (the held outline two render pixels wide)
     void set_carried_edge(bool on) { carried_edge_ = on; }  // (held carried pixels beside a slightly moving carried one: not held)
     void set_carried_free(bool on) { carried_free_ = on; }  // (dev: carried pixels - share ~0 - not held by the warp)
@@ -511,6 +515,9 @@ private:
     unsigned mem_res_ = 1;
     bool ui_synth_last_ = false, colour_unblend_ = true, unblend_exact_ = false;  // (kPUi holds the layer cs_hudless_ui made from the last frame)
     bool share_whole_ = false, att_smooth_ = true, att_hist_valid_ = false, share_full_mask_ = false, mem_fringe_ = false, ui_from_hudless_ = true,  mem_vis_off_ = false, mem_pos_ = false, mem_nearest_ = false, share_seam_ = false, mem_age_old_ = false, ring_old_ = false, fill_inside_old_ = false, memory_scenery_ = false, attached_carried_ = true, chars_carried_ = false, splat_turns_ = true, own_carried_only_ = false, own_depth_blind_ = false, paths_capture_ = false, in_paths_ = false, outlines_held_ = true, outline_scenery_ = false, carried_free_ = false, carried_edge_ = true, outline_wide_ = false, memory_margin_ = true, infill_mirror_ = false, infill_memory_ = true, infill_wide_ = false, game_vectors_ = false, edge_dither_ = false, claim_rule_old_ = false;
+    int rim_mode_ = 2;
+    bool orbit_centre_turn_ = false, orbit_kind_ = true, share_orbit_ = false;
+    bool behind_own_share_ = false;
     bool share_resid_built_ = false, shown_share_resid_ = false;
     struct RecSlot {
         ComPtr<ID3D12Resource> buffer[4];  // colour, depth, motion, coverage

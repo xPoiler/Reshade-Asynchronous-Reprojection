@@ -114,7 +114,6 @@ constexpr Persisted kPersisted[] = {
     {"HoldReticles", &fw::Settings::hold_reticles, nullptr},
     {"GameHudLayers", &fw::Settings::game_hud_layers, nullptr},
     {"HudLearn", &fw::Settings::hud_learn, nullptr},
-    {"WaitForCameraModel", &fw::Settings::wait_for_model, nullptr},
     {"FollowShare", &fw::Settings::follow_share, nullptr},
     {"ShareFromInput", &fw::Settings::share_from_input, nullptr},
     {"ForwardSplatWarp", &fw::Settings::warp_splat, nullptr},
@@ -749,8 +748,8 @@ void draw_overlay(effect_runtime*) {
         ImGui::SliderFloat("Latency <-> smoothness (ms)", &s.prediction_ms, -40.0f, 30.0f, "%.0f");
         if (auto_latency) ImGui::EndDisabled();
         hint("Negative: smoother, adds that much delay | positive: predicts further ahead.");
-        static const char* const kOrbitModes[] = {"Measured (default)", "Off", "Manual"};
-        int orbit_mode = s.orbit_mode <= 2 ? static_cast<int>(s.orbit_mode) : 0;
+        static const char* const kOrbitModes[] = {"Measured", "Off (default)", "Manual"};
+        int orbit_mode = s.orbit_mode <= 2 ? static_cast<int>(s.orbit_mode) : 1;
         if (ImGui::Combo("Orbit pivot", &orbit_mode, kOrbitModes, 3)) s.orbit_mode = static_cast<std::uint32_t>(orbit_mode);
         hint("Third-person cameras circle the character: turns are predicted around that point instead of on the spot. "
              "Measured: in games that give the upscaler (DLSS, FSR) their motion vectors but no camera, the pivot XPAR "
@@ -771,12 +770,6 @@ void draw_overlay(effect_runtime*) {
                     p.calibrated_x ? "fitted" : "learning", p.gain_x * 1000.0f, p.tau_x_ms, p.fit_quality_x);
         ImGui::Text("            pitch: %s gain %.3g mrad/count, smoothing %.0f ms, quality %.2f",
                     p.calibrated_y ? "fitted" : "learning", p.gain_y * 1000.0f, p.tau_y_ms, p.fit_quality_y);
-        {
-            bool wait = s.wait_for_model != 0;
-            if (ImGui::Checkbox("Wait for the camera model (the game's own frames until it is learned)", &wait)) s.wait_for_model = wait;
-            if (p.waiting_for_model)
-                ImGui::TextDisabled("Waiting for the camera model: warping after the first moments of turning the camera (5 s at most)");
-        }
         ImGui::Text("Input delay %.0f ms | game latency %.1f ms | measured orbit %s", p.delay_ms, p.latency_ms,
                     p.orbit_cm > 0.0f ? std::to_string(static_cast<int>(p.orbit_cm + 0.5f)).c_str() : "none (no consistent orbit)");
         if (!p.controller)

@@ -115,7 +115,7 @@ struct Settings {
     std::uint32_t use_controller;      // the controller's right stick drives rotation too (option, on by default, saved per game)
     std::uint32_t present_lead_auto;   // default on: the present lead follows the measured warp time (present_lead_ms unused)
     std::uint32_t edge_fill;           // own warp, what a turn uncovers past the frame's edge: 0 extended edge pixels, 1 soft, 2 dithered (default; saved per game)
-    std::uint32_t orbit_mode;          // turning around a pivot: 0 measured (default; camera estimated from the game's own motion vectors), 1 off,
+    std::uint32_t orbit_mode;          // turning around a pivot: 0 measured (camera estimated from the game's own motion vectors), 1 off (default since 2026-10-22),
                                        // 2 manual (orbit_distance); saved per game
     float edge_limit_pct;              // Auto latency "camera as of now": the most of the screen's width (percent) the warp may uncover
                                        // beyond what the regular Auto latency uncovers lately (0: no more than it; saved per game)
@@ -129,8 +129,8 @@ struct Settings {
                                        // held, and the character's limbs with it (Renderer::hold_characters; saved per game)
     std::uint32_t hud_learn;           // default on: learn where the game draws its HUD (hud_learn.hpp) and take the HUD from there
     std::uint32_t hud_relearn;         // incremented by the panel: learn again
-    std::uint32_t wait_for_model;      // default on: the game's own frames until the camera model explains a fifth of the camera's
-                                       // motion on both axes (then warped for the session; saved per game)
+    std::uint32_t wait_for_model;      // off (no option, not saved, since 2026-10-22 - more problems than it solved, user): the game's
+                                       // own frames until the camera model explains a fifth of the camera's motion on both axes
     std::uint32_t follow_share;        // default on: the character/weapon by how much of the camera's turn each spot follows
                                        // (Renderer::follow_share) instead of held whole (hold_characters, the stretch; saved per game)
     std::uint32_t share_from_input;    // default on: ...measured against the turn the input explains (what the warp applies), not

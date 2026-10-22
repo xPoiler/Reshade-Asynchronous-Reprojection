@@ -42,14 +42,14 @@ void default_settings(Settings& s) {
     s.present_lead_ms = 6.0f;  // manual value, used when the automatic lead is off
     s.present_lead_auto = 1;
     s.frame_cap = 1;  // prevent GPU queueing, standing aside while the game's Reflex is on
-    s.orbit_mode = 0;  // the measured orbit, games without a camera of their own
+    s.orbit_mode = 1;  // off (2026-10-22, user): the measured pivot wanders when the camera does more than orbit - Enshrouded's and Dawnwalker's character juddered
     s.floor_release = 1;  // the ground around the character moves with a measured orbit (acts only while one is in use)
     s.hold_reticles = 1;  // sight reticles drawn without depth move with the gun (acts only inside a sight's window)
     s.game_hud_layers = 1;  // the HUD from the game's own HUD layer / final picture where found
     s.warp_splat = 1;  // the XPAR warp by forward splat
     s.hold_characters = 1;  // whole characters held
     s.hud_learn = 1;  // learn where the game draws its HUD
-    s.wait_for_model = 1;  // the game's own frames until the camera model is learned
+    s.wait_for_model = 0;  // (off, no option since 2026-10-22, user: more problems than it solved - see Settings::wait_for_model)
     s.follow_share = 1;  // the character/weapon by the share of the turn it follows
     s.share_from_input = 1;  // ...of the turn the input explains
     s.edge_limit_pct = 0.0f;  // camera as of now: no more of the edge uncovered than Auto's

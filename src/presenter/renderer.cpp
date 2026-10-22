@@ -777,7 +777,16 @@ void share_measure_at(uint2 id) {
             // there against the turn, as before. Against the turn alone everywhere, scenery took the camera's movement
             // across the turn into its share: 0.6 in the synthetic orbit, under 0.5 on half the screen while strafing with
             // little turn - the warp moved it by that much of the turn, seen scenery error x2..x4.6 against no share at all)
-            const bool whole_here = (flags & 4) || ((flags & 256) && length(cam_px) >= 0.5 * length(turn_px));
+            // (flag 512, with the warp turning around a measured orbit - flag 4: the same at the orbit's centre. Against the
+            // whole motion there too, the character the camera circles - its whole motion near none - measured nothing, kept
+            // the prior's 1: scenery - not in the mask, taken into the background memory, moved by the orbit warp's motion at
+            // its spot, so any error in the pivot moved it: Enshrouded's character juddered, and the memory's copies of her
+            // edge filled the strips beside her arms - a floating outline. Orbit pivot Off: both gone)
+            const bool centre_by_turn = length(cam_px) < 0.5 * length(turn_px);
+            // (...only where the analysis finds no scenery - attached to the camera or moving on its own, o.w: at the pivot's
+            // distance the floor too barely moves under an orbit, and measured against the turn there it was held as well -
+            // 5-10x the held pixels, the recording's error +38..59%)
+            const bool whole_here = ((flags & 4) && !((flags & 512) && centre_by_turn && o.w > 0.5)) || ((flags & 256) && !centre_by_turn);
             const float2 whole_px = whole_here ? cam_px : turn_px;
             const bool rest = (flags & 32) && !(flags & 64);
             const float unit = 1080.0 / float(rect.w);
@@ -1064,8 +1073,15 @@ RWTexture2D<float> ah_u : register(u0);
     // (w: the pixel's nearness, 32 steps per doubling of the distance as ow_near, halved - for the outline - plus 0.5 where
     // it follows under half of its band's share: carried by the camera, not scenery that follows little because the camera
     // orbits - see cs_mask)
+    // (flag 64, with the warp turning around a measured orbit: carried also where the analysis finds it attached to the
+    // camera - its share stays as measured. Under the orbit the character the camera circles measures the scenery's share:
+    // its whole motion is near none, there is nothing to tell it by - and marked nowhere, none of what keeps characters out
+    // of the scenery acted on it: the background memory took it in, and the area behind it a turn uncovers was filled with
+    // a dark copy of its silhouette, its edge drawn round it, sliding with the scenery - Enshrouded seq_2, its outline
+    // floating off it. With ow_beside_carried, replayed: false edges -3.6..-5.1%, error -0.6..-0.7%, the edge gone)
+    const bool by_kind = (flags & 64) && ((flags & 8192) ? su_att_t.Load(int3(pr, 0)) >= 0.5 : su_object_t.Load(int3(pr, 0)).w > 1.5);
     const float x = (flags & 16) ? d0 : 1.0 - d0;
-    sf_share_u[pr] = float4(turned, moved, 0.5 * saturate((log2(max(x, 1e-12)) + 30.0) / 32.0) + (kept.x < 0.5 ? 0.5 : 0.0));
+    sf_share_u[pr] = float4(turned, moved, 0.5 * saturate((log2(max(x, 1e-12)) + 30.0) / 32.0) + (kept.x < 0.5 || by_kind ? 0.5 : 0.0));
 }
 // Seams blended (set_share_seam - the user's design, 2026-10-21): the shares the warp applies, after every cut (share_kept's
 // floor, the attached rule) - spread once more along each surface, a little: where two parts of one body at about the same
@@ -3039,6 +3055,38 @@ bool ow_beside_held(float2 s, float2 l) {
     // (its own held part beside it: claims only where it lands on the object's own pixels)
     return ow_mask_t.Load(int3(min(uint2(saturate(l) * float2(out_size)), out_size - 1), 0)).x < 0.65;
 }
+// A spot the scenery's surface (nearness nk) is stretched onto - the steps' end - whose rendered pixel is clearly nearer than
+// that surface (> 6 nearness steps), or a held outline (0.95): not taken. The steps over a surface accept a spot with any of
+// the four rendered pixels around on it (ow_on_surface: a near object's anti-aliased edge goes with it), so the scenery a
+// turn uncovers beside a character took its colour from the character's own edge - a bright line at the strip's far side,
+// moving with the scenery, opposite to the camera (Enshrouded captures 5-6: paths 7 and 1, 0.25-0.30 against 0.09). The
+// claim then tries the next claimant, the ring the scenery behind / the memory. (By depth, not by the mask or ow_held: the
+// character's last output pixel has a share blended from the scenery beside it - 0.70, it follows a little - and with
+// characters carried on along their own motion none of it counts as held: tested that way, capture 6 kept the line.)
+// set_rim_mode - read from `threshold` (ow_dev), unused by the warp (no flag bits left): 0 off, 1 the ring's stretch (path 7) alone,
+// 2 (default) the claims' own steps too (paths 1/2). Synthetic suite, 2 against 0 (2026-10-22): "behind" false edges
+// -14..-21% in the orbits, -2..-7% in the first-person scenes, error behind up to -6%, uncovered false edges -1..-2%;
+// nothing worse. (Tried: by the mask - the character's 0.65 up - the same less 1-2% uncovered; also not taking rendered
+// pixels beside a held nearer thing - the estimated turn's error behind +10-16%.)
+// (the warp's development switches, carried in `threshold` - no flag bits left: bits 0-1 the rim mode, 4 ow_behind's steps at
+// the far surface's own share - see ow_behind)
+uint ow_dev() { return uint(threshold + 0.5); }
+bool ow_rim(float2 s, float nk) {
+    if ((ow_dev() & 3u) == 0) return false;
+    const float m = ow_mask_t.Load(int3(min(uint2(saturate(s) * float2(out_size)), out_size - 1), 0)).x;
+    return (m >= 0.94 && m < 0.955) || ow_near(ow_depth(s)) > nk + 6.0;
+}
+bool ow_beside_carried(float2 s) {
+    const float2 step = 1.0 / float2(rect.zw);
+    const float here = ow_near(ow_depth(s));
+    [unroll] for (int k = 0; k < 16; ++k) {
+        const float2 q = s + float2(kRetDirs[k & 7] * ((k >> 3) + 1)) * step;
+        if (any(q < 0) || any(q > 1)) continue;
+        const float m = ow_mask_t.Load(int3(min(uint2(q * float2(out_size)), out_size - 1), 0)).x;
+        if (m >= 0.65 && m < 0.9 && ow_near(ow_depth(q)) > here + 6.0) return true;
+    }
+    return false;
+}
 [numthreads(8, 8, 1)] void cs_warp_claim(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= rect.zw)) return;
     const float2 s = (float2(id.xy) + 0.5) / float2(rect.zw);
@@ -3047,6 +3095,11 @@ bool ow_beside_held(float2 s, float2 l) {
     if (f.z <= 1e-6) return;
     const float2 l = ow_lands(s, f);
     if ((flags & 2) && (flags & 2097152) && ow_beside_held(s, l)) return;
+    // (ow_dev 8 - the character marked carried under a measured orbit, cs_share_up's flag 64: not held, it moves with the
+    // orbit, so ow_beside_held does not see it. Its rim - rendered pixels at the scenery's depth carrying its colour - claimed
+    // as scenery and slid off with it: a bright outline round the area behind it the turn uncovers, Enshrouded seq_2. A
+    // rendered pixel within two of a carried one clearly nearer - more than 6 nearness steps - claims nothing either)
+    if ((ow_dev() & 8u) && (flags & 2) && ow_beside_carried(s)) return;
     if (any(l < 0) || any(l >= 1)) return;
     const int2 cell = int2(l * float2(rect.zw));
     const int2 d = int2(id.xy) - cell;
@@ -3145,10 +3198,17 @@ float2 ow_behind(float2 uv, int2 p, float far_near) {
     const float2 s0 = (float2(p) + 0.5) / float2(rect.zw);
     const float far_d = ow_depth(s0);
     float2 s = s0;
+    // (ow_dev 4: the steps at the far surface's own share, read once at its claimant - as ow_refine. Read at every step, a
+    // step that went under the held character took its share - none - and stopped following the scenery: the memory was
+    // asked at the character's own spot, not where the scenery behind it came from, and the strip a turn uncovers beside
+    // an orbited character showed a dark copy of her outline, moving with the scenery - Enshrouded capture 9, the wall
+    // beside her following 0.3-0.5 of the turn)
+    const bool own_share = (ow_dev() & 4u) != 0 && (flags & 128);
+    const float4 m0 = own_share ? ow_mask_at(s0) : float4(0, 1, 1, 0);
     [loop] for (int it = 0; it < 4; ++it) {
         const float3 f = ow_forward_at(s, far_d);
         if (f.z <= 1e-6) break;
-        s += uv - ow_lands(s, f);
+        s += uv - (own_share ? ow_lands_by(s, f, saturate(1.0 - m0.x / 0.9), m0.y, m0.z) : ow_lands(s, f));
     }
     if (all(s >= 0) && all(s <= 1) && abs(ow_near(ow_depth(s)) - far_near) > 6.0) {
         if (flags & 64) ow_hidden = ow_from_memory_behind(s, far_near, ow_hidden_c);
@@ -3200,7 +3260,7 @@ bool ow_claimed(float2 uv, out float2 src, out bool hole) {
         [unroll] for (int k = 0; k < 9; ++k)
             if (keys[k] && all(ow_claimant(clamp(c0 + int2(k % 3 - 1, k / 3 - 1), int2(0, 0), int2(rect.zw) - 1), keys[k]) == pb)) keys[k] = 0;
         float2 s;
-        if (ow_refine(uv, pb, float(best >> 22), s)) { src = s; ow_first = attempt == 0; ow_path = attempt == 0 ? 1 : 2; return true; }
+        if (ow_refine(uv, pb, float(best >> 22), s) && !((ow_dev() & 3u) >= 2 && ow_rim(s, float(best >> 22)))) { src = s; ow_first = attempt == 0; ow_path = attempt == 0 ? 1 : 2; return true; }
         if (attempt == 0) first_s = s;
     }
     // (none reaches it, and even the farthest around is a character carried on along its own motion - flag 65536: a crack
@@ -3291,7 +3351,7 @@ bool ow_ring(float2 uv, out float2 src) {
         return true;
     }
     float2 s;
-    if (ow_refine(uv, ow_claimant(near_cell, near_key), near_n, s)) { src = s; ow_path = 7; return true; }
+    if (ow_refine(uv, ow_claimant(near_cell, near_key), near_n, s) && !ow_rim(s, near_n)) { src = s; ow_path = 7; return true; }
     src = ow_behind(uv, ow_claimant(far_cell, far_key), float(far_key >> 22));
     ow_path = ow_hidden ? 4 : 8;
     return true;
@@ -5338,7 +5398,7 @@ void Renderer::follow_share(const IngestedSource& src, const float clip_to_prev_
     // (the game's own camera - set_share_whole: measured against its whole motion, see share_measure_at's flag 256)
     const bool auto_whole = share_whole_ && !whole_motion;
     c.flags = (scale_valid ? 1u : 0u) | (whole_motion ? 4u : 0u) | (depth_inverted ? 16u : 0u) | (fresh || share_reset_ ? 8u : 0u) |
-              (auto_whole ? 256u : 0u);
+              (auto_whole ? 256u : 0u) | (whole_motion && orbit_centre_turn_ ? 512u : 0u);
     if (own_motion_ && private_[kPFlowB].texture) { c.flags |= 2u; c.out_size[0] = std::max(1u, w / 2); c.out_size[1] = std::max(1u, h / 2); }
     if (share_mode) c.flags |= 32u | (share_mode == 1 ? 64u : 0u);
     if (share_diag_ && share_readback_) c.flags |= 128u;
@@ -5424,6 +5484,8 @@ void Renderer::follow_share(const IngestedSource& src, const float clip_to_prev_
         b.flags |= 8192u;
     }
     b.flags |= att_cut_ == 1 ? 16384u : att_cut_ == 2 ? 32768u : 0u;
+    share_orbit_ = whole_motion && attached_carried_ && game_vectors_;  // (the warp's claims too - see ow_beside_carried)
+    if (orbit_kind_ && share_orbit_) b.flags |= 64u;  // (see cs_share_up)
     att_hist_valid_ = att_hist;
     transition(private_[kPShare], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     w_dispatch(cs_share_up_.Get(), &b, wc, kWShareUp, (c.rect[2] + 7) / 8, (c.rect[3] + 7) / 8);
@@ -6216,6 +6278,7 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
     const bool own_motion = mask && share_mask && stretched && warp_ahead_ > 0 && !moving && shown(kPOwnMove).texture &&
                             shown(kPOwnMove).width == dw && shown(kPOwnMove).height == dh;
     if (own_motion) { c.flags |= 65536u; wc[19] = warp_ahead_; }
+    c.threshold = float(rim_mode_ | (behind_own_share_ ? 4 : 0) | (orbit_kind_ && share_orbit_ ? 8 : 0));  // (see ow_dev)
     if (!outlines_held_) c.flags |= 131072u;
     if (carried_free_) c.flags |= 262144u;
     if (carried_edge_) c.flags |= 524288u;

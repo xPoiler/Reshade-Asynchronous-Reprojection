@@ -13,6 +13,9 @@ DXGI_FORMAT dxgi_format_of(VkFormat f, std::uint32_t* depth_bytes) {
         case VK_FORMAT_D16_UNORM: case VK_FORMAT_D16_UNORM_S8_UINT: depth = 2; out = DXGI_FORMAT_R16_UNORM; break;
         case VK_FORMAT_R32_SFLOAT: out = DXGI_FORMAT_R32_FLOAT; break;
         case VK_FORMAT_R16G16_SFLOAT: out = DXGI_FORMAT_R16G16_FLOAT; break;
+        // (motion vectors in -1..1 with the game's MV scale - Enshrouded's DLSS: unlisted, they were turned away and XPAR
+        // estimated its own motion from the picture instead)
+        case VK_FORMAT_R16G16_SNORM: out = DXGI_FORMAT_R16G16_SNORM; break;
         case VK_FORMAT_R32G32_SFLOAT: out = DXGI_FORMAT_R32G32_FLOAT; break;
         case VK_FORMAT_R16G16B16A16_SFLOAT: out = DXGI_FORMAT_R16G16B16A16_FLOAT; break;
         case VK_FORMAT_B10G11R11_UFLOAT_PACK32: out = DXGI_FORMAT_R11G11B10_FLOAT; break;
@@ -31,6 +34,7 @@ VkFormat vk_format_of(DXGI_FORMAT f) {
         case DXGI_FORMAT_R32_FLOAT: return VK_FORMAT_R32_SFLOAT;
         case DXGI_FORMAT_R16_UNORM: return VK_FORMAT_R16_UNORM;
         case DXGI_FORMAT_R16G16_FLOAT: return VK_FORMAT_R16G16_SFLOAT;
+        case DXGI_FORMAT_R16G16_SNORM: return VK_FORMAT_R16G16_SNORM;
         case DXGI_FORMAT_R32G32_FLOAT: return VK_FORMAT_R32G32_SFLOAT;
         case DXGI_FORMAT_R16G16B16A16_FLOAT: return VK_FORMAT_R16G16B16A16_SFLOAT;
         case DXGI_FORMAT_R11G11B10_FLOAT: return VK_FORMAT_B10G11R11_UFLOAT_PACK32;

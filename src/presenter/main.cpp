@@ -292,7 +292,7 @@ void open_recordings() {
         }
         g_app.csv_outputs = open_csv(L"outputs.csv",
             "qpc,source_frame,warped,yaw,pitch,horizon_ms,gpu_ms,mark,t_submit,t_gpu_start,t_gpu_end,last_present,present_count,present_refresh,"
-            "sync_refresh,sync_qpc,stats_hr,t_wake,cam_x,cam_y,cam_z,cam_fx,cam_fy,cam_fz");
+            "sync_refresh,sync_qpc,stats_hr,t_wake,cam_x,cam_y,cam_z,cam_fx,cam_fy,cam_fz,orbit_used,orbit_learned,orbit_consistent");
     }
     g_recording.store(true, std::memory_order_release);
 }
@@ -1958,13 +1958,15 @@ void render_thread() {
         if (rec(g_app.csv_outputs)) {
             const auto tm = renderer.last_timing();
             const auto pstats = renderer.present_stats();
-            // (the displayed camera too: position and forward, in the game's world)
+            // (the displayed camera too: position and forward, in the game's world; and the orbit pivot - the distance the turn
+            // is predicted around, the one measured, the one the recent turns agree on - see PoseModel::orbit)
             const auto& dc = applied.camera;
-            wr(g_app.csv_outputs, "%lld,%llu,%d,%.6f,%.6f,%.4f,%.3f,%d,%lld,%lld,%lld,%u,%u,%u,%u,%lld,%ld,%lld,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f\n",
+            wr(g_app.csv_outputs, "%lld,%llu,%d,%.6f,%.6f,%.4f,%.3f,%d,%lld,%lld,%lld,%u,%u,%u,%u,%lld,%ld,%lld,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f,%.4f,%.4f,%.4f\n",
                          qpc_now(), static_cast<unsigned long long>(source_frame), same_picture ? 2 : int(warped), applied.yaw, applied.pitch,
                          applied.horizon * 1000.0, renderer.last_gpu_ms(), mark, tm.submit, tm.gpu_start, tm.gpu_end, pstats.last_present_count,
                          pstats.present_count, pstats.present_refresh, pstats.sync_refresh, pstats.sync_qpc, static_cast<long>(pstats.hr), wake_qpc,
-                         dc.pos.x, dc.pos.y, dc.pos.z, dc.fwd.x, dc.fwd.y, dc.fwd.z);
+                         dc.pos.x, dc.pos.y, dc.pos.z, dc.fwd.x, dc.fwd.y, dc.fwd.z, g_app.model.orbit(), g_app.model.learned_orbit(),
+                         g_app.model.consistent_orbit());
         }
         record_timeline(sh, settings);
         // (a refresh: a present, or with pacing a refresh that keeps the same picture - not the 1 ms polls of the
