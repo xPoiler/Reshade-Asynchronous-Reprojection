@@ -1,3 +1,6 @@
+DISABLE GLOBAL FRAME LIMITERS, INCLUDING BACKGROUND FRAME LIMITERS (CHECK NVIDIA CONTROL PANEL) OR THE REPROJECTION WON'T WORK.
+
+ 
 # FrameWarp
 
 **Asynchronous camera reprojection for PC games.** FrameWarp shows camera motion at your display's
