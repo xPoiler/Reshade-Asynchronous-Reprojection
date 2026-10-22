@@ -23,6 +23,7 @@ struct IngestedSource {
     bool valid = false;
     bool has_hudless = false, has_ui = false, has_depth = false, has_scene = false;
     bool ui_from_hudless = false;  // (the UI layer taken from the frame and the HUD-less picture - see cs_hudless_ui)
+    bool scene_derived = false;    // (the scenery under a colour UI layer taken out of the frame, in kPHudless - see cs_layer_unblend)
     std::uint32_t color_w = 0, color_h = 0;
     Rect2 color_rect, depth_rect;
     bool has_motion = false;  // game motion vectors converted into the private motion texture
@@ -252,6 +253,10 @@ public:
     // A HUD layer taken from the frame and the HUD-less picture for a game that sends no layer (see cs_hudless_ui) - with the
     // option that splits them ("Keep HUD still"), else the HUD where the two differ, held, as before.
     void set_ui_from_hudless(bool on) { ui_from_hudless_ = on; }
+    void set_colour_unblend(bool on) { colour_unblend_ = on; }
+    void set_unblend_exact(bool on) { unblend_exact_ = on; }  // (dev: the scenery under a colour layer kept unclamped - see cs_layer_unblend)  // (dev: a colour UI layer as a coverage alone - see cs_layer_unblend)
+    bool blend_linear() const { return blend_linear_; }
+    bool layer_linear() const { return layer_linear_; }
     void set_mem_resolution(unsigned level) { mem_res_ = level > 2 ? 2 : level; }  // (the memory at the picture's resolution, half, a quarter)
     void set_mem_vis_off(bool on) { mem_vis_off_ = on; }
     void set_mem_pos(bool on) { mem_pos_ = on; }  // (dev: memory content carried with its own position, not sampled - see mem_off)
@@ -504,7 +509,7 @@ private:
     int layer_faint_est_ = 1;
     bool infill_est_ = false, flow_ui_ = false, flow_ui_masked_ = false, flow_ui_off_ = false;  // (the motion estimate this frame: the HUD layer given / left out - fl_under_hud)
     unsigned mem_res_ = 1;
-    bool ui_synth_last_ = false;  // (kPUi holds the layer cs_hudless_ui made from the last frame)
+    bool ui_synth_last_ = false, colour_unblend_ = true, unblend_exact_ = false;  // (kPUi holds the layer cs_hudless_ui made from the last frame)
     bool share_whole_ = false, att_smooth_ = true, att_hist_valid_ = false, share_full_mask_ = false, mem_fringe_ = false, ui_from_hudless_ = true,  mem_vis_off_ = false, mem_pos_ = false, mem_nearest_ = false, share_seam_ = false, mem_age_old_ = false, ring_old_ = false, fill_inside_old_ = false, memory_scenery_ = false, attached_carried_ = true, chars_carried_ = false, splat_turns_ = true, own_carried_only_ = false, own_depth_blind_ = false, paths_capture_ = false, in_paths_ = false, outlines_held_ = true, outline_scenery_ = false, carried_free_ = false, carried_edge_ = true, outline_wide_ = false, memory_margin_ = true, infill_mirror_ = false, infill_memory_ = true, infill_wide_ = false, game_vectors_ = false, edge_dither_ = false, claim_rule_old_ = false;
     bool share_resid_built_ = false, shown_share_resid_ = false;
     struct RecSlot {
@@ -523,7 +528,7 @@ private:
     bool learning_stalled_ = true;
     std::uint32_t detection_idle_ = 0;  // game frames since the HUD was last detected (build_no_warp_mask)
     std::uint32_t scene_idle_ = 0;      // game frames since the upscaler's output last came (ingest)
-    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_own_warp_reset_, cs_own_warp_lean_, cs_own_warp_args_, cs_own_warp_rest_, cs_warp_claims_clear_, cs_warp_claim_, cs_memory_, cs_mem_vis_, cs_hudless_ui_, cs_hudless_keep_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_, cs_probe_tiles_, cs_probe_clear_, cs_probe_score_, cs_share_measure_, cs_share_blur_, cs_share_bins_, cs_share_final_, cs_share_up_, cs_share_seam_, cs_att_hist_, cs_rec_down_, cs_share_resid_, cs_resid_blur_, cs_own_up_;
+    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_own_warp_reset_, cs_own_warp_lean_, cs_own_warp_args_, cs_own_warp_rest_, cs_warp_claims_clear_, cs_warp_claim_, cs_memory_, cs_mem_vis_, cs_hudless_ui_, cs_hudless_keep_, cs_layer_unblend_, cs_layer_seam_clear_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_, cs_probe_tiles_, cs_probe_clear_, cs_probe_score_, cs_share_measure_, cs_share_blur_, cs_share_bins_, cs_share_final_, cs_share_up_, cs_share_seam_, cs_att_hist_, cs_rec_down_, cs_share_resid_, cs_resid_blur_, cs_own_up_;
     // Sight reticles (option): the passes, which history texture holds the latest layer, and whether the layer was
     // built for the frame taken in last / the shown one (see cs_ret_layer).
     ComPtr<ID3D12PipelineState> cs_ret_cells_, cs_ret_enclose_, cs_ret_layer_, cs_ret_align_, cs_ret_pick_, cs_ret_args_, cs_ret_shift_;
@@ -538,7 +543,7 @@ private:
     ComPtr<ID3D12Resource> hud_counts_, hud_readback_, scene_fit_, scene_stamps_readback_;
     // The game's HUD layer checked (cs_layer_check): 0 not yet, 1 a HUD (trusted: a frame without it shows no HUD), 2 not
     // a HUD (ignored, the HUD is detected). Counts every second pixel: covered, and of them drawn over the picture.
-    ComPtr<ID3D12Resource> layer_counts_, layer_readback_;
+    ComPtr<ID3D12Resource> layer_counts_, layer_readback_, seam_counts_, seam_readback_;
     ComPtr<ID3D12Resource> probe_sums_, probe_readback_;  // (score_hud_probe)
     bool probe_pending_[kRing] = {};
     std::uint32_t probe_pending_cand_[kRing] = {}, probe_pending_tiles_[kRing] = {};
@@ -579,6 +584,10 @@ private:
     // (...their game frames counted, and the one each layer texture - A, B - was last written in: see cs_ret_layer)
     std::uint32_t ret_frame_ = 0, ret_written_[2] = {};
     bool layer_pending_[kRing] = {};
+    bool seam_pending_[kRing] = {};
+    double seam_stored_ = 0, seam_linear_ = 0;  // (the blend space's misfit each way - see cs_layer_unblend)
+    double layer_raw_ = 0, layer_enc_ = 0;      // (the layer's colour against the frame where opaque: as it is, encoded)
+    bool blend_linear_ = false, layer_linear_ = false;
     int layer_trust_ = 0;
     bool layer_cover_only_[kRing] = {};  // (that readback: the coverage alone - see build_no_warp_mask)
     bool layer_full_ = false;            // ...the latest one read back: 90% of the screen or more

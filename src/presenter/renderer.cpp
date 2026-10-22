@@ -1743,10 +1743,13 @@ RWTexture2D<float> hl_score_u : register(u0);
 // (synthetic benchmark: 10x the error of plain scenery there; moved: -40%). Not with motion estimated from the picture:
 // the HUD standing still in it threw the estimate off around the panels (synthetic, estimated motion: +21% overall) - only
 // since the estimate leaves out what the layer covers (fl_under_hud, 2026-10-21).
+// Flag 2 (a layer with its colour - the scenery taken out of the frame, cs_layer_unblend): held only where the layer lets
+// too little through to take the scenery back: taken out, the frame's rounding to 8 bits grows by 1 / (1 - a) - at a quarter
+// let through, 4 steps of 256: past that the scenery is held, the fill behind it. Below, exact whatever the HUD is.
 [numthreads(8, 8, 1)] void cs_layer_hud(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= out_size)) return;
     const float a = hl_layer_t.Load(int3(id.xy, 0)).a;
-    hl_score_u[id.xy] = a > ((flags & 1) ? 0.5 : 0.02) ? 1.0 : 0.0;
+    hl_score_u[id.xy] = a > ((flags & 2) ? 0.75 : (flags & 1) ? 0.5 : 0.02) ? 1.0 : 0.0;
 }
 // Is that layer the game's HUD (see Renderer::layer_trust)? Everything of a HUD - fixed or anchored in the world - is drawn
 // over the finished picture, after the upscaler: where the layer clearly covers, the frame differs from the upscaler's
@@ -1839,6 +1842,80 @@ RWTexture2D<float4> hk_hudless_u : register(u0);
 [numthreads(8, 8, 1)] void cs_hudless_keep(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= out_size) || hh_counts_u.Load(8) * 2 < out_size.x * out_size.y) return;
     hk_hudless_u[id.xy] = hh_frame_t.Load(int3(id.xy, 0));
+}
+// The scenery under a HUD layer that has its colour (the add-on's layers; not a coverage alone): the frame with the layer
+// taken back out - frame = scene (1 - a) + rgb solved for the scene - the picture the warp moves (as a game's own HUD-less
+// one), the layer laid over it again where the HUD is (ow_over). Nothing faint is held and nothing guessed: a thin white
+// ring (Armored Core VI's), a glow added without coverage (Cyberpunk's, DOOM's), a light plate come out of the scenery
+// exactly and stay where they are, the scenery under them moving. Where the layer lets too little through, the scenery is
+// not there to take: see cs_layer_hud's flag 2. In which values the game blends - its picture's own, or linear light (DOOM
+// Eternal: decoded, blended, encoded) - is measured here: along the edges of the layer's faint parts the scenery taken
+// out must go on as the scenery just outside it does; each way's misfit is summed (u1: [0] in the stored values, [4] in
+// linear light, [8] the pixels, x1024) and the presenter takes the one that fits better (flag 1: linear). And whether the
+// layer's colour is itself linear (flag 2 - RE Requiem: frame = encode(layer) where it is opaque, misfit 0.0012 against
+// 0.25 taken as it is; DOOM's is encoded): where the layer is opaque the frame is the layer's colour alone - as it is, or
+// encoded ([12], [16], the pixels [20]). A linear layer is blended in linear light. scRGB pictures are linear already
+// (flag 32768): all the same. The scenery is kept as it comes out - half floats, nothing clamped - so taken out and laid
+// back it is the frame again exactly where nothing moved, whatever way was taken (clamped to 8 bits, a way not yet
+// measured darkened the menus' translucent panels - Requiem, until gameplay had measured it).
+Texture2D<float4> lu_frame_t : register(t0);
+Texture2D<float4> lu_ui_t : register(t1);
+RWTexture2D<float4> lu_scene_u : register(u0);
+RWByteAddressBuffer lu_seam_u : register(u1);
+// (sRGB both ways, the sign kept and nothing clamped - see above)
+float3 lu_lin(float3 c) {
+    if (flags & 32768) return c;
+    const float3 m = abs(c);
+    return sign(c) * (m <= 0.04045 ? m / 12.92 : pow((m + 0.055) / 1.055, 2.4));
+}
+float3 lu_enc(float3 c) {
+    if (flags & 32768) return c;
+    const float3 m = abs(c);
+    return sign(c) * (m <= 0.0031308 ? m * 12.92 : 1.055 * pow(m, 1.0 / 2.4) - 0.055);
+}
+float3 lu_scene(float3 f, float4 ui, bool lin, bool layer_lin) {
+    const float through = max(1.0 - ui.a, 1.0 / 255.0);
+    return lin ? lu_enc((lu_lin(f) - (layer_lin ? ui.rgb : lu_lin(ui.rgb))) / through) : (f - ui.rgb) / through;
+}
+[numthreads(1, 1, 1)] void cs_layer_seam_clear(uint3 id : SV_DispatchThreadID) { lu_seam_u.Store4(0, uint4(0, 0, 0, 0)); lu_seam_u.Store2(16, uint2(0, 0)); }
+[numthreads(8, 8, 1)] void cs_layer_unblend(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= out_size)) return;
+    const float3 f = lu_frame_t.Load(int3(id.xy, 0)).rgb;
+    const float4 ui = lu_ui_t.Load(int3(id.xy, 0));
+    const bool drawn = ui.a > 0.0 || any(ui.rgb > 0.0);
+    const bool layer_lin = (flags & 2) != 0;
+    // (within range - flag 4 (dev, set_unblend_exact): as it comes, nothing clamped - laid back exactly where nothing moved,
+    // but the layer's 8-bit rounding, grown under faint panels, came out of range and gave the fills behind the gun false
+    // edges, +11% at 30 fps; within range the frame comes back exactly wherever the way is the game's - measured, see above)
+    float3 scene = drawn ? lu_scene(f, ui, (flags & 1) || layer_lin, layer_lin) : f;
+    if (!(flags & 4)) scene = (flags & 32768) ? max(scene, 0.0) : saturate(scene);
+    lu_scene_u[id.xy] = float4(scene, 1.0);
+    uint ignored;
+    // (the layer's colour: where it is opaque, the frame against it as it is and encoded)
+    if (ui.a > 0.99 && max(ui.r, max(ui.g, ui.b)) > 0.05) {
+        lu_seam_u.InterlockedAdd(12, uint(dot(abs(f - ui.rgb), 1.0) * 1024.0), ignored);
+        lu_seam_u.InterlockedAdd(16, uint(dot(abs(f - lu_enc(ui.rgb)), 1.0) * 1024.0), ignored);
+        lu_seam_u.InterlockedAdd(20, 1, ignored);
+        return;
+    }
+    // (the seam: a faint pixel of the layer - the scenery recoverable, see cs_layer_hud - beside one it does not touch)
+    if (ui.a <= 0.0 || ui.a > 0.75) return;
+    const float3 s0 = lu_scene(f, ui, false, false), s1 = lu_scene(f, ui, true, layer_lin);
+    float m0 = 0, m1 = 0;
+    uint n = 0;
+    const int2 last = int2(out_size) - 1;
+    [unroll] for (int k = 0; k < 4; ++k) {
+        const int2 q = clamp(int2(id.xy) + int2(k == 0 ? -1 : k == 1 ? 1 : 0, k == 2 ? -1 : k == 3 ? 1 : 0), int2(0, 0), last);
+        const float4 uq = lu_ui_t.Load(int3(q, 0));
+        if (uq.a > 0.0 || any(uq.rgb > 0.0)) continue;
+        const float3 fq = lu_frame_t.Load(int3(q, 0)).rgb;
+        m0 += dot(abs(s0 - fq), 1.0); m1 += dot(abs(s1 - fq), 1.0);
+        ++n;
+    }
+    if (n == 0) return;
+    lu_seam_u.InterlockedAdd(0, uint(min(m0, 64.0) * 1024.0), ignored);
+    lu_seam_u.InterlockedAdd(4, uint(min(m1, 64.0) * 1024.0), ignored);
+    lu_seam_u.InterlockedAdd(8, n, ignored);
 }
 
 // Camera-attached pixels widened by 1 render px, at render resolution (R8), for the mask below.
@@ -3371,6 +3448,17 @@ float4 ow_scene_from(uint2 id, float2 uv, float2 src, bool valid) {
 // (only where the colour came from a faint spot - under half: landed on the HUD itself, held, the colour was taken from
 // elsewhere - the memory, or stepping past it - and evened out by the HUD's coverage it brightened up to 4 times: a white
 // band beside the minimap, synthetic estimated motion, where those fallbacks run)
+// (flag 1073741824: the scenery taken out of the frame - cs_layer_unblend - is t0: a held pixel is the frame itself (t5),
+// with its HUD, the layer not laid over it again. Flag 536870912: the layer laid over in linear light - see cs_layer_unblend)
+float4 ow_held_colour(int3 p) { return (flags & 1073741824) ? ow_fill_t.Load(p) : ow_color_t.Load(p); }
+// (flag 2147483648: the layer's colour is linear already - Requiem's. sRGB both ways, the sign kept, nothing clamped: the
+// scenery comes as cs_layer_unblend left it)
+float3 ow_slin(float3 c) { const float3 m = abs(c); return sign(c) * (m <= 0.04045 ? m / 12.92 : pow((m + 0.055) / 1.055, 2.4)); }
+float3 ow_senc(float3 c) { const float3 m = abs(c); return sign(c) * (m <= 0.0031308 ? m * 12.92 : 1.055 * pow(m, 1.0 / 2.4) - 0.055); }
+float3 ow_over(float3 c, float4 ui) {
+    if (!(flags & 536870912)) return c * (1.0 - ui.a) + ui.rgb;
+    return ow_senc(ow_slin(c) * (1.0 - ui.a) + ((flags & 2147483648u) ? ui.rgb : ow_slin(ui.rgb)));
+}
 float3 ow_faint(float3 c, int2 p, float2 src) {
     const float here = ow_ui_t.Load(int3(p, 0)).a, there = ow_ui_t.SampleLevel(ow_linear, src, 0).a;
     if (there >= 0.5) return c;
@@ -3381,7 +3469,8 @@ float3 ow_faint(float3 c, int2 p, float2 src) {
 void ow_finish(uint2 pid, float2 uv, float2 src, bool valid) {
     const uint3 id = uint3(pid, 0);
     float4 c = ow_scene_from(id.xy, uv, src, valid);
-    if ((flags & 2) && ow_held(int3(id.xy, 0))) c = ow_color_t.Load(int3(id.xy, 0));
+    const bool held_here = (flags & 2) && ow_held(int3(id.xy, 0));
+    if (held_here) c = ow_held_colour(int3(id.xy, 0));
     else if ((flags & 2048) && valid) {
         const float4 here = ow_layer_t.Load(int3(id.xy, 0)), there = ow_layer_t.SampleLevel(ow_linear, src, 0);
         float3 scene = c.rgb - there.rgb;
@@ -3407,10 +3496,7 @@ void ow_finish(uint2 pid, float2 uv, float2 src, bool valid) {
         }
         c.rgb = lerp(scene + here.rgb, ow_color_t.Load(int3(id.xy, 0)).rgb, ow_cover(here));
     }
-    if (flags & 1) {
-        const float4 ui = ow_ui_t.Load(int3(id.xy, 0));
-        c.rgb = c.rgb * (1.0 - ui.a) + ui.rgb;
-    }
+    if ((flags & 1) && !((flags & 1073741824) && held_here)) c.rgb = ow_over(c.rgb, ow_ui_t.Load(int3(id.xy, 0)));
     if ((flags & 8388608) && valid && !((flags & 2) && ow_held(int3(id.xy, 0)))) c.rgb = ow_faint(c.rgb, int2(id.xy), src);
     // (the path / 16: the presenter's output is 8 or 10 bits per channel - whole numbers clamped to 1 there)
     if (flags & 32768) c = float4(float((flags & 2) && ow_held(int3(id.xy, 0)) ? 14 : ow_path) / 16.0, float(ow_why) / 16.0, 0, 1);
@@ -3454,8 +3540,9 @@ bool ow_lean_claim(float2 uv, out float2 src) {
 bool ow_lean(uint2 p) {
     const int3 pi = int3(p, 0);
     float4 c;
-    if ((flags & 2) && ow_held(pi)) {
-        c = ow_color_t.Load(pi);
+    const bool held_here = (flags & 2) && ow_held(pi);
+    if (held_here) {
+        c = ow_held_colour(pi);
     } else {
         const float2 uv = (float2(p) + 0.5) / float2(out_size);
         float2 src;
@@ -3472,10 +3559,7 @@ bool ow_lean(uint2 p) {
         }
         if (flags & 8388608) c.rgb = ow_faint(c.rgb, pi.xy, src);
     }
-    if (flags & 1) {
-        const float4 ui = ow_ui_t.Load(pi);
-        c.rgb = c.rgb * (1.0 - ui.a) + ui.rgb;
-    }
+    if ((flags & 1) && !((flags & 1073741824) && held_here)) c.rgb = ow_over(c.rgb, ow_ui_t.Load(pi));
     ow_out_u[p] = float4(c.rgb, 1);
     return true;
 }
@@ -3847,7 +3931,12 @@ bool mem_carry(float2 s, float far, out float4 prev, out float d, out float2 off
                 kept = float4(prev.rgb, age); kz = d; koff = off;
             }
         }
-        mem_u[id.xy] = keep ? kept : float4(mem_frame_t.SampleLevel(ow_linear, s, 0).rgb, 0);
+        // (flag 2048: the scenery taken out from under a colour layer, kept unclamped for laying the layer back exactly - see
+        // cs_layer_unblend: into the memory within range. Its 8-bit layer's rounding, grown under faint panels, carried and
+        // shown again behind the gun: behind false edges +11% at 30 fps, the synthetic colour scenes)
+        float3 seen_now = mem_frame_t.SampleLevel(ow_linear, s, 0).rgb;
+        if (flags & 2048) seen_now = (flags & 32768) ? max(seen_now, 0.0) : saturate(seen_now);
+        mem_u[id.xy] = keep ? kept : float4(seen_now, 0);
         memz_u[id.xy] = float2(keep ? kz : vz, mem_pack(keep ? koff : float2(0, 0)));
         return;
     }
@@ -4127,24 +4216,27 @@ RWTexture2D<float4> tint_u : register(u0);
     else if ((flags & 1) && s > 0.05) tint_u[id.xy] = float4(lerp(c.rgb, float3(0, 1, 0), 0.5 * saturate(s / 0.6)), c.a);
 }
 // Sequence recording (development, Renderer::record_frame): the game's picture shrunk by a whole factor (groups_x) to about
-// 1080 lines - a box average, grid its size, out_size the picture's - and with flag 1 the HUD layer's coverage likewise.
+// 1080 lines - a box average, grid its size, out_size the picture's - and with flag 1 the HUD layer likewise: its coverage,
+// or with its colour (RGBA - a layer that has one: see cs_layer_unblend) all four.
 Texture2D<float4> rec_colour_t : register(t0);
 Texture2D<float4> rec_ui_t : register(t1);
 RWTexture2D<float4> rec_colour_u : register(u0);
-RWTexture2D<unorm float> rec_ui_u : register(u1);
+RWTexture2D<float4> rec_ui_u : register(u1);
 [numthreads(8, 8, 1)] void cs_rec_down(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= grid)) return;
     const uint f = max(groups_x, 1u);
     float3 c = 0;
-    float a = 0;
+    float4 u = 0;
     for (uint y = 0; y < f; ++y)
         for (uint x = 0; x < f; ++x) {
             const int3 q = int3(min(id.xy * f + uint2(x, y), out_size - 1), 0);
             c += rec_colour_t.Load(q).rgb;
-            if (flags & 1) a += rec_ui_t.Load(q).a;
+            if (flags & 1) u += rec_ui_t.Load(q);
         }
     rec_colour_u[id.xy] = float4(c / float(f * f), 1);
-    rec_ui_u[id.xy] = (flags & 1) ? a / float(f * f) : 0.0;
+    u /= float(f * f);
+    // (a one-channel texture keeps x: the coverage there)
+    rec_ui_u[id.xy] = (flags & 1) ? ((flags & 2) ? u : u.aaaa) : 0.0;
 }
 )";
 
@@ -4187,7 +4279,9 @@ constexpr UINT kXRec = kXCoverUav + 2;
 constexpr UINT kXMemVisSrv = kXRec + Renderer::kRecSlots * 8, kXMemVisUav = kXMemVisSrv + 6;
 // The HUD layer from the HUD-less picture (cs_hudless_count, _ui, _keep at ingestion; 6 + 2 each).
 constexpr UINT kXHudUiSrv = kXMemVisUav + 2, kXHudUiUav = kXHudUiSrv + 6, kXHudKeepSrv = kXHudUiUav + 2, kXHudKeepUav = kXHudKeepSrv + 6;
-constexpr UINT kW = kXHudKeepUav + 2;
+// The scenery under a colour HUD layer (cs_layer_unblend; 6 + 2).
+constexpr UINT kXUnblendSrv = kXHudKeepUav + 2, kXUnblendUav = kXUnblendSrv + 6;
+constexpr UINT kW = kXUnblendUav + 2;
 enum WTable : UINT { kWWarp, kWShown, kWClear, kWSplat, kWMove, kWCopyColour, kWCopyDepth, kWJoinInit, kWJoinAB, kWJoinBA, kWJoinFinal,
                      kWGenDepth0, kWGenDepth1, kWGenDepth2, kWGenUi0, kWGenUi1, kWGenUi2, kWFgMotion, kWFgInverse, kWClaim,
                      kWStill, kWHoldInit, kWHoldAB, kWHoldBA, kWHoldFinal, kWHoldFill, kWHoldFillFinal, kWGrowInit, kWGrowAB, kWGrowBA,
@@ -4626,7 +4720,7 @@ bool Renderer::create_pipelines(std::string& error) {
         {"cs_scene_clear", &cs_scene_clear_}, {"cs_scene_accum", &cs_scene_accum_}, {"cs_scene_finish", &cs_scene_finish_},
         {"cs_scene_tiles", &cs_scene_tiles_}, {"cs_scene_hud", &cs_scene_hud_}, {"cs_scene_fill", &cs_scene_fill_}, {"cs_scene_grey", &cs_scene_grey_},
         {"cs_scene_grey_finish", &cs_scene_grey_finish_}, {"cs_scene_wash", &cs_scene_wash_}, {"cs_scene_wash_finish", &cs_scene_wash_finish_},
-        {"cs_attached", &cs_attached_}, {"cs_probe_tiles", &cs_probe_tiles_}, {"cs_probe_clear", &cs_probe_clear_}, {"cs_probe_score", &cs_probe_score_}, {"cs_memory", &cs_memory_}, {"cs_hudless_ui", &cs_hudless_ui_}, {"cs_hudless_keep", &cs_hudless_keep_}, {"cs_mem_vis", &cs_mem_vis_}, {"cs_ramp_rows", &cs_ramp_rows_}, {"cs_ramp", &cs_ramp_},
+        {"cs_attached", &cs_attached_}, {"cs_probe_tiles", &cs_probe_tiles_}, {"cs_probe_clear", &cs_probe_clear_}, {"cs_probe_score", &cs_probe_score_}, {"cs_memory", &cs_memory_}, {"cs_hudless_ui", &cs_hudless_ui_}, {"cs_hudless_keep", &cs_hudless_keep_}, {"cs_layer_unblend", &cs_layer_unblend_}, {"cs_layer_seam_clear", &cs_layer_seam_clear_}, {"cs_mem_vis", &cs_mem_vis_}, {"cs_ramp_rows", &cs_ramp_rows_}, {"cs_ramp", &cs_ramp_},
         {"cs_flow_luma", &cs_flow_luma_}, {"cs_flow_feat", &cs_flow_feat_}, {"cs_flow_search", &cs_flow_search_}, {"cs_flow_lk", &cs_flow_lk_},
         {"cs_flow_median", &cs_flow_median_}, {"cs_flow_motion", &cs_flow_motion_}, {"cs_flow_fill", &cs_flow_fill_},
         {"cs_ret_cells", &cs_ret_cells_}, {"cs_ret_enclose", &cs_ret_enclose_}, {"cs_ret_layer", &cs_ret_layer_},
@@ -4680,6 +4774,10 @@ bool Renderer::create_pipelines(std::string& error) {
     if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&grow_counts_)))) {
         error = "held area buffer"; return false;
     }
+    bd.Width = 32;  // the blend space's seam sums, the layer's colour against the frame (cs_layer_unblend)
+    if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&seam_counts_)))) {
+        error = "HUD layer seam buffer"; return false;
+    }
     bd.Width = 16;  // the HUD layer's check (cs_layer_check)
     if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&layer_counts_)))) {
         error = "HUD layer check buffer"; return false;
@@ -4728,6 +4826,10 @@ bool Renderer::create_pipelines(std::string& error) {
     bd.Width = kRing * 8;
     if (FAILED(device_->CreateCommittedResource(&rbh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&layer_readback_)))) {
         error = "HUD layer check readback"; return false;
+    }
+    bd.Width = kRing * 32;
+    if (FAILED(device_->CreateCommittedResource(&rbh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&seam_readback_)))) {
+        error = "HUD layer seam readback"; return false;
     }
     bd.Width = kRing * 16;
     if (FAILED(device_->CreateCommittedResource(&rbh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&hud_readback_)))) {
@@ -5616,6 +5718,7 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
         {
             XConstants k = c;
             k.flags = game_vectors_ || (flow_ui_masked_ && layer_faint_est_ != 0) || layer_faint_est_ == 2 ? 1u : 0u;  // (faint parts moved - see cs_layer_hud; and the warp, own_warp's cover)
+            if (src.scene_derived) k.flags |= 2u;  // (the scenery taken out of the frame: held only where too little shows through)
             x_dispatch(cs_layer_hud_.Get(), &k, kXHudlessSrv, kXHudlessUav, (ow + 7) / 8, (oh + 7) / 8);
         }
         transition(private_[kPHudScore], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -6130,12 +6233,18 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
     // Frame generation: one of the game's generated images, with its own depth (prepare_generated).
     const bool gen = generated >= 0 && generated < src.generated && shown(static_cast<PrivateId>(kPGen0 + generated)).width == ow &&
                      shown(static_cast<PrivateId>(kPGenZ0 + generated)).width == dw;
-    set_x_srv(t + 0, gen ? static_cast<PrivateId>(kPGen0 + generated) : split ? kPHudless : kPBackbuffer, true);
+    // (the scenery under a colour layer, taken out of the frame - see cs_layer_unblend: moved as a HUD-less picture is, the
+    // layer laid over it again; held pixels the frame as it is)
+    const bool derived = !split && !gen && src.scene_derived && shown(kPHudless).texture && shown(kPHudless).width == ow &&
+                         shown(kPUi).texture && shown(kPUi).width == ow;
+    const bool linear_over = (blend_linear_ || layer_linear_) && color_space_ != 1;
+    if (derived) c.flags |= 1u | 1073741824u | (linear_over ? 536870912u : 0u) | (linear_over && layer_linear_ ? 2147483648u : 0u);
+    set_x_srv(t + 0, gen ? static_cast<PrivateId>(kPGen0 + generated) : split || derived ? kPHudless : kPBackbuffer, true);
     // (the add-on's HUD layer, its coverage alone - one channel - while it gives the HUD: its faint parts moved, see ow_faint)
-    const bool cover = !split && mask && !gen && (game_vectors_ || (flow_ui_masked_ && layer_faint_est_ != 0) || layer_faint_est_ == 2) && src.has_ui && !src.has_hudless && layer_trust_ != 2 && !layer_full_ && shown(kPUi).texture &&
+    const bool cover = !split && !derived && mask && !gen && (game_vectors_ || (flow_ui_masked_ && layer_faint_est_ != 0) || layer_faint_est_ == 2) && src.has_ui && !src.has_hudless && layer_trust_ != 2 && !layer_full_ && shown(kPUi).texture &&
                        shown(kPUi).format == DXGI_FORMAT_R8_UNORM && shown(kPUi).width == ow && shown(kPUi).height == oh;
     if (cover) c.flags |= 8388608u;
-    set_x_srv(t + 1, split || cover ? kPUi : kPBackbuffer, true);  // (only read with a UI layer)
+    set_x_srv(t + 1, split || cover || derived ? kPUi : kPBackbuffer, true);  // (only read with a UI layer)
     set_x_srv(t + 2, mask ? mask_id : kPDepth, true);
     set_x_srv(t + 14, mask && share_mask ? kPShare : kPDepth, true);
     set_x_srv(t + 15, own_motion ? kPOwnMove : kPDepth, true);
@@ -6506,7 +6615,8 @@ bool Renderer::update_memory(const IngestedSource& src, const float clip_to_prev
     c.flags = (prev ? 1u : 0u) | (depth_inverted ? 16u : 0u) | (memory_margin_ ? 2u : 0u) | (objects ? 4u : 0u) | (mem_age_old_ ? 8u : 0u) | (mem_fringe_ ? 32u : 0u) |
               (mem_pos_ ? 512u : mem_nearest_ ? 0u : 1024u);
     // (the HUD-less picture when the game sends one: the memory is scenery)
-    const PrivateId frame = src.has_hudless && private_[kPHudless].texture ? kPHudless : kPBackbuffer;
+    const PrivateId frame = (src.has_hudless || src.scene_derived) && private_[kPHudless].texture ? kPHudless : kPBackbuffer;
+    if (frame == kPHudless && src.scene_derived) c.flags |= 2048u;
     set_x_srv(kXMemSrv + 0, frame);
     set_x_srv(kXMemSrv + 1, kPMask);
     set_x_srv(kXMemSrv + 2, kPDepth);
@@ -6872,6 +6982,28 @@ ID3D12GraphicsCommandList* Renderer::begin(int context) {
             grow_cells_ = v[frame_index_];
             D3D12_RANGE none{0, 0};
             grow_readback_->Unmap(0, &none);
+        }
+    }
+    // (the blend space: each way's misfit along the layer's faint edges, summed over the frames with a decay - see
+    // cs_layer_unblend; the better fit taken, nothing to tune)
+    if (seam_pending_[frame_index_] && seam_readback_) {
+        seam_pending_[frame_index_] = false;
+        std::uint32_t* v = nullptr;
+        D3D12_RANGE range{frame_index_ * 32, frame_index_ * 32 + 32};
+        if (SUCCEEDED(seam_readback_->Map(0, &range, reinterpret_cast<void**>(&v)))) {
+            const std::uint32_t* s = v + frame_index_ * 8;
+            if (s[2]) {
+                seam_stored_ = seam_stored_ * 0.98 + double(s[0]) / 1024.0;
+                seam_linear_ = seam_linear_ * 0.98 + double(s[1]) / 1024.0;
+                blend_linear_ = seam_linear_ < seam_stored_;
+            }
+            if (s[5]) {
+                layer_raw_ = layer_raw_ * 0.98 + double(s[3]) / 1024.0;
+                layer_enc_ = layer_enc_ * 0.98 + double(s[4]) / 1024.0;
+                layer_linear_ = layer_enc_ < layer_raw_;
+            }
+            D3D12_RANGE none{0, 0};
+            seam_readback_->Unmap(0, &none);
         }
     }
     if (layer_pending_[frame_index_] && layer_readback_) {
@@ -7276,7 +7408,10 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
     // (the coverage of the game's HUD layer, as the add-on hands it over, stays one channel: 8 MB at 4K instead of 64. Before
     // the motion estimate, which leaves out what it covers - see fl_under_hud)
     const auto& ui = m.tex[kUi];
-    const DXGI_FORMAT ui_format = static_cast<DXGI_FORMAT>(ui.format) == DXGI_FORMAT_R8_UNORM ? DXGI_FORMAT_R8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
+    // (a coverage alone kept one channel, a colour layer in 8 bits as it comes - the add-on's - else half floats)
+    const DXGI_FORMAT ui_source = static_cast<DXGI_FORMAT>(ui.format);
+    const DXGI_FORMAT ui_format = ui_source == DXGI_FORMAT_R8_UNORM ? DXGI_FORMAT_R8_UNORM
+                                  : ui_source == DXGI_FORMAT_R8G8B8A8_UNORM ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
     if (sources[kUi] && ui.width == bb.width && ui.height == bb.height && ensure_private(kPUi, bb.width, bb.height, ui_format)) {
         convert(sources[kUi], static_cast<DXGI_FORMAT>(ui.format), slot, kUi, kPUi, bb.width, bb.height);
         out.has_ui = true;
@@ -7326,6 +7461,39 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
         out.has_hudless = true;
     }
     // A HUD-less picture without a UI layer: the layer taken from the two (see cs_hudless_ui) - split as a game that sends both
+    // A UI layer with its colour and no HUD-less picture: the scenery under it taken out of the frame (cs_layer_unblend), into
+    // the HUD-less picture's texture - not reported as one (the HUD stays the layer's, held where it lets too little through)
+    if (out.has_ui && !out.has_hudless && colour_unblend_ && private_[kPUi].format != DXGI_FORMAT_R8_UNORM && private_[kPBackbuffer].texture &&
+        ensure_private(kPHudless, bb.width, bb.height, DXGI_FORMAT_R16G16B16A16_FLOAT)) {
+        XConstants u{};
+        u.out_size[0] = bb.width; u.out_size[1] = bb.height;
+        u.flags = (blend_linear_ ? 1u : 0u) | (layer_linear_ ? 2u : 0u) | (unblend_exact_ ? 4u : 0u);
+        for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXUnblendSrv + i, kPUi);
+        set_x_srv(kXUnblendSrv + 0, kPBackbuffer);
+        set_x_uav(kXUnblendUav + 0, kPHudless);
+        D3D12_UNORDERED_ACCESS_VIEW_DESC raw{};
+        raw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; raw.Format = DXGI_FORMAT_R32_TYPELESS;
+        raw.Buffer.NumElements = 8; raw.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        device_->CreateUnorderedAccessView(seam_counts_.Get(), nullptr, &raw, cpu(kXUnblendUav + 1));
+        D3D12_RESOURCE_BARRIER counts{}; counts.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; counts.UAV.pResource = seam_counts_.Get();
+        const bool sum = !seam_pending_[frame_index_];
+        if (sum) {
+            x_dispatch(cs_layer_seam_clear_.Get(), &u, kXUnblendSrv, kXUnblendUav, 1, 1);
+            list_->ResourceBarrier(1, &counts);
+        }
+        transition(private_[kPHudless], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        x_dispatch(cs_layer_unblend_.Get(), &u, kXUnblendSrv, kXUnblendUav, (bb.width + 7) / 8, (bb.height + 7) / 8);
+        transition(private_[kPHudless], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (sum) {
+            auto to_copy = transition_barrier(seam_counts_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list_->ResourceBarrier(1, &to_copy);
+            list_->CopyBufferRegion(seam_readback_.Get(), UINT64(frame_index_) * 32, seam_counts_.Get(), 0, 32);
+            std::swap(to_copy.Transition.StateBefore, to_copy.Transition.StateAfter);
+            list_->ResourceBarrier(1, &to_copy);
+            seam_pending_[frame_index_] = true;
+        }
+        out.scene_derived = true;
+    }
     // (its coverage kept from the frame before - cs_hudless_ui's flag 1 - only when that one made it, at this size)
     const bool ui_before = ui_synth_last_ && private_[kPUi].texture && private_[kPUi].width == bb.width && private_[kPUi].height == bb.height &&
                            private_[kPUi].format == DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -7728,7 +7896,10 @@ bool Renderer::record_frame(std::uint64_t tag, bool ui) {
     const UINT f = std::max(1u, static_cast<UINT>(std::lround(double(c0.height) / 1080.0)));
     const UINT cw = (c0.width + f - 1) / f, ch = (c0.height + f - 1) / f;
     ui = ui && private_[kPUi].texture && private_[kPUi].width == c0.width && private_[kPUi].height == c0.height;
-    if (!ensure_private(kPRecColour, cw, ch, DXGI_FORMAT_R11G11B10_FLOAT) || !ensure_private(kPRecUi, cw, ch, DXGI_FORMAT_R8_UNORM)) return false;
+    // (the layer with its colour when it has one - RGBA 8 bits, as the add-on hands it over: see cs_layer_unblend)
+    const bool ui_colour = ui && private_[kPUi].format != DXGI_FORMAT_R8_UNORM;
+    if (!ensure_private(kPRecColour, cw, ch, DXGI_FORMAT_R11G11B10_FLOAT) ||
+        !ensure_private(kPRecUi, cw, ch, ui_colour ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R8_UNORM)) return false;
     // (the read-back buffers, made again when a size changes)
     const PrivateId ids[4] = {kPRecColour, kPDepth, kPMotion, kPRecUi};
     for (int k = 0; k < 4; ++k) {
@@ -7753,7 +7924,7 @@ bool Renderer::record_frame(std::uint64_t tag, bool ui) {
     transition(private_[kPRecColour], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     transition(private_[kPRecUi], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     XConstants c{};
-    c.grid[0] = cw; c.grid[1] = ch; c.out_size[0] = c0.width; c.out_size[1] = c0.height; c.groups_x = f; c.flags = ui ? 1u : 0u;
+    c.grid[0] = cw; c.grid[1] = ch; c.out_size[0] = c0.width; c.out_size[1] = c0.height; c.groups_x = f; c.flags = (ui ? 1u : 0u) | (ui_colour ? 2u : 0u);
     x_dispatch(cs_rec_down_.Get(), &c, t, t + kXSrvCount, (cw + 7) / 8, (ch + 7) / 8);
     for (int k = 0; k < 4; ++k) {
         auto& src = private_[ids[k]];
@@ -7770,7 +7941,8 @@ bool Renderer::record_frame(std::uint64_t tag, bool ui) {
     return true;
 }
 
-// The oldest recorded frame the GPU has finished, in tight rows (colour R11G11B10, depth R32F, motion R16G16F, coverage R8).
+// The oldest recorded frame the GPU has finished, in tight rows (colour R11G11B10, depth R32F, motion R16G16F, the layer's
+// coverage R8 - or with its colour, RGBA8).
 // (one other thread may call it - the presenter's collector - while the render thread records: the slots' states are
 // atomic, 0 free, 1 queued, 2 submitted)
 bool Renderer::take_recorded(RecordedFrame& out) {
@@ -7787,7 +7959,8 @@ bool Renderer::take_recorded(RecordedFrame& out) {
         if (k == 3 && !r.has_ui) continue;
         std::uint8_t* mapped = nullptr;
         if (FAILED(r.buffer[k]->Map(0, nullptr, reinterpret_cast<void**>(&mapped)))) { r.state.store(0, std::memory_order_release); return false; }
-        const std::size_t row = std::size_t(r.width[k]) * kBytes[k];
+        const std::uint32_t bytes = k == 3 && r.foot[k].Footprint.Format == DXGI_FORMAT_R8G8B8A8_UNORM ? 4u : kBytes[k];
+        const std::size_t row = std::size_t(r.width[k]) * bytes;
         dst[k]->resize(row * r.height[k]);
         for (std::uint32_t y = 0; y < r.height[k]; ++y)
             std::memcpy(dst[k]->data() + y * row, mapped + r.foot[k].Offset + std::size_t(y) * r.foot[k].Footprint.RowPitch, row);

@@ -452,7 +452,12 @@ void Producer::on_ui_layer(ID3D12Resource* source, D3D12_RESOURCE_STATES state, 
     if (!ready() || !source || !list || !device_) return;
     const auto desc = source->GetDesc();
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1) return;
-    const DXGI_FORMAT format = copy_format(desc.Format);
+    // (an sRGB layer copied as its family's typeless format: read as plain UNORM, its bytes as the game stored them - read
+    // through its sRGB format it came out decoded to linear and was stored in 8 bits so, the darks in steps: banding in
+    // RE Requiem's menus and dark corners where the scenery under its layer moved, 2026-10-22)
+    DXGI_FORMAT format = copy_format(desc.Format);
+    if (format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    else if (format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) format = DXGI_FORMAT_B8G8R8A8_TYPELESS;
     if (!ui_pending_ || ui_pending_->GetDesc().Width != desc.Width || ui_pending_->GetDesc().Height != desc.Height ||
         ui_pending_->GetDesc().Format != format) {
         // (the old one may still be in use on the GPU - the last frame's copies: kept until the fence is past it, as the
@@ -1063,18 +1068,23 @@ void Producer::d3d11_cover(ID3D11DeviceContext* context, int slot) {
     ++shared_->hooks.ui_layer_handed;
 }
 
-// The HUD layer's coverage pass (see begin_present): alpha into an 8-bit one-channel texture - 1 - alpha for a layer
-// cleared to opaque black (INVERTED: its alpha is how much of the picture shows through, Armored Core VI).
+// The HUD layer pass (see begin_present): its colour and coverage - premultiplied RGB as the game blended it in, and alpha;
+// 1 - alpha for a layer cleared to opaque black (INVERTED: its alpha is how much of the picture shows through, Armored Core
+// VI - its colour is the HUD's all the same). With the colour the presenter takes the HUD back out of the frame exactly
+// (cs_layer_unblend): a faint white line or a glow is no longer told from a dark panel by its coverage alone. 8 bits a
+// channel, half floats for a layer that is floating point (HDR: its colour above 1).
 static const char kUiAlphaShader[] = R"(
 Texture2D<float4> layer : register(t0);
-RWTexture2D<unorm float> coverage : register(u0);
+RWTexture2D<float4> coverage : register(u0);
 [numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
     uint w, h;
     coverage.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    const float4 c = layer.Load(int3(id.xy, 0));
 #ifdef INVERTED
-    if (id.x < w && id.y < h) coverage[id.xy] = 1.0 - layer.Load(int3(id.xy, 0)).a;
+    coverage[id.xy] = float4(c.rgb, 1.0 - c.a);
 #else
-    if (id.x < w && id.y < h) coverage[id.xy] = layer.Load(int3(id.xy, 0)).a;
+    coverage[id.xy] = c;
 #endif
 }
 )";
@@ -1164,13 +1174,17 @@ std::uint64_t Producer::begin_present(ID3D12Resource* backbuffer, ID3D12Graphics
     // submitted right after: the descriptor heap bound here disturbs nothing of the game's)
     if (ui_pending_valid_ && !layer_not_kept && !m.tex[kUi].valid && ensure_ui_pass()) {
         const auto pd = ui_pending_->GetDesc();
-        if (!ui_alpha_ || ui_alpha_->GetDesc().Width != pd.Width || ui_alpha_->GetDesc().Height != pd.Height) {
+        // (the layer handed over with its colour - see kUiAlphaShader)
+        const DXGI_FORMAT tf = typed_format(pd.Format);
+        const DXGI_FORMAT ui_format = tf == DXGI_FORMAT_R16G16B16A16_FLOAT || tf == DXGI_FORMAT_R32G32B32A32_FLOAT || tf == DXGI_FORMAT_R11G11B10_FLOAT
+                                          ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+        if (!ui_alpha_ || ui_alpha_->GetDesc().Width != pd.Width || ui_alpha_->GetDesc().Height != pd.Height || ui_alpha_->GetDesc().Format != ui_format) {
             if (ui_alpha_) retired_.push_back({ui_alpha_, nullptr, fence_value_ + 1, {}, nullptr});
             ui_alpha_.Reset();
             D3D12_RESOURCE_DESC ad{};
             ad.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
             ad.Width = pd.Width; ad.Height = pd.Height; ad.DepthOrArraySize = 1; ad.MipLevels = 1;
-            ad.Format = DXGI_FORMAT_R8_UNORM; ad.SampleDesc.Count = 1; ad.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            ad.Format = ui_format; ad.SampleDesc.Count = 1; ad.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
             D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
             if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &ad, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&ui_alpha_))))
                 ui_alpha_.Reset();
@@ -1187,7 +1201,7 @@ std::uint64_t Producer::begin_present(ID3D12Resource* backbuffer, ID3D12Graphics
             device_->CreateShaderResourceView(ui_pending_.Get(), &sv, cpu);
             cpu.ptr += ui_heap_step_;
             D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
-            uv.Format = DXGI_FORMAT_R8_UNORM;
+            uv.Format = ui_format;
             uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
             device_->CreateUnorderedAccessView(ui_alpha_.Get(), nullptr, &uv, cpu);
             D3D12_RESOURCE_BARRIER b[2]{};
