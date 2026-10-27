@@ -623,6 +623,7 @@ private:
     // light (0.34 either way), the scenery taken out under its minimap and menus came out wrong and they tinted while
     // turning. Not fitting, or not measured yet: the layer's coverage alone, as before colour layers (ow_faint)
     double layer_opaque_ = 0;
+    std::uint64_t layer_fit_frames_ = 0, layer_misfit_frames_ = 0;  // (frames whose opaque pixels fit, and not - see layer_fits_)
     bool layer_fits_ = false;
     bool blend_linear_ = false, layer_linear_ = false;
     int layer_trust_ = 0;

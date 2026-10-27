@@ -7165,8 +7165,13 @@ ID3D12GraphicsCommandList* Renderer::begin(int context) {
                 layer_opaque_ = layer_opaque_ * 0.98 + double(s[5]);
                 layer_linear_ = layer_enc_ < layer_raw_;
                 // (the colour path only where the layer's colour is what the game lays: where opaque, the frame within an
-                // 8-bit step a channel of the layer, one way or the other - see layer_fits_)
-                layer_fits_ = std::min(layer_raw_, layer_enc_) <= layer_opaque_ * 3.0 / 255.0;
+                // 8-bit step a channel of the layer, one way or the other - see layer_fits_. Each frame votes and most frames
+                // decide, counted over the session: from the faded misfit, a few frames that did not fit - a menu, a
+                // screen effect - turned Armored Core VI's colour path off for seconds at a time, its crosshair sliding
+                // and snapping back until it came on again)
+                const bool frame_fits = std::min(double(s[3]), double(s[4])) / 1024.0 <= double(s[5]) * 3.0 / 255.0;
+                (frame_fits ? layer_fit_frames_ : layer_misfit_frames_) += 1;
+                layer_fits_ = layer_fit_frames_ > layer_misfit_frames_;
             }
             D3D12_RANGE none{0, 0};
             seam_readback_->Unmap(0, &none);
