@@ -74,6 +74,9 @@ struct MotionFit {
 class Renderer {
 public:
     ~Renderer();
+    // (2.2 Phase 0, development: the presenter inside the game - the renderer on the game's own device instead of one of
+    // its own; set before init)
+    void use_device(ID3D12Device* device) { external_device_ = device; }
     bool init(const LUID& adapter, HWND window, std::uint32_t width, std::uint32_t height, DXGI_FORMAT game_format,
               std::uint32_t color_space, std::string& error);
     ID3D12Device* device() const { return device_.Get(); }
@@ -471,7 +474,7 @@ private:
     // Two recording contexts: 0 the realtime (direct) queue, 1 the intake (compute) queue with split
     // queues. Frame slots 0-2 belong to context 0 and 3-5 to context 1 (allocators, readbacks, timing).
     static constexpr int kRing = 6;
-    ComPtr<ID3D12Device> device_;
+    ComPtr<ID3D12Device> device_, external_device_;
     ComPtr<ID3D12CommandQueue> queue_, iqueue_;
     ComPtr<ID3D12CommandAllocator> allocators_[kRing];
     ComPtr<ID3D12GraphicsCommandList> list_, lists_[2];

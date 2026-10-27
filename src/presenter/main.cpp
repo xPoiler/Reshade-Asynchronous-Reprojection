@@ -38,6 +38,20 @@ double now_seconds() { return seconds(qpc_now()); }
 
 struct App {
     DWORD pid = 0;
+    // The presenter inside the game (Direct3D 12 games): FrameWarpPresenter.dll, started by the add-on with the game's
+    // device - no process-wide changes (priority classes, DPI), and a lost device ends the presenter, not the game.
+    // start_failed: the renderer did not start there - the add-on falls back to FrameWarpPresenter.exe
+    ID3D12Device* device = nullptr;
+    bool in_process = false;
+    DWORD ui_thread = 0;
+    std::atomic<bool> start_failed{false};
+    // (development, a gate for an intake inside the game beside the exe's warp: FW_SHADOW_INTAKE=1, set by the add-on with ShadowIntake=1. Inside
+    // the game beside FrameWarpPresenter.exe, taking in every game frame as Show original does and nothing else: no window,
+    // no warp, no present, no claims - on a private copy of the shared memory, refreshed every refresh, so nothing it
+    // writes reaches the add-on or the exe. What the game's fps loses to it is the intake's cost inside the game while the
+    // exe's warp interrupts the game)
+    bool shadow = false;
+    Shared* real_shared = nullptr;
     HANDLE game_process = nullptr;
     HANDLE mapping = nullptr;
     Shared* shared = nullptr;
@@ -70,7 +84,10 @@ struct App {
     std::int64_t events_read = 0;
     bool mark_was_down = false, dump_was_down = false, record_was_down = false;
 };
-App g_app;
+// (never destroyed, nor g_rec and g_files: inside the game - FrameWarpPresenter.dll - the process ends under the presenter's
+// threads, and a std::thread still running when its owner is destroyed aborts the game on exit; the add-on keeps its
+// producer the same way)
+App& g_app = *new App;
 
 // Sequence recording (development, Ctrl+Shift+F8 with "Record detailed diagnostics" ticked): every game frame the presenter
 // takes in - its picture shrunk to about 1080 lines, depth, motion vectors, the HUD layer's coverage - and per frame the
@@ -179,7 +196,7 @@ struct SequenceRecorder {
         busy = false;
     }
 };
-SequenceRecorder g_rec;
+SequenceRecorder& g_rec = *new SequenceRecorder;
 
 // Files (the log and the recordings) are written by a background thread. A disk write can take several
 // ms (a slow or busy drive, antivirus), and the refresh loop must never wait for one: written in place, a
@@ -246,7 +263,7 @@ private:
     std::vector<std::pair<std::filesystem::path, std::string>> replace_;
     std::thread thread_;
 };
-FileWriter g_files;
+FileWriter& g_files = *new FileWriter;
 void wr(FILE* f, const char* format, ...) {
     if (!f) return;
     va_list args; va_start(args, format);
@@ -307,6 +324,7 @@ void logf(const char* format, ...) {
     if (m > 0) n += std::min(m, int(sizeof(line)) - n - 2);
     line[n++] = '\n';
     g_files.write(g_app.log, line, std::size_t(n));
+    if (g_app.in_process) g_files.flush_now();  // (inside the game a crash takes the presenter with it: every line on disk)
 }
 
 // Detailed diagnostics: the add-on's call counters once a second (hooks.csv) - which calls stop when the frames
@@ -443,6 +461,9 @@ struct VramMonitor {
             if (_wcsnicmp(items[i].szName, luid_tag, wcslen(luid_tag)) == 0) total += items[i].FmtValue.doubleValue;
         return total / (1024.0 * 1024.0);
     }
+    // (inside the game the process's use and budget are the game's and XPAR's together - the right ones for the guard:
+    // its steps free XPAR's part of them)
+    static const char* who() { return g_app.in_process ? "game + presenter" : "presenter"; }
     // (fast: every 0.25 s instead of 2 - while the memory guard has let something go, so it comes back as soon as there is room)
     void poll(double now, const char* reason = nullptr, bool fast = false) {
         if (!reason && now - last_poll < (fast ? 0.25 : 2.0)) return;
@@ -459,13 +480,13 @@ struct VramMonitor {
         const bool own_tight = own.Budget && double(own.Budget) < double(own.CurrentUsage) * 1.25;
         const bool card_full = size_mb > 0 && total > 0 && total >= 0.95 * size_mb;
         if (own_tight || card_full) {
-            if (pressure_until < now) logf("vram nearly full: presenter %.0f MB of a %.0f MB budget, adapter %.0f of %.0f MB in use", own_mb, budget_mb, total,
-                                           size_mb);
+            if (pressure_until < now) logf("vram nearly full: %s %.0f MB of a %.0f MB budget, adapter %.0f of %.0f MB in use", who(), own_mb, budget_mb,
+                                           total, size_mb);
             pressure_until = now + 30.0;
         }
         if (!reason && std::abs(total - logged_total) < 100 && now - last_log < 30.0) return;
-        logf("vram%s%s: adapter %.0f MB used (all processes) | presenter %.0f MB, budget %.0f MB", reason ? " at " : "", reason ? reason : "",
-             total, own.CurrentUsage / 1048576.0, own.Budget / 1048576.0);
+        logf("vram%s%s: adapter %.0f MB used (all processes) | %s %.0f MB, budget %.0f MB", reason ? " at " : "", reason ? reason : "",
+             total, who(), own.CurrentUsage / 1048576.0, own.Budget / 1048576.0);
         logged_total = total; last_log = now;
     }
 };
@@ -504,7 +525,7 @@ struct MemoryGuard {
         if (v.own_mb > 0.98 * v.budget_mb && level < 3 && now - changed >= 4.0) {
             if (now - recovered < 30.0) hold = std::min(hold * 2.0, 30.0);  // (5, 10, 20, 30 s)
             before_mb[++level] = v.own_mb; freed_mb[level] = 0; measuring = true; changed = now; roomy_since = -1;
-            logf("video memory short: presenter %.0f MB of a %.0f MB budget - %s let go of", v.own_mb, v.budget_mb, what(level));
+            logf("video memory short: %s %.0f MB of a %.0f MB budget - %s let go of", VramMonitor::who(), v.own_mb, v.budget_mb, what(level));
             return true;
         }
         if (level > 0 && !measuring && v.own_mb + freed_mb[level] < 0.9 * v.budget_mb) {
@@ -713,7 +734,11 @@ void controller_thread() {
 std::uint32_t g_applied_priority = 0xFFFFFFFF;
 void apply_gpu_priority(std::uint32_t setting) {
     if (setting == g_applied_priority) return;
+    // (inside the game too, and the game's own work with it - the class is the process's: on its queue priority alone
+    // the warp's presents missed their refresh, two refreshes apart half the time while turning - Cyberpunk 2077,
+    // 2026-10-27: 60 pictures a second on screen of the 120 drawn)
     g_applied_priority = setting;
+    if (g_app.shadow) { std::snprintf(g_gpu_priority, sizeof(g_gpu_priority), "%s", "the game's (shadow intake)"); return; }
     using SetClassFn = LONG(APIENTRY*)(HANDLE, int);
     auto fn = reinterpret_cast<SetClassFn>(GetProcAddress(GetModuleHandleW(L"gdi32.dll"), "D3DKMTSetProcessSchedulingPriorityClass"));
     const int wanted = setting == 1 ? 4 : setting == 2 ? 2 : 5;  // D3DKMT class: 2 normal, 4 high, 5 realtime
@@ -759,8 +784,10 @@ void render_thread() {
     std::string error;
     const std::uint32_t w = sh.backbuffer_width, h = sh.backbuffer_height;
     Renderer::set_shader_cache((g_app.data_dir / L"shadercache").wstring());
+    if (g_app.device) renderer.use_device(g_app.device);
     if (!renderer.init(sh.adapter, g_app.overlay, w, h, static_cast<DXGI_FORMAT>(sh.backbuffer_format), sh.color_space, error)) {
         set_status("Renderer init failed: %s", error.c_str()); logf("renderer init failed: %s", error.c_str());
+        g_app.start_failed = true;
         g_app.running = false; PostMessageW(g_app.overlay, WM_CLOSE, 0, 0); return;
     }
     logf("renderer ready %ux%u, queue priority %s; %s", w, h, renderer.queue_priority(), renderer.shader_report().c_str());
@@ -769,7 +796,8 @@ void render_thread() {
     vram.poll(now_seconds(), "start");
     MemoryGuard memory_guard;
     Latewarp12 latewarp;
-    if (!latewarp.initialize(renderer.device(), g_app.base_dir, g_app.data_dir / L"logs"))
+    if (g_app.in_process) logf("in the game's process on its device: latewarp not used");  // (the game's own NGX)
+    else if (!latewarp.initialize(renderer.device(), g_app.base_dir, g_app.data_dir / L"logs"))
         logf("latewarp unavailable: %s", latewarp.status().c_str());
     else
         logf("latewarp ready");
@@ -896,10 +924,18 @@ void render_thread() {
         }
         else if (!paced_last) sleep_until(qpc_now() + g_qpc_frequency / 1000);
         if (!g_app.running) break;
+        if (g_app.shadow) {
+            std::memcpy(&sh, g_app.real_shared, sizeof(Shared));
+            sh.settings.show_original = 1;
+            sh.presenter.pid = static_cast<LONG>(GetCurrentProcessId());
+        }
         Settings settings = sh.settings;
         // (the memory guard: what it let go of stays off - see MemoryGuard)
         vram.poll(now_seconds(), nullptr, memory_guard.level > 0);
-        if (memory_guard.update(vram, now_seconds())) {
+        // (not inside the game: the budget there is the game's and XPAR's together, and the game's own streaming answers to
+        // it - Cyberpunk 2077 at 4K, 2026-10-27: stepped aside at 98%, then the game alone used 7.1-7.5 GB of a 6.9 GB budget
+        // and XPAR never came back; stepping aside only made room the game took. Pressure is still logged - see VramMonitor)
+        if (!g_app.in_process && memory_guard.update(vram, now_seconds())) {
             if (memory_guard.level >= 1) renderer.release_reticle_layers();
             if (memory_guard.level >= 2) renderer.release_memory();
         }
@@ -930,7 +966,7 @@ void render_thread() {
             int newest = -1;
             for (int i = 0; i < kSlots; ++i) {
                 const auto& m = sh.slots[i];
-                if (m.state == kReady && m.frame_id > source_frame && m.camera.valid && m.fence_value <= game_done &&
+                if ((m.state == kReady || (g_app.shadow && m.state == kReading)) && m.frame_id > source_frame && m.camera.valid && m.fence_value <= game_done &&
                     (newest < 0 || m.frame_id > sh.slots[newest].frame_id)) newest = i;
             }
             if (newest >= 0 || !source_frame) return newest;
@@ -955,7 +991,7 @@ void render_thread() {
         // estimates the camera, builds the no-warp mask and makes the frame the source. Between refreshes
         // the two steps are separate submissions, so the CPU never waits for the GPU in between.
         auto take_in_start = [&](int newest) {
-            if (InterlockedCompareExchange(&sh.slots[newest].state, kReading, kReady) != kReady) return false;
+            if (!g_app.shadow && InterlockedCompareExchange(&sh.slots[newest].state, kReading, kReady) != kReady) return false;
             const SlotMeta& m = sh.slots[newest];
             // The previous frame's colour feeds the learned HUD detector; not needed while the HUD comes from
             // the upscaler's output.
@@ -2111,6 +2147,11 @@ void render_thread() {
                 for (const auto& entry : held) InterlockedCompareExchange(&sh.slots[entry.slot].state, kFree, kReading);
                 sh.presenter.pid = 0;
                 g_files.flush_now();
+                if (g_app.in_process) {  // (in the game: end the presenter, never the game)
+                    g_app.running = false;
+                    PostThreadMessageW(g_app.ui_thread, WM_QUIT, 0, 0);
+                    for (;;) Sleep(1000);  // (nothing on a lost device completes: no teardown)
+                }
                 ExitProcess(0);
             }
             auto& st = sh.presenter;
@@ -2318,7 +2359,7 @@ void follow_game_window() {
     show = show && (fg == game || fg == g_app.overlay);
     g_app.visible = show;
     // Never cover the game until we actually have frames to show (avoids a black overlay).
-    if (show && g_app.has_frames) {
+    if (show && g_app.has_frames && !g_app.shadow) {  // (the shadow intake works while the game is in front, never shown)
         const int w = rc.right - rc.left, h = rc.bottom - rc.top;
         SetWindowPos(g_app.overlay, HWND_TOPMOST, origin.x, origin.y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         g_app.client_w = static_cast<std::uint32_t>(w); g_app.client_h = static_cast<std::uint32_t>(h);
@@ -2326,6 +2367,24 @@ void follow_game_window() {
         ShowWindow(g_app.overlay, SW_HIDE);
     }
 }
+
+void take_mouse(std::int64_t q, long dx, long dy) {
+    // (not while the ReShade menu has the mouse: the game's camera does not move then)
+    if (!g_app.shared || !g_app.shared->overlay_open) g_app.model.mouse.add(seconds(q), dx, dy);
+    if (rec(g_app.csv_mouse)) wr(g_app.csv_mouse, "%lld,%ld,%ld\n", q, dx, dy);
+}
+
+// (2.2 Phase 0, development: inside the game the raw mouse is read by a small process of its own -
+// FrameWarpPresenter.exe --mouse-for <pid> - since raw input is one registration per process and ours would take the
+// game's; it hands the events over in this ring, signalling the event after each)
+struct MouseRing {
+    struct Event { std::int64_t qpc; std::int32_t dx, dy; };
+    static constexpr std::uint32_t kSize = 4096;
+    volatile LONG64 written;
+    Event events[kSize];
+};
+std::wstring mouse_ring_name(DWORD pid) { return L"Local\\FrameWarpMouse_" + std::to_wstring(pid); }
+std::wstring mouse_event_name(DWORD pid) { return L"Local\\FrameWarpMouseEvent_" + std::to_wstring(pid); }
 
 LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
@@ -2335,12 +2394,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT, &raw, &size, sizeof(RAWINPUTHEADER)) != UINT(-1) &&
                 raw.header.dwType == RIM_TYPEMOUSE && !(raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) &&
                 (raw.data.mouse.lLastX || raw.data.mouse.lLastY))
-            {
-                const std::int64_t q = qpc_now();
-                // (not while the ReShade menu has the mouse: the game's camera does not move then)
-                if (!g_app.shared || !g_app.shared->overlay_open) g_app.model.mouse.add(seconds(q), raw.data.mouse.lLastX, raw.data.mouse.lLastY);
-                if (rec(g_app.csv_mouse)) wr(g_app.csv_mouse, "%lld,%ld,%ld\n", q, raw.data.mouse.lLastX, raw.data.mouse.lLastY);
-            }
+                take_mouse(qpc_now(), raw.data.mouse.lLastX, raw.data.mouse.lLastY);
             break;  // DefWindowProc must still run for WM_INPUT cleanup
         }
         case WM_TIMER:
@@ -2359,6 +2413,79 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+// The in-process presenter's side of the mouse ring: creates it, starts the helper and feeds its events in, on a thread
+// of its own (the render thread never waits for the mouse).
+std::thread start_mouse_from_helper() {
+    HANDLE map = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(MouseRing), mouse_ring_name(g_app.pid).c_str());
+    auto* ring = map ? static_cast<MouseRing*>(MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(MouseRing))) : nullptr;
+    HANDLE signal = CreateEventW(nullptr, FALSE, FALSE, mouse_event_name(g_app.pid).c_str());
+    std::wstring cmd = L"\"" + (g_app.base_dir / L"FrameWarpPresenter.exe").wstring() + L"\" --mouse-for " + std::to_wstring(g_app.pid);
+    STARTUPINFOW si{sizeof(si)};
+    PROCESS_INFORMATION pi{};
+    if (!ring || !signal || !CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        logf("in the game's process: the mouse helper did not start - no raw mouse input");
+        return {};
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    logf("in the game's process: raw mouse input from a helper process (pid %lu)", pi.dwProcessId);
+    return std::thread([ring, signal]() {
+        LONG64 read = 0;
+        while (g_app.running) {
+            if (WaitForSingleObject(signal, 100) != WAIT_OBJECT_0) continue;
+            const LONG64 written = InterlockedCompareExchange64(&ring->written, 0, 0);
+            if (written - read > LONG64(MouseRing::kSize)) read = written - MouseRing::kSize;
+            for (; read < written; ++read) {
+                const MouseRing::Event e = ring->events[read % MouseRing::kSize];
+                take_mouse(e.qpc, e.dx, e.dy);
+            }
+        }
+    });
+}
+
+#ifndef FW_PRESENTER_DLL
+MouseRing* g_mouse_ring = nullptr;
+HANDLE g_mouse_signal = nullptr;
+
+LRESULT CALLBACK mouse_helper_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_INPUT) {
+        RAWINPUT raw{};
+        UINT size = sizeof(raw);
+        if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT, &raw, &size, sizeof(RAWINPUTHEADER)) != UINT(-1) &&
+            raw.header.dwType == RIM_TYPEMOUSE && !(raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) &&
+            (raw.data.mouse.lLastX || raw.data.mouse.lLastY))
+        {
+            const LONG64 n = g_mouse_ring->written;
+            g_mouse_ring->events[n % MouseRing::kSize] = {qpc_now(), raw.data.mouse.lLastX, raw.data.mouse.lLastY};
+            InterlockedExchange64(&g_mouse_ring->written, n + 1);
+            SetEvent(g_mouse_signal);
+        }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// FrameWarpPresenter.exe --mouse-for <pid>: the raw mouse for the presenter inside that game; ends with the game.
+int mouse_helper(HINSTANCE instance, DWORD pid) {
+    HANDLE game = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    HANDLE map = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, mouse_ring_name(pid).c_str());
+    g_mouse_signal = OpenEventW(EVENT_MODIFY_STATE, FALSE, mouse_event_name(pid).c_str());
+    g_mouse_ring = map ? static_cast<MouseRing*>(MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(MouseRing))) : nullptr;
+    if (!game || !g_mouse_signal || !g_mouse_ring) return 1;
+    SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = mouse_helper_proc; wc.hInstance = instance; wc.lpszClassName = L"FrameWarpMouse";
+    RegisterClassW(&wc);
+    HWND window = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"FrameWarp mouse", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
+    RAWINPUTDEVICE rid{0x01, 0x02, RIDEV_INPUTSINK, window};  // generic desktop / mouse
+    if (!window || !RegisterRawInputDevices(&rid, 1, sizeof(rid))) return 1;
+    for (;;) {
+        if (MsgWaitForMultipleObjects(1, &game, FALSE, INFINITE, QS_ALLINPUT) == WAIT_OBJECT_0) return 0;
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+    }
+}
+#endif
+
 bool open_shared(DWORD pid) {
     for (int attempt = 0; attempt < 300; ++attempt) {
         g_app.mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, map_name(pid).c_str());
@@ -2369,24 +2496,32 @@ bool open_shared(DWORD pid) {
     g_app.shared = static_cast<Shared*>(MapViewOfFile(g_app.mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Shared)));
     if (!g_app.shared || g_app.shared->magic != kMagic || g_app.shared->version != kVersion) return false;
     for (int attempt = 0; attempt < 600 && (!g_app.shared->game_hwnd || !g_app.shared->backbuffer_width); ++attempt) Sleep(100);
+    if (g_app.shadow) {  // (see App::shadow)
+        g_app.real_shared = g_app.shared;
+        g_app.shared = new Shared;
+        std::memcpy(g_app.shared, g_app.real_shared, sizeof(Shared));
+    }
     return g_app.shared->game_hwnd && g_app.shared->backbuffer_width;
 }
 
 }  // namespace
 }  // namespace fw
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+static int presenter_main(HINSTANCE instance, DWORD pid, const std::filesystem::path& base_dir, ID3D12Device* device) {
     using namespace fw;
     LARGE_INTEGER f; QueryPerformanceFrequency(&f); g_qpc_to_seconds = 1.0 / double(f.QuadPart); g_qpc_frequency = f.QuadPart;
-    int argc = 0;
-    wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    for (int i = 1; i + 1 < argc; ++i)
-        if (std::wstring(argv[i]) == L"--pid") g_app.pid = static_cast<DWORD>(std::wcstoul(argv[i + 1], nullptr, 10));
-    wchar_t exe[MAX_PATH]{};
-    GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    g_app.base_dir = std::filesystem::path(exe).parent_path();
+    g_app.pid = pid;
+    g_app.base_dir = base_dir;
+    g_app.device = device;
+    g_app.in_process = device != nullptr;
+    g_app.ui_thread = GetCurrentThreadId();
     // Logs, calibration and captures go next to the presenter; some game folders only let administrators
     // write (the game then runs as the user), so fall back to the user's local app data.
+    {
+        wchar_t shadow[4]{};
+        g_app.shadow = g_app.in_process && GetEnvironmentVariableW(L"FW_SHADOW_INTAKE", shadow, 4) && shadow[0] == L'1';
+        if (g_app.shadow) g_app.base_dir /= L"shadow";  // (its own logs and shader cache: the exe keeps FrameWarp's)
+    }
     g_app.data_dir = g_app.base_dir;
     {
         std::error_code ec;
@@ -2416,13 +2551,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
         logf("FrameWarp presenter " FW_VERSION ", qpc frequency %lld", fq.QuadPart);
         if (g_app.data_dir != g_app.base_dir) logf("the FrameWarp folder is read-only: logs and calibration are kept in %ls", g_app.data_dir.c_str());
+        if (g_app.in_process) logf("running inside the game's process, on its D3D12 device");
     }
     if (!g_app.pid) { logf("usage: FrameWarpPresenter --pid <game pid>"); return 1; }
 
     // One presenter per game.
     const std::wstring mutex_name = L"Local\\FrameWarpPresenter_" + std::to_wstring(g_app.pid);
-    HANDLE single = CreateMutexW(nullptr, TRUE, mutex_name.c_str());
-    if (GetLastError() == ERROR_ALREADY_EXISTS) { logf("presenter already running"); g_files.stop(); return 0; }
+    HANDLE single = g_app.shadow ? nullptr : CreateMutexW(nullptr, TRUE, mutex_name.c_str());  // (the shadow beside the exe: see App::shadow)
+    if (single && GetLastError() == ERROR_ALREADY_EXISTS) { logf("presenter already running"); g_files.stop(); return 0; }
 
     g_app.game_process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, g_app.pid);
     wchar_t game_exe[MAX_PATH]{}; DWORD len = MAX_PATH;
@@ -2430,7 +2566,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         g_app.profile_path = g_app.data_dir / L"profiles" / (std::filesystem::path(game_exe).stem().wstring() + L".txt");
     else
         g_app.profile_path = g_app.data_dir / L"profiles" / L"default.txt";
-    if (!open_shared(g_app.pid)) { logf("shared memory from the game add-on not found"); return 1; }
+    if (!open_shared(g_app.pid)) {
+        logf("shared memory from the game add-on not found");
+        if (single) CloseHandle(single);  // (inside the game: the presenter the add-on falls back to must not find it taken)
+        g_files.stop();
+        return 1;
+    }
     g_app.shared->presenter.pid = static_cast<LONG>(GetCurrentProcessId());
     g_app.game = reinterpret_cast<HWND>(g_app.shared->game_hwnd);
     load_profile();
@@ -2438,7 +2579,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
          g_app.shared->backbuffer_height, g_app.shared->backbuffer_format, g_app.shared->color_space);
 
     // Render thread priority matters as much as GPU priority for hitting every vblank.
-    SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+    if (!g_app.in_process) SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
     apply_gpu_priority(g_app.shared->settings.gpu_priority);
     {
         const std::uint32_t hags = hardware_scheduling(g_app.shared->adapter);
@@ -2449,7 +2590,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     // Real pixels everywhere. Without this, on a display with Windows scaling (laptops: 125-150%) the game
     // window's size reads scaled (2560x1440 for a 4K panel at 150%) and the overlay showed only the
     // top-left part of the frame, enlarged.
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    if (g_app.in_process) SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);  // (the game's own: this thread only)
+    else SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     WNDCLASSW wc{};
     wc.lpfnWndProc = window_proc; wc.hInstance = instance; wc.lpszClassName = L"FrameWarpOverlay";
     wc.hCursor = nullptr;
@@ -2459,8 +2601,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
                                         WS_EX_NOREDIRECTIONBITMAP,
                                     wc.lpszClassName, L"FrameWarp", WS_POPUP, 0, 0, 16, 16, nullptr, nullptr, instance, nullptr);
     SetLayeredWindowAttributes(g_app.overlay, 0, 255, LWA_ALPHA);
+    // (not inside the game: raw input is one registration per process and usage - ours would take the game's mouse; there
+    // a helper process reads it - see MouseRing)
     RAWINPUTDEVICE rid{0x01, 0x02, RIDEV_INPUTSINK, g_app.overlay};  // generic desktop / mouse
-    if (!RegisterRawInputDevices(&rid, 1, sizeof(rid))) logf("raw input registration failed");
+    std::thread mouse_reader;
+    if (g_app.shadow) logf("shadow intake (development): Show original's intake beside FrameWarpPresenter.exe - no window, no claims");
+    else if (g_app.in_process) mouse_reader = start_mouse_from_helper();
+    else if (!RegisterRawInputDevices(&rid, 1, sizeof(rid))) logf("raw input registration failed");
     SetTimer(g_app.overlay, 1, 100, nullptr);
     follow_game_window();
 
@@ -2472,11 +2619,36 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     g_app.running = false;
     renderer.join();
     controller.join();
+    if (mouse_reader.joinable()) mouse_reader.join();
     if (g_app.shared) g_app.shared->presenter.pid = 0;
     logf("exit");
     g_files.stop();
     for (FILE* csv : {g_app.csv_events, g_app.csv_mouse, g_app.csv_sources, g_app.csv_outputs, g_app.csv_motion, g_app.csv_stick, g_app.csv_hooks, g_app.csv_upscaler, g_app.csv_share}) if (csv) std::fclose(csv);
     if (g_app.log) std::fclose(g_app.log);
     if (single) CloseHandle(single);
-    return 0;
+    return g_app.start_failed ? 2 : 0;
 }
+
+#ifdef FW_PRESENTER_DLL
+// The presenter inside the game: FrameWarpPresenter.dll, called by the add-on on a thread of its own with the game's
+// D3D12 device; returns when the presenter ends (not 0: it did not start - see App::start_failed).
+extern "C" __declspec(dllexport) int fw_presenter_run(DWORD pid, ID3D12Device* device, const wchar_t* base_dir) {
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&fw_presenter_run), &self);
+    return presenter_main(self, pid, base_dir, device);
+}
+#else
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+    DWORD pid = 0;
+    int argc = 0;
+    wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::wstring(argv[i]) == L"--pid") pid = static_cast<DWORD>(std::wcstoul(argv[i + 1], nullptr, 10));
+        if (std::wstring(argv[i]) == L"--mouse-for") return fw::mouse_helper(instance, static_cast<DWORD>(std::wcstoul(argv[i + 1], nullptr, 10)));
+    }
+    wchar_t exe[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    return presenter_main(instance, pid, std::filesystem::path(exe).parent_path(), nullptr);
+}
+#endif

@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cmath>
 #include <atomic>
+#include <thread>
 #include <cstdio>
 #include <string>
 #include <cstring>
@@ -38,7 +39,7 @@ std::unique_ptr<fw::Producer> g_producer;
 // the process is ending anyway.)
 struct KeepProducerAtExit { ~KeepProducerAtExit() { (void)g_producer.release(); } } g_keep_producer_at_exit;
 HMODULE g_module = nullptr;
-bool g_presenter_launched = false;
+std::atomic<bool> g_presenter_launched{false};
 HANDLE g_presenter_process = nullptr;
 std::wstring g_presenter_path;
 
@@ -49,6 +50,56 @@ std::uint32_t to_dxgi_color_space(color_space cs) {
         case color_space::hdr10_hlg: return 18;  // DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020
         default: return 0;                       // DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
     }
+}
+
+// (development, [FrameWarp] InProcessPresenter=1 in ReShade.ini, Direct3D 12 games: the whole presenter inside the game -
+// FrameWarpPresenter.dll on a thread of the add-on, on the game's own device. Taking frames in got cheaper (Armored Core
+// VI, Show original 51 -> ~63 fps), but the warp lost its realtime priority over the game - one process: its presents
+// missed refreshes and the game's frames queued (Cyberpunk 2077, 2026-10-27: ~60 pictures a second on screen, the camera
+// ~100 ms behind, against ~0 out of process). The intake alone inside the game, beside the exe's warp (ShadowIntake=1),
+// cost more than the exe's own: ~8.5 ms a game frame under the warp's interruptions, AC6 38.5 -> 29 fps - the cost is
+// sharing the GPU with the realtime warp, not the second process.
+// Once per game run: when it ends, or did not start, FrameWarpPresenter.exe takes over)
+std::atomic<bool> g_in_process_running{false}, g_in_process_used{false};
+bool launch_in_process(const std::wstring& dir) {
+    char value[8] = {};
+    size_t size = sizeof(value);
+    // (development, the hybrid's gate - ShadowIntake=1: the presenter's intake alone inside the game beside the exe, which
+    // starts as usual - see App::shadow in the presenter)
+    bool shadow = false;
+    if (reshade::get_config_value(nullptr, "FrameWarp", "ShadowIntake", value, &size) && value[0] == '1') shadow = true;
+    size = sizeof(value);
+    if (!shadow && (!reshade::get_config_value(nullptr, "FrameWarp", "InProcessPresenter", value, &size) || value[0] != '1')) return false;
+    ID3D12Device* device = g_producer ? g_producer->game_d3d12_device() : nullptr;
+    if (!device || g_in_process_used.exchange(true)) return false;
+    // (RivaTuner's overlay hooks every present in the game's process, ours too, and broke on the presenter's first one -
+    // Armored Core VI at its title screen, 2026-10-27: the exe while it is there)
+    if (GetModuleHandleW(L"RTSSHooks64.dll")) {
+        g_producer->log_line("FrameWarp: RivaTuner's overlay is hooked into the game - FrameWarpPresenter.exe instead of the presenter inside the game");
+        return false;
+    }
+    HMODULE dll = LoadLibraryW((dir + L"\\FrameWarpPresenter.dll").c_str());
+    using RunFn = int (*)(DWORD, ID3D12Device*, const wchar_t*);
+    auto run = dll ? reinterpret_cast<RunFn>(GetProcAddress(dll, "fw_presenter_run")) : nullptr;
+    if (!run) {
+        g_producer->log_line("FrameWarp: FrameWarpPresenter.dll not found next to the presenter - FrameWarpPresenter.exe instead");
+        return false;
+    }
+    device->AddRef();
+    if (shadow) {
+        SetEnvironmentVariableW(L"FW_SHADOW_INTAKE", L"1");
+        std::thread([run, device, dir]() { run(GetCurrentProcessId(), device, dir.c_str()); device->Release(); }).detach();
+        return false;  // (the exe as usual)
+    }
+    g_in_process_running = true;
+    std::thread([run, device, dir]() {
+        const int result = run(GetCurrentProcessId(), device, dir.c_str());
+        device->Release();
+        if (result != 0) g_producer->log_line("FrameWarp: the presenter did not start inside the game - FrameWarpPresenter.exe instead");
+        g_presenter_launched = false;  // (the exe on the next frame, if reprojection is still on)
+        g_in_process_running = false;
+    }).detach();
+    return true;
 }
 
 void launch_presenter() {
@@ -67,6 +118,7 @@ void launch_presenter() {
         if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
         std::wstring cmd = L"\"" + path + L"\"" + args;
         const std::wstring dir = path.substr(0, path.find_last_of(L"\\/"));
+        if (launch_in_process(dir)) return;
         STARTUPINFOW si{sizeof(si)};
         PROCESS_INFORMATION pi{};
         if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, dir.c_str(), &si, &pi)) {
@@ -83,6 +135,7 @@ void launch_presenter() {
 }
 
 bool presenter_running() {
+    if (g_in_process_running) return true;
     if (g_presenter_process && WaitForSingleObject(g_presenter_process, 0) == WAIT_TIMEOUT) return true;
     // Started some other way (e.g. by hand): adopt the presenter that registered in shared memory.
     const LONG pid = g_producer && g_producer->shared() ? g_producer->shared()->presenter.pid : 0;

@@ -1770,13 +1770,18 @@ RWTexture2D<float> hl_score_u : register(u0);
 // (synthetic benchmark: 10x the error of plain scenery there; moved: -40%). Not with motion estimated from the picture:
 // the HUD standing still in it threw the estimate off around the panels (synthetic, estimated motion: +21% overall) - only
 // since the estimate leaves out what the layer covers (fl_under_hud, 2026-10-21).
+// Seen through is only a backdrop, though: a faint stroke that gives off its own light - Cyberpunk's shotgun crosshair,
+// thin cyan brackets at a third coverage - was moved with the scenery, sliding off the screen's centre while turning (the
+// pistol's, brighter, held). Told apart by the layer's colour per unit of coverage: the backdrops are dark (quest panel 0.12),
+// the strokes light (the brackets 1.3, 1.06 their 10th percentile) - held from 0.5, mid-way, in that wide gap (2026-10-27).
 // Flag 2 (a layer with its colour - the scenery taken out of the frame, cs_layer_unblend): held only where the layer lets
 // too little through to take the scenery back: taken out, the frame's rounding to 8 bits grows by 1 / (1 - a) - at a quarter
 // let through, 4 steps of 256: past that the scenery is held, the fill behind it. Below, exact whatever the HUD is.
 [numthreads(8, 8, 1)] void cs_layer_hud(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= out_size)) return;
-    const float a = hl_layer_t.Load(int3(id.xy, 0)).a;
-    hl_score_u[id.xy] = a > ((flags & 2) ? 0.75 : (flags & 1) ? 0.5 : 0.02) ? 1.0 : 0.0;
+    const float4 l = hl_layer_t.Load(int3(id.xy, 0));
+    const bool stroke = (flags & 1) && !(flags & 2) && l.a > 0.02 && max(l.r, max(l.g, l.b)) > 0.5 * l.a;
+    hl_score_u[id.xy] = stroke || l.a > ((flags & 2) ? 0.75 : (flags & 1) ? 0.5 : 0.02) ? 1.0 : 0.0;
 }
 // Is that layer the game's HUD (see Renderer::layer_trust)? Everything of a HUD - fixed or anchored in the world - is drawn
 // over the finished picture, after the upscaler: where the layer clearly covers, the frame differs from the upscaler's
@@ -4602,10 +4607,22 @@ bool Renderer::init(const LUID& adapter_luid, HWND window, std::uint32_t width, 
         ComPtr<ID3D12Debug> debug;
         if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) debug->EnableDebugLayer();
     }
-    if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory_)))) { error = "DXGI factory"; return false; }
+    // (inside the game - use_device - from Windows' own dxgi.dll: the game's folder may hold ReShade as dxgi.dll, which
+    // would take our swapchain for a second one of the game's)
+    HRESULT factory_hr = E_FAIL;
+    if (external_device_) {
+        wchar_t system[MAX_PATH]{};
+        GetSystemDirectoryW(system, MAX_PATH);
+        using CreateFn = HRESULT(WINAPI*)(UINT, REFIID, void**);
+        HMODULE dxgi = LoadLibraryW((std::wstring(system) + L"\\dxgi.dll").c_str());
+        if (auto create = dxgi ? reinterpret_cast<CreateFn>(GetProcAddress(dxgi, "CreateDXGIFactory2")) : nullptr)
+            factory_hr = create(0, IID_PPV_ARGS(&factory_));
+    } else factory_hr = CreateDXGIFactory2(0, IID_PPV_ARGS(&factory_));
+    if (FAILED(factory_hr)) { error = "DXGI factory"; return false; }
     ComPtr<IDXGIAdapter1> adapter;
     if (FAILED(factory_->EnumAdapterByLuid(adapter_luid, IID_PPV_ARGS(&adapter)))) { error = "game adapter not found"; return false; }
-    if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device_)))) { error = "D3D12 device"; return false; }
+    if (external_device_) device_ = external_device_;  // (in the game: its device - see use_device)
+    else if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device_)))) { error = "D3D12 device"; return false; }
 
     // Highest queue priority we are allowed: realtime needs SeIncreaseBasePriorityPrivilege (admin).
     D3D12_COMMAND_QUEUE_DESC qd{};
@@ -4620,15 +4637,20 @@ bool Renderer::init(const LUID& adapter_luid, HWND window, std::uint32_t width, 
     D3D12_COMMAND_QUEUE_DESC iqd{};
     iqd.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
     iqd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+    // (in the game's process normal is the game's own level - out of process the presenter's raised process priority
+    // put it ahead - and the intake fell to half the game's frames (AC6, 2026-10-27): above the game there. A compute
+    // queue there runs alongside the game's own work, on a share of the GPU (~30 ms a frame, against ~5 out of
+    // process): a graphics queue, taking turns with it)
+    if (external_device_) { iqd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH; iqd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT; }
     if (FAILED(device_->CreateCommandQueue(&iqd, IID_PPV_ARGS(&iqueue_)))) iqueue_.Reset();
     for (int i = 0; i < kRing; ++i) {
-        const auto type = i < 3 ? D3D12_COMMAND_LIST_TYPE_DIRECT : D3D12_COMMAND_LIST_TYPE_COMPUTE;
+        const auto type = i < 3 ? D3D12_COMMAND_LIST_TYPE_DIRECT : iqd.Type;
         if (i >= 3 && !iqueue_) break;
         if (FAILED(device_->CreateCommandAllocator(type, IID_PPV_ARGS(&allocators_[i])))) { error = "allocator"; return false; }
     }
     if (FAILED(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators_[0].Get(), nullptr, IID_PPV_ARGS(&lists_[0])))) { error = "command list"; return false; }
     lists_[0]->Close();
-    if (iqueue_ && FAILED(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, allocators_[3].Get(), nullptr, IID_PPV_ARGS(&lists_[1])))) iqueue_.Reset();
+    if (iqueue_ && FAILED(device_->CreateCommandList(0, iqd.Type, allocators_[3].Get(), nullptr, IID_PPV_ARGS(&lists_[1])))) iqueue_.Reset();
     if (lists_[1]) lists_[1]->Close();
     list_ = lists_[0];
     for (auto& f : fences_)

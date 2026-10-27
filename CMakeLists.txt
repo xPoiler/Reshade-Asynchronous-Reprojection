@@ -51,6 +51,12 @@ add_executable(FrameWarpPresenter WIN32 src/presenter/main.cpp)
 target_link_libraries(FrameWarpPresenter PRIVATE fw_presenter_core user32 pdh xinput cabinet)
 set_target_properties(FrameWarpPresenter PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreadedDLL"
                       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>/FrameWarp")
+# The presenter inside the game (2.2 Phase 0, development; the add-on loads it with InProcessPresenter=1, D3D12 only).
+add_library(FrameWarpPresenterDll SHARED src/presenter/main.cpp)
+target_link_libraries(FrameWarpPresenterDll PRIVATE fw_presenter_core user32 pdh xinput cabinet)
+target_compile_definitions(FrameWarpPresenterDll PRIVATE FW_PRESENTER_DLL)
+set_target_properties(FrameWarpPresenterDll PROPERTIES OUTPUT_NAME "FrameWarpPresenter" MSVC_RUNTIME_LIBRARY "MultiThreadedDLL"
+                      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>/FrameWarp")
 if(EXISTS "${LATEWARP_DLL}")
   add_custom_command(TARGET FrameWarpPresenter POST_BUILD
                      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${LATEWARP_DLL}" "$<TARGET_FILE_DIR:FrameWarpPresenter>")

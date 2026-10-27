@@ -65,6 +65,8 @@ public:
     bool attach_d3d11(reshade::api::device* device);
     void detach_d3d11();
     bool d3d11() const { return d11_ != nullptr; }
+    // The game's own D3D12 device (not for D3D11 or Vulkan games: their device is the add-on's own) - see InProcessPresenter
+    ID3D12Device* game_d3d12_device() const { return d11_ || vk_ ? nullptr : device_.Get(); }
     void on_tag_d3d11(std::uint64_t frame, Tex kind, ID3D11Resource* source, std::uint32_t ext_x, std::uint32_t ext_y,
                       std::uint32_t ext_w, std::uint32_t ext_h, ID3D11DeviceContext* context);
     std::uint64_t begin_present_d3d11(ID3D11Resource* backbuffer, ID3D11DeviceContext* context);
