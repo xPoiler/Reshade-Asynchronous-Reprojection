@@ -791,6 +791,14 @@ void render_thread() {
         g_app.running = false; PostMessageW(g_app.overlay, WM_CLOSE, 0, 0); return;
     }
     logf("renderer ready %ux%u, queue priority %s; %s", w, h, renderer.queue_priority(), renderer.shader_report().c_str());
+    {
+        // (development: the claims reused across the refreshes of one game frame - FW_CLAIMS_REUSE, from the add-on's
+        // ClaimsReuse; see Renderer::set_claims_reuse)
+        wchar_t reuse[4]{};
+        const bool claims_reuse = GetEnvironmentVariableW(L"FW_CLAIMS_REUSE", reuse, 4) && reuse[0] == L'1';
+        renderer.set_claims_reuse(claims_reuse);
+        if (claims_reuse) logf("the warp's claims reused across the refreshes of a game frame (development: ClaimsReuse)");
+    }
     VramMonitor vram;
     vram.init(sh.adapter);
     vram.poll(now_seconds(), "start");

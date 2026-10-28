@@ -3062,29 +3062,31 @@ RWTexture2D<uint> wc_claims_u : register(u0);
 // edge a few px off it (synthetic strafe: "behind" false edges +10%) - Stalker 2's outline following the movement. The
 // HUD counts at any depth: it stands at the scenery's depth (counted by depth alone, the scenery beside the text claimed
 // again - faint panels +25-40%).
-bool ow_beside_held(float2 s, float2 l) {
-    const float2 step = 1.0 / float2(rect.zw);
+// (the part of it that depends on the rendered pixel alone - cs_warp_beside: 1 beside a held thing, claims nothing; 2 beside
+// its own held part only, claims only where it lands on the object's own pixels - see cs_warp_claim; 0 neither)
+// (over the rendered pixels' own tests - cs_warp_held, t12: each pixel's at its own spot, not again at each of the 32 spots
+// around every pixel)
+float ow_near_at(int2 r) { return ow_near(ow_depth_t.Load(int3(int2(rect.xy) + r, 0))); }
+uint ow_beside_held(int2 r) {
     if (flags & 33554432) {  // (development, set_claim_rule_old: the rule as before 2026-10-20 - any held pixel within 2)
         [unroll] for (int k0 = 0; k0 < 16; ++k0) {
-            const float2 q = s + float2(kRetDirs[k0 & 7] * ((k0 >> 3) + 1)) * step;
-            if (all(q >= 0) && all(q <= 1) && ow_held(int3(min(uint2(q * float2(out_size)), out_size - 1), 0))) return true;
+            const int2 q = r + kRetDirs[k0 & 7] * ((k0 >> 3) + 1);
+            if (all(q >= 0) && all(q < int2(rect.zw)) && (ow_claims_t.Load(int3(q, 0)) & 1u)) return 1;
         }
-        return false;
+        return 0;
     }
-    const float here = ow_near(ow_depth(s));
+    const float here = ow_near_at(r);
     bool held_by = false;
     [unroll] for (int k = 0; k < 16; ++k) {
-        const float2 q = s + float2(kRetDirs[k & 7] * ((k >> 3) + 1)) * step;
-        if (any(q < 0) || any(q > 1)) continue;
-        const int3 qi = int3(min(uint2(q * float2(out_size)), out_size - 1), 0);
-        if (ow_held(qi)) {
-            if (!(flags & 16384) || ow_mask_t.Load(qi).x > 0.97 || ow_near(ow_depth(q)) > here + 6.0) return true;
+        const int2 q = r + kRetDirs[k & 7] * ((k >> 3) + 1);
+        if (any(q < 0) || any(q >= int2(rect.zw))) continue;
+        const uint h = ow_claims_t.Load(int3(q, 0));
+        if (h & 1u) {
+            if (!(flags & 16384) || (h & 2u) || ow_near_at(q) > here + 6.0) return 1;
             held_by = true;
         }
     }
-    if (!held_by) return false;
-    // (its own held part beside it: claims only where it lands on the object's own pixels)
-    return ow_mask_t.Load(int3(min(uint2(saturate(l) * float2(out_size)), out_size - 1), 0)).x < 0.65;
+    return held_by ? 2 : 0;
 }
 // A spot the scenery's surface (nearness nk) is stretched onto - the steps' end - whose rendered pixel is clearly nearer than
 // that surface (> 6 nearness steps), or a held outline (0.95): not taken. The steps over a surface accept a spot with any of
@@ -3107,30 +3109,55 @@ bool ow_rim(float2 s, float nk) {
     const float m = ow_mask_t.Load(int3(min(uint2(saturate(s) * float2(out_size)), out_size - 1), 0)).x;
     return (m >= 0.94 && m < 0.955) || ow_near(ow_depth(s)) > nk + 6.0;
 }
-bool ow_beside_carried(float2 s) {
-    const float2 step = 1.0 / float2(rect.zw);
-    const float here = ow_near(ow_depth(s));
+bool ow_beside_carried(int2 r) {
+    const float here = ow_near_at(r);
     [unroll] for (int k = 0; k < 16; ++k) {
-        const float2 q = s + float2(kRetDirs[k & 7] * ((k >> 3) + 1)) * step;
-        if (any(q < 0) || any(q > 1)) continue;
-        const float m = ow_mask_t.Load(int3(min(uint2(q * float2(out_size)), out_size - 1), 0)).x;
-        if (m >= 0.65 && m < 0.9 && ow_near(ow_depth(q)) > here + 6.0) return true;
+        const int2 q = r + kRetDirs[k & 7] * ((k >> 3) + 1);
+        if (any(q < 0) || any(q >= int2(rect.zw))) continue;
+        if ((ow_claims_t.Load(int3(q, 0)) & 4u) && ow_near_at(q) > here + 6.0) return true;
     }
     return false;
+}
+// What of the claim's rules depends on the rendered pixel alone, once per shown game frame (the warp's inputs are the same
+// for all its refreshes): 4 held, claims nothing; 1 beside a held thing (ow_beside_held) or a carried one (ow_beside_carried),
+// claims nothing; 2 beside its own held part, claims only landing on the object's own pixels. Read by cs_warp_claim at t12.
+// (Each of the two looks at 16 rendered pixels around, the share and the mask at each: done for every refresh, they were
+// 0.33 of the warp's 1.8 ms at 4K, AC6)
+// (first each rendered pixel's own tests at its spot - cs_warp_held: 1 held, 2 the HUD - the mask above 0.97 -, 4 carried -
+// the mask 0.65 to 0.9; then cs_warp_beside over them, t12)
+[numthreads(8, 8, 1)] void cs_warp_held(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= rect.zw)) return;
+    const int3 qi = int3(min(uint2((float2(id.xy) + 0.5) / float2(rect.zw) * float2(out_size)), out_size - 1), 0);
+    const float m = ow_mask_t.Load(qi).x;
+    wc_claims_u[id.xy] = (ow_held(qi) ? 1u : 0u) | (m > 0.97 ? 2u : 0u) | (m >= 0.65 && m < 0.9 ? 4u : 0u);
+}
+[numthreads(8, 8, 1)] void cs_warp_beside(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= rect.zw)) return;
+    const int2 r = int2(id.xy);
+    uint rule = 0;
+    if (flags & 2) {
+        if (ow_claims_t.Load(int3(r, 0)) & 1u) rule = 4;
+        else {
+            if (flags & 2097152) rule = ow_beside_held(r);
+            // (ow_dev 8 - the character marked carried under a measured orbit, cs_share_up's flag 64: not held, it moves with
+            // the orbit, so ow_beside_held does not see it. Its rim - rendered pixels at the scenery's depth carrying its colour -
+            // claimed as scenery and slid off with it: a bright outline round the area behind it the turn uncovers, Enshrouded
+            // seq_2. A rendered pixel within two of a carried one clearly nearer - more than 6 nearness steps - claims nothing
+            // either)
+            if ((ow_dev() & 8u) && ow_beside_carried(r)) rule = 1;
+        }
+    }
+    wc_claims_u[id.xy] = rule;
 }
 [numthreads(8, 8, 1)] void cs_warp_claim(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= rect.zw)) return;
     const float2 s = (float2(id.xy) + 0.5) / float2(rect.zw);
-    if ((flags & 2) && ow_held(int3(min(uint2(s * float2(out_size)), out_size - 1), 0))) return;
+    const uint rule = ow_claims_t.Load(int3(id.xy, 0));  // (cs_warp_beside's)
+    if (rule & 4) return;
     const float3 f = ow_forward(s);
     if (f.z <= 1e-6) return;
     const float2 l = ow_lands(s, f);
-    if ((flags & 2) && (flags & 2097152) && ow_beside_held(s, l)) return;
-    // (ow_dev 8 - the character marked carried under a measured orbit, cs_share_up's flag 64: not held, it moves with the
-    // orbit, so ow_beside_held does not see it. Its rim - rendered pixels at the scenery's depth carrying its colour - claimed
-    // as scenery and slid off with it: a bright outline round the area behind it the turn uncovers, Enshrouded seq_2. A
-    // rendered pixel within two of a carried one clearly nearer - more than 6 nearness steps - claims nothing either)
-    if ((ow_dev() & 8u) && (flags & 2) && ow_beside_carried(s)) return;
+    if ((rule & 1) || ((rule & 2) && ow_mask_t.Load(int3(min(uint2(saturate(l) * float2(out_size)), out_size - 1), 0)).x < 0.65)) return;
     if (any(l < 0) || any(l >= 1)) return;
     const int2 cell = int2(l * float2(rect.zw));
     const int2 d = int2(id.xy) - cell;
@@ -3277,7 +3304,19 @@ float2 ow_claims_uv(float2 uv) {
     // missed: the synthetic aim's gun error +10..18%, the orbits' character +12..42%. The share read at uv - where the
     // spot is now, as the warp's own reads at the output)
     const float f = (flags & 128) ? ow_follow(uv) : 1.0;
-    return lerp(uv, float2(n.x * 0.5 + 0.5, 0.5 - n.y * 0.5), f);
+    const float2 turned = lerp(uv, float2(n.x * 0.5 + 0.5, 0.5 - n.y * 0.5), f);
+    if (wh2.y < 1.5) return turned;
+    // (wh2.y 2 - by depth: the camera moving too, Armored Core VI's orbit around the mech, a near thing shifts against a far
+    // one between two refreshes - the turn's map put it up to ~20 rendered px off its claims. The claim found by the turn
+    // tells which rendered pixel claimed there and the cell it landed in for that refresh's camera; where it lands for this
+    // one - its own depth, its own share, as the warp moves it - shifts uv's claims by the same, exact for that surface)
+    const int2 cell = clamp(int2(turned * float2(rect.zw)), int2(0, 0), int2(rect.zw) - 1);
+    const uint key = ow_claims_t.Load(int3(cell, 0));
+    if (!key) return turned;
+    const float2 s = (float2(ow_claimant(cell, key)) + 0.5) / float2(rect.zw);
+    const float3 fw = ow_forward(s);
+    if (fw.z <= 1e-6) return turned;
+    return uv - (ow_lands(s, fw) - (float2(cell) + 0.5) / float2(rect.zw));
 }
 bool ow_claimed(float2 uv, out float2 src, out bool hole) {
     src = uv;
@@ -3577,6 +3616,14 @@ float3 ow_faint(float3 c, int2 p, float2 src) {
     if (there >= 0.5) return c;
     return c * clamp((1.0 - here) / max(1.0 - there, 0.05), 0.0, 4.0);
 }
+// (ow_dev 32 - set_lowres_between, development: a refresh between two game frames warped at the game's resolution - one
+// output pixel of each 2x2 block, into kPLowScene - u0 - at half the size, without the UI layer; cs_own_warp_up scales it
+// up and lays held pixels and the UI layer over at full resolution)
+bool ow_low() { return (ow_dev() & 32u) != 0; }
+void ow_store(uint2 p, float3 c) {
+    if (ow_low()) ow_out_u[p >> 1] = float4(c, 1);
+    else ow_out_u[p] = float4(c, 1);
+}
 // The output pixel's colour from where its search landed: the scene there, held pixels as the frame shows them, the
 // sight-reticle layer, the UI layer.
 void ow_finish(uint2 pid, float2 uv, float2 src, bool valid) {
@@ -3609,11 +3656,11 @@ void ow_finish(uint2 pid, float2 uv, float2 src, bool valid) {
         }
         c.rgb = lerp(scene + here.rgb, ow_color_t.Load(int3(id.xy, 0)).rgb, ow_cover(here));
     }
-    if ((flags & 1) && !((flags & 1073741824) && held_here)) c.rgb = ow_over(c.rgb, ow_ui_at(int3(id.xy, 0)));
+    if ((flags & 1) && !ow_low() && !((flags & 1073741824) && held_here)) c.rgb = ow_over(c.rgb, ow_ui_at(int3(id.xy, 0)));
     if ((flags & 8388608) && valid && !((flags & 2) && ow_held(int3(id.xy, 0)))) c.rgb = ow_faint(c.rgb, int2(id.xy), src);
     // (the path / 16: the presenter's output is 8 or 10 bits per channel - whole numbers clamped to 1 there)
     if (flags & 32768) c = float4(float((flags & 2) && ow_held(int3(id.xy, 0)) ? 14 : ow_path) / 16.0, float(ow_why) / 16.0, 0, 1);
-    ow_out_u[id.xy] = float4(c.rgb, 1);
+    ow_store(id.xy, c.rgb);
 }
 // One thread per output pixel (search warp, a pure turn).
 [numthreads(8, 8, 1)] void cs_own_warp(uint3 id : SV_DispatchThreadID) {
@@ -3672,15 +3719,16 @@ bool ow_lean(uint2 p) {
         }
         if (flags & 8388608) c.rgb = ow_faint(c.rgb, pi.xy, src);
     }
-    if ((flags & 1) && !((flags & 1073741824) && held_here)) c.rgb = ow_over(c.rgb, ow_ui_at(pi));
-    ow_out_u[p] = float4(c.rgb, 1);
+    if ((flags & 1) && !ow_low() && !((flags & 1073741824) && held_here)) c.rgb = ow_over(c.rgb, ow_ui_at(pi));
+    ow_store(p, c.rgb);
     return true;
 }
 [numthreads(8, 8, 1)] void cs_own_warp_lean(uint3 id : SV_DispatchThreadID) {
     const uint2 p0 = id.xy * 2;
     if (any(p0 >= out_size)) return;
     uint rest = 0;
-    [loop] for (uint k = 0; k < 4; ++k) {
+    const uint n = ow_low() ? 1u : 4u;  // (at the game's resolution: the block's first pixel alone)
+    [loop] for (uint k = 0; k < n; ++k) {
         const uint2 p = p0 + uint2(k & 1, k >> 1);
         if (all(p < out_size) && !ow_lean(p)) rest |= 1u << k;
     }
@@ -3691,12 +3739,14 @@ bool ow_lean(uint2 p) {
     }
 }
 [numthreads(1, 1, 1)] void cs_own_warp_args(uint3 id : SV_DispatchThreadID) {
-    ow_args_u.Store3(0, uint3((ow_list_u.Load(0) * 4 + 63) / 64, 1, 1));  // (a thread per pixel of each block)
+    // (a thread per pixel of each block - at the game's resolution, ow_low, one: the block's first pixel alone)
+    ow_args_u.Store3(0, uint3((ow_list_u.Load(0) * (ow_low() ? 1 : 4) + 63) / 64, 1, 1));
 }
 [numthreads(64, 1, 1)] void cs_own_warp_rest(uint3 id : SV_DispatchThreadID) {
     // (a thread per pixel of each listed block: its four in parallel, those not left idle)
-    if (id.x / 4 >= ow_list_u.Load(0)) return;
-    const uint e = ow_list_u.Load(16 + 4 * (id.x / 4)), k = id.x & 3u;
+    const uint per = ow_low() ? 1u : 4u;
+    if (id.x / per >= ow_list_u.Load(0)) return;
+    const uint e = ow_list_u.Load(16 + 4 * (id.x / per)), k = id.x % per;
     if (!((e >> (24 + k)) & 1u)) return;
     const uint2 p = uint2(e & 4095u, (e >> 12) & 4095u) * 2 + uint2(k & 1, k >> 1);
     const float2 uv = (float2(p) + 0.5) / float2(out_size);
@@ -3704,6 +3754,22 @@ bool ow_lean(uint2 p) {
     ow_hidden = false;
     const bool valid = ow_find(uv, src);
     ow_finish(p, uv, src, valid);
+}
+// (ow_dev 32: the refresh warped at the game's resolution - kPLowScene at t8 - scaled up to every output pixel, bilinear;
+// held pixels and the UI layer at full resolution, as the warp lays them)
+[numthreads(8, 8, 1)] void cs_own_warp_up(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= out_size)) return;
+    const int3 pi = int3(id.xy, 0);
+    const bool held_here = (flags & 2) && ow_held(pi);
+    float4 c;
+    if (held_here) c = ow_held_colour(pi);
+    else {
+        uint lw, lh;
+        ow_prev_t.GetDimensions(lw, lh);
+        c = ow_prev_t.SampleLevel(ow_linear, (float2(id.xy) * 0.5 + 0.5) / float2(lw, lh), 0);
+    }
+    if ((flags & 1) && !((flags & 1073741824) && held_here)) c.rgb = ow_over(c.rgb, ow_ui_at(pi));
+    ow_out_u[id.xy] = float4(c.rgb, 1);
 }
 
 // Moving objects (option), after the warp: only the output pixels a moving pixel claimed (cs_obj_splat)
@@ -4400,7 +4466,7 @@ constexpr UINT kW = kXUiTilesUav + 2;
 enum WTable : UINT { kWWarp, kWShown, kWClear, kWSplat, kWMove, kWCopyColour, kWCopyDepth, kWJoinInit, kWJoinAB, kWJoinBA, kWJoinFinal,
                      kWGenDepth0, kWGenDepth1, kWGenDepth2, kWGenUi0, kWGenUi1, kWGenUi2, kWFgMotion, kWFgInverse, kWClaim,
                      kWStill, kWHoldInit, kWHoldAB, kWHoldBA, kWHoldFinal, kWHoldFill, kWHoldFillFinal, kWGrowInit, kWGrowAB, kWGrowBA,
-                     kWGrowFinal, kWWarpArgs, kWShareMeasure, kWShareH, kWShareV, kWShareBins, kWShareUp, kWShareResid, kWResidBlurH, kWResidBlurV, kWOwnUp, kWSeamH, kWSeamV, kWAttHist, kWFgImages,
+                     kWGrowFinal, kWWarpArgs, kWShareMeasure, kWShareH, kWShareV, kWShareBins, kWShareUp, kWShareResid, kWResidBlurH, kWResidBlurV, kWOwnUp, kWSeamH, kWSeamV, kWAttHist, kWBeside, kWHeld, kWWarpUp, kWFgImages,
                      kWTables = kWFgImages + 5 * 3 };
 // XPAR frame generation: each image's own tables (descriptors are read when the GPU runs the pass, so one set reused
 // for every image would have them all write the last one).
@@ -4879,7 +4945,7 @@ bool Renderer::create_pipelines(std::string& error) {
         error = "warp root signature"; return false;
     }
     struct { const char* entry; ComPtr<ID3D12PipelineState>* pso; } ws[] = {
-        {"cs_own_warp", &cs_own_warp_}, {"cs_own_warp_reset", &cs_own_warp_reset_}, {"cs_own_warp_lean", &cs_own_warp_lean_}, {"cs_own_warp_args", &cs_own_warp_args_}, {"cs_own_warp_rest", &cs_own_warp_rest_}, {"cs_warp_claims_clear", &cs_warp_claims_clear_}, {"cs_warp_claim", &cs_warp_claim_}, {"cs_obj_fix", &cs_obj_fix_}, {"cs_obj_move", &cs_obj_move_}, {"cs_gen_depth", &cs_gen_depth_}, {"cs_gen_unui", &cs_gen_unui_}, {"cs_obj_join_init", &cs_obj_join_init_}, {"cs_obj_join", &cs_obj_join_}, {"cs_obj_join_final", &cs_obj_join_final_}, {"cs_still", &cs_still_}, {"cs_hold_fill", &cs_hold_fill_}, {"cs_grow_init", &cs_grow_init_}, {"cs_grow_clear", &cs_grow_clear_}, {"cs_grow", &cs_grow_}, {"cs_grow_final", &cs_grow_final_}, {"cs_obj_clear", &cs_obj_clear_}, {"cs_obj_clear_tiles", &cs_obj_clear_tiles_}, {"cs_obj_splat", &cs_obj_splat_}, {"cs_share_measure", &cs_share_measure_}, {"cs_share_blur", &cs_share_blur_}, {"cs_share_bins", &cs_share_bins_}, {"cs_share_final", &cs_share_final_}, {"cs_share_up", &cs_share_up_}, {"cs_share_seam", &cs_share_seam_}, {"cs_att_hist", &cs_att_hist_}, {"cs_share_resid", &cs_share_resid_}, {"cs_resid_blur", &cs_resid_blur_}, {"cs_own_up", &cs_own_up_},
+        {"cs_own_warp", &cs_own_warp_}, {"cs_own_warp_reset", &cs_own_warp_reset_}, {"cs_own_warp_lean", &cs_own_warp_lean_}, {"cs_own_warp_args", &cs_own_warp_args_}, {"cs_own_warp_rest", &cs_own_warp_rest_}, {"cs_warp_claims_clear", &cs_warp_claims_clear_}, {"cs_warp_claim", &cs_warp_claim_}, {"cs_warp_beside", &cs_warp_beside_}, {"cs_warp_held", &cs_warp_held_}, {"cs_own_warp_up", &cs_own_warp_up_}, {"cs_obj_fix", &cs_obj_fix_}, {"cs_obj_move", &cs_obj_move_}, {"cs_gen_depth", &cs_gen_depth_}, {"cs_gen_unui", &cs_gen_unui_}, {"cs_obj_join_init", &cs_obj_join_init_}, {"cs_obj_join", &cs_obj_join_}, {"cs_obj_join_final", &cs_obj_join_final_}, {"cs_still", &cs_still_}, {"cs_hold_fill", &cs_hold_fill_}, {"cs_grow_init", &cs_grow_init_}, {"cs_grow_clear", &cs_grow_clear_}, {"cs_grow", &cs_grow_}, {"cs_grow_final", &cs_grow_final_}, {"cs_obj_clear", &cs_obj_clear_}, {"cs_obj_clear_tiles", &cs_obj_clear_tiles_}, {"cs_obj_splat", &cs_obj_splat_}, {"cs_share_measure", &cs_share_measure_}, {"cs_share_blur", &cs_share_blur_}, {"cs_share_bins", &cs_share_bins_}, {"cs_share_final", &cs_share_final_}, {"cs_share_up", &cs_share_up_}, {"cs_share_seam", &cs_share_seam_}, {"cs_att_hist", &cs_att_hist_}, {"cs_share_resid", &cs_share_resid_}, {"cs_resid_blur", &cs_resid_blur_}, {"cs_own_up", &cs_own_up_},
         {"cs_copy4", &cs_copy4_}, {"cs_copy1", &cs_copy1_}, {"cs_fg_motion", &cs_fg_motion_}, {"cs_fg_inverse", &cs_fg_inverse_},
         {"cs_fg_clear", &cs_fg_clear_}, {"cs_fg_splat_cur", &cs_fg_splat_cur_}, {"cs_fg_splat_prev", &cs_fg_splat_prev_},
         {"cs_fg_resolve", &cs_fg_resolve_}, {"cs_fg_depth", &cs_fg_depth_}};
@@ -4979,6 +5045,8 @@ bool Renderer::create_pipelines(std::string& error) {
 }
 
 void Renderer::set_x_srv(UINT index, PrivateId id, bool from_shown) {
+    // (what the warp's table holds, for cs_own_warp_up's - see set_lowres_between)
+    if (index >= kWSrv(kWWarp) && index < kWSrv(kWWarp) + kWSrvCount) warp_srv_[index - kWSrv(kWWarp)] = {id, from_shown};
     D3D12_SHADER_RESOURCE_VIEW_DESC d{};
     d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D; d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     d.Texture2D.MipLevels = 1;
@@ -6478,22 +6546,52 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
             for (int r = 0; r < 3; ++r)
                 for (int k = 0; k < 3; ++k) h[r * 3 + k] = inv[r * 3 + 0] * ac[0 * 3 + k] + inv[r * 3 + 1] * ac[1 * 3 + k] + inv[r * 3 + 2] * ac[2 * 3 + k];
             for (int i = 0; i < 9; ++i) wc[20 + i] = float(h[i]);
-            wc[29] = 1.0f;
+            wc[29] = claims_turn_only_ ? 1.0f : 2.0f;
             set_x_srv(t + 12, kPWarpClaims);
             c.flags |= 4096u;
             stamp(kPassWarpClaim);
         }
     }
-    if (!(c.flags & 4096u) && warp_splat_ && !no_depth && ensure_private(kPWarpClaims, dw, dh, DXGI_FORMAT_R32_UINT)) {
+    if (!(c.flags & 4096u) && warp_splat_ && !no_depth && ensure_private(kPWarpClaims, dw, dh, DXGI_FORMAT_R32_UINT) &&
+        ensure_private(kPWarpBeside, dw, dh, DXGI_FORMAT_R8_UINT)) {
         std::memcpy(claims_matrix_, source_to_target, sizeof(claims_matrix_));
         claims_serial_ = shown_serial_;
         claims_valid_ = true;
-        const UINT ct = kWSrv(kWClaim);
-        for (UINT i = 0; i < kWSrvCount; ++i) set_x_srv(ct + i, kPDepth, true);
-        set_x_srv(ct + 2, mask ? mask_id : kPDepth, true);
-        set_x_srv(ct + 14, mask && share_mask ? kPShare : kPDepth, true);
-        set_x_srv(ct + 15, own_motion ? kPOwnMove : kPDepth, true);
-        set_x_srv(ct + 3, gen ? static_cast<PrivateId>(kPGenZ0 + generated) : kPDepth, true);
+        const UINT ct = kWSrv(kWClaim), bt = kWSrv(kWBeside);
+        for (const UINT table : {ct, bt}) {
+            for (UINT i = 0; i < kWSrvCount; ++i) set_x_srv(table + i, kPDepth, true);
+            set_x_srv(table + 2, mask ? mask_id : kPDepth, true);
+            set_x_srv(table + 14, mask && share_mask ? kPShare : kPDepth, true);
+            set_x_srv(table + 15, own_motion ? kPOwnMove : kPDepth, true);
+            set_x_srv(table + 3, gen ? static_cast<PrivateId>(kPGenZ0 + generated) : kPDepth, true);
+        }
+        // The claim rules of the shown frame's rendered pixels (cs_warp_beside): from the same textures, once per shown frame
+        // with split queues - the intake writes the other set until the next swap (shown_serial_) - for every warp otherwise
+        // (the intake may still rewrite the mask or the share between two warps of one serial). The same result either way.
+        std::uint32_t threshold_bits;
+        std::memcpy(&threshold_bits, &c.threshold, 4);
+        // (and the texture itself: one made again - released meanwhile - holds nothing yet)
+        const std::array<std::uint64_t, 7> key = {shown_serial_, reinterpret_cast<std::uint64_t>(private_[kPWarpBeside].texture.Get()), c.flags, std::uint64_t(c.rect[0]) | std::uint64_t(c.rect[1]) << 32,
+                                                  std::uint64_t(c.rect[2]) | std::uint64_t(c.rect[3]) << 32, std::uint64_t(ow) | std::uint64_t(oh) << 32,
+                                                  std::uint64_t(threshold_bits) | std::uint64_t(gen ? generated + 1 : 0) << 32 |
+                                                      std::uint64_t((mask ? 1 : 0) | (share_mask ? 2 : 0) | (mask_id == kPMask ? 4 : 0)) << 40};
+        if (!(beside_valid_ && (split_ || beside_kept_) && key == beside_key_) && ensure_private(kPWarpHeld, dw, dh, DXGI_FORMAT_R8_UINT)) {
+            for (UINT i = 0; i < kWSrvCount; ++i) set_x_srv(kWSrv(kWHeld) + i, kPDepth, true);
+            set_x_srv(kWSrv(kWHeld) + 2, mask ? mask_id : kPDepth, true);
+            set_x_srv(kWSrv(kWHeld) + 14, mask && share_mask ? kPShare : kPDepth, true);
+            set_x_uav(kWUav(kWHeld) + 0, kPWarpHeld); set_x_uav(kWUav(kWHeld) + 1, kPWarpHeld);
+            transition(private_[kPWarpHeld], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            w_dispatch(cs_warp_held_.Get(), &c, wc, kWHeld, (c.rect[2] + 7) / 8, (c.rect[3] + 7) / 8);
+            transition(private_[kPWarpHeld], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            set_x_srv(bt + 12, kPWarpHeld);
+            set_x_uav(kWUav(kWBeside) + 0, kPWarpBeside); set_x_uav(kWUav(kWBeside) + 1, kPWarpBeside);
+            transition(private_[kPWarpBeside], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            w_dispatch(cs_warp_beside_.Get(), &c, wc, kWBeside, (c.rect[2] + 7) / 8, (c.rect[3] + 7) / 8);
+            transition(private_[kPWarpBeside], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            beside_key_ = key;
+            beside_valid_ = true;
+        }
+        set_x_srv(ct + 12, kPWarpBeside);
         set_x_uav(kWUav(kWClaim) + 0, kPWarpClaims); set_x_uav(kWUav(kWClaim) + 1, kPWarpClaims);
         transition(private_[kPWarpClaims], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         w_dispatch(cs_warp_claims_clear_.Get(), &c, wc, kWClaim, (c.rect[2] + 7) / 8, (c.rect[3] + 7) / 8);
@@ -6506,8 +6604,15 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
         stamp(kPassWarpClaim);
     }
     if (warp_stop_ <= 1) return true;
-    set_x_uav(kWUav(kWWarp) + 0, kPOutput); set_x_uav(kWUav(kWWarp) + 1, kPOutput);
-    transition(private_[kPOutput], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    // (set_lowres_between, development: a refresh of the same shown frame as the last warp - between two game frames -
+    // warped at the game's resolution, one pixel of each 2x2 block, then scaled up - see ow_low)
+    const bool low = lowres_between_ && last_warp_serial_ == shown_serial_ && (c.flags & 4096) && warp_blocks_ && !moving && !in_paths_ &&
+                     ensure_private(kPLowScene, (ow + 1) / 2, (oh + 1) / 2, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    last_warp_serial_ = shown_serial_;
+    if (low) c.threshold = float(static_cast<std::uint32_t>(c.threshold + 0.5f) | 32u);
+    const PrivateId target = low ? kPLowScene : kPOutput;
+    set_x_uav(kWUav(kWWarp) + 0, target); set_x_uav(kWUav(kWWarp) + 1, target);
+    transition(private_[target], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     // (forward splat: the plain pixels first, the rest packed for the full warp - see cs_own_warp_lean)
     if ((c.flags & 4096) && warp_blocks_ && !moving && ensure_warp_list(ow, oh)) {
         D3D12_UNORDERED_ACCESS_VIEW_DESC raw{};
@@ -6533,6 +6638,16 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
         list_->ResourceBarrier(1, &to_args);
     } else {
         w_dispatch(cs_own_warp_.Get(), &c, wc, kWWarp, (ow + 7) / 8, (oh + 7) / 8);
+    }
+    if (low) {
+        transition(private_[kPLowScene], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        const UINT ut = kWSrv(kWWarpUp);
+        const auto bound = warp_srv_;
+        for (UINT i = 0; i < kWSrvCount; ++i) set_x_srv(ut + i, bound[i].first, bound[i].second);
+        set_x_srv(ut + 8, kPLowScene);
+        set_x_uav(kWUav(kWWarpUp) + 0, kPOutput); set_x_uav(kWUav(kWWarpUp) + 1, kPOutput);
+        transition(private_[kPOutput], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        w_dispatch(cs_own_warp_up_.Get(), &c, wc, kWWarpUp, (ow + 7) / 8, (oh + 7) / 8);
     }
     stamp(kPassWarpRest);
 
@@ -7938,7 +8053,7 @@ void Renderer::release_stash() {
 }
 
 std::string Renderer::memory_report() {
-    static const char* const kNames[] = {"Backbuffer", "Hudless", "Ui", "Depth", "Motion", "ZeroUi", "Output", "Object", "ObjKeys", "ObjMove", "ObjTiles", "ObjOutTiles", "ObjKindA", "ObjKindB", "Gen0", "Gen1", "Gen2", "GenZ0", "GenZ1", "GenZ2", "PrevColour", "PrevDepth", "Previous", "HudScore", "Mask", "Scene", "Attached", "World", "Fill", "Mem0", "Mem1", "MemZ0", "MemZ1", "RampRows", "Ramp", "WarpMask", "HudKind", "StashColor", "StashDepth", "StashMotion", "StashHudless", "Stash2Color", "Stash2Hudless", "Stash2Depth", "Stash2Motion", "LumaA", "LumaB", "Feat", "FlowA", "FlowB", "RetCells", "RetEncl", "RetA", "RetB", "RetLayer", "FgMotion", "FgInv", "FgK1", "FgK0", "HudLearned", "HudTiles", "WarpClaims", "Still", "GrowA", "GrowB", "Probe", "ProbeTilesA", "ProbeTilesB", "ShareA", "ShareB", "ShareT", "Share", "RetDirtyA", "RetDirtyB", "ShareT2", "ShareHalf", "RecColour", "RecUi", "ShareResid", "OwnMove", "Paths", "ShareSeam", "AttHist", "MemVis", "UiTiles"};
+    static const char* const kNames[] = {"Backbuffer", "Hudless", "Ui", "Depth", "Motion", "ZeroUi", "Output", "Object", "ObjKeys", "ObjMove", "ObjTiles", "ObjOutTiles", "ObjKindA", "ObjKindB", "Gen0", "Gen1", "Gen2", "GenZ0", "GenZ1", "GenZ2", "PrevColour", "PrevDepth", "Previous", "HudScore", "Mask", "Scene", "Attached", "World", "Fill", "Mem0", "Mem1", "MemZ0", "MemZ1", "RampRows", "Ramp", "WarpMask", "HudKind", "StashColor", "StashDepth", "StashMotion", "StashHudless", "Stash2Color", "Stash2Hudless", "Stash2Depth", "Stash2Motion", "LumaA", "LumaB", "Feat", "FlowA", "FlowB", "RetCells", "RetEncl", "RetA", "RetB", "RetLayer", "FgMotion", "FgInv", "FgK1", "FgK0", "HudLearned", "HudTiles", "WarpClaims", "Still", "GrowA", "GrowB", "Probe", "ProbeTilesA", "ProbeTilesB", "ShareA", "ShareB", "ShareT", "Share", "RetDirtyA", "RetDirtyB", "ShareT2", "ShareHalf", "RecColour", "RecUi", "ShareResid", "OwnMove", "Paths", "ShareSeam", "AttHist", "MemVis", "UiTiles", "WarpBeside", "WarpHeld", "LowScene"};
     static_assert(sizeof(kNames) / sizeof(kNames[0]) == kPCount, "a name for every private texture");
     struct Item { std::string name; double mb; };
     std::vector<Item> items;

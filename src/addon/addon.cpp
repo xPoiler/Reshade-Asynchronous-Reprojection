@@ -113,6 +113,13 @@ void launch_presenter() {
     exe_dir = exe_dir.substr(0, exe_dir.find_last_of(L"\\/"));
     const std::wstring candidates[] = {g_presenter_path, exe_dir + L"\\FrameWarp\\FrameWarpPresenter.exe"};
     const std::wstring args = L" --pid " + std::to_wstring(GetCurrentProcessId());
+    // (development, [FrameWarp] ClaimsReuse=0/1 in ReShade.ini: the warp's claims reused across the refreshes of a game frame
+    // or not, for an A/B in a game - handed to the presenter in its environment, see Renderer::set_claims_reuse)
+    {
+        char value[8] = {};
+        size_t size = sizeof(value);
+        if (reshade::get_config_value(nullptr, "FrameWarp", "ClaimsReuse", value, &size)) SetEnvironmentVariableW(L"FW_CLAIMS_REUSE", value[0] == '1' ? L"1" : L"0");
+    }
     DWORD error = ERROR_FILE_NOT_FOUND;
     for (const auto& path : candidates) {
         if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
