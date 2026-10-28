@@ -58,9 +58,11 @@ void on_reshade_reloaded_effects(effect_runtime*) { g.scanned = false; }  // (ev
 
 void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, resource_view, resource_view) {
     Producer* p = g_producer;
-    if (!p || !p->ready() || p->vulkan() || !runtime || !cmd_list) return;
+    if (!p || !p->ready() || !runtime || !cmd_list) return;
     device* dev = runtime->get_device();
-    if (!dev || (dev->get_api() != device_api::d3d12 && !(dev->get_api() == device_api::d3d11 && p->d3d11()))) return;
+    if (!dev || (dev->get_api() != device_api::d3d12 && !(dev->get_api() == device_api::d3d11 && p->d3d11()) &&
+                 !(dev->get_api() == device_api::vulkan && p->vulkan())))
+        return;
     // The game's own depth and motion vectors (an upscaler's, Streamline's) always come first: the feed is
     // what there is when nothing else gives them (a game without DLSS or FSR, or with both switched off, at
     // the start or in the middle of a session), and it is out from the first frame an upscaler gives. It
@@ -73,8 +75,26 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
     const bool wanted = p->shared()->settings.enabled && !p->game_depth_seen() && !p->generation_active();
     if (!g.scanned) scan(runtime);
     if (wanted) track_depth_buffers(); else release_depth_choice(runtime);
-    if (!wanted || ++g.waited < 600) {
+    // (and only once the game draws a 3D scene - 600 frames of it in a row: its menus at the start of a session are no
+    // reason to start. Started there, in a game whose upscaler comes with gameplay, the presenter took its ~900 MB
+    // before the game loaded its world: Enshrouded on an 8 GB card at 6-8 fps for a minute after loading. Once running,
+    // the feed stays on through menus and pauses)
+    if (wanted && g.waited < 600) {
+        const double binds = depth_binds_per_frame();
+        if (binds >= 20.0) ++g.waited;
+        else g.waited = 0;
+        if (g.waited == 600) {
+            char text[160];
+            std::snprintf(text, sizeof(text), "XPAR: no DLSS or FSR data, a 3D scene drawn (%.0f depth buffers bound a frame): the ReShade feed starts", binds);
+            reshade::log::message(reshade::log::level::info, text);
+        }
+    }
+    if (!wanted || g.waited < 600) {
         g.status[0] = 0;
+        // (waiting for a 3D scene: said, so that a game whose scene binds its depth buffers fewer times is seen)
+        if (wanted && g.waited == 0 && g.feed.handle)
+            std::snprintf(g.status, sizeof(g.status), "No DLSS or FSR data from this game: waiting for a 3D scene (%.0f depth buffers bound a frame, 20 needed).",
+                          depth_binds_per_frame());
         if (!wanted) g.waited = 0;
         // (the technique is hidden and only ever enabled here: off whenever the feed is not running)
         if (g.feed.handle && runtime->get_technique_state(g.feed)) runtime->set_technique_state(g.feed, false);
@@ -132,7 +152,13 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
     cam.mvec_scale[0] = static_cast<float>(w);
     cam.mvec_scale[1] = static_cast<float>(h);
     p->on_constants(frame, cam);
-    if (dev->get_api() == device_api::d3d11) {
+    if (dev->get_api() == device_api::vulkan) {
+        // (XPAR.fx's depth, R32F, left readable by shaders as every effect render target is - see copy_probe)
+        if (desc.texture.format != format::r32_float) return;
+        constexpr std::uint32_t kVkR32Float = 100, kVkColour = 1, kVkShaderReadOnly = 5;  // (VK_FORMAT_R32_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT,
+                                                                                           // VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+        p->on_tag_vk(frame, kDepth, depth.handle, kVkR32Float, kVkColour, 0, 0, kVkShaderReadOnly, w, h, 0, 0, w, h, reinterpret_cast<void*>(cmd_list->get_native()));
+    } else if (dev->get_api() == device_api::d3d11) {
         // (the immediate context: ReShade renders its effects there)
         p->on_tag_d3d11(frame, kDepth, reinterpret_cast<ID3D11Resource*>(depth.handle), 0, 0, w, h,
                         reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native()));

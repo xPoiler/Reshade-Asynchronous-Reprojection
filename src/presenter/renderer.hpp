@@ -324,6 +324,8 @@ public:
     // Development: a refresh between two game frames (the same shown frame as the last warp) warped at the game's
     // resolution - one pixel of each 2x2 block - and scaled up; held pixels and the UI layer at full resolution.
     void set_lowres_between(bool on) { lowres_between_ = on; }
+    // The motion estimate's textures released (once the game gives its own motion vectors; made again if needed).
+    void release_own_motion() { for (const PrivateId id : {kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB}) if (private_[id].texture) retire(id); }
     void set_ui_tiles_off(bool on) { ui_tiles_off_ = on; }  // (development: the HUD layer read everywhere - see ow_ui_at)
     void set_rim_mode(int m) { rim_mode_ = m; }  // (scenery not stretched onto a nearer edge: see ow_rim; 2 by default)
     void set_outline_wide(bool on) { outline_wide_ = on; }  // (the held outline two render pixels wide)

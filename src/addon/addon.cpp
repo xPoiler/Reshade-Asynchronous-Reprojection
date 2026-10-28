@@ -444,7 +444,8 @@ void on_init_swapchain(swapchain* sc, bool) {
         fw::install_streamline_hooks(g_producer.get());
         fw::install_ffx_hooks(g_producer.get());
     }
-    if (dev->get_api() == device_api::d3d12 || dev->get_api() == device_api::d3d11) fw::install_reshade_feed(g_producer.get());
+    if (dev->get_api() == device_api::d3d12 || dev->get_api() == device_api::d3d11 || dev->get_api() == device_api::vulkan)
+        fw::install_reshade_feed(g_producer.get());
     // The settings remembered per game (ReShade.ini, [FrameWarp]). They belong to the build that saved them:
     // after an update - any new build, a test build of the same version too - they go back to the defaults,
     // so the improved defaults apply right after installing it. The build: the version and the add-on's own

@@ -43,13 +43,18 @@ std::atomic<bool> g_track{false};
 std::atomic<std::uint64_t> g_frame{0};
 std::mutex g_mutex;
 std::unordered_map<std::uint64_t, Candidate> g_seen;  // by resource handle
+// Depth buffers bound, all of them, per frame (depth_binds_per_frame): over the last 60 frames.
+std::atomic<std::uint64_t> g_binds{0};
+std::uint64_t g_rate_frame = 0, g_rate_binds = 0;
+double g_rate = 0;
 
 void note(command_list* cmd_list, resource_view dsv) {
     if (!g_track.load(std::memory_order_relaxed) || !dsv.handle || !cmd_list) return;
     device* dev = cmd_list->get_device();
-    if (!dev || (dev->get_api() != device_api::d3d12 && dev->get_api() != device_api::d3d11)) return;
+    if (!dev || (dev->get_api() != device_api::d3d12 && dev->get_api() != device_api::d3d11 && dev->get_api() != device_api::vulkan)) return;
     const resource res = dev->get_resource_from_view(dsv);
     if (!res.handle) return;
+    g_binds.fetch_add(1, std::memory_order_relaxed);
     const std::uint64_t frame = g_frame.load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(g_mutex);
     if (const auto it = g_seen.find(res.handle); it != g_seen.end()) { it->second.last_frame = frame; ++it->second.binds; return; }
@@ -95,12 +100,38 @@ struct ProbeReader {
     std::uint64_t readback_bytes = 0;
     std::uint64_t present = 0;  // the present the copy was recorded for (frame_cap_gpu_done)
     int waited = 0;
-    void reset() { readback.Reset(); staging.Reset(); }
+    // (Vulkan: through ReShade's own calls - a readback buffer, and a fence of its own: frame_cap's present fence is Direct3D
+    // only. Signalled on the queue at the next frame's effects, once ReShade has submitted the frame that holds the copy)
+    device* vk_device = nullptr;
+    resource vk_buffer{0};
+    fence vk_fence{0};
+    std::uint64_t vk_signalled = 0, vk_target = 0;  // (vk_target: the value that marks this copy done; 0: not signalled yet)
+    bool vk_signal = false;                         // (the copy recorded: the fence signalled at the next readiness check)
+    std::uint32_t vk_w = 0, vk_h = 0;
+    void reset() {
+        readback.Reset(); staging.Reset();
+        if (vk_device) {
+            if (vk_buffer.handle) vk_device->destroy_resource(vk_buffer);
+            if (vk_fence.handle) vk_device->destroy_fence(vk_fence);
+        }
+        vk_device = nullptr; vk_buffer = {0}; vk_fence = {0};
+        vk_signalled = vk_target = 0; vk_signal = false; vk_w = vk_h = 0;
+    }
 };
+command_queue* g_queue = nullptr;  // (the effect runtime's, as of this frame - for ProbeReader's Vulkan fence)
 // The copy done on the GPU: a fixed few frames were not enough with frames queued on the GPU (RE4 uncapped, 2-3 frames
 // behind) - the probe was read before the GPU had written it, every buffer scored as nothing, no depth was ever chosen
 // and the camera estimate, without depth, failed a third of the frames. (Read anyway after 120 frames: never stuck.)
 bool probe_ready(ProbeReader& r) {
+    if (r.vk_buffer.handle) {
+        if (r.vk_signal) {
+            r.vk_signal = false;
+            if (r.vk_fence.handle && g_queue && g_queue->signal(r.vk_fence, r.vk_signalled + 1)) r.vk_target = ++r.vk_signalled;
+        }
+        // (no fence - not made, or not signalled: a fixed few frames more, as Direct3D 11 without fences did)
+        if (r.vk_target ? r.vk_device->get_completed_fence_value(r.vk_fence) >= r.vk_target : r.waited >= 8) return true;
+        return ++r.waited > 120;
+    }
     if (frame_cap_gpu_done(r.present) || ++r.waited > 120) return true;
     return false;
 }
@@ -145,6 +176,29 @@ bool fits_picture(const Candidate& k, std::uint32_t fw_, std::uint32_t fh) {
 bool copy_probe(ProbeReader& r, device* dev, command_list* cmd_list, resource_view probe) {
     r.present = frame_cap_presents() + 1;  // (recorded during this frame: done once its present is)
     r.waited = 0;
+    if (dev->get_api() == device_api::vulkan) {
+        const resource tex = dev->get_resource_from_view(probe);
+        if (!tex.handle) return false;
+        const resource_desc desc = dev->get_resource_desc(tex);
+        if (desc.texture.format != format::r32g32_float) return false;
+        if (r.vk_device != dev || !r.vk_buffer.handle || r.vk_w != desc.texture.width || r.vk_h != desc.texture.height) {
+            r.reset();
+            const std::uint64_t bytes = std::uint64_t(desc.texture.width) * desc.texture.height * 8;
+            if (!dev->create_resource(resource_desc(bytes, memory_heap::readback, resource_usage::copy_dest), nullptr, resource_usage::copy_dest,
+                                      &r.vk_buffer))
+                return false;
+            r.vk_device = dev;
+            if (!dev->create_fence(0, fence_flags::none, &r.vk_fence)) r.vk_fence = {0};
+            r.vk_w = desc.texture.width; r.vk_h = desc.texture.height;
+        }
+        // (ReShade leaves an effect's render targets readable by shaders between passes, as with Direct3D 12)
+        cmd_list->barrier(tex, resource_usage::shader_resource, resource_usage::copy_source);
+        cmd_list->copy_texture_to_buffer(tex, 0, nullptr, r.vk_buffer, 0);
+        cmd_list->barrier(tex, resource_usage::copy_source, resource_usage::shader_resource);
+        r.vk_signal = true;
+        r.vk_target = 0;
+        return true;
+    }
     if (dev->get_api() == device_api::d3d11) {
         auto* tex = reinterpret_cast<ID3D11Texture2D*>(dev->get_resource_from_view(probe).handle);
         auto* context = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
@@ -202,6 +256,16 @@ bool copy_probe(ProbeReader& r, device* dev, command_list* cmd_list, resource_vi
 }
 
 bool read_probe(ProbeReader& r, std::vector<float>& px, std::uint32_t& w, std::uint32_t& h) {
+    if (r.vk_buffer.handle) {
+        void* mapped = nullptr;
+        const std::uint64_t bytes = std::uint64_t(r.vk_w) * r.vk_h * 8;
+        if (!r.vk_device->map_buffer_region(r.vk_buffer, 0, bytes, map_access::read_only, &mapped) || !mapped) return false;
+        w = r.vk_w; h = r.vk_h;
+        px.resize(std::size_t(w) * h * 2);
+        std::memcpy(px.data(), mapped, std::size_t(bytes));
+        r.vk_device->unmap_buffer_region(r.vk_buffer);
+        return true;
+    }
     if (r.staging) {
         ComPtr<ID3D11Device> d3d;
         ComPtr<ID3D11DeviceContext> context;
@@ -334,6 +398,7 @@ void unregister_depth_choice_events() {
 
 DepthChoice choose_depth_buffer(effect_runtime* runtime, command_list* cmd_list, resource_view probe, resource_view bound_depth) {
     device* dev = runtime->get_device();
+    g_queue = runtime->get_command_queue();
     const std::uint64_t frame = g_frame.load();
     if (c.disabled) return DepthChoice::kUnavailable;
     auto* gd = runtime->get_private_data<generic_depth_data>();
@@ -527,6 +592,7 @@ DepthChoice choose_depth_buffer(effect_runtime* runtime, command_list* cmd_list,
 
 bool depth_orientation_ready(effect_runtime* runtime, command_list* cmd_list, resource_view probe, effect_uniform_variable flip_variable) {
     Orientation& o = g_orient;
+    g_queue = runtime->get_command_queue();
     if (!probe.handle || !flip_variable.handle) return true;  // (an older XPAR.fx: ReShade's setting as it is)
     runtime->set_uniform_value_bool(flip_variable, o.flip);
     if (--o.wait > 0) return o.decided;
@@ -578,8 +644,15 @@ bool depth_usable() { return c.disabled || c.users || c.chosen.handle != 0; }
 
 void track_depth_buffers() {
     g_track = true;
-    ++g_frame;
+    const std::uint64_t frame = ++g_frame;
+    if (frame >= g_rate_frame + 60) {
+        const std::uint64_t binds = g_binds.load(std::memory_order_relaxed);
+        g_rate = g_rate_frame ? double(binds - g_rate_binds) / double(frame - g_rate_frame) : 0.0;
+        g_rate_frame = frame; g_rate_binds = binds;
+    }
 }
+
+double depth_binds_per_frame() { return g_track ? g_rate : 0.0; }
 
 void release_depth_choice(effect_runtime* runtime) {
     if (!g_track.exchange(false)) return;

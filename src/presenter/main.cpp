@@ -1051,6 +1051,8 @@ void render_thread() {
                     mv_scale = MotionVectorScale{};
                     camera_check = CameraCheck{};
                     renderer.reset_hud_detection();
+                    // (the motion estimated from the picture is not needed with the game's own: its textures go)
+                    if (!s.motion_estimated) renderer.release_own_motion();
                     logf("camera source switched to %s", !cam.estimated ? "the game's own camera data" :
                          s.motion_estimated ? "XPAR's own motion vectors (estimated from the picture)" : "the upscaler's motion vectors (estimated)");
                 }
