@@ -2052,8 +2052,14 @@ RWByteAddressBuffer re_buf_u : register(u1);  // (the window cells counted: see 
         const float2 lo = float2(id.xy) + 0.5 - float2(axes.y, axes.w) - sway, hi = float2(id.xy) + 0.5 + float2(axes.x, axes.z) + sway;
         if (hits == 8 && all(centre >= lo) && all(centre <= hi)) {
             r = float4(g / 8.0, 1, frame);
+            // (counted - a sight's window seen, the layers made and the passes run - only within a small circle round the
+            // screen's centre: 8% of the height, the sway and the recoil's kick. The box alone let a gap beside Armored
+            // Core VI's machine through - its frame spans the centre - and the layers were made, 128 MB at 4K, in a game
+            // with no sights. A sight is aimed with: its glass is on the centre. The window's other cells are kept as
+            // they were - a wide scope's whole glass carries the layer)
+            const float circle = 0.08 * float(rect.w) / float(max(groups_x, 1u));
             uint ignored;
-            re_buf_u.InterlockedAdd(uint(kRetTrackN + 3) * 4, 1, ignored);
+            if (length(float2(id.xy) + 0.5 - centre) <= circle) re_buf_u.InterlockedAdd(uint(kRetTrackN + 3) * 4, 1, ignored);
         }
     }
     re_encl_u[id.xy] = r;
@@ -7777,8 +7783,14 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
     // A HUD-less picture without a UI layer: the layer taken from the two (see cs_hudless_ui) - split as a game that sends both
     // A UI layer with its colour and no HUD-less picture: the scenery under it taken out of the frame (cs_layer_unblend), into
     // the HUD-less picture's texture - not reported as one (the HUD stays the layer's, held where it lets too little through)
+    // (in the picture's own format where that is 8 or 10 bits: the scenery comes out within range there - cs_layer_unblend's
+    // saturate - and in the picture's encoding, so it loses only its rounding, laid back under the layer within a step of
+    // the half-float result; half the memory at 4K, 32 MB for the set and as much for the shown one. Half floats for scRGB
+    // and the rest)
+    const DXGI_FORMAT bf = private_[kPBackbuffer].format;
+    const DXGI_FORMAT scene_format = bf == DXGI_FORMAT_R8G8B8A8_UNORM || bf == DXGI_FORMAT_R10G10B10A2_UNORM ? bf : DXGI_FORMAT_R16G16B16A16_FLOAT;  // (colour_format's)
     if (out.has_ui && !out.has_hudless && colour_unblend_ && private_[kPUi].format != DXGI_FORMAT_R8_UNORM && private_[kPBackbuffer].texture &&
-        ensure_private(kPHudless, bb.width, bb.height, DXGI_FORMAT_R16G16B16A16_FLOAT)) {
+        ensure_private(kPHudless, bb.width, bb.height, scene_format)) {
         XConstants u{};
         u.out_size[0] = bb.width; u.out_size[1] = bb.height;
         u.flags = (blend_linear_ ? 1u : 0u) | (layer_linear_ ? 2u : 0u) | (unblend_exact_ ? 4u : 0u);
@@ -8058,8 +8070,12 @@ std::string Renderer::memory_report() {
     struct Item { std::string name; double mb; };
     std::vector<Item> items;
     double total = 0;
+    // (each texture once: with split queues the previous frame is the shown one, read in place - kPPrevious names
+    // front_'s texture - and was counted twice)
+    std::vector<ID3D12Resource*> counted;
     auto add = [&](const std::string& name, ID3D12Resource* r) {
-        if (!r) return;
+        if (!r || std::find(counted.begin(), counted.end(), r) != counted.end()) return;
+        counted.push_back(r);
         const auto desc = r->GetDesc();
         const double mb = double(device_->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes) / 1048576.0;
         char text[96];

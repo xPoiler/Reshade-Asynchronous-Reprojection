@@ -10,8 +10,10 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 71;
-constexpr int kSlots = 4;
+constexpr std::uint32_t kVersion = 72;
+// (three: the add-on writing one, one ready, the presenter taking one in - a fourth only held an older ready frame the
+// newer one replaces anyway; each is a 4K picture + HUD layer + depth, ~72 MB of video memory - 2026-10-28)
+constexpr int kSlots = 3;
 
 // Streamline buffer kinds we capture. Values are our own; tags are classified by BufferType + format.
 // kScene: the upscaler's output (games without Streamline): the scene before post-processing and HUD.
