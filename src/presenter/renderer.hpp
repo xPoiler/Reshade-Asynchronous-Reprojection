@@ -82,10 +82,13 @@ public:
     ID3D12Device* device() const { return device_.Get(); }
     HANDLE waitable() const { return waitable_; }
     const char* queue_priority() const { return priority_name_; }
-    // Shaders kept on disk (set before init; empty: none - compiled every time): the compiled code of each, valid only for
-    // the same shader source, compiler and presenter build - any update compiles them all again. What init did with them,
-    // for the log.
+    // Shaders kept on disk (set before init; empty: none - compiled every time): the compiled code of each, valid for the
+    // same shader source - a shader built into the presenter (bake_shaders) is taken first. What init did with them, for the
+    // log.
     static void set_shader_cache(const std::wstring& dir);
+    // Every shader compiled into one file, the presenter's built-in pack (src/presenter/shader_bake.cpp, at build time).
+    // False: one failed to compile or the file could not be written.
+    static bool bake_shaders(const std::wstring& file, std::string& report);
     const std::string& shader_report() const { return shader_report_; }
     bool resize(std::uint32_t width, std::uint32_t height);
     // The game's picture format and colour space (HDR on/off): swap chain format, final pass and colour space follow.
@@ -276,7 +279,13 @@ public:
     void set_mem_pos(bool on) { mem_pos_ = on; }  // (dev: memory content carried with its own position, not sampled - see mem_off)
     void set_mem_nearest(bool on) { mem_nearest_ = on; }  // (dev: the memory's colour carried from the nearest pixel, as before)  // (dev: the memory's checks for each of its pixels, no cs_mem_vis)
     void set_mem_fringe(bool on) { mem_fringe_ = on; }  // (the memory takes nothing beside what is clearly nearer - see mem_beside_nearer)
-    void set_mem_age_old(bool on) { mem_age_old_ = on; }  // (dev: the memory older by a frame each frame, as before 2026-10-20)
+    void set_mem_age_old(bool on) { mem_age_old_ = on; }
+    void set_mem_front(bool on) { mem_front_ = on; }
+    void set_mem_static(bool on) { mem_static_ = on; }
+    void set_mem_two(bool on) { mem_two_ = on; }
+    void set_hud_keep_check(bool on) { hud_keep_check_ = on; }
+    // Development: the attached rule (set_attached_carried) with XPAR's own motion estimate too - off: only with the game's vectors.
+    void set_attached_estimated(bool on) { attached_est_ = on; }  // (dev: the HUD-less layer's kept coverage only while it still gives the frame - see cs_hudless_ui)  // (dev: the background memory in two layers - see ow_mem_front)  // (dev: held but still in the world remembered - see mem_static_held)  // (dev: what is visible always replaces the memory - see cs_memory's flag 8192)  // (dev: the memory older by a frame each frame, as before 2026-10-20)
     // (the game's own camera this frame: the share measured against its whole motion - see share_measure_at, flag 256)
     void set_share_whole(bool on) { share_whole_ = on; }
     void set_infill_est(bool on) { infill_est_ = on; }
@@ -324,6 +333,14 @@ public:
     // Development: a refresh between two game frames (the same shown frame as the last warp) warped at the game's
     // resolution - one pixel of each 2x2 block - and scaled up; held pixels and the UI layer at full resolution.
     void set_lowres_between(bool on) { lowres_between_ = on; }
+    // Development: the edges of what the follow share carries split in two layers per game frame (cs_edge_split).
+    void set_edge_layers(bool on) { edge_layers_ = on; }
+    // Development: the no-warp mask's boundaries smoothed - see cs_mask_smooth.
+    void set_mask_smooth(bool on) { mask_smooth_ = on; }
+    // Development: the claim rule beside held characters and weapons off (the HUD keeps it) - see ow_beside_held.
+    void set_claims_beside_held(bool on) { claims_beside_held_ = on; }
+    // Development: beside a held character the claim rule only once a pixel has moved a rendered pixel (1) or half (2) - cs_warp_claim.
+    void set_beside_moved(int mode) { beside_moved_ = mode; }
     // The motion estimate's textures released (once the game gives its own motion vectors; made again if needed).
     void release_own_motion() { for (const PrivateId id : {kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB}) if (private_[id].texture) retire(id); }
     void set_ui_tiles_off(bool on) { ui_tiles_off_ = on; }  // (development: the HUD layer read everywhere - see ow_ui_at)
@@ -429,6 +446,9 @@ public:
     // 19: the game's HUD-less picture; 29-31: XPAR frame generation's motion, claims of this frame (last image) and on
     // the previous frame)
     bool read_back(int which, std::vector<std::uint16_t>& pixels, std::uint32_t& w, std::uint32_t& h);
+    // Development (warp_replay): the reverse - half-float RGBA written into texture `which` (read_back's numbering) of the
+    // same size, in its own format (R8 / R16 / RGBA16 unorm or float). A capture's mask and share replayed as the game had them.
+    bool write_back(int which, const std::vector<std::uint16_t>& pixels, std::uint32_t w, std::uint32_t h);
     // Diagnostics: keeps a copy of the current game frame's picture (and HUD-less picture), depth and motion
     // vectors on the GPU (a few milliseconds, nothing is read back), so a capture taken on a later game frame
     // holds consecutive ones. Two sets: 0 is read back as 10-14, 1 as 15-18.
@@ -445,7 +465,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     };
-    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKeys, kPObjMove, kPObjTiles, kPObjOutTiles, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevColour, kPPrevDepth, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPFgMotion, kPFgInv, kPFgK1, kPFgK0, kPHudLearned, kPHudTiles, kPWarpClaims, kPStill, kPGrowA, kPGrowB, kPProbe, kPProbeTilesA, kPProbeTilesB, kPShareA, kPShareB, kPShareT, kPShare, kPRetDirtyA, kPRetDirtyB, kPShareT2, kPShareHalf, kPRecColour, kPRecUi, kPShareResid, kPOwnMove, kPPaths, kPShareSeam, kPAttHist, kPMemVis, kPUiTiles, kPWarpBeside, kPWarpHeld, kPLowScene, kPCount };
+    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKeys, kPObjMove, kPObjTiles, kPObjOutTiles, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevColour, kPPrevDepth, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPFgMotion, kPFgInv, kPFgK1, kPFgK0, kPHudLearned, kPHudTiles, kPWarpClaims, kPStill, kPGrowA, kPGrowB, kPProbe, kPProbeTilesA, kPProbeTilesB, kPShareA, kPShareB, kPShareT, kPShare, kPRetDirtyA, kPRetDirtyB, kPShareT2, kPShareHalf, kPRecColour, kPRecUi, kPShareResid, kPOwnMove, kPPaths, kPShareSeam, kPAttHist, kPMemVis, kPUiTiles, kPWarpBeside, kPWarpHeld, kPLowScene, kPEdge, kPMaskRaw, kPMemF0, kPMemF1, kPMemFZ0, kPMemFZ1, kPCount };
 
     bool create_pipelines(std::string& error);
     std::string shader_report_;
@@ -458,7 +478,7 @@ private:
     static bool shown_id(PrivateId id) {
         return id == kPBackbuffer || id == kPHudless || id == kPUi || id == kPDepth || id == kPMask || id == kPFill || id == kPWarpMask || id == kPShare || id == kPOwnMove ||
                id == kPObjMove || id == kPObjTiles || id == kPPrevColour || id == kPPrevDepth || (id >= kPGen0 && id <= kPGenZ2) ||
-               id == kPRetLayer || id == kPUiTiles;
+               id == kPRetLayer || id == kPUiTiles || id == kPEdge;
     }
     const Private& shown(PrivateId id) const { return split_ && shown_id(id) ? front_[id] : private_[id]; }
     void swap_shown();  // exchanges the two sets (and the per-texture descriptors)
@@ -548,7 +568,7 @@ private:
     bool infill_est_ = false, flow_ui_ = false, flow_ui_masked_ = false, flow_ui_off_ = false;  // (the motion estimate this frame: the HUD layer given / left out - fl_under_hud)
     unsigned mem_res_ = 1;
     bool ui_synth_last_ = false, colour_unblend_ = true, unblend_exact_ = false;  // (kPUi holds the layer cs_hudless_ui made from the last frame)
-    bool share_whole_ = false, att_smooth_ = true, att_hist_valid_ = false, share_full_mask_ = false, mem_fringe_ = false, ui_from_hudless_ = true,  mem_vis_off_ = false, mem_pos_ = false, mem_nearest_ = false, share_seam_ = false, mem_age_old_ = false, ring_old_ = false, fill_inside_old_ = false, memory_scenery_ = false, attached_carried_ = true, chars_carried_ = false, splat_turns_ = true, own_carried_only_ = false, own_depth_blind_ = false, paths_capture_ = false, in_paths_ = false, outlines_held_ = true, outline_scenery_ = false, carried_free_ = false, carried_edge_ = true, outline_wide_ = false, memory_margin_ = true, infill_mirror_ = false, infill_memory_ = true, infill_wide_ = false, game_vectors_ = false, edge_dither_ = false, claim_rule_old_ = false;
+    bool share_whole_ = false, att_smooth_ = true, att_hist_valid_ = false, share_full_mask_ = false, mem_fringe_ = false, ui_from_hudless_ = true,  mem_vis_off_ = false, mem_pos_ = false, mem_nearest_ = false, share_seam_ = false, mem_age_old_ = false, mem_front_ = false, mem_static_ = false, mem_two_ = false, mem_front_valid_ = false, hud_keep_check_ = false, attached_est_ = false, ring_old_ = false, fill_inside_old_ = false, memory_scenery_ = false, attached_carried_ = true, chars_carried_ = false, splat_turns_ = true, own_carried_only_ = false, own_depth_blind_ = false, paths_capture_ = false, in_paths_ = false, outlines_held_ = true, outline_scenery_ = false, carried_free_ = false, carried_edge_ = true, outline_wide_ = false, memory_margin_ = true, infill_mirror_ = false, infill_memory_ = true, infill_wide_ = false, game_vectors_ = false, edge_dither_ = false, claim_rule_old_ = false;
     int rim_mode_ = 2;
     bool claims_reuse_ = false, claims_valid_ = false, ui_tiles_off_ = false, claims_turn_only_ = false;
     std::uint64_t shown_serial_ = 0, claims_serial_ = ~0ull;
@@ -556,9 +576,12 @@ private:
     // kept only with split queues, where the shown set does not change until the next swap - see own_warp)
     std::array<std::uint64_t, 7> beside_key_ = {};
     bool beside_valid_ = false, beside_kept_ = false;
-    bool lowres_between_ = false;
+    bool lowres_between_ = false, edge_layers_ = false, mask_smooth_ = false, claims_beside_held_ = false;
+    int beside_moved_ = 0;
+    bool edge_written_ = false, edge_written_shown_ = false;
+    PrivateId edge_colour_ = kPBackbuffer;  // (the picture the layer was made from)  // (kPEdge written for the set being taken in / the shown one)
     std::uint64_t last_warp_serial_ = ~0ull;
-    std::array<std::pair<PrivateId, bool>, 16> warp_srv_ = {};  // (the warp table's SRVs as last set - set_x_srv)
+    std::array<std::pair<PrivateId, bool>, 18> warp_srv_ = {};  // (the warp table's SRVs as last set - set_x_srv)
     float claims_matrix_[16] = {};
     bool orbit_centre_turn_ = false, orbit_kind_ = true, share_orbit_ = false, projection_changed_ = false, zoom_freeze_ = true, ui8_force_ = false, flow_stamps_ = false;
     bool behind_own_share_ = false;
@@ -579,7 +602,7 @@ private:
     bool learning_stalled_ = true;
     std::uint32_t detection_idle_ = 0;  // game frames since the HUD was last detected (build_no_warp_mask)
     std::uint32_t scene_idle_ = 0;      // game frames since the upscaler's output last came (ingest)
-    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_own_warp_reset_, cs_own_warp_lean_, cs_own_warp_args_, cs_own_warp_rest_, cs_warp_claims_clear_, cs_warp_claim_, cs_warp_beside_, cs_warp_held_, cs_own_warp_up_, cs_memory_, cs_mem_vis_, cs_hudless_ui_, cs_hudless_keep_, cs_ui_tiles_, cs_layer_unblend_, cs_layer_seam_clear_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_, cs_probe_tiles_, cs_probe_clear_, cs_probe_score_, cs_share_measure_, cs_share_blur_, cs_share_bins_, cs_share_final_, cs_share_up_, cs_share_seam_, cs_att_hist_, cs_rec_down_, cs_share_resid_, cs_resid_blur_, cs_own_up_;
+    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_own_warp_reset_, cs_own_warp_lean_, cs_own_warp_args_, cs_own_warp_rest_, cs_warp_claims_clear_, cs_warp_claim_, cs_warp_beside_, cs_warp_held_, cs_own_warp_up_, cs_edge_split_, cs_mask_smooth_, cs_memory_, cs_mem_vis_, cs_hudless_ui_, cs_hudless_keep_, cs_ui_tiles_, cs_layer_unblend_, cs_layer_seam_clear_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_, cs_probe_tiles_, cs_probe_clear_, cs_probe_score_, cs_share_measure_, cs_share_blur_, cs_share_bins_, cs_share_final_, cs_share_up_, cs_share_seam_, cs_att_hist_, cs_rec_down_, cs_share_resid_, cs_resid_blur_, cs_own_up_;
     // Sight reticles (option): the passes, which history texture holds the latest layer, and whether the layer was
     // built for the frame taken in last / the shown one (see cs_ret_layer).
     ComPtr<ID3D12PipelineState> cs_ret_cells_, cs_ret_enclose_, cs_ret_layer_, cs_ret_align_, cs_ret_pick_, cs_ret_args_, cs_ret_shift_;

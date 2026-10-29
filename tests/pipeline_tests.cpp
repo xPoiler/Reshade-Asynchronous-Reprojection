@@ -132,6 +132,9 @@ int main(int argc, char** argv) {
     std::string error;
     if (!renderer.init(sh.adapter, window, W, H, kColour, 0, error)) { std::printf("FAIL renderer: %s\n", error.c_str()); return 1; }
     std::printf("presenter queue priority: %s\n", renderer.queue_priority());
+    // (every shader from the pack built in, as in the presenter - none compiled at start: one the pack missed would be)
+    std::printf("%s\n", renderer.shader_report().c_str());
+    EXPECT(renderer.shader_report().find(" 0 from the cache, 0 compiled") != std::string::npos, "every shader built in");
     // (FW_WARP_SPLAT=1: every own-warp test with the forward splat)
     if (std::getenv("FW_WARP_SPLAT")) { renderer.set_warp_splat(true); std::printf("own warp: forward splat\n"); }
     // (the motion analysis with the rig check, as the presenter runs it)

@@ -798,6 +798,35 @@ void render_thread() {
         const bool claims_reuse = GetEnvironmentVariableW(L"FW_CLAIMS_REUSE", reuse, 4) && reuse[0] == L'1';
         renderer.set_claims_reuse(claims_reuse);
         if (claims_reuse) logf("the warp's claims reused across the refreshes of a game frame (development: ClaimsReuse)");
+        // (development: FW_EDGE, from the add-on's EdgeLayers - see Renderer::set_edge_layers)
+        wchar_t edge[4]{};
+        const bool edge_layers = GetEnvironmentVariableW(L"FW_EDGE", edge, 4) && edge[0] == L'1';
+        renderer.set_edge_layers(edge_layers);
+        if (edge_layers) logf("edges of what the share carries split in two layers (development: EdgeLayers)");
+        wchar_t smooth[4]{};
+        const bool mask_smooth = GetEnvironmentVariableW(L"FW_MASK_SMOOTH", smooth, 4) && smooth[0] == L'1';
+        renderer.set_mask_smooth(mask_smooth);
+        wchar_t beside[4]{};
+        const bool claims_beside = GetEnvironmentVariableW(L"FW_CLAIMS_BESIDE", beside, 4) && beside[0] == L'1';
+        renderer.set_claims_beside_held(claims_beside);
+        wchar_t moved[4]{};
+        const int beside_moved = GetEnvironmentVariableW(L"FW_BESIDE_MOVED", moved, 4) ? (moved[0] >= L'1' && moved[0] <= L'4' ? int(moved[0] - L'0') : 0) : 0;
+        renderer.set_beside_moved(beside_moved);
+        if (beside_moved) logf("beside held characters the claim rule only once a pixel moved %s rendered pixel%s%s (development: BesideMoved=%d)", beside_moved == 2 ? "half a" : "a",
+                                  beside_moved >= 3 ? "; held pixels' last output pixels as the frame" : "",
+                                  beside_moved >= 4 ? "; the memory not behind the surfaces around a gap" : "", beside_moved);
+        wchar_t two[4]{};
+        const bool mem_two = GetEnvironmentVariableW(L"FW_MEM_TWO", two, 4) && two[0] == L'1';
+        renderer.set_mem_two(mem_two);
+        if (mem_two) logf("the background memory in two layers: the nearest scenery seen and the farther behind it (development: MemoryTwoLayers)");
+        // (CarriedFree, MemoryPositions, AttachedEstimated: dev switches the synthetic scenes rate better since 2026-10-29 - see
+        // Renderer::set_carried_free, set_mem_pos, set_attached_estimated)
+        const auto env_on = [](const wchar_t* name) { wchar_t v[4]{}; return GetEnvironmentVariableW(name, v, 4) && v[0] == L'1'; };
+        if (env_on(L"FW_CARRIED_FREE")) { renderer.set_carried_free(true); logf("carried pixels not held by the warp (development: CarriedFree)"); }
+        if (env_on(L"FW_MEM_POS")) { renderer.set_mem_pos(true); logf("the background memory carried with its own positions (development: MemoryPositions)"); }
+        if (env_on(L"FW_ATT_EST")) { renderer.set_attached_estimated(true); logf("the attached rule with XPAR's own motion estimate too (development: AttachedEstimated)"); }
+        if (claims_beside) logf("beside held characters and weapons the scenery claims as anywhere (development: ClaimsBesideHeld)");
+        if (mask_smooth) logf("the no-warp mask's boundaries smoothed (development: MaskSmooth)");
     }
     VramMonitor vram;
     vram.init(sh.adapter);

@@ -47,13 +47,29 @@ target_link_libraries(fw_presenter_core PUBLIC fw_options d3d12 dxgi dcomp d3dco
 target_include_directories(fw_presenter_core SYSTEM PUBLIC "${FW_NGX_INCLUDE}")
 set_target_properties(fw_presenter_core PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
 
-add_executable(FrameWarpPresenter WIN32 src/presenter/main.cpp)
+# The presenter's shaders compiled at build time and built into it (FW_SHADERS - see Renderer::bake_shaders): a game's
+# first start compiles nothing. shader_bake keeps its own cache, so only changed shaders are compiled again.
+add_executable(shader_bake src/presenter/shader_bake.cpp)
+target_link_libraries(shader_bake PRIVATE fw_presenter_core)
+set_target_properties(shader_bake PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+set(FW_SHADER_PACK "${CMAKE_BINARY_DIR}/shaders.pack")
+add_custom_command(OUTPUT "${FW_SHADER_PACK}"
+                   COMMAND shader_bake "${FW_SHADER_PACK}" "${CMAKE_BINARY_DIR}/shader_bake_cache"
+                   DEPENDS shader_bake src/presenter/renderer.cpp
+                   COMMENT "Compiling the presenter's shaders into shaders.pack")
+file(WRITE "${CMAKE_BINARY_DIR}/shaders.rc" "FW_SHADERS RCDATA \"${FW_SHADER_PACK}\"\n")
+set_source_files_properties("${CMAKE_BINARY_DIR}/shaders.rc" PROPERTIES OBJECT_DEPENDS "${FW_SHADER_PACK}")
+add_custom_target(shader_pack DEPENDS "${FW_SHADER_PACK}")  # (one target: two would run the bake at once on the same file)
+
+add_executable(FrameWarpPresenter WIN32 src/presenter/main.cpp "${CMAKE_BINARY_DIR}/shaders.rc")
 target_link_libraries(FrameWarpPresenter PRIVATE fw_presenter_core user32 pdh xinput cabinet)
+add_dependencies(FrameWarpPresenter shader_pack)
 set_target_properties(FrameWarpPresenter PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreadedDLL"
                       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>/FrameWarp")
 # The presenter inside the game (2.2 Phase 0, development; the add-on loads it with InProcessPresenter=1, D3D12 only).
-add_library(FrameWarpPresenterDll SHARED src/presenter/main.cpp)
+add_library(FrameWarpPresenterDll SHARED src/presenter/main.cpp "${CMAKE_BINARY_DIR}/shaders.rc")
 target_link_libraries(FrameWarpPresenterDll PRIVATE fw_presenter_core user32 pdh xinput cabinet)
+add_dependencies(FrameWarpPresenterDll shader_pack)
 target_compile_definitions(FrameWarpPresenterDll PRIVATE FW_PRESENTER_DLL)
 set_target_properties(FrameWarpPresenterDll PROPERTIES OUTPUT_NAME "FrameWarpPresenter" MSVC_RUNTIME_LIBRARY "MultiThreadedDLL"
                       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>/FrameWarp")
@@ -84,7 +100,8 @@ if(BUILD_TESTING)
   add_test(NAME inline_hook COMMAND hook_tests)
 
   # End-to-end on the real GPU: producer on one device, presenter renderer + Latewarp on another.
-  add_executable(pipeline_tests tests/pipeline_tests.cpp src/addon/producer.cpp src/addon/vk_transport.cpp)
+  add_executable(pipeline_tests tests/pipeline_tests.cpp src/addon/producer.cpp src/addon/vk_transport.cpp "${CMAKE_BINARY_DIR}/shaders.rc")
+  add_dependencies(pipeline_tests shader_pack)  # (the built-in shaders, as the presenter has them - checked below)
   target_link_libraries(pipeline_tests PRIVATE fw_presenter_core user32 dxgi)
   target_include_directories(pipeline_tests SYSTEM PRIVATE third_party/reshade/include third_party/vulkan/include)
   set_target_properties(pipeline_tests PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreadedDLL"

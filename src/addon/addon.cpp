@@ -119,6 +119,28 @@ void launch_presenter() {
         char value[8] = {};
         size_t size = sizeof(value);
         if (reshade::get_config_value(nullptr, "FrameWarp", "ClaimsReuse", value, &size)) SetEnvironmentVariableW(L"FW_CLAIMS_REUSE", value[0] == '1' ? L"1" : L"0");
+        // (development, EdgeLayers=1: the edges of what the share carries split in two layers - see Renderer::set_edge_layers)
+        size = sizeof(value); value[0] = 0;
+        SetEnvironmentVariableW(L"FW_EDGE", reshade::get_config_value(nullptr, "FrameWarp", "EdgeLayers", value, &size) && value[0] == '1' ? L"1" : nullptr);
+        // (development, MaskSmooth=1: the no-warp mask's boundaries smoothed - see Renderer::set_mask_smooth)
+        size = sizeof(value); value[0] = 0;
+        size = sizeof(value); value[0] = 0;
+        // (development, BesideMoved=1/2: beside a held character the claim rule once a pixel moved a rendered pixel / half - see Renderer::set_beside_moved)
+        SetEnvironmentVariableW(L"FW_BESIDE_MOVED", reshade::get_config_value(nullptr, "FrameWarp", "BesideMoved", value, &size) && (value[0] >= '1' && value[0] <= '4') ? (value[0] == '1' ? L"1" : value[0] == '2' ? L"2" : value[0] == '3' ? L"3" : L"4") : nullptr);
+        size = sizeof(value); value[0] = 0;
+        // (development, MemoryTwoLayers=1: the background memory in two layers - see Renderer::set_mem_two)
+        SetEnvironmentVariableW(L"FW_MEM_TWO", reshade::get_config_value(nullptr, "FrameWarp", "MemoryTwoLayers", value, &size) && value[0] == '1' ? L"1" : nullptr);
+        // (development, CarriedFree / MemoryPositions / AttachedEstimated=1 - see the presenter's log lines for them)
+        size = sizeof(value); value[0] = 0;
+        SetEnvironmentVariableW(L"FW_CARRIED_FREE", reshade::get_config_value(nullptr, "FrameWarp", "CarriedFree", value, &size) && value[0] == '1' ? L"1" : nullptr);
+        size = sizeof(value); value[0] = 0;
+        SetEnvironmentVariableW(L"FW_MEM_POS", reshade::get_config_value(nullptr, "FrameWarp", "MemoryPositions", value, &size) && value[0] == '1' ? L"1" : nullptr);
+        size = sizeof(value); value[0] = 0;
+        SetEnvironmentVariableW(L"FW_ATT_EST", reshade::get_config_value(nullptr, "FrameWarp", "AttachedEstimated", value, &size) && value[0] == '1' ? L"1" : nullptr);
+        size = sizeof(value); value[0] = 0;
+        SetEnvironmentVariableW(L"FW_CLAIMS_BESIDE", reshade::get_config_value(nullptr, "FrameWarp", "ClaimsBesideHeld", value, &size) && value[0] == '1' ? L"1" : nullptr);
+        size = sizeof(value); value[0] = 0;
+        SetEnvironmentVariableW(L"FW_MASK_SMOOTH", reshade::get_config_value(nullptr, "FrameWarp", "MaskSmooth", value, &size) && value[0] == '1' ? L"1" : nullptr);
     }
     DWORD error = ERROR_FILE_NOT_FOUND;
     for (const auto& path : candidates) {
