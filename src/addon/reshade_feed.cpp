@@ -1,8 +1,11 @@
 #include "addon/reshade_feed.hpp"
 #include "addon/depth_choice.hpp"
 #include "addon/ngx_hooks.hpp"
+#include "addon/mv_probe.hpp"
+#include "addon/vk_transport.hpp"
 #include <reshade.hpp>
 #include <d3d12.h>
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -51,7 +54,7 @@ void set_status(const char* text) { std::snprintf(g.status, sizeof(g.status), "%
 
 }  // namespace
 
-void install_reshade_feed(Producer* producer) { g_producer = producer; }
+void install_reshade_feed(Producer* producer) { g_producer = producer; mv_probe::set_producer(producer); }
 const char* reshade_feed_status() { return g.status; }
 
 void on_reshade_reloaded_effects(effect_runtime*) { g.scanned = false; }  // (every handle from before is gone)
@@ -75,6 +78,11 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
     const bool wanted = p->shared()->settings.enabled && !p->game_depth_seen() && !p->generation_active();
     if (!g.scanned) scan(runtime);
     if (wanted) track_depth_buffers(); else release_depth_choice(runtime);
+    // (an upscaler's data now: nothing of the search stays - its scale, its timing, its hooks at work on every target. Found again if the feed comes back)
+    if (!wanted) {
+        mv_probe::pause();
+        if (p->shared()->motion_found) { InterlockedExchange(&p->shared()->motion_found, 0); InterlockedIncrement(&p->shared()->motion_restarts); }
+    }
     // (and only once the game draws a 3D scene - 600 frames of it in a row: its menus at the start of a session are no
     // reason to start. Started there, in a game whose upscaler comes with gameplay, the presenter took its ~900 MB
     // before the game loaded its world: Enshrouded on an 8 GB card at 6-8 fps for a minute after loading. Once running,
@@ -88,6 +96,14 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
             std::snprintf(text, sizeof(text), "XPAR: no DLSS or FSR data, a 3D scene drawn (%.0f depth buffers bound a frame): the ReShade feed starts", binds);
             reshade::log::message(reshade::log::level::info, text);
         }
+    }
+    // (why the feed has not started, every 300 frames while it has not: a game that stays without depth says what holds it)
+    static unsigned s_said = 0;
+    if ((!wanted || g.waited < 600) && ++s_said % 300 == 0) {
+        char text[200];
+        std::snprintf(text, sizeof(text), "XPAR: ReShade feed waiting: on %d, the game's depth seen %d, frame generation %d, depth buffers bound a frame %.0f, frames of a 3D scene %u of 600, XPAR.fx %d",
+                      int(p->shared()->settings.enabled), int(p->game_depth_seen()), int(p->generation_active()), depth_binds_per_frame(), g.waited, int(g.feed.handle != 0));
+        reshade::log::message(reshade::log::level::info, text);
     }
     if (!wanted || g.waited < 600) {
         g.status[0] = 0;
@@ -151,6 +167,17 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
     // No motion vectors: the presenter estimates them from the picture, in uv; this makes them pixels of the depth.
     cam.mvec_scale[0] = static_cast<float>(w);
     cam.mvec_scale[1] = static_cast<float>(h);
+    // (development, MotionSearch=1: the game's own motion, once found - see mv_probe::motion_step. Direct3D 11, 12 and Vulkan)
+    Shared* sh = p->shared();
+    const mv_probe::MotionStep search = mv_probe::motion_step(sh->motion_found != 0, sh->motion_candidate, w, sh->motion_ruled_out);
+    if (search.lost) { InterlockedExchange(&sh->motion_found, 0); InterlockedIncrement(&sh->motion_restarts); }
+    // (the motion and the candidates at no more than 1920 wide, whatever the depth's size: the warp needs no more of it, and at 4K four slots of it took XPAR over
+    // an 8 GB card's budget - the background memory let go of, Cyberpunk with XeSS)
+    const std::uint32_t small_w = std::min(w, 1920u), small_h = std::max(1u, static_cast<std::uint32_t>(std::uint64_t(h) * small_w / std::max(w, 1u)));
+    if (sh->motion_found) {  // (also while it is not drawn: see Renderer::ingest)
+        cam.mvec_scale[0] = sh->motion_scale_x;
+        cam.mvec_scale[1] = sh->motion_scale_y;
+    }
     p->on_constants(frame, cam);
     if (dev->get_api() == device_api::vulkan) {
         // (XPAR.fx's depth, R32F, left readable by shaders as every effect render target is - see copy_probe)
@@ -158,16 +185,39 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
         constexpr std::uint32_t kVkR32Float = 100, kVkColour = 1, kVkShaderReadOnly = 5;  // (VK_FORMAT_R32_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT,
                                                                                            // VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
         p->on_tag_vk(frame, kDepth, depth.handle, kVkR32Float, kVkColour, 0, 0, kVkShaderReadOnly, w, h, 0, 0, w, h, reinterpret_cast<void*>(cmd_list->get_native()));
+        // (the add-on's copy of the target, as big as the game made it, in copy_source - see mv_probe. The presenter resamples it to the depth's size)
+        if (search.vulkan.handle) {
+            constexpr std::uint32_t kVkTransferSource = 6;  // (VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+            const resource_desc md = dev->get_resource_desc(search.vulkan);
+            const VkFormat format = vk_format_of(static_cast<DXGI_FORMAT>(md.texture.format));
+            if (format != VK_FORMAT_UNDEFINED) {
+                p->on_tag_vk(frame, search.motion.handle ? kMotion : kMotionProbe, search.vulkan.handle, static_cast<std::uint32_t>(format), kVkColour, 0, 0, kVkTransferSource,
+                             md.texture.width, md.texture.height, 0, 0, md.texture.width, md.texture.height, reinterpret_cast<void*>(cmd_list->get_native()));
+                p->set_motion_meta(frame, search.candidate, search.motion.handle ? (sh->motion_channel_x + 1) | ((sh->motion_channel_y + 1) << 8) : 0u);
+            }
+        }
     } else if (dev->get_api() == device_api::d3d11) {
         // (the immediate context: ReShade renders its effects there)
         p->on_tag_d3d11(frame, kDepth, reinterpret_cast<ID3D11Resource*>(depth.handle), 0, 0, w, h,
                         reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native()));
+        const resource handed = search.motion.handle ? search.motion : search.probe;
+        if (handed.handle) {
+            if (p->on_motion_d3d11(frame, search.motion.handle ? kMotion : kMotionProbe, reinterpret_cast<ID3D11Resource*>(handed.handle), small_w, small_h,
+                                   reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native())))
+                p->set_motion_meta(frame, search.candidate, search.motion.handle ? (sh->motion_channel_x + 1) | ((sh->motion_channel_y + 1) << 8) : 0u);
+        }
     } else {
         // ReShade leaves an effect's render targets readable by shaders between passes.
         const auto state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         p->on_tag(frame, kDepth, reinterpret_cast<ID3D12Resource*>(depth.handle), state, 0, 0, w, h,
                   reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()));
+        const resource handed = search.motion.handle ? search.motion : search.probe;
+        p->want_motion_d3d12(search.motion.handle ? kMotion : kMotionProbe, search.id, small_w, small_h, search.candidate,
+                             search.motion.handle ? (sh->motion_channel_x + 1) | ((sh->motion_channel_y + 1) << 8) : 0u);
     }
+    // This frame's data is tagged inside its own present, on a command list not submitted yet: the present is told, or it takes the newest frame submitted, the one
+    // before - every picture paired with the depth and motion of the frame before it (Enshrouded: colour fitted the next index's motion in 27 of 27 frames).
+    p->on_present_marker(frame);
     char text[200];
     if (far_only)
         std::snprintf(text, sizeof(text), "%s", choosing && depth_usable()
@@ -176,7 +226,10 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
     else if (depth_restart_needed())
         std::snprintf(text, sizeof(text), "No DLSS or FSR data from this game. Its depth reads empty: XPAR switched on ReShade's depth copy - restart the game once.");
     else
-        std::snprintf(text, sizeof(text), "No DLSS or FSR data from this game: depth from ReShade (%ux%u), motion and camera estimated by XPAR.", w, h);
+        std::snprintf(text, sizeof(text), "Motion vectors from: %s. Depth from ReShade (%ux%u).",
+                      search.motion.handle ? "the game's own render targets, found automatically (camera estimated from them)"
+                      : search.probe.handle ? "the picture, estimated by XPAR (looking for the game's own: turn the camera)"
+                                            : "the picture, estimated by XPAR", w, h);
     set_status(text);
 }
 

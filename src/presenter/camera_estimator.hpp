@@ -220,8 +220,11 @@ public:
     }
 
     // One game frame. Updates the orientation and returns the synthesized camera. noisy: the motion vectors
-    // are estimated from the picture; when the plain fit fails, see consensus_rotation.
-    Camera update(const std::vector<MotionSample>& all, double w, double h, const Camera& game, bool noisy = false) {
+    // are estimated from the picture; when the plain fit fails, see consensus_rotation. found: the game's own, found by the
+    // motion search. No error limit for those: a camera that orbits the character (Enshrouded) always moves as it turns, the
+    // rotation alone never passes, and the move, kept only on the frames under the limit, came and went from frame to frame:
+    // the picture shook. A model is kept when it explains the frame better than the one before it, whatever its error.
+    Camera update(const std::vector<MotionSample>& all, double w, double h, const Camera& game, bool noisy = false, bool found = false) {
         // The game may tell the field of view (FSR asks for the vertical one). It is checked against the one
         // learned from the motion: some games hand over the horizontal one, and some values are simply off.
         // (only plausible values: some games hand FSR nonsense while loading)
@@ -246,7 +249,7 @@ public:
         // The previous frame's focal length (differs only while the game zooms and tells us its field of view).
         const double fprev_fov = prev_fov_ > 0 ? prev_fov_ : fov_;
         if (distant.size() >= 16) {
-            if (!learned_locked_) learn_fov(distant, all, w, h, noisy);
+            if (!learned_locked_) learn_fov(distant, all, w, h, noisy, found);
             const double f = focal(h), fp = (h * 0.5) / std::tan((follow_zoom ? fprev_fov : fov_) * 0.5);
             omega = linear_rotation(distant, w, h, f, fp);
             V3 no_move{};
@@ -265,6 +268,7 @@ public:
             last_residual_ = std::sqrt(e);
             // Estimated motion vectors that the plain fit cannot explain (a storm, water): the turn most of
             // them agree with.
+            if (!ok && found) ok = typical_error(distant, omega, V3{}, w, h, f, fp) < typical_error(distant, V3{}, V3{}, w, h, f, fp);
             if (!ok && noisy) {
                 double share = 0;
                 ok = consensus = consensus_rotation(distant, w, h, f, fp, omega, share);
@@ -333,7 +337,9 @@ public:
             std::vector<MotionSample> inliers;
             for (std::size_t i = 0; i < valid.size(); ++i) if (errs[i] <= limit) inliers.push_back(valid[i]);
             if (inliers.size() >= 32) e = fit_motion(inliers, w, h, f, o, t, fp, prior, move_prior);
-            if (std::isfinite(e) && std::sqrt(e) < acceptable(valid)) { omega = o; T = t; last_residual_ = std::sqrt(e); }
+            if (std::isfinite(e) && (std::sqrt(e) < acceptable(valid) || (found && typical_error(valid, o, t, w, h, f, fp) < typical_error(valid, omega, V3{}, w, h, f, fp)))) {
+                omega = o; T = t; last_residual_ = std::sqrt(e);
+            }
         }
         // A field of view learned and then locked has to keep explaining the frames: when it fails a third of 300,
         // it is learned again (estimated vectors and the upscaler's alike).
@@ -356,7 +362,7 @@ public:
         // made the view swing like a pendulum. It keeps the motion of the frame before instead, for two
         // frames at most.
         bool carried = false;
-        if (!ok && noisy && !game.reset && have_good_ && carried_frames_ < 2) {
+        if (!ok && (noisy || found) && !game.reset && have_good_ && carried_frames_ < 2) {
             omega = good_omega_; T = good_move_; carried = true; ++carried_frames_;
         }
         if (ok) { good_omega_ = omega; good_move_ = T; have_good_ = !game.reset; carried_frames_ = 0; }
@@ -408,6 +414,22 @@ public:
         std::vector<MotionSample> out;
         for (const auto& p : s) if (p.depth < cut) out.push_back(p);
         return out;
+    }
+
+    // The median error of a turn and a move over these samples (px).
+    static double typical_error(const std::vector<MotionSample>& s, const V3& o, const V3& t, double w, double h, double f, double fp) {
+        const M3 R = rotation(o);
+        std::vector<double> errors;
+        for (const auto& p : s) {
+            if (p.valid <= 0.5f) continue;
+            const double X = (p.x - w * 0.5) / f, Y = -(p.y - h * 0.5) / f;
+            const V3 c = mul(R, V3{X, Y, 1.0});
+            const double qz = std::max(c[2] + t[2] * p.depth, 1e-6);
+            errors.push_back(std::hypot(w * 0.5 + fp * (c[0] + t[0] * p.depth) / qz - (p.x + p.mx), h * 0.5 - fp * (c[1] + t[1] * p.depth) / qz - (p.y + p.my)));
+        }
+        if (errors.empty()) return 0;
+        std::nth_element(errors.begin(), errors.begin() + errors.size() / 2, errors.end());
+        return errors[errors.size() / 2];
     }
 
     // Largest fit error (px, root mean square) still accepted: 4 px, or 6% of the typical motion on fast
@@ -551,7 +573,7 @@ private:
     // erred the same way and a turn-only judgement settled 15 to 30 degrees too wide (Assassin's Creed Black
     // Flag: 55 to 70 degrees for a real 39). (A move alone says nothing about the field of view, a turn does:
     // frames are still chosen by their turn.)
-    void learn_fov(const std::vector<MotionSample>& s, const std::vector<MotionSample>& all, double w, double h, bool noisy = false) {
+    void learn_fov(const std::vector<MotionSample>& s, const std::vector<MotionSample>& all, double w, double h, bool noisy = false, bool found = false) {
         const double pi = 3.14159265358979;
         double best_fov = fov_, best = 1e30;
         // (some nine hundred samples are plenty to tell one field of view from another)
@@ -624,9 +646,23 @@ private:
         if (some.size() < 32) return;
         auto score = [&](double fov) {
             const double f = (h * 0.5) / std::tan(fov * 0.5);
-            V3 turn = linear_rotation(s, w, h, f), move{};
-            const double e = fit_motion(some, w, h, f, turn, move);
-            return std::isfinite(e) ? e : 1e30;
+            V3 turn = linear_rotation(s, w, h, f), t{};
+            double m = fit_motion(some, w, h, f, turn, t);
+            if (!found) return std::isfinite(m) ? m : 1e30;
+            // (the game's own vectors, an orbit: by the mean error it came out 69-71 degrees in Enshrouded, by the turn alone on what is far 79, true 65. By the median
+            // error of the turn and the move, the outliers out: the error's lowest lay at 64 to 66 with the motion of both its upscalers)
+            if (!std::isfinite(m)) return 1e30;
+            for (int pass = 0; pass < 2; ++pass) {
+                std::vector<MotionSample> in;
+                std::vector<double> errors;
+                for (const auto& p : some) errors.push_back(move_error(p, rotation(turn), t, f));
+                std::vector<double> sorted = errors;
+                std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
+                const double limit = 3.0 * sorted[sorted.size() / 2] + 0.5;
+                for (std::size_t i = 0; i < some.size(); ++i) if (errors[i] <= limit) in.push_back(some[i]);
+                if (in.size() >= 32) m = fit_motion(in, w, h, f, turn, t, f);
+            }
+            return std::isfinite(m) ? typical_error(some, turn, t, w, h, f, f) : 1e30;
         };
         V3 o;
         fit_rotation(s, w, h, focal(h), o);

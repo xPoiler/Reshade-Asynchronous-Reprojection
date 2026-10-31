@@ -25,14 +25,68 @@ uniform bool XPAR_Far < hidden = true; > = false;
 
 texture XPAR_Depth { Width = BUFFER_WIDTH / XPAR_FEED_DIV; Height = BUFFER_HEIGHT / XPAR_FEED_DIV; Format = R32F; };
 
+// A game that draws each frame into the next of two depth buffers: ReShade binds the one chosen, the add-on binds the other here. Which of them this
+// frame drew into is seen in them: a few points of each are kept from the last frame (XPAR_Seen), and the second one is read when the chosen one did not
+// change and it did. (Told apart from what the game binds, it went wrong: both are bound every frame, one to draw into, one to read last frame's from.)
+uniform bool XPAR_Twin < hidden = true; > = false;
+texture XPAR_TwinDepth : XPAR_TWIN_DEPTH;
+sampler XPAR_TwinSampler { Texture = XPAR_TwinDepth; };
+sampler XPAR_ChosenPoint { Texture = ReShade::DepthBufferTex; MagFilter = POINT; MinFilter = POINT; MipFilter = POINT; };
+sampler XPAR_TwinPoint { Texture = XPAR_TwinDepth; MagFilter = POINT; MinFilter = POINT; MipFilter = POINT; };
+texture XPAR_SeenChosen { Width = 16; Height = 9; Format = R32F; };
+texture XPAR_SeenTwin { Width = 16; Height = 9; Format = R32F; };
+texture XPAR_Pick { Width = 1; Height = 1; Format = R8; };
+sampler XPAR_SeenChosenPoint { Texture = XPAR_SeenChosen; MagFilter = POINT; MinFilter = POINT; MipFilter = POINT; };
+sampler XPAR_SeenTwinPoint { Texture = XPAR_SeenTwin; MagFilter = POINT; MinFilter = POINT; MipFilter = POINT; };
+sampler XPAR_PickPoint { Texture = XPAR_Pick; MagFilter = POINT; MinFilter = POINT; MipFilter = POINT; };
+
+float XPAR_PickPS(in float4 position : SV_Position, in float2 texcoord : TEXCOORD) : SV_Target
+{
+    if (!XPAR_Twin) return 0.0;
+    float chosen = 0.0, twin = 0.0;
+    for (int y = 0; y < 9; y++)
+        for (int x = 0; x < 16; x++)
+        {
+            const float4 at = float4((x + 0.5) / 16.0, (y + 0.5) / 9.0, 0, 0);
+            chosen += abs(tex2Dlod(XPAR_ChosenPoint, at).x - tex2Dlod(XPAR_SeenChosenPoint, at).x);
+            twin += abs(tex2Dlod(XPAR_TwinPoint, at).x - tex2Dlod(XPAR_SeenTwinPoint, at).x);
+        }
+    return chosen == 0.0 && twin != 0.0 ? 1.0 : 0.0;
+}
+float XPAR_SeenChosenPS(in float4 position : SV_Position, in float2 texcoord : TEXCOORD) : SV_Target { return tex2Dlod(XPAR_ChosenPoint, float4(texcoord, 0, 0)).x; }
+float XPAR_SeenTwinPS(in float4 position : SV_Position, in float2 texcoord : TEXCOORD) : SV_Target { return tex2Dlod(XPAR_TwinPoint, float4(texcoord, 0, 0)).x; }
+
 float XPAR_GameDepth(float2 texcoord)
 {
-    // ReShade.fxh orients the depth buffer (upside down, reversed, logarithmic, scaled) and then makes it
-    // linear with a near plane of 1 and the configured far plane. XPAR wants the oriented buffer itself,
-    // near = 1 and far = 0 (then it is proportional to 1 / distance): undo the last step and turn it round.
-    const float far_plane = RESHADE_DEPTH_LINEARIZATION_FAR_PLANE;
-    const float lin = ReShade::GetLinearizedDepth(texcoord);
-    const float depth = 1.0 - lin * far_plane / (1.0 + lin * (far_plane - 1.0));
+    // As ReShade.fxh orients the depth buffer (upside down, reversed, logarithmic, scaled), without its last step:
+    // XPAR wants the oriented buffer itself, near = 1 and far = 0 (then it is proportional to 1 / distance).
+#if RESHADE_DEPTH_INPUT_IS_UPSIDE_DOWN
+    texcoord.y = 1.0 - texcoord.y;
+#endif
+#if RESHADE_DEPTH_INPUT_IS_MIRRORED
+    texcoord.x = 1.0 - texcoord.x;
+#endif
+    texcoord.x /= RESHADE_DEPTH_INPUT_X_SCALE;
+    texcoord.y /= RESHADE_DEPTH_INPUT_Y_SCALE;
+#if RESHADE_DEPTH_INPUT_X_PIXEL_OFFSET
+    texcoord.x -= RESHADE_DEPTH_INPUT_X_PIXEL_OFFSET * BUFFER_RCP_WIDTH;
+#else
+    texcoord.x -= RESHADE_DEPTH_INPUT_X_OFFSET / 2.000000001;
+#endif
+#if RESHADE_DEPTH_INPUT_Y_PIXEL_OFFSET
+    texcoord.y += RESHADE_DEPTH_INPUT_Y_PIXEL_OFFSET * BUFFER_RCP_HEIGHT;
+#else
+    texcoord.y += RESHADE_DEPTH_INPUT_Y_OFFSET / 2.000000001;
+#endif
+    const bool twin = tex2Dlod(XPAR_PickPoint, float4(0.5, 0.5, 0, 0)).x > 0.5;
+    float depth = (twin ? tex2Dlod(XPAR_TwinSampler, float4(texcoord, 0, 0)).x : tex2Dlod(ReShade::DepthBuffer, float4(texcoord, 0, 0)).x) * RESHADE_DEPTH_MULTIPLIER;
+#if RESHADE_DEPTH_INPUT_IS_LOGARITHMIC
+    const float C = 0.01;
+    depth = (exp(depth * log(C + 1.0)) - 1.0) / C;
+#endif
+#if !RESHADE_DEPTH_INPUT_IS_REVERSED
+    depth = 1.0 - depth;
+#endif
     return XPAR_Flip ? 1.0 - depth : depth;
 }
 
@@ -60,6 +114,12 @@ technique XPAR_Feed <
     pass
     {
         VertexShader = PostProcessVS;
+        PixelShader = XPAR_PickPS;
+        RenderTarget = XPAR_Pick;
+    }
+    pass
+    {
+        VertexShader = PostProcessVS;
         PixelShader = XPAR_FeedPS;
         RenderTarget = XPAR_Depth;
     }
@@ -68,5 +128,17 @@ technique XPAR_Feed <
         VertexShader = PostProcessVS;
         PixelShader = XPAR_ProbePS;
         RenderTarget = XPAR_Probe;
+    }
+    pass
+    {
+        VertexShader = PostProcessVS;
+        PixelShader = XPAR_SeenChosenPS;
+        RenderTarget = XPAR_SeenChosen;
+    }
+    pass
+    {
+        VertexShader = PostProcessVS;
+        PixelShader = XPAR_SeenTwinPS;
+        RenderTarget = XPAR_SeenTwin;
     }
 }

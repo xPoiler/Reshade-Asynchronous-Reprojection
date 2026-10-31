@@ -428,6 +428,47 @@ public:
     // "camera as of now"): a new frame's correction is then measured and faded in at the displayed time - at
     // Auto's time it left a small jump at every game frame (a gritty camera on small mouse movements).
     void set_display_ahead(double ahead) { display_ahead_ = ahead; }
+    // The wall time the camera's position is shown for, set before each refresh's predictions: the position follows the wall
+    // clock alone (a game frame and the game's latency behind it - see predict), not the time asked for the turn, which the
+    // edge limit and Auto latency move about.
+    void set_position_clock(double now) { position_clock_ = now; }
+    // How far behind the newest game frame the position is shown, in game frames (0..1) - for the held weapon, shown at the
+    // same moment (Renderer::set_held_between).
+    double position_frames_back() const {
+        if (frame_interval_ <= 0 || frames_.empty()) return 0.0;
+        return std::clamp((frames_.back().t - (position_clock_ - latency_ - frame_interval_)) / frame_interval_, 0.0, 1.0);
+    }
+    // ...and how it was turned then (unwrapped yaw, pitch - as Frame::theta), the same way.
+    void theta_at(double t, double out[2]) const {
+        out[0] = src_.theta[0]; out[1] = src_.theta[1];
+        if (frames_.empty() || t >= frames_.back().t) return;
+        for (std::size_t i = frames_.size(); i-- > 1 && frames_.size() - i < 64;) {
+            const Frame& b = frames_[i];
+            const Frame& a = frames_[i - 1];
+            if (!b.consecutive) { out[0] = b.theta[0]; out[1] = b.theta[1]; return; }
+            if (a.t <= t) {
+                const double w = (t - a.t) / (b.t - a.t);
+                for (int k = 0; k < 2; ++k) out[k] = a.theta[k] + (b.theta[k] - a.theta[k]) * w;
+                return;
+            }
+            out[0] = a.theta[0]; out[1] = a.theta[1];
+        }
+    }
+    // Whether the camera has turned around a pivot lately (a third-person camera; see orbit_consistent_), within `seconds`.
+    bool orbited_within(double now, double seconds) const { return orbit_seen_t_ > 0 && now - orbit_seen_t_ < seconds; }
+    // Where the game's camera was at time t, between its frames (straight between two; no further than the newest - nothing
+    // extrapolated - nor back across a cut).
+    Vec3 position_at(double t) const {
+        if (frames_.empty()) return src_.basis.pos;
+        if (t >= frames_.back().t) return frames_.back().pos;
+        for (std::size_t i = frames_.size(); i-- > 1 && frames_.size() - i < 64;) {
+            const Frame& b = frames_[i];
+            const Frame& a = frames_[i - 1];
+            if (!b.consecutive) return b.pos;
+            if (a.t <= t) return a.pos + (b.pos - a.pos) * ((t - a.t) / (b.t - a.t));
+        }
+        return frames_[frames_.size() - std::min<std::size_t>(frames_.size(), 64)].pos;
+    }
     // Median of the recent game frame intervals (0 until measured).
     double frame_interval() const { return frame_interval_; }
     // The latency setting actually in use (auto: exactly one game frame behind).
@@ -528,6 +569,7 @@ public:
                     const double median = v[v.size() / 2], spread = (v[v.size() * 3 / 4] - v[v.size() / 4]) / std::max(std::fabs(median), 1e-9);
                     orbit_active_ = median > 0 && spread < (orbit_active_ ? 0.25 : 0.15);
                     orbit_consistent_ = orbit_active_ ? median : 0.0;
+                    if (orbit_active_) orbit_seen_t_ = t;
                 }
                 orbit_used_ += (orbit_consistent_ - orbit_used_) * std::clamp(src_.dt / 0.3, 0.0, 1.0);
             }
@@ -574,6 +616,32 @@ public:
         blend_t_ = now + display_ahead_;
     }
 
+    // The camera's movement (walking, strafing) is not predicted: the position glides between the game's own frames, a game
+    // frame behind the newest one (see position_at) - smooth at every refresh, and never anywhere the game has not been. The
+    // turn alone is predicted ahead. Carried on to the displayed time (the velocity of the last frames, then from the movement
+    // keys - 2026-10-29/30), every stop, start and turn-around was overshot and snapped back, and the strip the move
+    // uncovers beside the hand and near things was as wide as ~50-85 ms of movement - none of it ever drawn (the user:
+    // "the more we try to predict the worse it gets").
+    // Around a pivot (a third-person camera turning round the character: orbit(), or the pivot the recent turns agree on even
+    // with the orbit option off) part of the position comes with the turn: that part is the turn's - ahead with it - and the
+    // rest, walking, is interpolated as above. Interpolated whole, the camera stood a frame back on its circle while it looked
+    // ahead along it: in RE Requiem everything beside Leon slid and wobbled against him while turning (the user, 2026-10-30).
+    // delta: the turn shown, from the newest frame. What to add to the camera turned by it.
+    Vec3 shown_movement(const double delta[2]) const {
+        const Vec3 world_up = up_.get();
+        const double tau = position_clock_ - latency_ - frame_interval_;
+        Vec3 moved = position_at(tau) - src_.basis.pos;
+        const double r = orbit() > 0 ? orbit() : orbit_used_;  // (the agreed pivot, gliding in and out as it comes and goes)
+        if (r > 0) {
+            double th[2];
+            theta_at(tau, th);
+            const Vec3 pv = src_.basis.pos + src_.basis.fwd * r;
+            moved = moved - (apply_rotation(src_.basis, world_up, th[0] - src_.theta[0], th[1] - src_.theta[1], pv).pos - src_.basis.pos);
+            if (orbit() <= 0) moved = moved + (apply_rotation(src_.basis, world_up, delta[0], delta[1], pv).pos - src_.basis.pos);
+        }
+        return moved;
+    }
+
     // Camera for display at wall time `now`, relative to the newest source.
     Prediction predict(double now) const {
         Prediction out;
@@ -608,7 +676,10 @@ public:
             for (int k = 0; k < 2; ++k) delta[k] = theta[k] - src_.theta[k] + blend_[k] * fade;
             const Vec3 pivot = src_.basis.pos + src_.basis.fwd * orbit();
             out.camera = apply_rotation(src_.basis, up_.get(), delta[0], delta[1], pivot);
-            out.camera.pos = pos + blend_pos_ * fade;
+            // (the position as below, not at the turn's time: the two ways round here took turns from one game frame to the next
+            // as the displayed time crossed the newest frame, a frame's movement apart - RE2's scenery wobbled walking, up to 8
+            // units back and forth a refresh, and a turn starting after a pause smeared across the screen, 2026-10-30)
+            out.camera.pos = (position_clock_ > 0 ? out.camera.pos + shown_movement(delta) : pos) + blend_pos_ * fade;
             out.yaw = delta[0]; out.pitch = delta[1]; out.horizon = reached - src_.t;
             // (the input's part, as below: the camera's own history the input's if there was input lately; never the blend)
             const bool lately = input_active(src_.t - kInputLately, now);
@@ -618,11 +689,16 @@ public:
         }
         // (the camera's own turn carried on - a smoothed camera finishing the input's turn, or one turning by itself; and the
         // handoff blend - what the last prediction missed)
-        double going_on[2] = {0, 0}, blended[2] = {0, 0};
+        // (with no input it is shown with the position, a game frame back - see below: nothing of the player's to catch up with, and
+        // the sway of walking is a turn and a sideways move that cancel on the screen. The turn ahead and the position behind, they
+        // no longer did: RE2's scenery wobbled while walking, the mouse untouched - 0.05-0.2 degrees a frame, 2026-10-30)
+        double going_on[2] = {0, 0}, blended[2] = {0, 0}, turned_then[2] = {0, 0};
+        const bool own_ahead = position_clock_ <= 0 || input_active(src_.t - kInputLately, now);
+        if (!own_ahead) theta_at(position_clock_ - latency_ - frame_interval_, turned_then);
         for (int k = 0; k < 2; ++k) {
             const AxisParams& p = params_[k];
             const double tau = p.tau;
-            going_on[k] = velocity_term(tau, src_.w[k], h) * settings_.rotation_extrapolation;
+            going_on[k] = own_ahead ? velocity_term(tau, src_.w[k], h) * settings_.rotation_extrapolation : turned_then[k] - src_.theta[k];
             delta[k] = going_on[k];
             const double g = gain(k);
             if (settings_.use_mouse && gate_ && follows_ && g != 0.0) {
@@ -640,11 +716,9 @@ public:
             blended[k] = blend_[k] * fade;
             delta[k] += blended[k];
         }
-        const Vec3 world_up = up_.get();
         const Vec3 pivot = src_.basis.pos + src_.basis.fwd * orbit();
-        out.camera = apply_rotation(src_.basis, world_up, delta[0], delta[1], pivot);
-        out.camera.pos = out.camera.pos + velocity_ * (h * settings_.translation_extrapolation) +
-                         blend_pos_ * std::exp(-(now - blend_t_) / std::max(settings_.blend_tau, 1e-4));
+        out.camera = apply_rotation(src_.basis, up_.get(), delta[0], delta[1], pivot);
+        out.camera.pos = out.camera.pos + shown_movement(delta) + blend_pos_ * std::exp(-(now - blend_t_) / std::max(settings_.blend_tau, 1e-4));
         out.yaw = delta[0]; out.pitch = delta[1]; out.horizon = h;
         // The input's part (the follow share's two parts, see Settings::share_from_input): the mouse and the stick, and the
         // camera's own turn going on while there was input lately (a smoothed camera finishing it) - not without (a car's
@@ -1032,11 +1106,13 @@ private:
     std::deque<double> latencies_;
     double blend_[2] = {0, 0}, blend_t_ = 0;
     double display_ahead_ = 0;  // set_display_ahead
+    double position_clock_ = 0;  // set_position_clock
     Vec3 blend_pos_{}, velocity_{};
     double orbit_num_ = 0, orbit_den_ = 0, orbit_fit_ = 0;
     std::deque<double> orbit_samples_;            // per-frame pivot distances of clear turns the pivot explains
     double orbit_consistent_ = 0, orbit_used_ = 0;  // the agreed pivot (0: none), and the one in use (glides to it)
     bool orbit_active_ = false;
+    double orbit_seen_t_ = 0;  // (the last source time a consistent pivot was measured - orbited_within)
     int since_fit_ = 0;
     std::deque<double> intervals_;
     double frame_interval_ = 0;

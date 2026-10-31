@@ -11,11 +11,13 @@
 #include "addon/ffx_hooks.hpp"
 #include "addon/depth_choice.hpp"
 #include "addon/ui_probe.hpp"
+#include "addon/mv_probe.hpp"
 #include "addon/ui_layer.hpp"
 #include "addon/shader_scan.hpp"
 #include "addon/hud_learn.hpp"
 #include "addon/reshade_feed.hpp"
 #include "addon/frame_cap.hpp"
+#include "shared/dev_keys.hpp"
 #include <d3d12.h>
 #include <dxgi1_2.h>
 #include <algorithm>
@@ -113,34 +115,14 @@ void launch_presenter() {
     exe_dir = exe_dir.substr(0, exe_dir.find_last_of(L"\\/"));
     const std::wstring candidates[] = {g_presenter_path, exe_dir + L"\\FrameWarp\\FrameWarpPresenter.exe"};
     const std::wstring args = L" --pid " + std::to_wstring(GetCurrentProcessId());
-    // (development, [FrameWarp] ClaimsReuse=0/1 in ReShade.ini: the warp's claims reused across the refreshes of a game frame
-    // or not, for an A/B in a game - handed to the presenter in its environment, see Renderer::set_claims_reuse)
-    {
+    // (development, [FrameWarp] keys in ReShade.ini, for an A/B in a game - handed to the presenter in its environment; see
+    // dev_keys.hpp, and the presenter's log lines for what each does)
+    for (const fw::DevKey& key : fw::kDevKeys) {
         char value[8] = {};
         size_t size = sizeof(value);
-        if (reshade::get_config_value(nullptr, "FrameWarp", "ClaimsReuse", value, &size)) SetEnvironmentVariableW(L"FW_CLAIMS_REUSE", value[0] == '1' ? L"1" : L"0");
-        // (development, EdgeLayers=1: the edges of what the share carries split in two layers - see Renderer::set_edge_layers)
-        size = sizeof(value); value[0] = 0;
-        SetEnvironmentVariableW(L"FW_EDGE", reshade::get_config_value(nullptr, "FrameWarp", "EdgeLayers", value, &size) && value[0] == '1' ? L"1" : nullptr);
-        // (development, MaskSmooth=1: the no-warp mask's boundaries smoothed - see Renderer::set_mask_smooth)
-        size = sizeof(value); value[0] = 0;
-        size = sizeof(value); value[0] = 0;
-        // (development, BesideMoved=1/2: beside a held character the claim rule once a pixel moved a rendered pixel / half - see Renderer::set_beside_moved)
-        SetEnvironmentVariableW(L"FW_BESIDE_MOVED", reshade::get_config_value(nullptr, "FrameWarp", "BesideMoved", value, &size) && (value[0] >= '1' && value[0] <= '4') ? (value[0] == '1' ? L"1" : value[0] == '2' ? L"2" : value[0] == '3' ? L"3" : L"4") : nullptr);
-        size = sizeof(value); value[0] = 0;
-        // (development, MemoryTwoLayers=1: the background memory in two layers - see Renderer::set_mem_two)
-        SetEnvironmentVariableW(L"FW_MEM_TWO", reshade::get_config_value(nullptr, "FrameWarp", "MemoryTwoLayers", value, &size) && value[0] == '1' ? L"1" : nullptr);
-        // (development, CarriedFree / MemoryPositions / AttachedEstimated=1 - see the presenter's log lines for them)
-        size = sizeof(value); value[0] = 0;
-        SetEnvironmentVariableW(L"FW_CARRIED_FREE", reshade::get_config_value(nullptr, "FrameWarp", "CarriedFree", value, &size) && value[0] == '1' ? L"1" : nullptr);
-        size = sizeof(value); value[0] = 0;
-        SetEnvironmentVariableW(L"FW_MEM_POS", reshade::get_config_value(nullptr, "FrameWarp", "MemoryPositions", value, &size) && value[0] == '1' ? L"1" : nullptr);
-        size = sizeof(value); value[0] = 0;
-        SetEnvironmentVariableW(L"FW_ATT_EST", reshade::get_config_value(nullptr, "FrameWarp", "AttachedEstimated", value, &size) && value[0] == '1' ? L"1" : nullptr);
-        size = sizeof(value); value[0] = 0;
-        SetEnvironmentVariableW(L"FW_CLAIMS_BESIDE", reshade::get_config_value(nullptr, "FrameWarp", "ClaimsBesideHeld", value, &size) && value[0] == '1' ? L"1" : nullptr);
-        size = sizeof(value); value[0] = 0;
-        SetEnvironmentVariableW(L"FW_MASK_SMOOTH", reshade::get_config_value(nullptr, "FrameWarp", "MaskSmooth", value, &size) && value[0] == '1' ? L"1" : nullptr);
+        const char c = reshade::get_config_value(nullptr, "FrameWarp", key.ini, value, &size) ? fw::dev_key_value(key, value[0]) : 0;
+        const wchar_t text[2] = {static_cast<wchar_t>(c), 0};
+        SetEnvironmentVariableW(key.wenv, c ? text : nullptr);
     }
     DWORD error = ERROR_FILE_NOT_FOUND;
     for (const auto& path : candidates) {
@@ -206,7 +188,6 @@ constexpr Persisted kPersisted[] = {
     {"FrameCap", &fw::Settings::frame_cap, nullptr},
     {"EdgeFill", &fw::Settings::edge_fill, nullptr},
     {"MemoryResolution", &fw::Settings::memory_resolution, nullptr},
-    {"CameraTurnsOnly", &fw::Settings::turns_only, nullptr},
     {"EdgeLimit", nullptr, &fw::Settings::edge_limit_pct},
     {"EdgeUnlimited", &fw::Settings::edge_unlimited, nullptr},
     {"WarpEngine", &fw::Settings::warp_engine, nullptr},
@@ -233,7 +214,7 @@ void write_persisted(const Persisted& p, double v) {
 struct Saved { const char* key; int default_value; };
 constexpr Saved kSaved[] = {{"HudFromDlssOutput", 2}, {"FillBehindHud", 1}, {"HoldOrbitedCharacter", 1},
                             {"NearCameraRule", 1}, {"RecordDiagnostics", 0}, {"BackgroundMemory", 1},
-                            {"StretchWidth", 1}, {"GameCameraCheck", 0}, {"MovingObjects", 0},
+                            {"StretchWidth", 1}, {"GameCameraCheck", 0},
                             {"GpuPriority", 0}, {"ForceBorderless", 0}, {"Controller", 1}};
 // At start: the remembered values (none yet, or after an update: the defaults are written instead).
 void load_persisted(fw::Settings& s, bool reset) {
@@ -507,7 +488,7 @@ void on_init_swapchain(swapchain* sc, bool) {
         shared->settings.near_camera_rule = saved("NearCameraRule") != 0;
         shared->settings.record_diagnostics = saved("RecordDiagnostics") != 0;
         shared->settings.background_memory = saved("BackgroundMemory") != 0;
-        shared->settings.moving_objects = saved("MovingObjects") != 0;
+        shared->settings.moving_objects = 0;  // (XPAR frame generation: removed 2026-10-30)
         shared->settings.stretch_width = static_cast<std::uint32_t>(std::clamp(saved("StretchWidth"), 0, 32));
         shared->settings.gpu_priority = static_cast<std::uint32_t>(std::clamp(saved("GpuPriority"), 0, 2));
         shared->settings.use_controller = saved("Controller") != 0;
@@ -532,7 +513,7 @@ bool on_create_resource(device* dev, resource_desc& desc, subresource_data*, res
     const bool depth = (desc.usage & resource_usage::depth_stencil) != 0;
     const bool two_channel = desc.texture.format == format::r16g16_float || desc.texture.format == format::r32g32_float;
     const bool storage = (desc.usage & resource_usage::unordered_access) != 0;  // upscaler outputs
-    if (!depth && !two_channel && !storage) return false;
+    if (!depth && !two_channel && !storage && !fw::mv_probe::wants_copyable(desc.texture.format, desc.usage)) return false;
     desc.usage |= resource_usage::copy_source;
     return true;
 }
@@ -725,9 +706,6 @@ void draw_overlay(effect_runtime*) {
     auto& h = sh.hooks;
     auto& p = sh.presenter;
     ImGui::TextDisabled("XPAR (xPoiler's Asynchronous Reprojection) " FW_VERSION);
-    if (s.turns_only)
-        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
-                           "Camera turns only is ON: walking and strafing are not reprojected, only turning.");
 
     bool enabled = s.enabled != 0;
     // Label follows the refresh rate the presenter measures on the overlay's display.
@@ -738,10 +716,6 @@ void draw_overlay(effect_runtime*) {
     ImGui::SameLine();
     bool original = s.show_original != 0;
     if (ImGui::Checkbox("Show original (A/B)", &original)) s.show_original = original;
-    bool turns = s.turns_only != 0;
-    if (ImGui::Checkbox("Camera turns only", &turns)) s.turns_only = turns;
-    hint("Only how the camera turns is reprojected, as if it stood where the game's frame was rendered: walking and "
-         "strafing come from the game's own frames alone. Off by default. Remembered per game.");
 
     const bool alive = presenter_running();
     ImGui::Text("Presenter: %s", alive ? "running" : "not running");
@@ -951,15 +925,6 @@ void draw_overlay(effect_runtime*) {
              "the scenery along the edge more the further out, slightly less saturated; extended edge pixels repeat the "
              "edge (sharper close to it, streaks further out); dithered shows the game's frame as it is there, mixed into "
              "the warped picture in a fine pattern near the edge - noisy, not smeared. Remembered per game.");
-        bool moving = s.moving_objects != 0;
-        if (ImGui::Checkbox("XPAR frame generation (XPAR engine, experimental)", &moving)) {
-            s.moving_objects = moving;
-            reshade::set_config_value(nullptr, "FrameWarp", "MovingObjects", moving ? "1" : "0");
-        }
-        hint("XPAR's own frame generation, for when the game's is off (the game's DLSS or FSR frame generation is used by "
-             "itself when it is on): the picture between the last two game frames at every refresh, so cars, people, "
-             "animations and your character/weapon move at the display rate, one game frame late (the camera is not delayed). "
-             "Games with DLSS or FSR.");
         if (!latewarp)
             ImGui::TextDisabled("NVIDIA Latewarp is not installed (optional: nvngx_latewarp.dll, NVIDIA GPUs only)");
         bool ui = s.use_ui_tags != 0;
@@ -1191,6 +1156,7 @@ void register_callbacks() {
     reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(fw::on_reshade_reloaded_effects);
     fw::register_depth_choice_events();
     fw::ui_probe::init();
+    fw::mv_probe::init();
     fw::shader_scan::init();
     fw::hud_learn::init(
         [](std::uint64_t picture, bool d3d11, std::uint32_t state, std::uint64_t list, std::uint32_t candidate, bool end, bool use) {
@@ -1260,6 +1226,7 @@ void unregister_callbacks() {
     reshade::unregister_event<reshade::addon_event::finish_present>(on_finish_present);
     fw::frame_cap_shutdown();
     fw::unregister_depth_choice_events();
+    fw::mv_probe::shutdown();
     fw::ui_probe::shutdown();
     fw::ui_layer::shutdown();
     fw::shader_scan::shutdown();

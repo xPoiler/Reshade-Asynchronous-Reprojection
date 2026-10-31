@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 73;
+constexpr std::uint32_t kVersion = 75;
 // (four: the presenter taking one in, one ready, and the add-on writing two - a game that starts its next frame before
 // the last one is presented (its tags and constants come first: Cyberpunk, Enshrouded) has two being written. Three
 // slots, 2026-10-28, dropped 43-55% of their frames before the presenter saw them - the reprojection fed at half the
@@ -23,10 +23,11 @@ constexpr int kSlots = 4;
 // and this one, in order (SlotMeta::generated).
 // kHudProbe: HUD learning (hud_learn.hpp) - where the final picture differs from a copy of it taken at one candidate point
 // of the frame (R8, 1 differs), for scoring only (SlotMeta::hud_candidate).
-enum Tex : int { kBackbuffer = 0, kHudless, kUi, kDepth, kMotion, kScene, kGen0, kGen1, kGen2, kHudProbe, kTexCount };
+// kMotionProbe: the motion search (motion_search.hpp) - one of the game's render targets, tried as its motion vectors.
+enum Tex : int { kBackbuffer = 0, kHudless, kUi, kDepth, kMotion, kScene, kGen0, kGen1, kGen2, kHudProbe, kMotionProbe, kTexCount };
 constexpr int kMaxGenerated = 3;
 inline const char* tex_name(int t) {
-    static const char* n[] = {"backbuffer", "hudless", "ui", "depth", "motion", "scene", "gen0", "gen1", "gen2", "hudprobe"};
+    static const char* n[] = {"backbuffer", "hudless", "ui", "depth", "motion", "scene", "gen0", "gen1", "gen2", "hudprobe", "motionprobe"};
     return t >= 0 && t < kTexCount ? n[t] : "?";
 }
 
@@ -74,6 +75,8 @@ struct SlotMeta {
     std::uint32_t gen_index[kMaxGenerated];
     std::uint32_t hud_candidate;  // HUD learning: the candidate kHudProbe was taken at (the fingerprint of the drawing that follows it)
     std::uint32_t hud_learned;    // ...kUi is the learned point's coverage (1), or empty: that point did not draw this frame (2)
+    std::uint32_t motion_candidate;  // the motion search: the candidate kMotionProbe holds (0: none)
+    std::uint32_t motion_channels;   // ...kMotion's channels for x and y, each + 1 (x, y << 8; 0: as they are)
 };
 
 // Settings are written by the add-on UI and read by the presenter.
@@ -83,7 +86,7 @@ struct Settings {
     std::uint32_t use_mouse;       // raw mouse drives rotation
     std::uint32_t use_ui_tags;     // pass HUD-less + UI to Latewarp (HUD stays still)
     float rotation_extrapolation;  // 0..1, non-mouse (residual) angular velocity extrapolation
-    float translation_extrapolation;  // 0..1
+    float translation_extrapolation;  // unused since 2026-10-30: movement is interpolated, not predicted (PoseModel::position_at)
     float orbit_distance;          // world units in front of the camera to orbit around (0 = first person)
     float max_horizon_ms;          // clamp for extrapolation
     std::uint32_t reset_calibration;  // incremented by UI
@@ -98,7 +101,7 @@ struct Settings {
                                    // 6: the lowest latency that uncovers nothing the game has not rendered (now .. one game frame back)
     float present_lead_ms;         // render this long before the next vblank (0: right after the previous one)
     std::uint32_t gpu_priority;    // presenter GPU scheduling class: 0 realtime (default), 1 high, 2 normal
-    std::uint32_t moving_objects;  // XPAR frame generation (XPAR engine): the picture between the game's frames at every refresh (option, off by default)
+    std::uint32_t moving_objects;  // unused since 2026-10-30 (XPAR's own frame generation, removed)
     std::uint32_t no_warp_mask;    // games without HUD layers: detect the HUD and keep it unwarped
     std::uint32_t show_mask;       // debug: tint the no-warp mask (magenta) and the HUD score still learning (green)
     std::uint32_t floor_release;   // option, on by default (saved per game): while turns are predicted around a measured orbit pivot, the
@@ -141,8 +144,7 @@ struct Settings {
                                        // the game camera's whole turn (a car's steering, a gun's own animation; saved per game)
     std::uint32_t memory_resolution;   // background memory: 0 the picture's own resolution, 1 half (default), 2 a quarter - less
                                        // video memory and GPU time, softer where it fills (saved per game)
-    std::uint32_t turns_only;          // option, off by default (saved per game): the warp applies the camera's predicted turn alone -
-                                       // its movement left to the game's own frames
+    std::uint32_t turns_only;          // unused since 2026-10-30 ("Camera turns only": movement is interpolated now)
 };
 
 // Presenter status, displayed by the add-on UI.
@@ -329,6 +331,13 @@ struct Shared {
     // ...and calls the game made to its frame generation (DLSS FG evaluations, FSR frame generation
     // dispatches): frame generation is on even where ReShade sees only the rendered frames' presents.
     volatile LONG generation_calls;
+    // The motion search's result, written by the presenter (motion_search.hpp): the add-on then hands that target over as the motion.
+    volatile LONG motion_found;
+    std::uint32_t motion_candidate, motion_channel_x, motion_channel_y;
+    float motion_scale_x, motion_scale_y, motion_quality;
+    // The add-on's turn: the target found is gone (a change of resolution): +1, and the presenter starts over. The presenter's turn: candidates ruled out, a bit each.
+    volatile LONG motion_restarts;
+    std::uint64_t motion_ruled_out[4];
     volatile LONG64 timeline_count;
     TimelineEvent timeline[kTimeline];
 };

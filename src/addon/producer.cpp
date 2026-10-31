@@ -144,6 +144,7 @@ int Producer::slot_for_frame(std::uint64_t frame, bool create) {
     auto claim = [&](int i, LONG from) {
         if (InterlockedCompareExchange(&shared_->slots[i].state, kWriting, from) != from) return false;
         auto& m = shared_->slots[i];
+        m.motion_candidate = 0; m.motion_channels = 0;
         m.frame_id = frame; m.fence_value = 0; m.qpc_sim_start = 0; m.qpc_constants = 0; m.qpc_present = 0;
         slot_list_[i] = 0; slot_submitted_[i] = false; ui_tagged_[i] = false;
         m.camera.valid = 0;
@@ -399,7 +400,19 @@ void Producer::on_execute(std::uint64_t list) {
     std::lock_guard lock(mutex_);
     if (!shared_ || !list) return;
     for (int i = 0; i < kSlots; ++i)
-        if (slot_list_[i] == list && shared_->slots[i].state == kWriting) slot_submitted_[i] = true;
+        if (slot_list_[i] == list) {
+            list_seen_qpc_ = qpc_now();
+            if (shared_->slots[i].state == kWriting) slot_submitted_[i] = true;
+        }
+}
+
+void Producer::set_motion_meta(std::uint64_t frame, std::uint32_t candidate, std::uint32_t channels) {
+    std::lock_guard lock(mutex_);
+    if (!ready()) return;
+    const int slot = slot_for_frame(frame, false);
+    if (slot < 0) return;
+    shared_->slots[slot].motion_candidate = candidate;
+    shared_->slots[slot].motion_channels = channels;
 }
 
 void Producer::on_present_marker(std::uint64_t frame) {
@@ -493,6 +506,11 @@ int Producer::present_slot() {
             if (shared_->slots[i].state == kWriting && shared_->slots[i].camera.valid &&
                 qpc_now() - shared_->slots[i].qpc_constants < shared_->qpc_frequency &&
                 (slot < 0 || shared_->slots[i].frame_id < shared_->slots[slot].frame_id)) slot = i;
+        // ...but not a frame the GPU has not been given, in a game whose frames are seen reaching it: this present cannot be
+        // showing that one, its own frame has gone already. Taken, it closed here and the next present found the same: every
+        // picture paired for good with the next frame's data, not yet copied (DOOM Eternal capped at 30 fps: the whole picture
+        // shook, a frame's turn off). Left out, the frame is there for the next present, the newest submitted.
+        if (slot >= 0 && !slot_submitted_[slot] && qpc_now() - list_seen_qpc_ < shared_->qpc_frequency) slot = -1;
     }
     have_present_marker_ = false;
     push_event(shared_, kEvPresent, slot >= 0 ? shared_->slots[slot].frame_id : pending_present_frame_, slot >= 0 ? via : 0);
@@ -652,6 +670,129 @@ bool Producer::ensure_probe_pass() {
     }
     probe_failed_ = false;
     return true;
+}
+// The motion search on Direct3D 12 (see the header).
+void Producer::on_motion_written_d3d12(ID3D12Resource* source, D3D12_RESOURCE_STATES state, ID3D12GraphicsCommandList* list, std::uint64_t id) {
+    std::lock_guard lock(mutex_);
+    if (!ready() || !source || !list || !device_) return;
+    const auto desc = source->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1) return;
+    const DXGI_FORMAT format = copy_format(desc.Format);
+    if (!motion_pending_ || motion_pending_->GetDesc().Width != desc.Width || motion_pending_->GetDesc().Height != desc.Height || motion_pending_->GetDesc().Format != format) {
+        if (motion_pending_) retired_.push_back({motion_pending_, nullptr, fence_value_ + 1, {}, nullptr});
+        motion_pending_.Reset();
+        motion_age_ = 8;
+        collect_retired();
+        D3D12_RESOURCE_DESC d{};
+        d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        d.Width = desc.Width; d.Height = desc.Height; d.DepthOrArraySize = 1; d.MipLevels = 1;
+        d.Format = format; d.SampleDesc.Count = 1; d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&motion_pending_)))) return;
+    }
+    copy_into(list, source, state, motion_pending_.Get());
+    motion_taken_ = id;
+    motion_age_ = 0;
+}
+void Producer::want_motion_d3d12(Tex kind, std::uint64_t source, std::uint32_t width, std::uint32_t height, std::uint32_t candidate, std::uint32_t channels) {
+    std::lock_guard lock(mutex_);
+    want_kind_ = kind; want_source_ = source; want_w_ = width; want_h_ = height; want_candidate_ = candidate; want_channels_ = channels;
+}
+static const char kMotionShader[] = R"(
+Texture2D<float4> from : register(t0);
+RWTexture2D<float4> to : register(u0);
+[numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
+    uint fw, fh, tw, th;
+    from.GetDimensions(fw, fh);
+    to.GetDimensions(tw, th);
+    if (id.x >= tw || id.y >= th) return;
+    to[id.xy] = from.Load(int3((float2(id.xy) + 0.5) * float2(fw, fh) / float2(tw, th), 0));
+}
+)";
+constexpr UINT kMotionRing = 8;
+bool Producer::ensure_motion_pass() {
+    if (motion_pso_) return true;
+    if (motion_failed_ || !device_) return false;
+    motion_failed_ = true;
+    ComPtr<ID3DBlob> code, errors, blob;
+    if (FAILED(D3DCompile(kMotionShader, sizeof(kMotionShader) - 1, "motion", nullptr, nullptr, "main", "cs_5_0", 0, 0, &code, &errors))) return false;
+    D3D12_DESCRIPTOR_RANGE ranges[2]{};
+    ranges[0] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+    ranges[1] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 1};
+    D3D12_ROOT_PARAMETER param{};
+    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    param.DescriptorTable = {2, ranges};
+    param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rd{1, &param, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors)) ||
+        FAILED(device_->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&motion_root_))))
+        return false;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = motion_root_.Get();
+    pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2 * kMotionRing, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    if (FAILED(device_->CreateComputePipelineState(&pd, IID_PPV_ARGS(&motion_pso_))) || FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&motion_heap_)))) {
+        motion_pso_.Reset();
+        return false;
+    }
+    motion_failed_ = false;
+    return true;
+}
+void Producer::d3d12_motion(ID3D12GraphicsCommandList* list, int slot) {
+    // (not only a copy since the last present: the game's lists run on their own threads - see mv_probe's Candidate. Copies run in order: this is the newest finished)
+    const bool fresh = want_source_ && motion_pending_ && motion_taken_ == want_source_ && motion_age_ < 8;
+    if (motion_age_ < 8) ++motion_age_;
+    if (!fresh || !want_w_ || !want_h_ || !ensure_motion_pass()) return;
+    if (!motion_small_ || motion_small_->GetDesc().Width != want_w_ || motion_small_->GetDesc().Height != want_h_) {
+        if (motion_small_) retired_.push_back({motion_small_, nullptr, fence_value_ + 1, {}, nullptr});
+        motion_small_.Reset();
+        D3D12_RESOURCE_DESC d{};
+        d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        d.Width = want_w_; d.Height = want_h_; d.DepthOrArraySize = 1; d.MipLevels = 1;
+        d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; d.SampleDesc.Count = 1; d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&motion_small_)))) return;
+    }
+    if (!ensure_texture(slot, want_kind_, motion_small_->GetDesc())) return;
+    const UINT step = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const UINT base = (motion_ring_++ % kMotionRing) * 2;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = motion_heap_->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += SIZE_T(base) * step;
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Texture2D.MipLevels = 1;
+    sv.Format = typed_format(motion_pending_->GetDesc().Format);
+    device_->CreateShaderResourceView(motion_pending_.Get(), &sv, cpu);
+    cpu.ptr += step;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+    uv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    device_->CreateUnorderedAccessView(motion_small_.Get(), nullptr, &uv, cpu);
+    D3D12_RESOURCE_BARRIER b[2]{};
+    for (auto& x : b) x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b[0].Transition = {motion_pending_.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+    b[1].Transition = {motion_small_.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+    list->ResourceBarrier(2, b);
+    ID3D12DescriptorHeap* heaps[] = {motion_heap_.Get()};
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetComputeRootSignature(motion_root_.Get());
+    list->SetPipelineState(motion_pso_.Get());
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = motion_heap_->GetGPUDescriptorHandleForHeapStart();
+    gpu.ptr += UINT64(base) * step;
+    list->SetComputeRootDescriptorTable(0, gpu);
+    list->Dispatch((want_w_ + 7) / 8, (want_h_ + 7) / 8, 1);
+    for (auto& x : b) std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+    list->ResourceBarrier(2, b);
+    auto& t = textures_[slot][want_kind_];
+    copy_into(list, motion_small_.Get(), D3D12_RESOURCE_STATE_COMMON, t.resource.Get());
+    auto& m = shared_->slots[slot];
+    auto& info = m.tex[want_kind_];
+    info.width = static_cast<std::uint32_t>(t.desc.Width); info.height = t.desc.Height; info.format = t.desc.Format;
+    info.generation = t.generation; info.ext_x = info.ext_y = 0; info.ext_w = info.width; info.ext_h = info.height;
+    info.valid = 1;
+    m.motion_candidate = want_candidate_;
+    m.motion_channels = want_channels_;
 }
 void Producer::d3d12_probe(ID3D12GraphicsCommandList* list, int slot) {
     if (!probe_pending_ || probe_age_ > 1 || !probe_candidate_) return;
@@ -883,6 +1024,9 @@ static DXGI_FORMAT d11_srv_format(DXGI_FORMAT f) {
         case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
         case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
         case DXGI_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+        case DXGI_FORMAT_R16G16_TYPELESS: return DXGI_FORMAT_R16G16_FLOAT;
+        case DXGI_FORMAT_R32G32_TYPELESS: return DXGI_FORMAT_R32G32_FLOAT;
+        case DXGI_FORMAT_R8G8_TYPELESS: return DXGI_FORMAT_R8G8_UNORM;
         default: return f;
     }
 }
@@ -1228,6 +1372,7 @@ std::uint64_t Producer::begin_present(ID3D12Resource* backbuffer, ID3D12Graphics
         info.width = static_cast<std::uint32_t>(t.desc.Width); info.height = t.desc.Height; info.format = t.desc.Format;
         info.generation = t.generation; info.ext_x = info.ext_y = 0; info.ext_w = info.width; info.ext_h = info.height;
         info.valid = 1;
+        d3d12_motion(list, slot);  // (the motion search's candidate, or the motion found)
         d3d12_probe(list, slot);  // (HUD learning: the copy at this frame's candidate point, against this picture)
     }
     if (probe_age_ < 2) ++probe_age_;
@@ -1728,6 +1873,90 @@ void Producer::copy_d3d11(ID3D11DeviceContext* context, ID3D11Resource* source, 
     } else {
         context->CopySubresourceRegion(target, 0, 0, 0, 0, source, 0, nullptr);
     }
+}
+
+static const char kD11MotionShader[] = R"(
+Texture2D<float4> from : register(t0);
+RWTexture2D<float4> to : register(u0);
+[numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
+    uint fw, fh, tw, th;
+    from.GetDimensions(fw, fh);
+    to.GetDimensions(tw, th);
+    if (id.x >= tw || id.y >= th) return;
+    to[id.xy] = from.Load(int3((float2(id.xy) + 0.5) * float2(fw, fh) / float2(tw, th), 0));
+}
+)";
+
+bool Producer::on_motion_d3d11(std::uint64_t frame, Tex kind, ID3D11Resource* source, std::uint32_t width, std::uint32_t height, ID3D11DeviceContext* context) {
+    std::lock_guard lock(mutex_);
+    if (!ready() || !d11_ || !source || !context || !width || !height) return false;
+    ComPtr<ID3D11Texture2D> texture;
+    if (FAILED(source->QueryInterface(IID_PPV_ARGS(&texture)))) return false;
+    D3D11_TEXTURE2D_DESC sd{};
+    texture->GetDesc(&sd);
+    if (sd.SampleDesc.Count != 1 || !(sd.BindFlags & D3D11_BIND_SHADER_RESOURCE)) return false;
+    ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    if (!device) return false;
+    if (!d11_motion_cs_) {
+        ComPtr<ID3DBlob> code, errors;
+        if (FAILED(D3DCompile(kD11MotionShader, sizeof(kD11MotionShader) - 1, "motion", nullptr, nullptr, "main", "cs_5_0", 0, 0, &code, &errors)) ||
+            FAILED(device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &d11_motion_cs_))) return false;
+    }
+    D3D11_TEXTURE2D_DESC cd{};
+    if (d11_motion_small_) d11_motion_small_->GetDesc(&cd);
+    if (!d11_motion_small_ || cd.Width != width || cd.Height != height) {
+        D3D11_TEXTURE2D_DESC d{};
+        d.Width = width; d.Height = height; d.MipLevels = 1; d.ArraySize = 1; d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+        d11_motion_small_.Reset();
+        if (FAILED(device->CreateTexture2D(&d, nullptr, &d11_motion_small_))) return false;
+    }
+    ComPtr<ID3D11ShaderResourceView> from_view;
+    ComPtr<ID3D11UnorderedAccessView> to_view;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = d11_srv_format(sd.Format); sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels = 1;
+    if (FAILED(device->CreateShaderResourceView(source, &sv, &from_view)) ||
+        FAILED(device->CreateUnorderedAccessView(d11_motion_small_.Get(), nullptr, &to_view))) return false;
+    const int slot = slot_for_frame(frame, true);
+    if (slot < 0) return false;
+    slot_list_[slot] = 0; slot_submitted_[slot] = true;  // (the immediate context: on the GPU's way at once)
+    collect_retired();
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width; desc.Height = height; desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    if (!ensure_texture(slot, kind, desc)) { ++shared_->hooks.copies_failed; return false; }
+    ComPtr<ID3D11ComputeShader> old_cs;
+    ID3D11ClassInstance* raw_instances[256] = {};
+    UINT instance_count = 256;
+    context->CSGetShader(&old_cs, raw_instances, &instance_count);
+    ID3D11ShaderResourceView* old_srv[1] = {};
+    ID3D11UnorderedAccessView* old_uav[1] = {};
+    context->CSGetShaderResources(0, 1, old_srv);
+    context->CSGetUnorderedAccessViews(0, 1, old_uav);
+    ID3D11ShaderResourceView* srvs[1] = {from_view.Get()};
+    ID3D11UnorderedAccessView* uavs[1] = {to_view.Get()};
+    context->CSSetShader(d11_motion_cs_.Get(), nullptr, 0);
+    context->CSSetShaderResources(0, 1, srvs);
+    context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+    context->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+    ID3D11ShaderResourceView* none_srv[1] = {};
+    context->CSSetShaderResources(0, 1, none_srv);
+    context->CSSetShader(old_cs.Get(), raw_instances, instance_count);
+    context->CSSetShaderResources(0, 1, old_srv);
+    context->CSSetUnorderedAccessViews(0, 1, old_uav, nullptr);
+    for (UINT i = 0; i < instance_count; ++i) if (raw_instances[i]) raw_instances[i]->Release();
+    for (auto* v : old_srv) if (v) v->Release();
+    for (auto* v : old_uav) if (v) v->Release();
+    auto& t = textures_[slot][kind];
+    copy_d3d11(context, d11_motion_small_.Get(), t.d11.Get());
+    auto& info = shared_->slots[slot].tex[kind];
+    info.width = width; info.height = height;
+    info.format = t.desc.Format; info.generation = t.generation;
+    info.ext_x = info.ext_y = 0; info.ext_w = width; info.ext_h = height;
+    info.valid = 1;
+    push_event(shared_, kEvTag, frame, static_cast<std::uint64_t>(kind) | (static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(source)) << 8));
+    return true;
 }
 
 void Producer::on_tag_d3d11(std::uint64_t frame, Tex kind, ID3D11Resource* source, std::uint32_t ext_x, std::uint32_t ext_y,

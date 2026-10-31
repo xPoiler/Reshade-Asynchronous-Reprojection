@@ -312,9 +312,8 @@ int main(int argc, char** argv) {
         EXPECT(std::fabs(std::fabs(xts - x0) - 2 * expected_side) < 4.0, "parallax uses the NEW depth after a resolution change");
     }
 
-    // Moving objects: static camera, the white bar's motion vectors say it moved 20 render px to the right
-    // since the previous frame. Shown half a frame back it must be 10 render px to the left, with the
-    // area it left showing background; the red bar (static) must not move.
+    // A game frame with motion vectors (a static camera, the white bar moved 20 render px to the right since the previous
+    // frame) - for the refreshes and the game's own frame generation below.
     {
         ComPtr<ID3D12Fence> gf; game->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gf));
         UINT64 gfv = 0;
@@ -349,10 +348,8 @@ int main(int argc, char** argv) {
             EXPECT(s_slot >= 0 && sh.slots[s_slot].tex[kMotion].valid, "frame with motion vectors published");
             return s_slot;
         };
-        renderer.set_object_history(true);
-        // The previous frame, then the current one (each keeps the one before it).
+        // The previous frame, then the current one.
         IngestedSource src;
-        bool moved_ok = false;
         for (std::uint64_t fid = 100; fid <= 101; ++fid) {
             const int s_slot = publish_mv(fid);
             renderer.begin_frame();
@@ -378,76 +375,36 @@ int main(int argc, char** argv) {
                 EXPECT(ne && elsewhere / ne < 0.01, "sampled static motion");
             }
             renderer.analyze_motion(src, still.clip_to_prev_clip, 1.0f, 1.0f, true, true, true, false, fid);
-            const bool built = renderer.object_motion(src, still.clip_to_prev_clip, still.view_to_clip, 1.0f, 1.0f);
-            if (fid == 100) EXPECT(!built, "no object motion without a previous frame");
-            else moved_ok = built;
             renderer.finish_frame(false, 0);
             renderer.wait_idle();
         }
-        EXPECT(moved_ok, "object motion built once the previous frame is kept");
         MotionFit fit{};
         // (the fits of both frames come back in order, a few frames later)
         for (int i = 0; i < 8 && fit.frame != 101; ++i)
             if (!renderer.take_motion_fit(fit)) { renderer.begin_frame(); renderer.finish_frame(false, 0); renderer.wait_idle(); }
         EXPECT(fit.frame == 101, "the motion fit comes back with its game frame (%llu, expected 101)", static_cast<unsigned long long>(fit.frame));
-        const Mat4 identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
-        auto show_back = [&](float frames_back) {
-            renderer.begin_frame();
-            Renderer::ObjectWarp objects;
-            objects.frames_back = frames_back;
-            std::memcpy(objects.prev_to_target, identity.data(), sizeof(objects.prev_to_target));
-            std::memcpy(objects.view_to_clip, still.view_to_clip, sizeof(objects.view_to_clip));
-            const bool ok = renderer.own_warp(src, true, false, identity.data(), true, false, frames_back > 0 ? &objects : nullptr);
-            EXPECT(ok, "own warp ran");
-            renderer.finish_frame(ok, 0);
-            renderer.read_back(true, px, w, h);
-        };
-        show_back(0.0f);
-        const double still_x = peak(px, w, h, true, 1), still_red = peak(px, w, h, false, 0);
-        show_back(0.5f);
-        const double half_x = peak(px, w, h, true, 1), half_red = peak(px, w, h, false, 0);
-        auto white_at = [&](double x) {
-            double sum = 0; const std::uint32_t xi = std::uint32_t(x);
-            for (std::uint32_t y = h / 5; y < h * 2 / 5; ++y) {
-                const std::size_t i = (std::size_t(y) * w + xi) * 4;
-                sum += (half_to_float(px[i]) + half_to_float(px[i + 1]) + half_to_float(px[i + 2])) / 3.0;
-            }
-            return sum / double(h / 5);
-        };
-        const double left_behind = white_at(still_x);  // where the bar is now; half a frame back it is a bar width further left
-        show_back(1.0f);
-        const double back_x = peak(px, w, h, true, 1);
-        const double step = 20.0 * double(W) / double(DW);
-        std::printf("moving objects: bar x=%.0f, half a frame back %.0f (expected %.1f), a whole frame back %.0f (expected %.1f); "
-                    "brightness where it left %.2f; red bar y %.0f -> %.0f; moving pixels %.0f of %.0f\n",
-                    still_x, half_x, still_x - step / 2, back_x, still_x - step, left_behind, still_red, half_red, fit.moving, fit.samples);
-        EXPECT(std::fabs((half_x - still_x) + step / 2) < 4.0, "half a frame back the object is half way to its previous position");
-        EXPECT(std::fabs((back_x - still_x) + step) < 4.0, "a whole frame back it is at its previous position");
-        EXPECT(left_behind < 0.5, "the area the object left shows background (%.2f)", left_behind);
-        EXPECT(std::fabs(half_red - still_red) < 1.5, "static geometry stays put");
         EXPECT(fit.moving > 0.5 * 12 * DH && fit.moving < 2.0 * 12 * DH, "moving pixels = the bar (%.0f)", fit.moving);
-        // GPU cost per presented frame, with and without moving objects: refreshes back to back (a GPU left idle
-        // between them clocks down and takes many times longer).
-        auto median_gpu = [&](float frames_back) {
-            Renderer::ObjectWarp objects;
-            objects.frames_back = frames_back;
-            std::memcpy(objects.prev_to_target, identity.data(), sizeof(objects.prev_to_target));
-            std::memcpy(objects.view_to_clip, still.view_to_clip, sizeof(objects.view_to_clip));
+        const Mat4 identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+        renderer.begin_frame();
+        EXPECT(renderer.own_warp(src, true, false, identity.data(), true), "own warp ran");
+        renderer.finish_frame(true, 0);
+        renderer.read_back(true, px, w, h);
+        const double still_x = peak(px, w, h, true, 1);
+        // GPU cost per presented frame: refreshes back to back (a GPU left idle between them clocks down and takes many
+        // times longer).
+        {
             renderer.wait_idle();
             renderer.take_gpu_usage();
             for (int i = 0; i < 200; ++i) {
                 renderer.begin_frame();
-                renderer.own_warp(src, true, false, identity.data(), true, false, frames_back > 0 ? &objects : nullptr);
+                renderer.own_warp(src, true, false, identity.data(), true);
                 renderer.finish_frame(true, 0);
             }
             renderer.wait_idle();
             for (int i = 0; i < 3; ++i) { renderer.begin_frame(); renderer.finish_frame(false, 0); renderer.wait_idle(); }
             const Renderer::GpuUsage u = renderer.take_gpu_usage();
-            return u.warps ? float(u.warp_ms / u.warps) : 0.0f;
-        };
-        const float plain = median_gpu(0.0f), with_objects = median_gpu(0.5f);
-        std::printf("GPU per presented frame: %.3f ms plain, %.3f ms with moving objects (+%.3f)\n", plain, with_objects, with_objects - plain);
-        renderer.set_object_history(false);
+            std::printf("GPU per presented frame: %.3f ms\n", u.warps ? float(u.warp_ms / u.warps) : 0.0f);
+        }
 
         // A refresh with nothing new to show is submitted without drawing or presenting (skip_frame): counted as
         // such, and the frame slots go on as usual.
@@ -507,7 +464,7 @@ int main(int argc, char** argv) {
                 renderer.wait_idle();
                 auto show_gen = [&](int which) {
                     renderer.begin_frame();
-                    const bool ok = renderer.own_warp(gs, true, false, identity.data(), true, false, nullptr, which);
+                    const bool ok = renderer.own_warp(gs, true, false, identity.data(), true, false, which);
                     renderer.finish_frame(ok, 0);
                     renderer.read_back(true, px, w, h);
                 };

@@ -32,6 +32,7 @@ struct IngestedSource {
     Rect2 color_rect, depth_rect;
     bool has_motion = false;  // game motion vectors converted into the private motion texture
     bool motion_estimated = false;  // ...or none from the game: XPAR's own, estimated from the picture
+    std::uint32_t motion_candidate = 0;  // the motion search: the candidate in kPMotionProbe (0: none)
     // Frame generation (the game's own): images generated between the previous frame and this one, taken in
     // with it (kPGen0..), of per_frame per frame; taken image i is the game's number gen_index[i], showing the
     // moment gen_index[i] / (per_frame + 1) of the way from the previous frame.
@@ -177,29 +178,15 @@ public:
     // source_to_target maps the rendered frame's clip space (with depth) to the displayed camera's (row vectors).
     // memory: what the warp uncovers beside held pixels and at the frame's edges comes from the background
     // memory when it holds that spot (see update_memory).
-    // objects: moving objects are shown where they are at the displayed moment (see object_motion).
-    struct ObjectWarp {
-        float frames_back = 0;       // the displayed moment, in game frames before the shown one (0..1)
-        float prev_to_target[16];    // the previous frame's clip space -> the displayed camera's
-        float view_to_clip[16];      // the shown frame's projection
-        bool debug = false;          // development: colour the pixels by what the moving-object pass did
-    };
     // generated: show the game's generated image of that index (frame generation, see prepare_generated)
     // instead of the frame; source_to_target is then that image's camera's.
     bool own_warp(const IngestedSource& src, bool use_ui_tags, bool use_mask, const float source_to_target[16], bool depth_inverted,
-                  bool memory = false, const ObjectWarp* objects = nullptr, int generated = -1, bool soft_edge = false, const float* input_to_target = nullptr);
+                  bool memory = false, int generated = -1, bool soft_edge = false, const float* input_to_target = nullptr);
     // Frame generation, once per game frame (after the motion analysis): the generated images taken in with
     // the frame made ready for the warp - each one's depth (this frame's, moved back along the motion vectors
     // to the image's moment) and, with the HUD-less picture and UI layer, the UI they show taken back out
     // (the warp puts the frame's UI back over it, as on every frame).
     void prepare_generated(const IngestedSource& src, float scale_x, float scale_y, bool scale_valid, bool use_ui_tags);
-    // XPAR frame generation (option): `count` images between the previous game frame and this one (at i / (count + 1)
-    // of the way, i = 1..count), made into the generated images' textures with their depth - shown through the same
-    // path as the game's own (the caller sets the frame's generated / per_frame / gen_index). From the frame kept by
-    // the object history (set_object_history), on the intake list after the no-warp mask. flow: picture_motion of
-    // this frame is there; hud: the mask's HUD stays where it is. Returns the images made (0: none).
-    int generate_frames(const IngestedSource& src, int count, const float clip_to_prev_clip[16], const float view_to_clip[16],
-                        float scale_x, float scale_y, bool use_ui_tags, bool flow, bool hud);
     // ...and once frame generation is off: whether its textures are still held, and letting them go (both
     // texture sets and the game's shared copies; waits for the GPU).
     bool has_generated() const;
@@ -238,11 +225,6 @@ public:
     void analyze_motion(const IngestedSource& src, const float clip_to_prev_clip[16], float scale_x, float scale_y, bool scale_valid,
                         bool depth_inverted = true, bool near_rule = true, bool turn_rule = false, std::uint64_t frame = 0,
                         float floor_pivot_depth = 0.0f);
-    // Moving objects (option, XPAR engine). set_object_history: each game frame taken in keeps the previous
-    // one's picture and depth (what objects uncover, and where they were). object_motion: once per game
-    // frame, after analyze_motion: for each pixel the analysis found moving on its own, its straight-line
-    // motion in 3D to the previous frame (both frames' depth; the game's clipToPrevClip and projection).
-    // False when there is nothing for the warp to move (no previous frame kept, a size change).
     // The XPAR warp by forward splat (cs_warp_claim) instead of the search alone.
     void set_warp_splat(bool on) { warp_splat_ = on; }
     // The motion analysis holds what stays on screen only where the camera rig carries it (see cs_analyze, flag 2048):
@@ -283,10 +265,14 @@ public:
     void set_mem_front(bool on) { mem_front_ = on; }
     void set_mem_static(bool on) { mem_static_ = on; }
     void set_mem_two(bool on) { mem_two_ = on; }
+    // The memory's second layer as the frame before: only what that frame saw, carried to this one's camera - what is shown
+    // between the two was seen by one of them, real pixels for the gaps movement opens (see update_memory). 0 off, 1 all of
+    // its scenery, right up to what is held; 2 not beside what is held; 3 nor beside something nearer (the memory's rules).
+    void set_mem_last(int mode) { mem_last_frame_ = mode; }
     void set_hud_keep_check(bool on) { hud_keep_check_ = on; }
     // Development: the attached rule (set_attached_carried) with XPAR's own motion estimate too - off: only with the game's vectors.
     void set_attached_estimated(bool on) { attached_est_ = on; }  // (dev: the HUD-less layer's kept coverage only while it still gives the frame - see cs_hudless_ui)  // (dev: the background memory in two layers - see ow_mem_front)  // (dev: held but still in the world remembered - see mem_static_held)  // (dev: what is visible always replaces the memory - see cs_memory's flag 8192)  // (dev: the memory older by a frame each frame, as before 2026-10-20)
-    // (the game's own camera this frame: the share measured against its whole motion - see share_measure_at, flag 256)
+    // (the share measured against the camera's whole motion - see share_measure_at, flag 256)
     void set_share_whole(bool on) { share_whole_ = on; }
     void set_infill_est(bool on) { infill_est_ = on; }
     void set_layer_faint_est(int k) { layer_faint_est_ = k; }  // (dev: faint panels seen through with the estimate - 0 never, 1 when it left the HUD out, 2 always)  // (dev: the memory fill with the motion estimate too)
@@ -333,14 +319,27 @@ public:
     // Development: a refresh between two game frames (the same shown frame as the last warp) warped at the game's
     // resolution - one pixel of each 2x2 block - and scaled up; held pixels and the UI layer at full resolution.
     void set_lowres_between(bool on) { lowres_between_ = on; }
-    // Development: the edges of what the follow share carries split in two layers per game frame (cs_edge_split).
-    void set_edge_layers(bool on) { edge_layers_ = on; }
     // Development: the no-warp mask's boundaries smoothed - see cs_mask_smooth.
     void set_mask_smooth(bool on) { mask_smooth_ = on; }
     // Development: the claim rule beside held characters and weapons off (the HUD keeps it) - see ow_beside_held.
     void set_claims_beside_held(bool on) { claims_beside_held_ = on; }
     // Development: beside a held character the claim rule only once a pixel has moved a rendered pixel (1) or half (2) - cs_warp_claim.
     void set_beside_moved(int mode) { beside_moved_ = mode; }
+    // Development: dithered screen edges without their band inside the picture (the warp there) - see ow_dither_warped.
+    void set_edge_dither_band(bool on) { edge_dither_band_ = on; }
+    // Development: the attached rule by the share a spot takes (its band's times its own), not its own against its band - cs_share_up.
+    void set_att_absolute(bool on) { att_absolute_ = on; }
+    // The held weapon and hand shown where they were frames_back game frames before the shown frame (0..1), along their own
+    // motion - the moment the camera's position is shown for (PoseModel::position_frames_back); off: as the frame has them.
+    // (development: the memory's hidden scenery relit by the light's change seen around it - cs_mem_ratio. RE Requiem seq_2
+    // -0.4% error, but the synthetic suite, no moving light, worse behind objects +2-5% and strafing +5-34%: off)
+    void set_mem_relight(bool on) { mem_relight_ = on; }
+    void set_dither_holes(bool on) { dither_holes_ = on; }  // (development: what no frame has dithered - see ow_scene_from)
+    void set_share_scenery(bool on) { share_scenery_ = on; }  // (see cs_share_up, flag 262144)
+    void set_held_between(bool on, float frames_back) { held_between_ = on; held_back_ = frames_back; }
+    // (for the log: warps since the last call, of them with the weapon moved, the frames back on those, and why not otherwise)
+    struct HeldStats { unsigned warps = 0, shifted = 0, off = 0, no_texture = 0, no_mask = 0, at_zero = 0, sums = 0; double back = 0; };
+    HeldStats take_held_stats() { const HeldStats s = held_stats_; held_stats_ = {}; return s; }
     // The motion estimate's textures released (once the game gives its own motion vectors; made again if needed).
     void release_own_motion() { for (const PrivateId id : {kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB}) if (private_[id].texture) retire(id); }
     void set_ui_tiles_off(bool on) { ui_tiles_off_ = on; }  // (development: the HUD layer read everywhere - see ow_ui_at)
@@ -388,14 +387,8 @@ public:
     // (for the log while it runs: frames checked, the share of the screen the layer covers on them, of it drawn over)
     std::uint64_t layer_frames_checked() const { return layer_frames_; }
     double layer_cover_share() const { return layer_frames_ && layer_frame_samples_ > 0 ? double(layer_covered_) / (double(layer_frames_) * layer_frame_samples_) : 0.0; }
-    void set_object_history(bool on) { object_history_ = on; if (!on) history_valid_ = objects_built_ = shown_objects_ = false; }
-    // held: what is attached to the camera and kept still (character/weapon) moves along its own on-screen motion.
-    // picture: also what the picture shows moving differently from the game's motion vectors (shadows, glare,
-    // markers), from picture_motion of the same frame.
-    bool object_motion(const IngestedSource& src, const float clip_to_prev_clip[16], const float view_to_clip[16], float scale_x, float scale_y,
-                       bool held = false, bool picture = false);
-    // Moving objects: the motion seen in the picture between the previous game frame and this one (XPAR's own
-    // motion estimation, without replacing the game's motion vectors). False: none this frame (no previous picture).
+    // The motion seen in the picture between the previous game frame and this one (XPAR's own motion estimation,
+    // without replacing the game's motion vectors). False: none this frame (no previous picture).
     bool picture_motion();
     // HUD learning: this game frame's probe scored against the previous one of the same candidate (tiles of 16 px:
     // the same spot on the screen, and where the camera's motion brings the scenery from); the scores so far, per
@@ -465,7 +458,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     };
-    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKeys, kPObjMove, kPObjTiles, kPObjOutTiles, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevColour, kPPrevDepth, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPFgMotion, kPFgInv, kPFgK1, kPFgK0, kPHudLearned, kPHudTiles, kPWarpClaims, kPStill, kPGrowA, kPGrowB, kPProbe, kPProbeTilesA, kPProbeTilesB, kPShareA, kPShareB, kPShareT, kPShare, kPRetDirtyA, kPRetDirtyB, kPShareT2, kPShareHalf, kPRecColour, kPRecUi, kPShareResid, kPOwnMove, kPPaths, kPShareSeam, kPAttHist, kPMemVis, kPUiTiles, kPWarpBeside, kPWarpHeld, kPLowScene, kPEdge, kPMaskRaw, kPMemF0, kPMemF1, kPMemFZ0, kPMemFZ1, kPCount };
+    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPHudLearned, kPHudTiles, kPWarpClaims, kPStill, kPGrowA, kPGrowB, kPProbe, kPProbeTilesA, kPProbeTilesB, kPShareA, kPShareB, kPShareT, kPShare, kPRetDirtyA, kPRetDirtyB, kPShareT2, kPShareHalf, kPRecColour, kPRecUi, kPShareResid, kPOwnMove, kPPaths, kPShareSeam, kPAttHist, kPMemVis, kPUiTiles, kPWarpBeside, kPWarpHeld, kPLowScene, kPMaskRaw, kPMemF0, kPMemF1, kPMemFZ0, kPMemFZ1, kPGunMove, kPMemRatio, kPMotionProbe, kPCount };
 
     bool create_pipelines(std::string& error);
     std::string shader_report_;
@@ -477,8 +470,8 @@ private:
     // The textures the warp reads, kept twice with split queues (front_: the shown set).
     static bool shown_id(PrivateId id) {
         return id == kPBackbuffer || id == kPHudless || id == kPUi || id == kPDepth || id == kPMask || id == kPFill || id == kPWarpMask || id == kPShare || id == kPOwnMove ||
-               id == kPObjMove || id == kPObjTiles || id == kPPrevColour || id == kPPrevDepth || (id >= kPGen0 && id <= kPGenZ2) ||
-               id == kPRetLayer || id == kPUiTiles || id == kPEdge;
+               (id >= kPGen0 && id <= kPGenZ2) ||
+               id == kPRetLayer || id == kPUiTiles || id == kPGunMove;
     }
     const Private& shown(PrivateId id) const { return split_ && shown_id(id) ? front_[id] : private_[id]; }
     void swap_shown();  // exchanges the two sets (and the per-texture descriptors)
@@ -542,12 +535,7 @@ private:
     void w_dispatch(ID3D12PipelineState* pso, const void* constants, const float w[kWConstants], UINT table, UINT groups_x, UINT groups_y);
     void w_dispatch_indirect(ID3D12PipelineState* pso, const void* constants, const float w[kWConstants], UINT table, ID3D12Resource* args);
     bool ensure_warp_list(UINT ow, UINT oh);
-    // Moving objects: the previous frame's picture and depth (ingest; the new frame's sizes and colour format).
-    void keep_history(PrivateId colour, std::uint32_t depth_w, std::uint32_t depth_h, std::uint32_t colour_w, std::uint32_t colour_h,
-                      DXGI_FORMAT colour_format);
-    ComPtr<ID3D12PipelineState> cs_obj_move_, cs_gen_depth_, cs_gen_unui_, cs_hudless_clear_, cs_hudless_count_, cs_hudless_score_, cs_hudless_fill_, cs_layer_hud_, cs_layer_check_clear_, cs_layer_check_, cs_obj_join_init_, cs_obj_join_, cs_obj_join_final_, cs_still_, cs_hold_fill_, cs_grow_init_, cs_grow_clear_, cs_grow_, cs_grow_final_, cs_obj_clear_, cs_obj_clear_tiles_, cs_obj_splat_, cs_obj_fix_, cs_copy4_, cs_copy1_;
-    ComPtr<ID3D12PipelineState> cs_fg_motion_, cs_fg_inverse_, cs_fg_clear_, cs_fg_splat_cur_, cs_fg_splat_prev_, cs_fg_resolve_, cs_fg_depth_;
-    bool object_history_ = false, history_valid_ = false, objects_built_ = false, shown_objects_ = false;
+    ComPtr<ID3D12PipelineState> cs_gen_depth_, cs_gen_unui_, cs_hudless_clear_, cs_hudless_count_, cs_hudless_score_, cs_hudless_fill_, cs_layer_hud_, cs_layer_check_clear_, cs_layer_check_, cs_obj_join_init_, cs_obj_join_, cs_obj_join_final_, cs_still_, cs_hold_fill_, cs_grow_init_, cs_grow_clear_, cs_grow_, cs_grow_final_, cs_copy4_;
     bool warp_splat_ = false;  // set_warp_splat
     bool rig_check_ = false;   // set_rig_check
     bool still_reset_ = false; // hold_characters: the score starts over
@@ -576,10 +564,14 @@ private:
     // kept only with split queues, where the shown set does not change until the next swap - see own_warp)
     std::array<std::uint64_t, 7> beside_key_ = {};
     bool beside_valid_ = false, beside_kept_ = false;
-    bool lowres_between_ = false, edge_layers_ = false, mask_smooth_ = false, claims_beside_held_ = false;
+    bool lowres_between_ = false, mask_smooth_ = false, claims_beside_held_ = false;
     int beside_moved_ = 0;
-    bool edge_written_ = false, edge_written_shown_ = false;
-    PrivateId edge_colour_ = kPBackbuffer;  // (the picture the layer was made from)  // (kPEdge written for the set being taken in / the shown one)
+    bool edge_dither_band_ = true, att_absolute_ = false, held_between_ = false, gun_built_ = false;
+    float held_back_ = 0;
+    bool mem_relight_ = false, share_scenery_ = true, dither_holes_ = false;
+    std::uint32_t motion_channels_ = 0, srv_motion_channels_ = 0;  // (SlotMeta::motion_channels now, and in the view made)
+    int mem_last_frame_ = 1;
+    HeldStats held_stats_;
     std::uint64_t last_warp_serial_ = ~0ull;
     std::array<std::pair<PrivateId, bool>, 18> warp_srv_ = {};  // (the warp table's SRVs as last set - set_x_srv)
     float claims_matrix_[16] = {};
@@ -602,7 +594,7 @@ private:
     bool learning_stalled_ = true;
     std::uint32_t detection_idle_ = 0;  // game frames since the HUD was last detected (build_no_warp_mask)
     std::uint32_t scene_idle_ = 0;      // game frames since the upscaler's output last came (ingest)
-    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_own_warp_reset_, cs_own_warp_lean_, cs_own_warp_args_, cs_own_warp_rest_, cs_warp_claims_clear_, cs_warp_claim_, cs_warp_beside_, cs_warp_held_, cs_own_warp_up_, cs_edge_split_, cs_mask_smooth_, cs_memory_, cs_mem_vis_, cs_hudless_ui_, cs_hudless_keep_, cs_ui_tiles_, cs_layer_unblend_, cs_layer_seam_clear_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_, cs_probe_tiles_, cs_probe_clear_, cs_probe_score_, cs_share_measure_, cs_share_blur_, cs_share_bins_, cs_share_final_, cs_share_up_, cs_share_seam_, cs_att_hist_, cs_rec_down_, cs_share_resid_, cs_resid_blur_, cs_own_up_;
+    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_own_warp_reset_, cs_own_warp_lean_, cs_own_warp_args_, cs_own_warp_rest_, cs_warp_claims_clear_, cs_warp_claim_, cs_warp_beside_, cs_warp_held_, cs_own_warp_up_, cs_mask_smooth_, cs_memory_, cs_mem_ratio_, cs_mem_relight_, cs_gun_motion_, cs_mem_vis_, cs_hudless_ui_, cs_hudless_keep_, cs_ui_tiles_, cs_layer_unblend_, cs_layer_seam_clear_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_, cs_probe_tiles_, cs_probe_clear_, cs_probe_score_, cs_share_measure_, cs_share_blur_, cs_share_bins_, cs_share_final_, cs_share_up_, cs_share_seam_, cs_att_hist_, cs_rec_down_, cs_share_resid_, cs_resid_blur_, cs_own_up_;
     // Sight reticles (option): the passes, which history texture holds the latest layer, and whether the layer was
     // built for the frame taken in last / the shown one (see cs_ret_layer).
     ComPtr<ID3D12PipelineState> cs_ret_cells_, cs_ret_enclose_, cs_ret_layer_, cs_ret_align_, cs_ret_pick_, cs_ret_args_, cs_ret_shift_;

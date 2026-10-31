@@ -78,7 +78,10 @@ bool on_begin_pass(command_list* cmd_list, uint32_t, const render_pass_render_ta
     if (ds) note(cmd_list, ds->view);
     return false;
 }
+resource g_twin{0};  // (see on_present)
+std::atomic<bool> g_twin_gone{false};
 void on_destroy(device*, resource res) {
+    if (res.handle == g_twin.handle) g_twin_gone = true;
     if (!g_track.load(std::memory_order_relaxed)) return;
     std::lock_guard<std::mutex> lock(g_mutex);
     g_seen.erase(res.handle);
@@ -143,7 +146,7 @@ struct Chooser {
     int round = 0, wait = 0;
     bool copied = false;
     resource chosen{0};
-    bool ours = false, users = false, disabled = false, said_missing = false;
+    bool ours = false, users = false, disabled = false, said_missing = false, said_twins = false;
     std::uint64_t retry_at = 0, retry_after = 120;
     std::vector<std::uint64_t> tried;  // the buffers the last choice was made among
     std::size_t said_candidates = ~std::size_t(0);
@@ -357,6 +360,11 @@ void settle(generic_depth_data* gd, std::uint64_t frame) {
     if (best)
         for (const auto& k : c.cand)
             if (k.probes && k.sum / k.probes >= 0.85 * (best->sum / best->probes) && k.binds > best->binds) best = &k;
+    // A reduced copy of the depth can score higher than the scene's own, its edges coarser and so on more of the picture's: Enshrouded's 640x360 at 1.49, the 1280x720 it
+    // reduces at 1.17. Of the same shape, larger, drawn into more and at half the score or better (a stopgap): that one.
+    if (best)
+        for (const auto& k : c.cand)
+            if (k.probes && k.w > best->w && k.w * best->h == k.h * best->w && k.binds > best->binds && k.sum / k.probes >= 0.5 * (best->sum / best->probes)) best = &k;
     char text[240];
     if (best && best->sum / best->probes >= kAcceptScore) {
         gd->override_depth_stencil = best->res;
@@ -383,12 +391,108 @@ void settle(generic_depth_data* gd, std::uint64_t frame) {
 
 }  // namespace
 
+// A game can draw each frame into the next of two depth buffers, the other being last frame's for its temporal passes (Enshrouded). The buffer chosen is then
+// a frame old every other frame: on half of the frames depth and motion disagreed, and the camera fit and the warp with them. Generic Depth stays on the chosen one;
+// its twin - the same size and format, bound as much (a stopgap: within a twentieth) - is copied each frame into a texture of ours, as Generic Depth copies when it
+// cannot read a buffer directly, and XPAR.fx sees which of the two changed.
+effect_runtime* g_runtime = nullptr;
+resource g_twin_copy{0};
+resource_view g_twin_view{0};
+std::uint64_t g_twin_of = 0;
+int g_said_why = 0;
+
+void why(int reason, const char* text) {  // (each reason once, in turn: a game whose twin is not read says what holds it)
+    if (reason == g_said_why) return;
+    g_said_why = reason;
+    say(text);
+}
+void drop_twin(effect_runtime* runtime) {
+    g_twin_gone = false;
+    g_twin_of = 0;
+    if (runtime) {
+        if (const auto v = runtime->find_uniform_variable("XPAR.fx", "XPAR_Twin"); v.handle) runtime->set_uniform_value_bool(v, false);
+        if (g_twin_view.handle) runtime->update_texture_bindings("XPAR_TWIN_DEPTH", resource_view{0}, resource_view{0});
+        if (g_twin_view.handle) runtime->get_device()->destroy_resource_view(g_twin_view);
+        if (g_twin_copy.handle) runtime->get_device()->destroy_resource(g_twin_copy);
+    }
+    g_twin = {0};
+    g_twin_copy = {0};
+    g_twin_view = {0};
+}
+bool bind_twin(effect_runtime* runtime, resource res) {
+    device* dev = runtime->get_device();
+    drop_twin(runtime);
+    resource_desc desc = dev->get_resource_desc(res);
+    if ((desc.usage & resource_usage::copy_source) == 0) { why(2, "XPAR: the second depth buffer cannot be copied (made before XPAR could ask for it): restart the game"); return false; }
+    const format view_format = format_to_default_typed(desc.texture.format, 0);
+    if (dev->get_api() != device_api::vulkan) desc.texture.format = format_to_typeless(desc.texture.format);
+    desc.heap = memory_heap::gpu_only;
+    desc.usage = resource_usage::shader_resource | resource_usage::copy_dest;
+    if (!dev->create_resource(desc, nullptr, resource_usage::shader_resource, &g_twin_copy)) { g_twin_copy = {0}; why(3, "XPAR: no texture for the second depth buffer"); return false; }
+    if (!dev->create_resource_view(g_twin_copy, resource_usage::shader_resource, resource_view_desc(view_format), &g_twin_view)) {
+        dev->destroy_resource(g_twin_copy); g_twin_copy = {0}; g_twin_view = {0};
+        why(4, "XPAR: no view of the second depth buffer's texture");
+        return false;
+    }
+    g_twin = res;
+    runtime->update_texture_bindings("XPAR_TWIN_DEPTH", g_twin_view, g_twin_view);
+    if (const auto v = runtime->find_uniform_variable("XPAR.fx", "XPAR_Twin"); v.handle) runtime->set_uniform_value_bool(v, true);
+    else why(5, "XPAR: this XPAR.fx cannot read a second depth buffer (an older one?)");
+    return true;
+}
+void on_present(command_queue*, swapchain*, const rect*, const rect*, uint32_t, const rect*) {
+    if (!g_runtime || !g_track.load(std::memory_order_relaxed)) return;
+    if (g_twin_gone.load()) drop_twin(g_runtime);
+    const bool settled = c.phase == Chooser::kSettled && c.ours && !c.users && !c.verifying && c.chosen.handle;
+    if (!g_runtime->get_private_data<generic_depth_data>()) return;
+    if (!settled) {
+        if (g_twin.handle) drop_twin(g_runtime);
+        return;
+    }
+    if (g_twin.handle && c.chosen.handle == g_twin_of) return;
+    if (g_twin.handle) drop_twin(g_runtime);
+    resource twin{0};
+    {
+        const std::uint64_t frame = g_frame.load(std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lock(g_mutex);
+        const auto chosen = g_seen.find(c.chosen.handle);
+        if (chosen == g_seen.end() || chosen->second.binds < 60) return;
+        int like = 0;
+        for (const auto& [handle, k] : g_seen)
+            if (handle != c.chosen.handle && k.last_frame + 2 >= frame && k.w == chosen->second.w && k.h == chosen->second.h && k.fmt == chosen->second.fmt) {
+                ++like;
+                if (k.binds * 20 >= chosen->second.binds * 19 && chosen->second.binds * 20 >= k.binds * 19) twin = k.res;
+            }
+        if (!twin.handle) { if (like) why(1, "XPAR: a second depth buffer like the chosen one, not bound as much: left alone"); return; }
+    }
+    if (bind_twin(g_runtime, twin)) {
+        g_twin_of = c.chosen.handle;
+        if (!c.said_twins) { c.said_twins = true; say("XPAR: the game takes turns between depth buffers: both are read"); }
+    }
+}
+void on_begin_effects(effect_runtime*, command_list* cmd_list, resource_view, resource_view) {
+    if (!g_twin.handle || !g_twin_copy.handle) return;
+    constexpr auto kGame = resource_usage::depth_stencil | resource_usage::shader_resource;  // (as Generic Depth takes the state of its own)
+    const resource both[2] = {g_twin, g_twin_copy};
+    const resource_usage from[2] = {kGame, resource_usage::shader_resource}, to[2] = {resource_usage::copy_source, resource_usage::copy_dest};
+    cmd_list->barrier(2, both, from, to);
+    cmd_list->copy_resource(g_twin, g_twin_copy);
+    cmd_list->barrier(2, both, to, from);
+}
+void on_destroy_runtime(effect_runtime* runtime) { if (runtime == g_runtime) { drop_twin(runtime); g_runtime = nullptr; } }
+
 void register_depth_choice_events() {
     reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(on_bind);
     reshade::register_event<reshade::addon_event::begin_render_pass>(on_begin_pass);
     reshade::register_event<reshade::addon_event::destroy_resource>(on_destroy);
+    reshade::register_event<reshade::addon_event::present>(on_present);
+    reshade::register_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_runtime);
+    reshade::register_event<reshade::addon_event::reshade_begin_effects>(on_begin_effects);
 }
 void unregister_depth_choice_events() {
+    reshade::unregister_event<reshade::addon_event::reshade_begin_effects>(on_begin_effects);
+    reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_runtime);
+    reshade::unregister_event<reshade::addon_event::present>(on_present);
     reshade::unregister_event<reshade::addon_event::destroy_resource>(on_destroy);
     reshade::unregister_event<reshade::addon_event::begin_render_pass>(on_begin_pass);
     reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(on_bind);
@@ -399,6 +503,7 @@ void unregister_depth_choice_events() {
 DepthChoice choose_depth_buffer(effect_runtime* runtime, command_list* cmd_list, resource_view probe, resource_view bound_depth) {
     device* dev = runtime->get_device();
     g_queue = runtime->get_command_queue();
+    g_runtime = runtime;
     const std::uint64_t frame = g_frame.load();
     if (c.disabled) return DepthChoice::kUnavailable;
     auto* gd = runtime->get_private_data<generic_depth_data>();
@@ -660,6 +765,7 @@ void release_depth_choice(effect_runtime* runtime) {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_seen.clear();
     }
+    drop_twin(runtime);
     if (runtime && !c.disabled && (c.ours || c.phase == Chooser::kProbe))
         if (auto* gd = runtime->get_private_data<generic_depth_data>()) gd->override_depth_stencil = {0};
     c.phase = Chooser::kIdle; c.chosen = {0}; c.ours = false; c.users = false; c.cand.clear(); c.tried.clear();

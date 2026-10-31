@@ -2,6 +2,7 @@
 // Latewarp to the camera predicted from raw mouse input and the game's own camera history.
 #include "presenter/pose.hpp"
 #include "presenter/camera_estimator.hpp"
+#include "presenter/motion_search.hpp"
 #include "presenter/frame_clock.hpp"
 #include "presenter/renderer.hpp"
 #include "shared/camera_check.hpp"
@@ -798,11 +799,6 @@ void render_thread() {
         const bool claims_reuse = GetEnvironmentVariableW(L"FW_CLAIMS_REUSE", reuse, 4) && reuse[0] == L'1';
         renderer.set_claims_reuse(claims_reuse);
         if (claims_reuse) logf("the warp's claims reused across the refreshes of a game frame (development: ClaimsReuse)");
-        // (development: FW_EDGE, from the add-on's EdgeLayers - see Renderer::set_edge_layers)
-        wchar_t edge[4]{};
-        const bool edge_layers = GetEnvironmentVariableW(L"FW_EDGE", edge, 4) && edge[0] == L'1';
-        renderer.set_edge_layers(edge_layers);
-        if (edge_layers) logf("edges of what the share carries split in two layers (development: EdgeLayers)");
         wchar_t smooth[4]{};
         const bool mask_smooth = GetEnvironmentVariableW(L"FW_MASK_SMOOTH", smooth, 4) && smooth[0] == L'1';
         renderer.set_mask_smooth(mask_smooth);
@@ -824,6 +820,9 @@ void render_thread() {
         const auto env_on = [](const wchar_t* name) { wchar_t v[4]{}; return GetEnvironmentVariableW(name, v, 4) && v[0] == L'1'; };
         if (env_on(L"FW_CARRIED_FREE")) { renderer.set_carried_free(true); logf("carried pixels not held by the warp (development: CarriedFree)"); }
         if (env_on(L"FW_MEM_POS")) { renderer.set_mem_pos(true); logf("the background memory carried with its own positions (development: MemoryPositions)"); }
+        if (env_on(L"FW_ATT_ABS")) { renderer.set_att_absolute(true); logf("the attached rule by the share a spot takes (development: AttachedAbsolute)"); }
+        if (env_on(L"FW_DITHER_NO_BAND")) { renderer.set_edge_dither_band(false); logf("dithered screen edges without their band inside the picture (development: EdgeDitherNoBand)"); }
+        if (env_on(L"FW_DITHER_HOLES")) { renderer.set_dither_holes(true); logf("what no frame has dithered (development: DitherHoles)"); }
         if (env_on(L"FW_ATT_EST")) { renderer.set_attached_estimated(true); logf("the attached rule with XPAR's own motion estimate too (development: AttachedEstimated)"); }
         if (claims_beside) logf("beside held characters and weapons the scenery claims as anywhere (development: ClaimsBesideHeld)");
         if (mask_smooth) logf("the no-warp mask's boundaries smoothed (development: MaskSmooth)");
@@ -858,9 +857,8 @@ void render_thread() {
     // then for the session (a dip - a menu with a cursor - does not switch it back), until the model is reset.
     bool model_ready = false;
     double wait_start = 0;  // (when the wait began: at most 5 s - see below)
-    double stat_start = now_seconds(), last_source_present = 0, last_profile_save = stat_start;
+    double stat_start = now_seconds(), last_profile_save = stat_start;
     std::uint32_t stat_frames = 0, stat_sources = 0;
-    double source_interval = 0;
     VblankClock vblank;
     std::int64_t wake_qpc = 0;
     std::int64_t last_target_vblank = 0;
@@ -875,6 +873,7 @@ void render_thread() {
     std::deque<std::pair<std::uint64_t, double>> frame_times;  // game frame -> its time (source_time), recent ones
     std::uint64_t shown_frame = 0;   // the game frame the warp shows (with split queues: after the one taken in last)
     double shown_since = 0;          // ...since when (moving objects: their own clock)
+    bool source_has_sim = false;     // (the frame says when it was simulated, not only when it was presented)
     double last_generated = -1e9;    // when a frame last came with generated images
     bool was_enabled = false;        // ("Enable reprojection", for the frame generation message)
     double last_pause_log = 0;
@@ -885,16 +884,19 @@ void render_thread() {
     bool presented_last = true, paced_last = false;
     double enabled_since = 0;
     bool generation_logged = false;
-    int fg_logged_images = 0;  // (XPAR frame generation: the images per game frame last logged)
-    int fg_images = 1;         // XPAR frame generation: images per game frame
     CameraCheck camera_check;        // the game's own camera against its motion vectors
     int poor_estimate_windows = 0;   // ...and, once it was found unusable, whether the estimate does any better
     bool have_source_kind = false, source_was_estimated = false, source_motion_estimated = false;
-    double last_mv_log = 0, last_usage_log = 0;
+    double last_usage_log = 0;
     bool game_has_hud_layers = false, mask_logged = false, source_masked = false, hudless_hud_logged = false, reticles_logged = false;
     bool layer_hud_logged = false;
     std::uint32_t hud_source_counts[8] = {}, hud_source_frames = 0, hud_with_ui = 0, hud_with_hudless = 0;
     CameraEstimator estimator;
+    MotionSearch motion_search;      // the game's own motion vectors among its render targets
+    std::vector<MotionSearch::Sample> search_samples;
+    LONG motion_restarts_seen = 0;
+    int search_frames = 0;           // (game frames of the motion search without a find)
+    bool scale_from_search = false;  // (the motion scale is the search's)
     // Whether the estimated camera can be learned from: the frame itself was explained, and so were most of the last 60.
     std::deque<bool> estimate_rejects;
     bool estimate_trusted = true, estimate_was_trusted = true;
@@ -986,7 +988,6 @@ void render_thread() {
         // game's generated images.
         auto own_engine_on = [&]() { return settings.warp_engine == 1 || !latewarp.ready(); };
         // Moving objects without frame generation (option): XPAR moves them itself, one game frame late.
-        auto moving_objects_on = [&]() { return settings.moving_objects != 0 && own_engine_on(); };
         // The game's frame generation is on and its images are not coming with the frames (NVIDIA Latewarp
         // chosen, or a kind of frame generation XPAR does not take): step aside.
         auto generation_aside = [&]() {
@@ -1036,8 +1037,6 @@ void render_thread() {
             // (sight reticles, option: compared with the previous frame too)
             renderer.set_keep_previous_colour((settings.no_warp_mask != 0 && !game_has_hud_layers && !hud_from_output) ||
                                               (settings.hold_reticles != 0 && settings.keep_attached != 0));
-            // Moving objects (option, XPAR engine): every frame keeps the previous one's picture and depth.
-            renderer.set_object_history(moving_objects_on());
             renderer.set_ui_from_hudless(settings.use_ui_tags != 0);
             renderer.set_mem_resolution(settings.memory_resolution);
             intake = {};
@@ -1065,6 +1064,56 @@ void render_thread() {
             const SlotMeta& m = sh.slots[newest];
             const IngestedSource s = intake.s;
             const bool sampled = intake.sampled && renderer.read_motion_samples(raw_samples);
+            // (the target found is gone: from the start - its candidates are other targets now)
+            if (sh.motion_restarts != motion_restarts_seen) {
+                motion_restarts_seen = sh.motion_restarts;
+                motion_search.reset();
+                for (auto& bits : sh.motion_ruled_out) bits = 0;
+                logf("the game's motion vectors are gone (a new render target?): searching again");
+            }
+            // (nothing found for a good while: everything again - a target may have had a bad start, or the game was in a menu then. 3 minutes at 60 fps, a stopgap)
+            if (s.motion_candidate && !sh.motion_found && ++search_frames > 10800) {
+                search_frames = 0;
+                motion_search.reset();
+                for (auto& bits : sh.motion_ruled_out) bits = 0;
+                logf("motion search: nothing found so far, trying every target again");
+            }
+            // The motion search: this frame's candidate against the motion the picture shows (see motion_search.hpp).
+            if (sampled && s.valid && s.motion_candidate && !sh.motion_found) {
+                constexpr std::size_t kCells = 80 * 45;
+                if (raw_samples.size() >= kCells * 8) {
+                    search_samples.resize(kCells);
+                    for (std::size_t i = 0; i < kCells; ++i) {
+                        const float* v = &raw_samples[i * 4];
+                        const float* c = &raw_samples[(kCells + i) * 4];
+                        auto& q = search_samples[i];
+                        q.rx = v[0] * m.camera.mvec_scale[0]; q.ry = v[1] * m.camera.mvec_scale[1]; q.valid = v[3];
+                        for (int k = 0; k < 4; ++k) q.c[k] = c[k];
+                    }
+                    if (motion_search.add(s.motion_candidate, search_samples)) {
+                        const int counted = motion_search.frames(s.motion_candidate);
+                        if (counted % MotionSearch::kFramesNeeded == 0) {
+                            float q[2], close[2], roughly[2];
+                            motion_search.best_so_far(s.motion_candidate, q);
+                            motion_search.steadiness(s.motion_candidate, close, roughly);
+                            float now = 0, before = 0;
+                            motion_search.timing(s.motion_candidate, now, before);
+                            logf("motion search: candidate %u, %d moving frames, best channels %.2f and %.2f (%.2f needed), frames near their scale %.2f %.2f, roughly %.2f %.2f, follows this frame %.2f, the one before %.2f", s.motion_candidate, counted, q[0], q[1], MotionSearch::kQuality, close[0], close[1], roughly[0], roughly[1], now, before);
+                        }
+                        MotionSearch::Found f = motion_search.decide();
+                        if (!f.found && s.motion_candidate < 256 && motion_search.ruled_out(s.motion_candidate))
+                            sh.motion_ruled_out[s.motion_candidate / 64] |= std::uint64_t(1) << (s.motion_candidate % 64);
+                        if (f.found) {
+                            const float measured_x = f.scale_x, measured_y = f.scale_y;
+                            MotionSearch::to_units(f, s.depth_rect.w, s.depth_rect.h);
+                            sh.motion_candidate = f.candidate; sh.motion_channel_x = std::uint32_t(f.channel_x); sh.motion_channel_y = std::uint32_t(f.channel_y);
+                            sh.motion_scale_x = f.scale_x; sh.motion_scale_y = f.scale_y; sh.motion_quality = f.quality;
+                            InterlockedExchange(&sh.motion_found, 1);
+                            logf("the game's own motion vectors found: candidate %u, channels %d and %d, scale %g x %g (measured %g x %g), quality %.2f", f.candidate, f.channel_x, f.channel_y, f.scale_x, f.scale_y, measured_x, measured_y, f.quality);
+                        }
+                    }
+                }
+            }
             if (s.valid) {
                 // Games without a camera (DLSS without Streamline): estimate it from the motion vectors.
                 Camera cam = m.camera;
@@ -1104,7 +1153,7 @@ void render_thread() {
                                 motion_samples.push_back(p);
                             }
                         const double t0 = now_seconds();
-                        cam = estimator.update(motion_samples, rw, rh, m.camera, s.motion_estimated);
+                        cam = estimator.update(motion_samples, rw, rh, m.camera, s.motion_estimated, sh.motion_found != 0);
                         estimator_ms_sum += (now_seconds() - t0) * 1000.0; ++estimator_runs;
                         {
                             estimate_rejects.push_back(estimator.last_rejected());
@@ -1184,13 +1233,24 @@ void render_thread() {
                     mv_scale.locked[0] = mv_scale.locked[1] = 1.0;
                     logf("no motion vectors from the game: estimating them from the picture");
                 }
+                // (the scale the search settled on, for the warp too: learned from a camera estimated from these same vectors it would only wander)
+                const bool from_search = sh.motion_found && !s.motion_estimated;
+                if (scale_from_search && !from_search && !s.motion_estimated) mv_scale = MotionVectorScale{};  // (an upscaler's now: learned again)
+                scale_from_search = from_search;
+                if (from_search) {
+                    mv_scale.valid = true;
+                    mv_scale.pixel_units = false;
+                    mv_scale.locked[0] = sh.motion_scale_x / s.depth_rect.w;
+                    mv_scale.locked[1] = sh.motion_scale_y / s.depth_rect.h;
+                }
                 incoming.s = s;
                 incoming.cam = cam;
                 incoming.basis = to_basis(cam);
-                // Frames that come without a simulation time from XPAR's own motion path (the ReShade path):
-                // timed at the game's steady pace instead of when they were presented (see FrameClock).
+                // Frames that come without a simulation time and with an estimated camera (the ReShade path, its motion estimated or found;
+                // an upscaler's data alone): timed at the game's steady pace instead of when they were presented (see FrameClock).
                 const double presented = seconds(m.qpc_sim_start ? m.qpc_sim_start : m.qpc_constants);
-                if (!m.qpc_sim_start && s.motion_estimated) source_time = frame_clock.next(m.frame_id, presented);
+                source_has_sim = m.qpc_sim_start != 0 && !cam.estimated;  // (a marker of the game's alone does not say it is this frame's: Reflex without a camera, Cyberpunk without DLSS)
+                if (!m.qpc_sim_start && (s.motion_estimated || cam.estimated)) source_time = frame_clock.next(m.frame_id, presented);
                 else { source_time = presented; frame_clock.reset(); }
                 source_frame = m.frame_id;
                 frame_times.emplace_back(m.frame_id, source_time);
@@ -1267,9 +1327,11 @@ void render_thread() {
                         }
                         rec_share_mode = share_mode; rec_orbit = orbit_warp;
                         renderer.set_share_diag(rec(g_app.csv_share) != nullptr, m.frame_id);
-                        // (the game's own camera and motion vectors: the share measured against the camera's whole motion - its
-                        // matrix explains the scenery, turn and movement alike; see Renderer::set_share_whole)
-                        renderer.set_share_whole(!cam.estimated && !s.motion_estimated);
+                        // (the share measured against the camera's whole motion - its matrix explains the scenery, turn and movement
+                        // alike; see Renderer::set_share_whole. An estimated camera too: measured against the turn alone, the scenery
+                        // of a camera moving as it turns came out 0.7 and followed that much of the turn, a fast turn's scenery 41 px
+                        // off in RE2. Recordings: Enshrouded's error -68%, RE2 -25%, AC6 -17%; synthetic orbit_est -58..63%)
+                        renderer.set_share_whole(true);
                         // (the projection against the frame before - a zoom, aiming's field of view: see Renderer::set_projection_changed)
                         static float prev_sx = 0.0f, prev_sy = 0.0f;
                         const float sx = cam.view_to_clip[0], sy = cam.view_to_clip[5];
@@ -1412,39 +1474,6 @@ void render_thread() {
                 } else if (g_rec.active) {
                     ++g_rec.dropped;
                 }
-                // XPAR frame generation (option, XPAR engine, without the game's own): the images between the previous
-                // frame and this one, as many as fit the refreshes of a game frame (at most kMaxGenerated), shown as the
-                // game's generated images are - objects one game frame late, the camera not delayed.
-                if (moving_objects_on() && s.generated == 0 && s.has_motion && mv_scale.valid) {
-                    const double interval = g_app.model.frame_interval();
-                    const double hz = vblank.period > 0 ? double(g_qpc_frequency) / vblank.period : g_app.display_mode_hz.load();
-                    // (the refreshes in between, rounded up: rounded, 2.5 at 47 fps on 120 Hz flipped between 1 and 2 images
-                    // every few hundred ms; up as soon as a tenth of a refresh more is needed, down only once a fifth of one
-                    // fewer is)
-                    if (interval > 0 && hz > 0) {
-                        const double need = interval * hz - 1.0;
-                        if (need > fg_images + 0.1 || need < fg_images - 1.2)
-                            fg_images = std::clamp(int(std::ceil(need - 0.1)), 1, kMaxGenerated);
-                    }
-                    const int images = fg_images;
-                    const bool picture = !s.motion_estimated && renderer.picture_motion();
-                    const int made = renderer.generate_frames(s, images, cam.clip_to_prev_clip, cam.view_to_clip, float(mv_scale.scale(0, s.depth_rect.w)),
-                                                              float(mv_scale.scale(1, s.depth_rect.h)), settings.use_ui_tags != 0, picture, hud_mask);
-                    if (made > 0) {
-                        incoming.s.generated = made;
-                        incoming.s.per_frame = made;
-                        for (int i = 0; i < made; ++i) incoming.s.gen_index[i] = i + 1;
-                        last_generated = now_seconds();
-                        if (made != fg_logged_images) {
-                            logf("XPAR frame generation: %d image%s between game frames (%.1f fps on a %.0f Hz display)", made, made == 1 ? "" : "s",
-                                 interval > 0 ? 1.0 / interval : 0.0, hz);
-                            fg_logged_images = made;
-                        }
-                    }
-                }
-                const double present_t = seconds(m.qpc_present);
-                if (last_source_present > 0) source_interval = present_t - last_source_present;
-                last_source_present = present_t;
                 ++stat_sources;
                 if (!renderer.split()) commit_incoming();
             }
@@ -1755,6 +1784,7 @@ void render_thread() {
             // (paced: the camera as of the planned wake-up, a fixed time before the refresh it is meant for - not
             // the moment the loop got there, which varies by a fraction of a millisecond and would jitter the motion)
             const double t_camera = frame_tick && seconds(frame_tick) <= now ? seconds(frame_tick) : now;
+            g_app.model.set_position_clock(t_camera);
             Prediction p = g_app.model.predict(t_camera);
             // Camera as of now (Auto latency 5): Auto's camera moved forward to this moment, the mouse up to now
             // through the learned model - as far as the uncovered edge allows: no more of the screen than
@@ -1804,7 +1834,13 @@ void render_thread() {
                 // (predict(t) shows the camera as of t - ahead: the oldest allowed is one frame before the newest frame)
                 const double oldest = std::min(0.0, g_app.model.source_time() - (frame > 0 ? frame : 0.0) + ahead - t_camera);
                 double allowed = ahead;
-                if (!covered(g_app.model.predict(t_camera + ahead))) {
+                const Prediction furthest = g_app.model.predict(t_camera + ahead);
+                // (forward only while the camera turns: standing still everything is covered, which says nothing - the time crept up to
+                // all of `ahead` in about a second, 0.25 ms a refresh, and the next turn started a whole game frame further on, with
+                // the room of none: a big smear across the screen every time, in every game, while a turn kept going never had it)
+                const bool turning = std::fabs(previous[0]) > kTolerance || std::fabs(previous[1]) > kTolerance ||
+                                     std::fabs(furthest.yaw) > kTolerance || std::fabs(furthest.pitch) > kTolerance;
+                if (!covered(furthest)) {
                     double lo = oldest, hi = ahead;
                     for (int it = 0; it < 8; ++it) {
                         const double mid = 0.5 * (lo + hi);
@@ -1812,17 +1848,13 @@ void render_thread() {
                     }
                     allowed = lo;
                 }
-                now_ahead = std::clamp(now_ahead + std::clamp(allowed - now_ahead, -1.5e-3, 0.25e-3), oldest, ahead);
+                now_ahead = std::clamp(now_ahead + std::clamp(allowed - now_ahead, -1.5e-3, turning ? 0.25e-3 : 0.0), oldest, ahead);
                 if (now_ahead != 0) p = g_app.model.predict(t_camera + now_ahead);
             } else {
                 now_ahead = 0;
             }
             g_app.model.set_display_ahead(now_ahead);
             if (settings.invert_warp) p.camera = apply_rotation(source_basis, g_app.model.world_up(), -p.yaw, -p.pitch, source_basis.pos);
-            // (option, Settings::turns_only: the predicted camera where the shown frame's stood - its turn, no movement. Not the
-            // shown frame's camera turned by p.yaw/p.pitch: those count from the model's newest frame, taken in a moment before
-            // it is shown - a frame's turn off once per game frame, judder)
-            else if (settings.turns_only) p.camera.pos = source_basis.pos;
             applied = p;
             const Vec3 origin = source_basis.pos;
             Mat4 projection;
@@ -1880,9 +1912,21 @@ void render_thread() {
                 // between the ones taken in (seq_replay FW_STRIDE), it tore characters apart - RE2 Claire's hair and hands cut by
                 // blocks of the floor behind, false edges on her +36-53%; the next-frame score alone had shown it better)
                 renderer.set_warp_ahead(0.0f);
+                // (the held weapon at the moment the camera's position is shown for - see PoseModel::position_at. Not on the game's own
+                // generated images: those show the weapon where it was at their moment already - moved again, it would go twice)
+                // (and only for a first-person view: no pivot measured in the last 10 s - a third-person character moved by its own
+                // motion vacated strips beside it the fill could not keep up with, RE Requiem seq_1 false edges +27%; it steps at the
+                // game's rate as before)
+                // (a frame known only by when it was presented: its time is late against the camera's clock, the moment stayed near a whole game
+                // frame back - 0.72-0.83 on average, 0.42-0.46 with simulation times - and had not come forward when the next frame took over: the
+                // weapon snapped at every game frame, Cyberpunk without DLSS strafing, 2026-10-31. There, how long the frame has been shown: from
+                // a whole game frame back to none as the next one is due)
+                const double interval = g_app.model.frame_interval();
+                const double held_back = !source_has_sim && interval > 0 ? std::clamp(1.0 - (now_seconds() - shown_since) / interval, 0.0, 1.0) : g_app.model.position_frames_back();
+                renderer.set_held_between(generated < 0 && !g_app.model.orbited_within(g_app.model.source_time(), 10.0), float(held_back));
                 renderer.set_edge_dither(settings.edge_fill == 2);
                 warped = unmoved || renderer.own_warp(source, settings.use_ui_tags != 0, inputs.no_warp_mask != nullptr, m.data(), inputs.depth_inverted,
-                                                     settings.background_memory != 0, nullptr, generated,
+                                                     settings.background_memory != 0, generated,
                                                      settings.edge_fill == 1, input_part ? m_input.data() : nullptr);
             } else {
                 warped = latewarp.evaluate(list, inputs, first_eval, view_matrix(p.camera, origin, z_sign),
@@ -2150,7 +2194,7 @@ void render_thread() {
                              fit.samples > 0 ? fit.moving / fit.samples : 0.0, agree[0], agree[1], source.depth_rect.w, source.depth_rect.h,
                              camera_fit);
             }
-            if (have_fit && !source.motion_estimated && mv_scale.add(fit, source.depth_rect.w, source.depth_rect.h))
+            if (have_fit && !source.motion_estimated && !scale_from_search && mv_scale.add(fit, source.depth_rect.w, source.depth_rect.h))
                 logf("motion vectors locked: %s, scale %.4g x %.4g (sign %+.0f %+.0f), fit quality %.3f",
                      mv_scale.pixel_units ? "render pixels" : std::fabs(std::fabs(mv_scale.locked[0]) - 1) < 1e-9 ? "uv" :
                      std::fabs(std::fabs(mv_scale.locked[0]) - 0.5) < 1e-9 ? "ndc" : "custom units", mv_scale.scale(0, source.depth_rect.w),
@@ -2196,7 +2240,7 @@ void render_thread() {
             auto& st = sh.presenter;
             st.latewarp = latewarp.ready() ? 2u : 1u;
             st.output_fps = float(stat_frames / (now - stat_start));
-            st.source_fps = source_interval > 0 ? float(1.0 / source_interval) : 0.0f;
+            st.source_fps = float(stat_sources / (now - stat_start));  // (over the window: one interval alone swings from 7 to 35 ms in Enshrouded)
             st.warp_gpu_ms = renderer.last_gpu_ms();
             st.source_age_ms = source.valid ? float((now - source_time) * 1000.0) : 0.0f;
             const auto &px = g_app.model.params(0), &py = g_app.model.params(1);
@@ -2212,14 +2256,15 @@ void render_thread() {
             st.mv_scale_y = mv_scale.valid ? float(mv_scale.scale(1, source.depth_rect.h)) : 0.0f;
             st.mv_fit_quality = float(mv_scale.quality);
             st.moving_fraction = float(mv_scale.moving_fraction);
-            if (moving_objects_on() && mv_scale.valid && now - last_mv_log > 10.0) {
-                logf("moving objects: motion vectors %s, last fit quality %.3f, moving pixels %.1f%%",
-                     mv_scale.pixel_units ? "in render pixels" : "in custom units", mv_scale.quality, mv_scale.moving_fraction * 100.0);
-                last_mv_log = now;
-            }
             // What the presenter costs the GPU (shared with the game), every 10 s.
             if (now - last_usage_log >= 10.0) {
                 const Renderer::GpuUsage u = renderer.take_gpu_usage();
+                {
+                    const auto hs = renderer.take_held_stats();
+                    logf("held weapon between game frames: %u of %u warps moved it (%.2f game frames back on average) | not: off %u, "
+                         "no motion texture %u, no mask %u, at the newest frame %u | its motion measured on %u game frames",
+                         hs.shifted, hs.warps, hs.shifted ? hs.back / hs.shifted : 0.0, hs.off, hs.no_texture, hs.no_mask, hs.at_zero, hs.sums);
+                }
                 const double span = last_usage_log > 0 ? now - last_usage_log : 0.0;
                 last_usage_log = now;
                 // (the HUD/masks/motion part of it, pass by pass)
@@ -2233,10 +2278,8 @@ void render_thread() {
                 }
                 if (pt.warps) {
                     const double k = 1.0 / pt.warps;
-                    logf("refresh warp GPU by pass (ms, %u refreshes): moving objects %.2f, claims %.2f, plain pixels (2x2) %.2f, "
-                         "the rest / full warp %.2f, moving objects' fix %.2f", pt.warps, pt.ms[Renderer::kPassWarpObjects] * k,
-                         pt.ms[Renderer::kPassWarpClaim] * k, pt.ms[Renderer::kPassWarpLean] * k, pt.ms[Renderer::kPassWarpRest] * k,
-                         pt.ms[Renderer::kPassWarpFix] * k);
+                    logf("refresh warp GPU by pass (ms, %u refreshes): claims %.2f, plain pixels (2x2) %.2f, the rest / full warp %.2f",
+                         pt.warps, pt.ms[Renderer::kPassWarpClaim] * k, pt.ms[Renderer::kPassWarpLean] * k, pt.ms[Renderer::kPassWarpRest] * k);
                 }
                 const auto subs = renderer.take_submissions();
                 if (span > 0) logf("GPU submissions: %.1f/s on the refresh queue, %.1f/s on the intake queue", subs[0] / span, subs[1] / span);

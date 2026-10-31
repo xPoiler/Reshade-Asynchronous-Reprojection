@@ -67,6 +67,14 @@ public:
     bool d3d11() const { return d11_ != nullptr; }
     // The game's own D3D12 device (not for D3D11 or Vulkan games: their device is the add-on's own) - see InProcessPresenter
     ID3D12Device* game_d3d12_device() const { return d11_ || vk_ ? nullptr : device_.Get(); }
+    // The game's motion (found, or a candidate) at the depth's size, every channel in half floats: 66 MB for the four slots at 1080p, against 265 MB for a
+    // G-buffer target at 4K as it is - which took the background memory out of the budget of an 8 GB card. One format for all candidates: no new textures while searching.
+    // Direct3D 12: the target as the game finished writing it - its own barrier from writing to reading tells when, and the state - copied in the game's
+    // list (nothing else can be done there: its bound state could not be put back), ...
+    void on_motion_written_d3d12(ID3D12Resource* source, D3D12_RESOURCE_STATES state, ID3D12GraphicsCommandList* list, std::uint64_t id);
+    // ...and that copy made small at the present, on the add-on's own list (d3d12_motion), as on_motion_d3d11. candidate 0: the found motion (kMotion).
+    void want_motion_d3d12(Tex kind, std::uint64_t source, std::uint32_t width, std::uint32_t height, std::uint32_t candidate, std::uint32_t channels);
+    bool on_motion_d3d11(std::uint64_t frame, Tex kind, ID3D11Resource* source, std::uint32_t width, std::uint32_t height, ID3D11DeviceContext* context);
     void on_tag_d3d11(std::uint64_t frame, Tex kind, ID3D11Resource* source, std::uint32_t ext_x, std::uint32_t ext_y,
                       std::uint32_t ext_w, std::uint32_t ext_h, ID3D11DeviceContext* context);
     std::uint64_t begin_present_d3d11(ID3D11Resource* backbuffer, ID3D11DeviceContext* context);
@@ -74,6 +82,7 @@ public:
     void set_swapchain(HWND hwnd, std::uint32_t width, std::uint32_t height, DXGI_FORMAT format, std::uint32_t color_space);
 
     void on_constants(std::uint64_t frame, const Camera& camera);
+    void set_motion_meta(std::uint64_t frame, std::uint32_t candidate, std::uint32_t channels);  // (SlotMeta::motion_candidate, motion_channels)
     void on_sim_start(std::uint64_t frame, std::int64_t qpc);
     void on_present_marker(std::uint64_t frame);
     // A command list / buffer handed to the GPU (ExecuteCommandLists, vkQueueSubmit): frames whose data was recorded on
@@ -203,6 +212,7 @@ private:
     // Each slot's last tag's command list, and whether it was handed to the GPU since (under mutex_).
     std::uint64_t slot_list_[kSlots] = {};
     bool slot_submitted_[kSlots] = {};
+    std::int64_t list_seen_qpc_ = 0;  // (when a frame's list was last seen handed to the GPU)
     bool ui_tagged_[kSlots] = {};  // (the slot's UI layer is one the game tags itself - on_tag - not one the add-on found)
     std::mutex open_mutex_;                  // (markers come from the game's threads)
     std::vector<std::uint64_t> open_frames_;  // started rendering, not presented, oldest first
@@ -268,6 +278,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Texture2D> d11_before_, d11_cover_;
     Microsoft::WRL::ComPtr<ID3D11Resource> d11_picture_;
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> d11_cover_cs_;
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> d11_motion_cs_;  // (on_motion_d3d11)
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> d11_motion_small_;
     bool d11_before_taken_ = false, d11_cs_failed_ = false, d11_none_ = false, d11_confirmed_ = false;
     void d3d11_cover(ID3D11DeviceContext* context, int slot);
     bool ensure_d11_cover_cs(ID3D11Device* device);
@@ -284,6 +296,18 @@ private:
     bool probe_failed_ = false;
     bool ensure_probe_pass();
     void d3d12_probe(ID3D12GraphicsCommandList* list, int slot);
+    void d3d12_motion(ID3D12GraphicsCommandList* list, int slot);
+    bool ensure_motion_pass();
+    Microsoft::WRL::ComPtr<ID3D12Resource> motion_pending_, motion_small_;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> motion_root_;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> motion_pso_;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> motion_heap_;
+    UINT motion_ring_ = 0;
+    bool motion_failed_ = false;
+    std::uint64_t motion_taken_ = 0, want_source_ = 0;  // (the target motion_pending_ holds, and the one wanted)
+    int motion_age_ = 8;                                // (presents since that copy)
+    Tex want_kind_ = kMotion;
+    std::uint32_t want_w_ = 0, want_h_ = 0, want_candidate_ = 0, want_channels_ = 0;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> d11_probe_before_, d11_probe_cov_;
     Microsoft::WRL::ComPtr<ID3D11Resource> d11_probe_picture_;
     bool d11_probe_taken_ = false, d11_probe_use_ = false, d11_probe_used_ = false;
