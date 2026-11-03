@@ -8,10 +8,15 @@
 // A game can keep last frame's motion too, for its temporal passes: that follows the turn as well, a frame behind, and warps everything a frame off. Fitted against
 // the turn of the frame before as well, for the log: a target that follows that one better reaches XPAR a frame late. Never a reason to drop it: Enshrouded's
 // only motion target was dropped so, and the search found nothing.
+// Some games draw vectors only for what moves on its own - characters, grass - and leave the rest at the value the target was cleared to:
+// their TAA takes the scenery's motion from depth and the camera (Dark Souls Remastered: (1, 1) on 91.5% of the picture). Such a target is
+// told by that value: one value, bit for bit, on most of a moving picture is never motion. It is judged on what it draws, against the
+// picture's motion there - and against that minus the scenery's, for a game that stores an object's motion on top of the camera's.
 #pragma once
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <map>
 #include <utility>
 #include <vector>
@@ -20,8 +25,10 @@ namespace fw {
 
 class MotionSearch {
 public:
-    struct Sample { float rx, ry, valid; float c[4]; };
-    struct Found { bool found = false; std::uint32_t candidate = 0; int channel_x = 0, channel_y = 1; float scale_x = 0, scale_y = 0, quality = 0; };
+    struct Sample { float rx, ry, valid; float c[4]; float x, y; };  // (x, y: the cell on the grid)
+    // (partial: the target holds clear_x, clear_y where nothing is drawn; full: its vectors are the whole motion on the screen, not the motion on top of the camera's)
+    struct Found { bool found = false; std::uint32_t candidate = 0; int channel_x = 0, channel_y = 1; float scale_x = 0, scale_y = 0, quality = 0;
+                   bool partial = false, full = true; float clear_x = 0, clear_y = 0; };
     static constexpr int kFramesNeeded = 12;      // frames that move, per candidate, before anything is decided
     static constexpr float kMovingPx = 2.0f;      // the median reference motion of a frame that counts
     static constexpr float kQuality = 0.6f;       // (a stopgap, tuned on RE2: real channels 0.71-0.91 a frame, the best other 0.54)
@@ -35,9 +42,107 @@ public:
         std::vector<const Sample*> used;
         used.reserve(samples.size());
         for (const Sample& s : samples) if (s.valid > 0.5f && std::isfinite(s.rx) && std::isfinite(s.ry)) used.push_back(&s);
-        if (used.size() < 64) return false;
+        if (used.size() < kCells) return false;
         ++calls_;
         Candidate& k = candidates_[candidate];
+        // The clear value: looked for on frames that move (a still picture can hold one value anywhere, a real target's zero).
+        if (moving(used)) {
+            const Sample* most = majority(used);
+            if (most && (!k.partial || std::memcmp(k.clear, most->c, sizeof(k.clear)) != 0)) {
+                // (first seen, or another value: what was counted before was judged on cells it never drew - from the start. A value that changes is not a clear value; the
+                // target is judged again on that one, and anything that is not motion stays far from it)
+                k = Candidate{};
+                k.partial = true;
+                std::memcpy(k.clear, most->c, sizeof(k.clear));
+                relative_.erase(candidate);
+            }
+        }
+        if (!k.partial) return track(k, used);
+        std::vector<const Sample*> drawn, scenery;
+        for (const Sample* s : used) (std::memcmp(s->c, k.clear, sizeof(k.clear)) ? drawn : scenery).push_back(s);
+        // (nothing drawn, as no character on the screen: the frame says nothing about the target)
+        if (drawn.size() < kCells || scenery.size() < kCells) {
+            k.empty += moving(used) ? 1 : 0;
+            return false;
+        }
+        // The scenery's motion, the camera's, taken off what is drawn for the second track: a plane over the screen on each axis, fitted to the scenery
+        // (one value for the whole frame leaves a turn's and a step's spread across the screen on each character, a scale off on every frame).
+        double plane[2][3];
+        if (!scenery_plane(scenery, plane)) return track(k, drawn);
+        std::vector<Sample> own(drawn.size());
+        std::vector<const Sample*> own_used(drawn.size());
+        for (std::size_t i = 0; i < drawn.size(); ++i) {
+            own[i] = *drawn[i];
+            own[i].rx -= float(plane[0][0] + plane[0][1] * own[i].x + plane[0][2] * own[i].y);
+            own[i].ry -= float(plane[1][0] + plane[1][1] * own[i].x + plane[1][2] * own[i].y);
+            own_used[i] = &own[i];
+        }
+        const bool counted = track(k, drawn);
+        return track(relative_[candidate], own_used) || counted;
+    }
+
+private:
+    struct Fit { bool ok = false; float scale = 0, quality = 0; };
+    struct Channel { bool good = false, steady = false; float scale = 0, quality = 0, close = 0, roughly = 0; };
+    struct Candidate {
+        int frames = 0;
+        std::vector<Fit> fits[4][2];
+        std::vector<float> reference[2], medians[4];
+        std::vector<float> reference_now[2], reference_before[2], medians_now[4];  // (frames whose frame before was seen too)
+        float last_turn[2] = {};
+        std::uint64_t last_call = 0;
+        bool partial = false;  // (the target's clear value found: judged on the cells that do not hold it)
+        float clear[4] = {};
+        int empty = 0;         // (frames that moved with too little of it drawn)
+    };
+    static constexpr std::size_t kCells = 64;  // (fewest cells a frame is judged on)
+
+    // More than half the cells holding one value in all four channels, bit for bit (Boyer-Moore's vote), or none.
+    static const Sample* majority(const std::vector<const Sample*>& used) {
+        const Sample* pick = nullptr;
+        std::size_t votes = 0;
+        for (const Sample* s : used) {
+            if (!votes) { pick = s; votes = 1; }
+            else votes += std::memcmp(s->c, pick->c, sizeof(s->c)) ? std::size_t(-1) : 1;
+        }
+        std::size_t count = 0;
+        for (const Sample* s : used) count += std::memcmp(s->c, pick->c, sizeof(s->c)) ? 0 : 1;
+        return count * 2 > used.size() ? pick : nullptr;
+    }
+    // motion = a + b x + c y by least squares, on each axis.
+    static bool scenery_plane(const std::vector<const Sample*>& s, double out[2][3]) {
+        double m[3][3] = {}, v[2][3] = {};
+        for (const Sample* p : s) {
+            const double row[3] = {1.0, p->x, p->y};
+            for (int i = 0; i < 3; ++i) {
+                for (int j = 0; j < 3; ++j) m[i][j] += row[i] * row[j];
+                v[0][i] += row[i] * p->rx;
+                v[1][i] += row[i] * p->ry;
+            }
+        }
+        // (Cramer's rule)
+        auto det = [](const double a[3][3]) {
+            return a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+        };
+        const double d = det(m);
+        if (!(std::fabs(d) > 1e-9)) return false;
+        for (int axis = 0; axis < 2; ++axis)
+            for (int k = 0; k < 3; ++k) {
+                double a[3][3];
+                for (int i = 0; i < 3; ++i)
+                    for (int j = 0; j < 3; ++j) a[i][j] = j == k ? v[axis][i] : m[i][j];
+                out[axis][k] = det(a) / d;
+            }
+        return true;
+    }
+    static bool moving(const std::vector<const Sample*>& used) {
+        std::vector<float> size;
+        size.reserve(used.size());
+        for (const Sample* s : used) size.push_back(std::hypot(s->rx, s->ry));
+        return median(size) >= kMovingPx;
+    }
+    // One frame of one track: the cells it is judged on.
+    bool track(Candidate& k, const std::vector<const Sample*>& used) {
         float now[4], turn[2];
         {
             std::vector<float> v(used.size());
@@ -55,11 +160,7 @@ public:
         std::copy(k.last_turn, k.last_turn + 2, turned);
         std::copy(turn, turn + 2, k.last_turn);
         k.last_call = calls_;
-        std::vector<float> size;
-        size.reserve(used.size());
-        for (const Sample* s : used) size.push_back(std::hypot(s->rx, s->ry));
-        std::nth_element(size.begin(), size.begin() + size.size() / 2, size.end());
-        if (size[size.size() / 2] < kMovingPx) return false;
+        if (!moving(used)) return false;
         ++k.frames;
         for (int axis = 0; axis < 2; ++axis) {
             k.reference[axis].push_back(turn[axis]);
@@ -76,45 +177,61 @@ public:
             }
         return true;
     }
-    // The candidate that explains both axes by two different channels, the best of those.
-    Found decide() const {
+
+public:
+    // The candidate that explains both axes by two different channels, the best of those (partial: targets with a clear value too).
+    Found decide(bool partial = true) const {
         Found best;
-        for (const auto& [id, k] : candidates_) {
-            if (k.frames < kFramesNeeded) continue;
+        auto consider = [&](std::uint32_t id, const Candidate& k, bool steady_only, float pass) {
+            if (!partial && candidates_.at(id).partial) return;
             Channel x[4], y[4];
             for (int ch = 0; ch < 4; ++ch) { x[ch] = channel(k, ch, 0); y[ch] = channel(k, ch, 1); }
+            const Candidate& target = candidates_.at(id);
             for (int a = 0; a < 4; ++a)
                 for (int b = 0; b < 4; ++b) {
-                    if (a == b || !x[a].good || !y[b].good) continue;
+                    if (a == b || !(steady_only ? x[a].steady : x[a].good) || !(steady_only ? y[b].steady : y[b].good)) continue;
                     const float q = std::min(x[a].quality, y[b].quality);
-                    if (!best.found || q > best.quality) best = {true, id, a, b, x[a].scale, y[b].scale, q};
+                    if (q >= pass && (!best.found || q > best.quality))
+                        best = {true, id, a, b, x[a].scale, y[b].scale, q, target.partial, true, target.clear[a], target.clear[b]};
                 }
+        };
+        for (const auto& [id, k] : candidates_) {
+            if (k.frames >= kFramesNeeded) consider(id, k, false, -1);
+            const auto own = relative_.find(id);
+            if (own != relative_.end() && own->second.frames >= kFramesNeeded) consider(id, own->second, false, -1);
         }
-        if (best.found) return best;
+        if (best.found) return settled(best);
         // How good a fit can get depends on how good the picture's motion is, not only on the target: Enshrouded's own stayed at 0.58 and 0.62 over 2500 frames, every other
         // target at ~0. So over many frames: far above all the others that were tried, at a steady scale.
         for (const auto& [id, k] : candidates_) {
-            if (k.frames < kFramesNeeded * 8) continue;
             float others = 0;
             int tried = 0;
             for (const auto& [other, o] : candidates_) {
-                if (other == id || o.frames < kFramesNeeded) continue;
+                if (other == id || frames(other) < kFramesNeeded) continue;
                 float q[2];
                 best_so_far(other, q);
                 others = std::max({others, q[0], q[1]});
                 ++tried;
             }
             if (tried < 2) continue;
-            Channel x[4], y[4];
-            for (int ch = 0; ch < 4; ++ch) { x[ch] = channel(k, ch, 0); y[ch] = channel(k, ch, 1); }
-            for (int a = 0; a < 4; ++a)
-                for (int b = 0; b < 4; ++b) {
-                    if (a == b || !x[a].steady || !y[b].steady) continue;
-                    const float q = std::min(x[a].quality, y[b].quality);
-                    if (q >= kAbove * std::max(others, kNothing) && (!best.found || q > best.quality)) best = {true, id, a, b, x[a].scale, y[b].scale, q};
-                }
+            const float pass = kAbove * std::max(others, kNothing);
+            if (k.frames >= kFramesNeeded * 8) consider(id, k, true, pass);
+            const auto own = relative_.find(id);
+            if (own != relative_.end() && own->second.frames >= kFramesNeeded * 8) consider(id, own->second, true, pass);
         }
-        return best;
+        return settled(best);
+    }
+    // Full motion or motion on top of the camera's: within a frame both fit what is drawn (the offset takes the camera's), across frames only one follows -
+    // the frames' medians of the full motion, or of that minus the scenery's. The better of the two on the channels found (alike, or no turns both ways yet: full).
+    Found settled(Found f) const {
+        if (!f.found || !f.partial) return f;
+        const auto own = relative_.find(f.candidate);
+        if (own == relative_.end()) return f;
+        const Candidate& k = candidates_.at(f.candidate);
+        const float full = std::min(across(k, f.channel_x, 0).quality, across(k, f.channel_y, 1).quality);
+        const float on_top = std::min(across(own->second, f.channel_x, 0).quality, across(own->second, f.channel_y, 1).quality);
+        f.full = full >= on_top;
+        return f;
     }
     // Follows the frame before better than this one, on the axis that moved most.
     bool late(std::uint32_t candidate) const {
@@ -125,9 +242,9 @@ public:
     // For the log: how well its best channel follows this frame's turn, and the frame before's (0 both: no turns both ways yet).
     void timing(std::uint32_t candidate, float& now, float& before) const {
         now = before = 0;
-        const auto it = candidates_.find(candidate);
-        if (it == candidates_.end()) return;
-        const Candidate& k = it->second;
+        const Candidate* best = best_track(candidate);
+        if (!best) return;
+        const Candidate& k = *best;
         for (int axis = 0; axis < 2; ++axis)
             for (int ch = 0; ch < 4; ++ch) {
                 const Channel a = across_of(k.reference_now[axis], k.medians_now[ch]), b = across_of(k.reference_before[axis], k.medians_now[ch]);
@@ -154,55 +271,85 @@ public:
     // and 0.35 over a slow first 12 frames, and 0.82 another time - ruled out, it was never tried again in that session. What is not motion scores ~0)
     bool ruled_out(std::uint32_t candidate) const {
         const auto it = candidates_.find(candidate);
-        if (it == candidates_.end() || it->second.frames < kFramesNeeded) return false;
-        // (only once the turns went both ways on an axis: over plain turns a frame's own fit sees nothing, whatever the target - Enshrouded's motion at 0.12 and 0.00, ruled out)
-        bool turned_both_ways = false;
-        for (int axis = 0; axis < 2; ++axis) {
-            int forth = 0, back = 0;
-            for (const float r : it->second.reference[axis]) { forth += r >= kMovingPx ? 1 : 0; back += r <= -kMovingPx ? 1 : 0; }
-            turned_both_ways = turned_both_ways || std::min(forth, back) >= kFramesNeeded;
-        }
-        if (!turned_both_ways) return false;
-        float q[2];
-        best_so_far(candidate, q);
-        return q[0] < kNothing && q[1] < kNothing;
+        if (it == candidates_.end()) return false;
+        // (a target that draws next to nothing while the picture moves - a mask, or one value everywhere: as many frames as the verdict over many frames takes. One
+        // with a character that stays off the screen that long is tried again with the rest, after a while: main.cpp)
+        if (it->second.partial && it->second.frames == 0 && it->second.empty >= kFramesNeeded * 8) return true;
+        if (it->second.frames < kFramesNeeded || !track_ruled_out(it->second)) return false;
+        const auto own = relative_.find(candidate);
+        return own == relative_.end() || own->second.frames < kFramesNeeded || track_ruled_out(own->second);
     }
     // For the log: its best channels so far, whatever the verdict (x, y: their quality; -1 none).
     void best_so_far(std::uint32_t candidate, float out[2]) const {
         out[0] = out[1] = -1;
-        const auto it = candidates_.find(candidate);
-        if (it == candidates_.end()) return;
-        for (int ch = 0; ch < 4; ++ch)
-            for (int axis = 0; axis < 2; ++axis) out[axis] = std::max(out[axis], channel(it->second, ch, axis).quality);
+        for (const Candidate* k : tracks(candidate)) {
+            float q[2];
+            best_of(*k, q);
+            out[0] = std::max(out[0], q[0]); out[1] = std::max(out[1], q[1]);
+        }
     }
     // For the log: of its best channels (x, y), the share of frames near their scale.
     void steadiness(std::uint32_t candidate, float close[2], float roughly[2]) const {
         close[0] = close[1] = roughly[0] = roughly[1] = 0;
-        const auto it = candidates_.find(candidate);
-        if (it == candidates_.end()) return;
+        const Candidate* k = best_track(candidate);
+        if (!k) return;
         for (int axis = 0; axis < 2; ++axis) {
             float best = -2;
             for (int ch = 0; ch < 4; ++ch) {
-                const Channel c = channel(it->second, ch, axis);
+                const Channel c = channel(*k, ch, axis);
                 if (c.quality > best) { best = c.quality; close[axis] = c.close; roughly[axis] = c.roughly; }
             }
         }
     }
-    int frames(std::uint32_t candidate) const { const auto it = candidates_.find(candidate); return it == candidates_.end() ? 0 : it->second.frames; }
-    void reset() { candidates_.clear(); }
+    // For the log: its clear value was found (it is judged on what it draws), and the better of its tracks is the motion on top of the scenery's.
+    bool partial(std::uint32_t candidate) const { const auto it = candidates_.find(candidate); return it != candidates_.end() && it->second.partial; }
+    bool on_top(std::uint32_t candidate) const { const Candidate* k = best_track(candidate); return k && k != &candidates_.at(candidate); }
+    int frames(std::uint32_t candidate) const {
+        int most = 0;
+        for (const Candidate* k : tracks(candidate)) most = std::max(most, k->frames);
+        return most;
+    }
+    void reset() { candidates_.clear(); relative_.clear(); }
 
 private:
-    struct Fit { bool ok = false; float scale = 0, quality = 0; };
-    struct Channel { bool good = false, steady = false; float scale = 0, quality = 0, close = 0, roughly = 0; };
-    struct Candidate {
-        int frames = 0;
-        std::vector<Fit> fits[4][2];
-        std::vector<float> reference[2], medians[4];
-        std::vector<float> reference_now[2], reference_before[2], medians_now[4];  // (frames whose frame before was seen too)
-        float last_turn[2] = {};
-        std::uint64_t last_call = 0;
-    };
 
+    // A target's tracks: what it draws against the picture's motion, and - a target with a clear value - against that minus the scenery's.
+    std::vector<const Candidate*> tracks(std::uint32_t candidate) const {
+        std::vector<const Candidate*> out;
+        const auto it = candidates_.find(candidate);
+        if (it != candidates_.end()) out.push_back(&it->second);
+        const auto own = relative_.find(candidate);
+        if (own != relative_.end()) out.push_back(&own->second);
+        return out;
+    }
+    const Candidate* best_track(std::uint32_t candidate) const {
+        const Candidate* best = nullptr;
+        float most = -3;
+        for (const Candidate* k : tracks(candidate)) {
+            float q[2];
+            best_of(*k, q);
+            if (q[0] + q[1] > most) { most = q[0] + q[1]; best = k; }
+        }
+        return best;
+    }
+    static void best_of(const Candidate& k, float out[2]) {
+        out[0] = out[1] = -1;
+        for (int ch = 0; ch < 4; ++ch)
+            for (int axis = 0; axis < 2; ++axis) out[axis] = std::max(out[axis], channel(k, ch, axis).quality);
+    }
+    // (only once the turns went both ways on an axis: over plain turns a frame's own fit sees nothing, whatever the target - Enshrouded's motion at 0.12 and 0.00, ruled out)
+    static bool track_ruled_out(const Candidate& k) {
+        bool turned_both_ways = false;
+        for (int axis = 0; axis < 2; ++axis) {
+            int forth = 0, back = 0;
+            for (const float r : k.reference[axis]) { forth += r >= kMovingPx ? 1 : 0; back += r <= -kMovingPx ? 1 : 0; }
+            turned_both_ways = turned_both_ways || std::min(forth, back) >= kFramesNeeded;
+        }
+        if (!turned_both_ways) return false;
+        float q[2];
+        best_of(k, q);
+        return q[0] < kNothing && q[1] < kNothing;
+    }
     static float median(std::vector<float>& v) {
         std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
         return v[v.size() / 2];
@@ -299,6 +446,7 @@ private:
         return other.quality > within.quality ? other : within;
     }
     std::map<std::uint32_t, Candidate> candidates_;
+    std::map<std::uint32_t, Candidate> relative_;  // (targets with a clear value: what they draw against the motion on top of the scenery's)
     std::uint64_t calls_ = 0;
 };
 

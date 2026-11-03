@@ -174,6 +174,61 @@ static void not_ruled_out_before_turns_both_ways() {
     for (int t = 0; t < 120; ++t) both.add(3, plain_turn(scene, t, false, 0));
     EXPECT(both.ruled_out(3), "a target without motion not ruled out after turns both ways");
 }
+// A target cleared to one value where nothing moves on its own (Dark Souls: (1, 1) on 91.5%), vectors drawn on two characters and some grass. The
+// camera turns both ways; the characters walk on their own. full: the vectors hold the whole motion on the screen; otherwise the motion on top of the camera's.
+// what: 0 motion, 1 a mask (1 where drawn), 2 albedo where drawn, 3 nothing drawn at all.
+static std::vector<MotionSearch::Sample> cleared(Scene& scene, int t, bool full, int what) {
+    std::vector<MotionSearch::Sample> out;
+    const float turn = 14.0f * std::sin(t * 0.4f) + (std::sin(t * 0.4f) >= 0 ? 4.0f : -4.0f), rise = 5.0f * std::cos(t * 0.3f);
+    const float walk_a = 9.0f * std::sin(t * 0.55f + 1.0f), walk_b = -7.0f * std::cos(t * 0.35f);
+    for (int y = 0; y < 45; ++y)
+        for (int x = 0; x < 80; ++x) {
+            const bool a = x >= 10 && x < 21 && y >= 20 && y < 35, b = x >= 50 && x < 61 && y >= 22 && y < 37, grass = y >= 42 && x % 3 == 0;
+            const float sway = grass ? 0.8f * std::sin(t * 0.9f + x) : 0.0f;
+            const float own_x = a ? walk_a : b ? walk_b : sway, own_y = a ? 0.6f * walk_a : b ? 5.0f * std::sin(t * 0.45f) : 0.0f;
+            const float camera_x = turn + (x - 40) * 0.05f, camera_y = rise + (y - 22) * 0.05f;
+            MotionSearch::Sample s{};
+            s.rx = camera_x + own_x + scene.noise(0.4f); s.ry = camera_y + own_y + scene.noise(0.4f); s.valid = 1; s.x = float(x); s.y = float(y);
+            s.c[0] = 1.0f; s.c[1] = 1.0f; s.c[2] = 0.0f; s.c[3] = 1.0f;
+            if ((a || b || grass) && what != 3) {
+                if (what == 0) {
+                    s.c[0] = ((full ? camera_x : 0.0f) + own_x + scene.noise(0.3f)) / 3840;
+                    s.c[1] = ((full ? camera_y : 0.0f) + own_y + scene.noise(0.3f)) / -2160;
+                } else if (what == 1) {
+                    s.c[0] = 0.0f;
+                } else {
+                    s.c[0] = 0.5f + 0.4f * std::sin(x * 0.7f) * std::cos(y * 0.5f + t * 0.05f);
+                    s.c[1] = 0.5f + 0.4f * std::cos(x * 0.4f + t * 0.03f);
+                }
+            }
+            out.push_back(s);
+        }
+    return out;
+}
+static void finds_motion_drawn_on_what_moves() {
+    for (const bool full : {true, false}) {
+        MotionSearch search;
+        Scene scene;
+        for (int t = 0; t < 120; ++t) { search.add(9, cleared(scene, t, full, 0)); search.add(4, scene.frame(t, 0, 1, 1, 1, false)); }
+        const auto f = search.decide();
+        EXPECT(f.found && f.candidate == 9 && f.channel_x == 0 && f.channel_y == 1, "%s motion on what moves: found %d candidate %u channels %d %d quality %g", full ? "full" : "on-top",
+               int(f.found), f.candidate, f.channel_x, f.channel_y, f.quality);
+        EXPECT(f.partial && f.clear_x == 1.0f && f.clear_y == 1.0f, "clear value not told: partial %d, %g %g", int(f.partial), f.clear_x, f.clear_y);
+        EXPECT(f.full == full, "stored %s, told %s", full ? "full" : "on top of the camera", f.full ? "full" : "on top of the camera");
+        EXPECT(std::fabs(f.scale_x / 3840 - 1) < 0.1f && std::fabs(f.scale_y / -2160 - 1) < 0.1f, "scales %g %g", f.scale_x, f.scale_y);
+    }
+}
+static void cleared_targets_without_motion() {
+    for (const int what : {1, 2, 3}) {
+        MotionSearch search;
+        Scene scene;
+        for (int t = 0; t < 200; ++t) { search.add(3, cleared(scene, t, true, what)); search.add(4, scene.frame(t, 0, 1, 1, 1, false)); search.add(5, scene.frame(t + 50, 0, 1, 1, 1, false)); }
+        const auto f = search.decide();
+        EXPECT(!f.found, "a cleared target without motion (%d) taken for motion: candidate %u quality %g", what, f.candidate, f.quality);
+        // (albedo on ~400 cells can follow a turn by chance - 0.16 here, by the "nothing" mark of 0.15: never found, not always ruled out)
+        EXPECT(what == 2 || search.ruled_out(3), "a cleared target without motion (%d) not ruled out", what);
+    }
+}
 static void whole_units() {
     const struct { float x, y, want_x, want_y; } kCases[] = {{1774, 1073, 1920, 1080}, {1917, 968, 1920, 1080}, {1478, 1078.5f, 1920, 1080}, {955.9f, -540.4f, 960, -540}, {-1082.8f, -1078.7f, -1080, -1080}, {1500, 300, 1500, 300}};
     for (const auto& k : kCases) {
@@ -186,6 +241,8 @@ static void whole_units() {
 
 int main() {
     whole_units();
+    finds_motion_drawn_on_what_moves();
+    cleared_targets_without_motion();
     not_ruled_out_before_turns_both_ways();
     late_motion_is_told_and_found();
     plain_turns();

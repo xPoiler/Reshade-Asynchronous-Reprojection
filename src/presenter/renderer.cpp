@@ -4183,15 +4183,44 @@ float fl_prev(uint k, float2 pos) {
 }
 // The motion texture (mv_size: its size, the render grid): uv to the previous frame. flags bit 2: no
 // previous frame yet - no motion.
+// flags bit 16: the game's vectors drawn only on what moves on its own (t3, its channels x and y as they come; clip_to_prev[0].xy:
+// the value where nothing is drawn, mv_scale: its units in px of this grid). Where it drew, its own; elsewhere this, in its units. And
+// what it drew counts as known (u1: level 0 of the confident displacements, z) - where XPAR's own is not trusted, a character's
+// motion would not be seen as its own (cs_analyze), nor sampled for the camera.
 RWTexture2D<float2> fl_motion_u : register(u0);
+Texture2D<float2> fl_game_t : register(t3);
+RWTexture2D<float4> fl_known_u : register(u1);
+bool fl_drawn(uint2 p) {
+    const float2 v = fl_game_t.Load(int3(p, 0)), clear = f16tof32(f32tof16(clip_to_prev[0].xy));  // (as the half floats hold it)
+    return any(v != clear);
+}
 [numthreads(8, 8, 1)] void cs_flow_motion(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= mv_size)) return;
-    if (flags & 4) { fl_motion_u[id.xy] = float2(0, 0); return; }
-    uint tw, th;
-    fl_flow_t.GetDimensions(tw, th);
-    const float2 g = float2(grid);
-    const float2 u = fl_flow_t.SampleLevel(ow_linear, clamp((float2(id.xy) + 0.5) / float2(mv_size) * g, 0.5, g - 0.5) / float2(tw, th), 0).xy;
-    fl_motion_u[id.xy] = u / g;
+    float2 m = 0;
+    if (!(flags & 4)) {
+        uint tw, th;
+        fl_flow_t.GetDimensions(tw, th);
+        const float2 g = float2(grid);
+        m = fl_flow_t.SampleLevel(ow_linear, clamp((float2(id.xy) + 0.5) / float2(mv_size) * g, 0.5, g - 0.5) / float2(tw, th), 0).xy / g;
+    }
+    if (flags & 16) {
+        const bool drawn = fl_drawn(id.xy);
+        fl_motion_u[id.xy] = drawn ? fl_game_t.Load(int3(id.xy, 0)) : m * float2(mv_size) / mv_scale;
+        // (each pixel of level 0 once: by the thread at its first full pixel - known if any of its four was drawn)
+        if (all((id.xy & 1) == 0)) {
+            const uint2 q = id.xy / 2;
+            if (all(q < grid)) {
+                bool any_drawn = drawn;
+                [unroll] for (uint k = 1; k < 4; ++k) {
+                    const uint2 p = id.xy + uint2(k & 1, k >> 1);
+                    any_drawn = any_drawn || (all(p < mv_size) && fl_drawn(p));
+                }
+                if (any_drawn) { float4 f = fl_known_u[q]; f.z = 1; fl_known_u[q] = f; }
+            }
+        }
+        return;
+    }
+    fl_motion_u[id.xy] = m;
 }
 
 // Debug view on the warped output: masked pixels magenta, HUD score still below the threshold green
@@ -7217,7 +7246,7 @@ void Renderer::convert(ID3D12Resource* source, DXGI_FORMAT source_format, int sl
     transition(p, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 }
 
-bool Renderer::estimate_motion(DXGI_FORMAT colour, bool write_motion) {
+bool Renderer::estimate_motion(DXGI_FORMAT colour, bool write_motion, const PartialMotion* game) {
     const UINT W = private_[kPDepth].width, H = private_[kPDepth].height;
     const UINT w0 = std::max(1u, W / 2), h0 = std::max(1u, H / 2);  // level 0: half the render grid
     constexpr UINT kLevels = 5;
@@ -7324,7 +7353,17 @@ bool Renderer::estimate_motion(DXGI_FORMAT colour, bool write_motion) {
         run(cs_flow_search_.Get(), table(kFlowFillAB, kPFeat, before, kPFeat, kPFlowB), kPFlowB, w0, h0);
         c.flags = 4;
     }
-    if (write_motion) run(cs_flow_motion_.Get(), motion, kPMotion, W, H);
+    if (write_motion && game) {
+        // (the game's vectors where it drew them, this where it did not - see cs_flow_motion's flag 16)
+        c.flags |= 16;
+        c.clip_to_prev[0] = game->clear[0]; c.clip_to_prev[1] = game->clear[1];
+        c.mv_scale[0] = game->scale[0]; c.mv_scale[1] = game->scale[1];
+        set_x_srv(motion + 3, kPMotionGame);
+        set_x_uav(motion + 7, kPFlowB);
+        transition(private_[kPFlowB], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        run(cs_flow_motion_.Get(), motion, kPMotion, W, H);
+        transition(private_[kPFlowB], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    } else if (write_motion) run(cs_flow_motion_.Get(), motion, kPMotion, W, H);
     if (flow_stamps_) pass_stamp(kPassFlowOut);
     flow_luma_ ^= 1;
     flow_previous_ = true;
@@ -7491,7 +7530,16 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
         convert(sources[kDepth], static_cast<DXGI_FORMAT>(dp.format), slot, kDepth, kPDepth, dp.width, dp.height);
         const auto& mv = m.tex[kMotion];
         motion_channels_ = m.motion_channels;
-        if (sources[kMotion]) {
+        if (sources[kMotion] && shared.motion_partial && ensure_private(kPMotionGame, dp.width, dp.height, DXGI_FORMAT_R16G16_FLOAT)) {
+            // The game's vectors only on what moves on its own (motion_search.hpp): the rest, the scenery, from the picture - XPAR's own estimate, as
+            // for a game without any. (Its TAA takes the scenery's motion from depth and its camera)
+            convert(sources[kMotion], static_cast<DXGI_FORMAT>(mv.format), slot, kMotion, kPMotionGame, dp.width, dp.height, mv.width, mv.height);
+            take_colour();
+            const PartialMotion game{{shared.motion_clear_x, shared.motion_clear_y}, {shared.motion_scale_x, shared.motion_scale_y}};
+            estimate_motion(colour, true, &game);
+            out.has_motion = true;
+            own_motion_ = true;  // (its confidence: what XPAR's own is trusted on, and what the game drew)
+        } else if (sources[kMotion]) {
             // (motion vectors at another resolution than the depth - output resolution: sampled at the matching
             // positions over the depth's grid, not cropped to its corner)
             if (mv.width != dp.width || mv.height != dp.height)
@@ -7825,7 +7873,7 @@ void Renderer::release_stash() {
 }
 
 std::string Renderer::memory_report() {
-    static const char* const kNames[] = {"Backbuffer", "Hudless", "Ui", "Depth", "Motion", "ZeroUi", "Output", "Object", "ObjKindA", "ObjKindB", "Gen0", "Gen1", "Gen2", "GenZ0", "GenZ1", "GenZ2", "Previous", "HudScore", "Mask", "Scene", "Attached", "World", "Fill", "Mem0", "Mem1", "MemZ0", "MemZ1", "RampRows", "Ramp", "WarpMask", "HudKind", "StashColor", "StashDepth", "StashMotion", "StashHudless", "Stash2Color", "Stash2Hudless", "Stash2Depth", "Stash2Motion", "LumaA", "LumaB", "Feat", "FlowA", "FlowB", "RetCells", "RetEncl", "RetA", "RetB", "RetLayer", "HudLearned", "HudTiles", "WarpClaims", "Still", "GrowA", "GrowB", "Probe", "ProbeTilesA", "ProbeTilesB", "ShareA", "ShareB", "ShareT", "Share", "RetDirtyA", "RetDirtyB", "ShareT2", "ShareHalf", "RecColour", "RecUi", "ShareResid", "OwnMove", "Paths", "ShareSeam", "AttHist", "MemVis", "UiTiles", "WarpBeside", "WarpHeld", "LowScene", "MaskRaw", "MemF0", "MemF1", "MemFZ0", "MemFZ1", "GunMove", "MemRatio", "MotionProbe"};
+    static const char* const kNames[] = {"Backbuffer", "Hudless", "Ui", "Depth", "Motion", "ZeroUi", "Output", "Object", "ObjKindA", "ObjKindB", "Gen0", "Gen1", "Gen2", "GenZ0", "GenZ1", "GenZ2", "Previous", "HudScore", "Mask", "Scene", "Attached", "World", "Fill", "Mem0", "Mem1", "MemZ0", "MemZ1", "RampRows", "Ramp", "WarpMask", "HudKind", "StashColor", "StashDepth", "StashMotion", "StashHudless", "Stash2Color", "Stash2Hudless", "Stash2Depth", "Stash2Motion", "LumaA", "LumaB", "Feat", "FlowA", "FlowB", "RetCells", "RetEncl", "RetA", "RetB", "RetLayer", "HudLearned", "HudTiles", "WarpClaims", "Still", "GrowA", "GrowB", "Probe", "ProbeTilesA", "ProbeTilesB", "ShareA", "ShareB", "ShareT", "Share", "RetDirtyA", "RetDirtyB", "ShareT2", "ShareHalf", "RecColour", "RecUi", "ShareResid", "OwnMove", "Paths", "ShareSeam", "AttHist", "MemVis", "UiTiles", "WarpBeside", "WarpHeld", "LowScene", "MaskRaw", "MemF0", "MemF1", "MemFZ0", "MemFZ1", "GunMove", "MemRatio", "MotionProbe", "MotionGame"};
     static_assert(sizeof(kNames) / sizeof(kNames[0]) == kPCount, "a name for every private texture");
     struct Item { std::string name; double mb; };
     std::vector<Item> items;

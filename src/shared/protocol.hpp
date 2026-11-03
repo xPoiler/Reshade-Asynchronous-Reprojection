@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 86;
+constexpr std::uint32_t kVersion = 87;
 // (four: the presenter taking one in, one ready, and the add-on writing two - a game that starts its next frame before
 // the last one is presented (its tags and constants come first: Cyberpunk, Enshrouded) has two being written. Three
 // slots, 2026-10-28, dropped 43-55% of their frames before the presenter saw them - the reprojection fed at half the
@@ -341,6 +341,10 @@ struct Shared {
     volatile LONG motion_found;
     std::uint32_t motion_candidate, motion_channel_x, motion_channel_y;
     float motion_scale_x, motion_scale_y, motion_quality;
+    // ...a target that holds vectors only for what moves on its own (motion_partial 1): the raw value of its channels x, y where nothing was drawn, and
+    // whether its vectors are the whole motion on the screen (motion_full 1) or the motion on top of the camera's (0).
+    std::uint32_t motion_partial, motion_full;
+    float motion_clear_x, motion_clear_y;
     // The add-on's turn: the target found is gone (a change of resolution): +1, and the presenter starts over. The presenter's turn: candidates ruled out, a bit each.
     volatile LONG motion_restarts;
     std::uint64_t motion_ruled_out[4];

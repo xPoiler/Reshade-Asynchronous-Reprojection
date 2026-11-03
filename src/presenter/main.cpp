@@ -1141,6 +1141,7 @@ void render_thread() {
                         const float* c = &raw_samples[(kCells + i) * 4];
                         auto& q = search_samples[i];
                         q.rx = v[0] * m.camera.mvec_scale[0]; q.ry = v[1] * m.camera.mvec_scale[1]; q.valid = v[3];
+                        q.x = float(i % 80); q.y = float(i / 80);
                         for (int k = 0; k < 4; ++k) q.c[k] = c[k];
                     }
                     if (motion_search.add(s.motion_candidate, search_samples)) {
@@ -1151,18 +1152,29 @@ void render_thread() {
                             motion_search.steadiness(s.motion_candidate, close, roughly);
                             float now = 0, before = 0;
                             motion_search.timing(s.motion_candidate, now, before);
-                            logf("motion search: candidate %u, %d moving frames, best channels %.2f and %.2f (%.2f needed), frames near their scale %.2f %.2f, roughly %.2f %.2f, follows this frame %.2f, the one before %.2f", s.motion_candidate, counted, q[0], q[1], MotionSearch::kQuality, close[0], close[1], roughly[0], roughly[1], now, before);
+                            logf("motion search: candidate %u, %d moving frames, best channels %.2f and %.2f (%.2f needed), frames near their scale %.2f %.2f, roughly %.2f %.2f, follows this frame %.2f, the one before %.2f%s", s.motion_candidate, counted, q[0], q[1], MotionSearch::kQuality, close[0], close[1], roughly[0], roughly[1], now, before,
+                                 !motion_search.partial(s.motion_candidate) ? "" : motion_search.on_top(s.motion_candidate) ? "; cleared where nothing is drawn, best as motion on top of the camera's" : "; cleared where nothing is drawn, best as the whole motion");
                         }
                         MotionSearch::Found f = motion_search.decide();
                         if (!f.found && s.motion_candidate < 256 && motion_search.ruled_out(s.motion_candidate))
                             sh.motion_ruled_out[s.motion_candidate / 64] |= std::uint64_t(1) << (s.motion_candidate % 64);
+                        // (vectors on top of the camera's, drawn only on what moves on its own: told, not used - the fill keeps what is drawn as it is,
+                        // the camera's motion is not added to it yet. No game seen so far: Dark Souls stores the whole motion)
+                        if (f.found && f.partial && !f.full) {
+                            if (counted % MotionSearch::kFramesNeeded == 0)
+                                logf("motion search: candidate %u would do, drawn only on what moves on its own, its vectors on top of the camera's: not used (not handled yet)", f.candidate);
+                            f.found = false;
+                        }
                         if (f.found) {
                             const float measured_x = f.scale_x, measured_y = f.scale_y;
                             MotionSearch::to_units(f, s.depth_rect.w, s.depth_rect.h);
                             sh.motion_candidate = f.candidate; sh.motion_channel_x = std::uint32_t(f.channel_x); sh.motion_channel_y = std::uint32_t(f.channel_y);
                             sh.motion_scale_x = f.scale_x; sh.motion_scale_y = f.scale_y; sh.motion_quality = f.quality;
+                            sh.motion_partial = f.partial ? 1 : 0; sh.motion_full = f.full ? 1 : 0; sh.motion_clear_x = f.clear_x; sh.motion_clear_y = f.clear_y;
                             InterlockedExchange(&sh.motion_found, 1);
                             logf("the game's own motion vectors found: candidate %u, channels %d and %d, scale %g x %g (measured %g x %g), quality %.2f", f.candidate, f.channel_x, f.channel_y, f.scale_x, f.scale_y, measured_x, measured_y, f.quality);
+                            if (f.partial)
+                                logf("...drawn only on what moves on its own: %g, %g where nothing is drawn; its vectors %s", f.clear_x, f.clear_y, f.full ? "the whole motion on the screen" : "the motion on top of the camera's");
                         }
                     }
                 }

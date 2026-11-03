@@ -458,7 +458,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     };
-    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPHudLearned, kPHudTiles, kPWarpClaims, kPStill, kPGrowA, kPGrowB, kPProbe, kPProbeTilesA, kPProbeTilesB, kPShareA, kPShareB, kPShareT, kPShare, kPRetDirtyA, kPRetDirtyB, kPShareT2, kPShareHalf, kPRecColour, kPRecUi, kPShareResid, kPOwnMove, kPPaths, kPShareSeam, kPAttHist, kPMemVis, kPUiTiles, kPWarpBeside, kPWarpHeld, kPLowScene, kPMaskRaw, kPMemF0, kPMemF1, kPMemFZ0, kPMemFZ1, kPGunMove, kPMemRatio, kPMotionProbe, kPCount };
+    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPHudLearned, kPHudTiles, kPWarpClaims, kPStill, kPGrowA, kPGrowB, kPProbe, kPProbeTilesA, kPProbeTilesB, kPShareA, kPShareB, kPShareT, kPShare, kPRetDirtyA, kPRetDirtyB, kPShareT2, kPShareHalf, kPRecColour, kPRecUi, kPShareResid, kPOwnMove, kPPaths, kPShareSeam, kPAttHist, kPMemVis, kPUiTiles, kPWarpBeside, kPWarpHeld, kPLowScene, kPMaskRaw, kPMemF0, kPMemF1, kPMemFZ0, kPMemFZ1, kPGunMove, kPMemRatio, kPMotionProbe, kPMotionGame, kPCount };
 
     bool create_pipelines(std::string& error);
     std::string shader_report_;
@@ -514,7 +514,9 @@ private:
     // Own motion estimation (games that give depth but no motion vectors): fills the motion texture from
     // the picture of this game frame and the previous one. Called by ingest, between the depth and the
     // motion samples.
-    bool estimate_motion(DXGI_FORMAT colour, bool write_motion = true);  // false: no previous picture
+    // The game's vectors drawn only on what moves on its own (Shared::motion_partial): the raw value where nothing is drawn, and their units in px of the depth.
+    struct PartialMotion { float clear[2]; float scale[2]; };
+    bool estimate_motion(DXGI_FORMAT colour, bool write_motion = true, const PartialMotion* game = nullptr);  // false: no previous picture
     int flow_luma_ = 0;            // which brightness pyramid holds the previous frame
     bool flow_previous_ = false;   // ...and whether it does (false: no motion this frame)
     bool own_motion_ = false;      // the current frame's motion vectors are XPAR's own (samples: confident ones only)
