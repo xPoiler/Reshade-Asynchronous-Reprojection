@@ -4222,6 +4222,19 @@ bool fl_drawn(uint2 p) {
     }
     fl_motion_u[id.xy] = m;
 }
+// The scenery's motion where the game drew none (its clear value: alpha, threshold), from depth and the camera found - as cs_analyze takes the camera's:
+// what does not move on its own moves by that alone. mv_scale: raw -> uv, the analysis'. (Behind the camera a frame ago: left as estimated)
+Texture2D<float> cf_depth_t : register(t0);
+Texture2D<float2> cf_game_t : register(t1);
+RWTexture2D<float2> cf_motion_u : register(u0);
+[numthreads(8, 8, 1)] void cs_camera_fill(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= mv_size) || any(id.xy < rect.xy) || any(id.xy >= rect.xy + rect.zw)) return;
+    if (any(cf_game_t.Load(int3(id.xy, 0)) != f16tof32(f32tof16(float2(alpha, threshold))))) return;
+    const float2 uv = (float2(id.xy - rect.xy) + 0.5) / float2(rect.zw);
+    const float4 prev = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, cf_depth_t.Load(int3(id.xy, 0)), 1), clip_to_prev);
+    if (prev.w <= 0) return;
+    cf_motion_u[id.xy] = (float2(prev.x / prev.w * 0.5 + 0.5, 0.5 - prev.y / prev.w * 0.5) - uv) / mv_scale;
+}
 
 // Debug view on the warped output: masked pixels magenta, HUD score still below the threshold green
 // (learned HUD only, flag 1: with the upscaler's output there is nothing being learned).
@@ -4313,7 +4326,9 @@ constexpr UINT kXMemFSrv = kXSmoothUav + 2, kXMemFUav = kXMemFSrv + 6;
 constexpr UINT kXGunSrv = kXMemFUav + 2, kXGunUav = kXGunSrv + 6;
 // The background memory relit (cs_mem_ratio, cs_mem_relight; 6 + 2 each).
 constexpr UINT kXMemRatioSrv = kXGunUav + 2, kXMemRatioUav = kXMemRatioSrv + 6, kXMemRelightSrv = kXMemRatioUav + 2, kXMemRelightUav = kXMemRelightSrv + 6;
-constexpr UINT kW = kXMemRelightUav + 2;
+// The scenery's motion from the camera found (cs_camera_fill; 6 + 2).
+constexpr UINT kXCamFillSrv = kXMemRelightUav + 2, kXCamFillUav = kXCamFillSrv + 6;
+constexpr UINT kW = kXCamFillUav + 2;
 enum WTable : UINT { kWWarp, kWShown, kWJoinInit, kWJoinAB, kWJoinBA, kWJoinFinal,
                      kWGenDepth0, kWGenDepth1, kWGenDepth2, kWGenUi0, kWGenUi1, kWGenUi2, kWClaim,
                      kWStill, kWHoldInit, kWHoldAB, kWHoldBA, kWHoldFinal, kWHoldFill, kWHoldFillFinal, kWGrowInit, kWGrowAB, kWGrowBA,
@@ -4815,7 +4830,7 @@ bool Renderer::create_pipelines(std::string& error) {
         {"cs_analyze", &cs_analyze_}, {"cs_reduce", &cs_reduce_},
         {"cs_hud", &cs_hud_}, {"cs_hud_world", &cs_hud_world_}, {"cs_mask", &cs_mask_}, {"cs_mask_smooth", &cs_mask_smooth_}, {"cs_clear_score", &cs_clear_score_}, {"cs_hudless_clear", &cs_hudless_clear_}, {"cs_hudless_count", &cs_hudless_count_},
         {"cs_hudless_score", &cs_hudless_score_}, {"cs_hudless_fill", &cs_hudless_fill_}, {"cs_layer_hud", &cs_layer_hud_}, {"cs_layer_check_clear", &cs_layer_check_clear_}, {"cs_layer_check", &cs_layer_check_},
-        {"cs_hud_count", &cs_hud_count_}, {"cs_clear_counts", &cs_clear_counts_}, {"cs_sample", &cs_sample_}, {"cs_tint", &cs_tint_}, {"cs_rec_down", &cs_rec_down_}, {"cs_hud_tiles", &cs_hud_tiles_}, {"cs_hud_spread", &cs_hud_spread_},
+        {"cs_hud_count", &cs_hud_count_}, {"cs_clear_counts", &cs_clear_counts_}, {"cs_sample", &cs_sample_}, {"cs_camera_fill", &cs_camera_fill_}, {"cs_tint", &cs_tint_}, {"cs_rec_down", &cs_rec_down_}, {"cs_hud_tiles", &cs_hud_tiles_}, {"cs_hud_spread", &cs_hud_spread_},
         {"cs_scene_clear", &cs_scene_clear_}, {"cs_scene_accum", &cs_scene_accum_}, {"cs_scene_finish", &cs_scene_finish_},
         {"cs_scene_tiles", &cs_scene_tiles_}, {"cs_scene_hud", &cs_scene_hud_}, {"cs_scene_fill", &cs_scene_fill_}, {"cs_scene_grey", &cs_scene_grey_},
         {"cs_scene_grey_finish", &cs_scene_grey_finish_}, {"cs_scene_wash", &cs_scene_wash_}, {"cs_scene_wash_finish", &cs_scene_wash_finish_},
@@ -5041,6 +5056,26 @@ struct XConstants {
     std::uint32_t groups_x, flags;
 };
 static_assert(sizeof(XConstants) == 32 * 4, "root constants");
+
+void Renderer::fill_from_camera(const float clip_to_prev_clip[16], float scale_x, float scale_y) {
+    if (!partial_motion_ || !private_[kPMotionGame].texture || !private_[kPMotion].texture || !private_[kPDepth].texture || scale_x == 0 || scale_y == 0) return;
+    const UINT w = private_[kPMotion].width, h = private_[kPMotion].height;
+    XConstants c{};
+    std::memcpy(c.clip_to_prev, clip_to_prev_clip, sizeof(c.clip_to_prev));
+    const Rect2 r = last_depth_rect_.w ? last_depth_rect_ : Rect2{0, 0, w, h};
+    c.rect[0] = r.x; c.rect[1] = r.y; c.rect[2] = std::min(r.w, w - r.x); c.rect[3] = std::min(r.h, h - r.y);
+    c.grid[0] = w; c.grid[1] = h;
+    c.mv_size[0] = w; c.mv_size[1] = h;
+    c.mv_scale[0] = scale_x; c.mv_scale[1] = scale_y;
+    c.alpha = partial_clear_[0]; c.threshold = partial_clear_[1];
+    for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXCamFillSrv + i, kPDepth);
+    set_x_srv(kXCamFillSrv + 1, kPMotionGame);
+    set_x_uav(kXCamFillUav + 0, kPMotion);
+    set_x_uav(kXCamFillUav + 1, kPMotion);
+    transition(private_[kPMotion], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    x_dispatch(cs_camera_fill_.Get(), &c, kXCamFillSrv, kXCamFillUav, (w + 7) / 8, (h + 7) / 8);
+    transition(private_[kPMotion], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+}
 
 void Renderer::analyze_motion(const IngestedSource& src, const float clip_to_prev_clip[16], float scale_x, float scale_y, bool scale_valid,
                               bool depth_inverted, bool near_rule, bool turn_rule, std::uint64_t frame, float floor_pivot_depth) {
@@ -7511,6 +7546,7 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
     // motion is estimated from the picture, which is then taken first.
     const bool estimate = sources[kDepth] && !sources[kMotion] && m.camera.estimated != 0;
     own_motion_ = false;
+    partial_motion_ = false;
     // (the coverage of the game's HUD layer, as the add-on hands it over, stays one channel: 8 MB at 4K instead of 64. Before
     // the motion estimate, which leaves out what it covers - see fl_under_hud)
     const auto& ui = m.tex[kUi];
@@ -7539,6 +7575,9 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
             estimate_motion(colour, true, &game);
             out.has_motion = true;
             own_motion_ = true;  // (its confidence: what XPAR's own is trusted on, and what the game drew)
+            partial_motion_ = true;
+            partial_clear_[0] = shared.motion_clear_x; partial_clear_[1] = shared.motion_clear_y;
+            last_depth_rect_ = {dp.ext_x, dp.ext_y, dp.ext_w, dp.ext_h};
         } else if (sources[kMotion]) {
             // (motion vectors at another resolution than the depth - output resolution: sampled at the matching
             // positions over the depth's grid, not cropped to its corner)

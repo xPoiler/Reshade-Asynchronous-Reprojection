@@ -222,6 +222,9 @@ public:
     // motion-vector scale fit of `frame` (read back a few frames later, see take_motion_fit).
     // near_rule: pixels near the camera that move against the camera model count as attached; turn_rule:
     // so do pixels nearly still on screen while the camera turns (third-person orbit cameras). See cs_analyze.
+    // The game's vectors drawn only on what moves on its own (ingest's partial motion): the rest, the scenery, from depth and the camera found
+    // (clip_to_prev_clip of the game's own camera, followed this frame) instead of XPAR's estimate. scale: the analysis' (raw -> uv).
+    void fill_from_camera(const float clip_to_prev_clip[16], float scale_x, float scale_y);
     void analyze_motion(const IngestedSource& src, const float clip_to_prev_clip[16], float scale_x, float scale_y, bool scale_valid,
                         bool depth_inverted = true, bool near_rule = true, bool turn_rule = false, std::uint64_t frame = 0,
                         float floor_pivot_depth = 0.0f);
@@ -520,6 +523,9 @@ private:
     int flow_luma_ = 0;            // which brightness pyramid holds the previous frame
     bool flow_previous_ = false;   // ...and whether it does (false: no motion this frame)
     bool own_motion_ = false;      // the current frame's motion vectors are XPAR's own (samples: confident ones only)
+    bool partial_motion_ = false;  // ...the game's where it drew them, XPAR's own elsewhere (kPMotionGame: the game's as drawn)
+    float partial_clear_[2] = {};  // (the game's value where nothing is drawn)
+    Rect2 last_depth_rect_{};      // (its depth's valid region)
     int mem_last_ = -1, mem_shown_ = -1, mem_pending_ = -1;  // background memory buffer written last / read by the warp / of the frame to show
     ID3D12CommandQueue* context_queue() const { return context_ ? iqueue_.Get() : queue_.Get(); }
     ComPtr<IDXGIFactory4> factory_;
@@ -596,7 +602,7 @@ private:
     bool learning_stalled_ = true;
     std::uint32_t detection_idle_ = 0;  // game frames since the HUD was last detected (build_no_warp_mask)
     std::uint32_t scene_idle_ = 0;      // game frames since the upscaler's output last came (ingest)
-    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_own_warp_reset_, cs_own_warp_lean_, cs_own_warp_args_, cs_own_warp_rest_, cs_warp_claims_clear_, cs_warp_claim_, cs_warp_beside_, cs_warp_held_, cs_own_warp_up_, cs_mask_smooth_, cs_memory_, cs_mem_ratio_, cs_mem_relight_, cs_gun_motion_, cs_mem_vis_, cs_hudless_ui_, cs_hudless_keep_, cs_ui_tiles_, cs_layer_unblend_, cs_layer_seam_clear_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_, cs_probe_tiles_, cs_probe_clear_, cs_probe_score_, cs_share_measure_, cs_share_blur_, cs_share_bins_, cs_share_final_, cs_share_up_, cs_share_seam_, cs_att_hist_, cs_rec_down_, cs_share_resid_, cs_resid_blur_, cs_own_up_;
+    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_own_warp_reset_, cs_own_warp_lean_, cs_own_warp_args_, cs_own_warp_rest_, cs_warp_claims_clear_, cs_warp_claim_, cs_warp_beside_, cs_warp_held_, cs_own_warp_up_, cs_mask_smooth_, cs_memory_, cs_mem_ratio_, cs_mem_relight_, cs_gun_motion_, cs_mem_vis_, cs_hudless_ui_, cs_hudless_keep_, cs_ui_tiles_, cs_layer_unblend_, cs_layer_seam_clear_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_, cs_camera_fill_, cs_probe_tiles_, cs_probe_clear_, cs_probe_score_, cs_share_measure_, cs_share_blur_, cs_share_bins_, cs_share_final_, cs_share_up_, cs_share_seam_, cs_att_hist_, cs_rec_down_, cs_share_resid_, cs_resid_blur_, cs_own_up_;
     // Sight reticles (option): the passes, which history texture holds the latest layer, and whether the layer was
     // built for the frame taken in last / the shown one (see cs_ret_layer).
     ComPtr<ID3D12PipelineState> cs_ret_cells_, cs_ret_enclose_, cs_ret_layer_, cs_ret_align_, cs_ret_pick_, cs_ret_args_, cs_ret_shift_;

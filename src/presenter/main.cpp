@@ -959,6 +959,7 @@ void render_thread() {
     std::uint64_t camera_last_frame = 0, camera_used = 0, camera_used_before = 0, camera_moving = 0, camera_none = 0, camera_capped = 0;
     std::map<std::uint32_t, int> camera_from;  // (the places the used frames came from, for the log)
     bool camera_found = false, camera_have_last = false;
+    bool camera_followed_now = false;  // (this frame's camera is the game's own, found: the scenery's motion can come from it - Renderer::fill_from_camera)
     MatrixCandidate camera_last{};  // (the value the camera was found in last frame)
     std::vector<float> camera_errors_now;
     CameraSearch::Motion camera_motion{};
@@ -1287,14 +1288,25 @@ void render_thread() {
                             if (known)
                                 for (std::uint32_t i = 0; i < camera_count; ++i)
                                     if (m.matrix[i].key == known->key) judge(m.matrix[i], *known);
+                            // Otherwise each value of the places with the one of the frame before nearest to it: a camera changes little from one frame to the next, a
+                            // shadow's or a reflection's view held in the same place does not look like it. Every pair, cut at 128, never got to the camera once Dark Souls'
+                            // places held 400-600 pairs a frame: missed on 289-300 frames of 300, and with no camera the frame before, lost for good.
                             if (!best || best_error > limit) {
                                 best = best_last = nullptr;
                                 best_error = 1e30f;
                                 for (std::uint32_t i = 0; i < camera_count && pairs < 128; ++i) {
                                     const MatrixCandidate& c = m.matrix[i];
                                     if (!c.key || !wanted(c.key)) continue;
-                                    for (const MatrixCandidate& l : camera_previous)
-                                        if (l.key == c.key && pairs < 128) judge(c, l);
+                                    const MatrixCandidate* nearest = nullptr;
+                                    double least = 0;
+                                    for (const MatrixCandidate& l : camera_previous) {
+                                        if (l.key != c.key) continue;
+                                        double apart = 0, size = 0;
+                                        for (int e = 0; e < 16; ++e) { apart += double(c.m[e] - l.m[e]) * (c.m[e] - l.m[e]); size += double(c.m[e]) * c.m[e]; }
+                                        apart /= std::max(size, 1e-12);
+                                        if (!nearest || apart < least) { nearest = &l; least = apart; }
+                                    }
+                                    if (nearest) judge(c, *nearest);
                                 }
                             }
                             const bool agrees = best && best_error <= limit;
@@ -1345,6 +1357,7 @@ void render_thread() {
                             for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) turn[i][j] = camera_motion.turn[i][j];
                             cam = estimator.follow(turn, CameraEstimator::V3{camera_motion.move[0], camera_motion.move[1], camera_motion.move[2]}, camera_motion.fov, rw, rh, m.camera);
                             ++camera_followed;
+                            camera_followed_now = true;
                         } else {
                             cam = estimator.update(motion_samples, rw, rh, m.camera, s.motion_estimated, sh.motion_found != 0);
                         }
@@ -1493,6 +1506,10 @@ void render_thread() {
                     if (std::fabs(cw) > 1e-9 && cz / cw > 0) floor_pivot_depth = float(cz / cw);
                 }
                 renderer.set_rig_check(true);  // (objects the player follows by turning are not held: see cs_analyze)
+                // (after the camera search judged this frame against the motion sampled at ingest: never against motion made from the camera judged)
+                if (camera_followed_now && mv_scale.valid)
+                    renderer.fill_from_camera(cam.clip_to_prev_clip, float(mv_scale.scale(0, s.depth_rect.w)), float(mv_scale.scale(1, s.depth_rect.h)));
+                camera_followed_now = false;
                 renderer.analyze_motion(s, cam.clip_to_prev_clip, float(mv_scale.scale(0, s.depth_rect.w)),
                                         float(mv_scale.scale(1, s.depth_rect.h)), mv_scale.valid, cam.depth_inverted != 0,
                                         settings.near_camera_rule != 0, settings.turn_rule != 0, m.frame_id, floor_pivot_depth);
