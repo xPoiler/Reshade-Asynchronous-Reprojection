@@ -82,6 +82,7 @@ public:
     void set_swapchain(HWND hwnd, std::uint32_t width, std::uint32_t height, DXGI_FORMAT format, std::uint32_t color_space);
 
     void on_constants(std::uint64_t frame, const Camera& camera);
+    void set_matrices(std::uint64_t frame, const MatrixCandidate* matrices, std::uint32_t count);  // (the camera search's candidates of this frame)
     void set_motion_meta(std::uint64_t frame, std::uint32_t candidate, std::uint32_t channels);  // (SlotMeta::motion_candidate, motion_channels)
     void on_sim_start(std::uint64_t frame, std::int64_t qpc);
     void on_present_marker(std::uint64_t frame);

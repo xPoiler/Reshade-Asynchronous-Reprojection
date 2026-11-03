@@ -2,6 +2,7 @@
 #include "addon/depth_choice.hpp"
 #include "addon/ngx_hooks.hpp"
 #include "addon/mv_probe.hpp"
+#include "addon/camera_search.hpp"
 #include "addon/vk_transport.hpp"
 #include <reshade.hpp>
 #include <d3d12.h>
@@ -217,6 +218,10 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
     }
     // This frame's data is tagged inside its own present, on a command list not submitted yet: the present is told, or it takes the newest frame submitted, the one
     // before - every picture paired with the depth and motion of the frame before it (Enshrouded: colour fitted the next index's motion in 27 of 27 frames).
+    {
+        static MatrixCandidate matrices[kMatrixCandidates];
+        if (const std::uint32_t count = camera_search::take(matrices, kMatrixCandidates, sh ? sh->camera_held : nullptr, sh ? sh->camera_held_state : 0)) p->set_matrices(frame, matrices, count);
+    }
     p->on_present_marker(frame);
     char text[200];
     if (far_only)
@@ -226,10 +231,16 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
     else if (depth_restart_needed())
         std::snprintf(text, sizeof(text), "No DLSS or FSR data from this game. Its depth reads empty: XPAR switched on ReShade's depth copy - restart the game once.");
     else
-        std::snprintf(text, sizeof(text), "Motion vectors from: %s. Depth from ReShade (%ux%u).",
-                      search.motion.handle ? "the game's own render targets, found automatically (camera estimated from them)"
+    {
+        char camera[64];
+        const LONG share = sh->camera_share;
+        if (share > 0) std::snprintf(camera, sizeof(camera), "Camera found in the game (used on %ld%% of frames).", share);
+        else std::snprintf(camera, sizeof(camera), "Camera estimated.");
+        std::snprintf(text, sizeof(text), "Motion vectors from: %s. %s Depth from ReShade (%ux%u).",
+                      search.motion.handle ? "the game's own render targets, found automatically"
                       : search.probe.handle ? "the picture, estimated by XPAR (looking for the game's own: turn the camera)"
-                                            : "the picture, estimated by XPAR", w, h);
+                                            : "the picture, estimated by XPAR", camera, w, h);
+    }
     set_status(text);
 }
 

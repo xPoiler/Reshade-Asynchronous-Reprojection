@@ -30,7 +30,7 @@ target_include_directories(fw_options INTERFACE src)
 
 # In-game ReShade add-on (static CRT so it has no runtime dependency inside the game).
 add_library(FrameWarpAddon SHARED src/addon/addon.cpp src/addon/producer.cpp src/addon/vk_transport.cpp src/addon/streamline_hooks.cpp
-            src/addon/ngx_hooks.cpp src/addon/ffx_hooks.cpp src/addon/reshade_feed.cpp src/addon/depth_choice.cpp src/addon/ui_probe.cpp src/addon/mv_probe.cpp src/addon/ui_layer.cpp src/addon/shader_scan.cpp src/addon/hud_learn.cpp src/addon/game_probe.cpp src/addon/frame_cap.cpp src/addon/fault_log.cpp src/common/inline_hook.cpp)
+            src/addon/ngx_hooks.cpp src/addon/ffx_hooks.cpp src/addon/reshade_feed.cpp src/addon/depth_choice.cpp src/addon/ui_probe.cpp src/addon/mv_probe.cpp src/addon/camera_search.cpp src/addon/ui_layer.cpp src/addon/shader_scan.cpp src/addon/hud_learn.cpp src/addon/game_probe.cpp src/addon/frame_cap.cpp src/addon/fault_log.cpp src/common/inline_hook.cpp)
 target_link_libraries(FrameWarpAddon PRIVATE fw_options d3d12 dxgi d3dcompiler)
 # Symbols (FrameWarp.pdb, kept in the build folder): the fault log's offsets resolve to functions and lines (fault_log.cpp)
 target_compile_options(FrameWarpAddon PRIVATE /Zi)
@@ -83,6 +83,9 @@ if(BUILD_TESTING)
   add_executable(motion_search_tests tests/motion_search_tests.cpp)
   target_link_libraries(motion_search_tests PRIVATE fw_options)
   add_test(NAME motion_search COMMAND motion_search_tests)
+  add_executable(camera_search_tests tests/camera_search_tests.cpp)
+  target_link_libraries(camera_search_tests PRIVATE fw_options)
+  add_test(NAME camera_search COMMAND camera_search_tests)
   add_executable(pose_tests tests/pose_tests.cpp)
   target_link_libraries(pose_tests PRIVATE fw_options)
   add_test(NAME pose COMMAND pose_tests)

@@ -144,7 +144,7 @@ int Producer::slot_for_frame(std::uint64_t frame, bool create) {
     auto claim = [&](int i, LONG from) {
         if (InterlockedCompareExchange(&shared_->slots[i].state, kWriting, from) != from) return false;
         auto& m = shared_->slots[i];
-        m.motion_candidate = 0; m.motion_channels = 0;
+        m.motion_candidate = 0; m.motion_channels = 0; m.matrices = 0;
         m.frame_id = frame; m.fence_value = 0; m.qpc_sim_start = 0; m.qpc_constants = 0; m.qpc_present = 0;
         slot_list_[i] = 0; slot_submitted_[i] = false; ui_tagged_[i] = false;
         m.camera.valid = 0;
@@ -404,6 +404,16 @@ void Producer::on_execute(std::uint64_t list) {
             list_seen_qpc_ = qpc_now();
             if (shared_->slots[i].state == kWriting) slot_submitted_[i] = true;
         }
+}
+
+void Producer::set_matrices(std::uint64_t frame, const MatrixCandidate* matrices, std::uint32_t count) {
+    std::lock_guard lock(mutex_);
+    if (!ready()) return;
+    const int slot = slot_for_frame(frame, false);
+    if (slot < 0) return;
+    count = std::min(count, kMatrixCandidates);
+    std::copy(matrices, matrices + count, shared_->slots[slot].matrix);
+    shared_->slots[slot].matrices = count;
 }
 
 void Producer::set_motion_meta(std::uint64_t frame, std::uint32_t candidate, std::uint32_t channels) {

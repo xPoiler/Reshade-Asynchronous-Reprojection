@@ -3,6 +3,7 @@
 #define ImTextureID ImU64
 #include <imgui.h>
 #include <reshade.hpp>
+#include "addon/camera_search.hpp"
 #include "addon/producer.hpp"
 #include "addon/fault_log.hpp"
 #include "addon/game_probe.hpp"
@@ -1157,6 +1158,7 @@ void register_callbacks() {
     fw::register_depth_choice_events();
     fw::ui_probe::init();
     fw::mv_probe::init();
+    fw::camera_search::init();
     fw::shader_scan::init();
     fw::hud_learn::init(
         [](std::uint64_t picture, bool d3d11, std::uint32_t state, std::uint64_t list, std::uint32_t candidate, bool end, bool use) {
@@ -1226,6 +1228,7 @@ void unregister_callbacks() {
     reshade::unregister_event<reshade::addon_event::finish_present>(on_finish_present);
     fw::frame_cap_shutdown();
     fw::unregister_depth_choice_events();
+    fw::camera_search::shutdown();
     fw::mv_probe::shutdown();
     fw::ui_probe::shutdown();
     fw::ui_layer::shutdown();

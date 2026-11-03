@@ -373,6 +373,32 @@ public:
         last_omega_ = omega;
         last_translation_ = T;
         prev_move_ = T; have_prev_move_ = ok && !game.reset;
+        return advance(omega, T, game, w, h, noisy, follow_zoom);
+    }
+
+    // One game frame whose camera was found in the game's constants (camera_search.hpp): its turn and move from the frame before are known, nothing is fitted
+    // (R and T as in update: current camera to previous, x right, y up, z forward, the move in near planes). Its field of view is the game's: it stays for the frames
+    // in between where the camera is not found, which go on being fitted from the motion, so the two never disagree on it.
+    Camera follow(const M3& R, const V3& move, double fov, double w, double h, const Camera& game) {
+        fov_ = learned_fov_ = fov;
+        fov_locked_ = learned_locked_ = true;
+        game_fov_mode_ = 3;  // (the game's own field of view, as handed to the upscaler, is not needed)
+        locked_frames_ = locked_rejected_ = 0;
+        V3 omega = rotation_vector(R), T = move;
+        if (game.reset) { omega = V3{}; T = V3{}; }
+        good_omega_ = omega; good_move_ = T; have_good_ = !game.reset; carried_frames_ = 0;
+        last_rejected_ = false;
+        last_residual_ = 0;
+        ++frames_;
+        last_omega_ = omega;
+        last_translation_ = T;
+        prev_move_ = T; have_prev_move_ = !game.reset;
+        return advance(omega, T, game, w, h, false, false);
+    }
+
+private:
+    // The turn and the move of a frame, added to the camera put together so far.
+    Camera advance(const V3& omega, const V3& T, const Camera& game, double w, double h, bool noisy, bool follow_zoom) {
         // The camera now sits at T in the previous camera's coordinates: world move = B_prev * T.
         for (int i = 0; i < 3; ++i) position_[i] += basis_[i][0] * T[0] + basis_[i][1] * T[1] + basis_[i][2] * T[2];
         // The position is handed on in single precision, and only its changes matter: far from the origin its
@@ -392,6 +418,8 @@ public:
         if (learned_locked_ && game_v_ > 0 && game_fov_mode_ == 0) decide_game_fov();
         return out;
     }
+
+public:
 
     // A first-person weapon (or hands) moves with the camera, not with the world: in the translation fit
     // its samples would be explained by an invented camera move (tiny in the world, but tied to the
@@ -482,6 +510,14 @@ public:
         return std::isfinite(m) && m <= 4096.0 && m * typical_depth <= 4.0;
     }
 
+    // The rotation vector (axis * angle) of a rotation matrix: rotation's inverse.
+    static V3 rotation_vector(const M3& R) {
+        const double c = std::clamp((R[0][0] + R[1][1] + R[2][2] - 1.0) * 0.5, -1.0, 1.0), a = std::acos(c);
+        const V3 v{R[2][1] - R[1][2], R[0][2] - R[2][0], R[1][0] - R[0][1]};
+        const double s = std::sin(a);
+        const double k = s > 1e-9 ? a / (2.0 * s) : 0.5;
+        return V3{v[0] * k, v[1] * k, v[2] * k};
+    }
     // Rotation matrix for a rotation vector (axis * angle).
     static M3 rotation(const V3& o) {
         const double a = std::sqrt(o[0] * o[0] + o[1] * o[1] + o[2] * o[2]);

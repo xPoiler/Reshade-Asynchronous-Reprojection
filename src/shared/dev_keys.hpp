@@ -24,6 +24,8 @@ inline constexpr DevKey kDevKeys[] = {
     {"EdgeDitherNoBand", "FW_DITHER_NO_BAND", L"FW_DITHER_NO_BAND", '1', false},
     {"MaskSmooth", "FW_MASK_SMOOTH", L"FW_MASK_SMOOTH", '1', false},
     {"DitherHoles", "FW_DITHER_HOLES", L"FW_DITHER_HOLES", '1', false},
+    {"CameraUse", "FW_CAMERA_USE", L"FW_CAMERA_USE", '1', false},
+    {"CameraDump", "FW_CAMERA_DUMP", L"FW_CAMERA_DUMP", '1', false},
 };
 
 // The variable's value for a key's first character (0: not set).

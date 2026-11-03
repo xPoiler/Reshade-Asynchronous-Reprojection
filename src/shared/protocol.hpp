@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 75;
+constexpr std::uint32_t kVersion = 86;
 // (four: the presenter taking one in, one ready, and the add-on writing two - a game that starts its next frame before
 // the last one is presented (its tags and constants come first: Cyberpunk, Enshrouded) has two being written. Three
 // slots, 2026-10-28, dropped 43-55% of their frames before the presenter saw them - the reprojection fed at half the
@@ -56,6 +56,10 @@ struct Camera {
     std::uint32_t pad;
 };
 
+// The camera search: a matrix from the game's constant buffers, and where it lies (camera_search.hpp).
+struct MatrixCandidate { std::uint32_t key; std::uint32_t flags; float m[16]; };  // (flags: 1 a world to clip by its shape, 2 ...in columns,)
+constexpr std::uint32_t kMatrixCandidates = 2048;
+
 struct SlotMeta {
     volatile LONG state;
     std::uint32_t pad0;
@@ -76,6 +80,8 @@ struct SlotMeta {
     std::uint32_t hud_candidate;  // HUD learning: the candidate kHudProbe was taken at (the fingerprint of the drawing that follows it)
     std::uint32_t hud_learned;    // ...kUi is the learned point's coverage (1), or empty: that point did not draw this frame (2)
     std::uint32_t motion_candidate;  // the motion search: the candidate kMotionProbe holds (0: none)
+    std::uint32_t matrices;          // the camera search: this frame's candidates
+    MatrixCandidate matrix[kMatrixCandidates];
     std::uint32_t motion_channels;   // ...kMotion's channels for x and y, each + 1 (x, y << 8; 0: as they are)
 };
 
@@ -338,6 +344,9 @@ struct Shared {
     // The add-on's turn: the target found is gone (a change of resolution): +1, and the presenter starts over. The presenter's turn: candidates ruled out, a bit each.
     volatile LONG motion_restarts;
     std::uint64_t motion_ruled_out[4];
+    volatile LONG camera_share;  // (percent of the last frames the camera found was used on: the status line)
+    volatile LONG camera_held[8];  // (the camera search's places that win, by key: the add-on reads them every frame, whatever its budget; 0: none)
+    volatile LONG camera_held_state;  // (on the last frame that moved and was judged, the places held: 1 predicted it, 2 did not - the add-on searches whole frames again; 0 not known)
     volatile LONG64 timeline_count;
     TimelineEvent timeline[kTimeline];
 };
