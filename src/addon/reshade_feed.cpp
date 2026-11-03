@@ -84,20 +84,6 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
         mv_probe::pause();
         if (p->shared()->motion_found) { InterlockedExchange(&p->shared()->motion_found, 0); InterlockedIncrement(&p->shared()->motion_restarts); }
     }
-    // (and only once the game draws a 3D scene - 600 frames of it in a row: its menus at the start of a session are no
-    // reason to start. Started there, in a game whose upscaler comes with gameplay, the presenter took its ~900 MB
-    // before the game loaded its world: Enshrouded on an 8 GB card at 6-8 fps for a minute after loading. Once running,
-    // the feed stays on through menus and pauses)
-    if (wanted && g.waited < 600) {
-        const double binds = depth_binds_per_frame();
-        if (binds >= 20.0) ++g.waited;
-        else g.waited = 0;
-        if (g.waited == 600) {
-            char text[160];
-            std::snprintf(text, sizeof(text), "XPAR: no DLSS or FSR data, a 3D scene drawn (%.0f depth buffers bound a frame): the ReShade feed starts", binds);
-            reshade::log::message(reshade::log::level::info, text);
-        }
-    }
     // (why the feed has not started, every 300 frames while it has not: a game that stays without depth says what holds it)
     static unsigned s_said = 0;
     if ((!wanted || g.waited < 600) && ++s_said % 300 == 0) {
@@ -106,13 +92,9 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
                       int(p->shared()->settings.enabled), int(p->game_depth_seen()), int(p->generation_active()), depth_binds_per_frame(), g.waited, int(g.feed.handle != 0));
         reshade::log::message(reshade::log::level::info, text);
     }
-    if (!wanted || g.waited < 600) {
+    if (!wanted) {
         g.status[0] = 0;
-        // (waiting for a 3D scene: said, so that a game whose scene binds its depth buffers fewer times is seen)
-        if (wanted && g.waited == 0 && g.feed.handle)
-            std::snprintf(g.status, sizeof(g.status), "No DLSS or FSR data from this game: waiting for a 3D scene (%.0f depth buffers bound a frame, 20 needed).",
-                          depth_binds_per_frame());
-        if (!wanted) g.waited = 0;
+        g.waited = 0;
         // (the technique is hidden and only ever enabled here: off whenever the feed is not running)
         if (g.feed.handle && runtime->get_technique_state(g.feed)) runtime->set_technique_state(g.feed, false);
         return;
@@ -146,6 +128,26 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
     const bool usable = depth_usable() && !choosing;
     const bool oriented = usable && depth_orientation_ready(runtime, cmd_list, probe_view, g.flip);
     const bool far_only = !oriented;
+    // Nothing goes to the presenter before the game draws a 3D scene - 600 frames of it in a row: its menus at the start of a session are no
+    // reason to start. Started there, in a game whose upscaler comes with gameplay, the presenter took its ~900 MB before the game loaded its
+    // world: Enshrouded on an 8 GB card at 6-8 fps for a minute after loading. A 3D scene: depth buffers bound, and the choice among them made -
+    // one holds a scene that is not one value everywhere (its orientation read), or none stands out (as a game whose depth reads empty: the
+    // feed runs on as far away). Not a count of binds: Dark Souls' world binds 11-15 a frame, a menu of Enshrouded's 8, 20 kept Dark Souls
+    // waiting for ever. Once running, the feed stays on through menus and pauses.
+    if (g.waited < 600) {
+        const bool scene = depth_binds_per_frame() > 0.0 && (oriented || (!choosing && !depth_usable()));
+        g.waited = scene ? g.waited + 1 : 0;
+        if (g.waited == 600) {
+            char text[200];
+            std::snprintf(text, sizeof(text), "XPAR: no DLSS or FSR data, a 3D scene drawn (%.0f depth buffers bound a frame, its depth %s): the ReShade feed starts",
+                          depth_binds_per_frame(), oriented ? "read" : "not told apart - handed over as far away");
+            reshade::log::message(reshade::log::level::info, text);
+        } else {
+            set_status(choosing ? "No DLSS or FSR data from this game: waiting for a 3D scene - finding the game's depth buffer..."
+                                : "No DLSS or FSR data from this game: waiting for a 3D scene.");
+            return;
+        }
+    }
     if (g.far_switch.handle) {
         // (applies from the next frame's depth: this frame's was drawn with the switch as it was)
         const bool was = g.far_on;

@@ -1200,7 +1200,12 @@ uint hud_classify(uint2 id, out float weight) {
     // attached to the camera this frame; before the motion-vector scale is known, everything in the
     // weapon's depth range (which in some games reaches metres - a crosshair over a near wall would be
     // missed, so only as a fallback).
-    if (flags & 32) { if (hud_object_t.Load(int3(pr, 0)).w > 1.5) return 3; }
+    // Nor anything the motion vectors say moves on its own (w 1): a third-person character stays put on the screen as the
+    // camera turns around her, as a HUD does, but her motion vectors say she moved with the camera - the HUD's are the
+    // scenery's under it. Counted as changed (kind 4: the score halves, the frame's counts untouched): what she gathered on
+    // frames the analysis did not tell her apart goes again (RE2: speckles of HUD over Claire until the game's HUD point was
+    // learned; as no evidence, 24% of the score left over a clip sat on her).
+    if (flags & 32) { const float kind = hud_object_t.Load(int3(pr, 0)).w; if (kind > 1.5) return 3; if (kind > 0.5) return 4; }
     else if ((flags & 16) && depth > 1.0 / 64.0) return 3;
     const int2 p = int2(id);
     const float3 delta = abs(seen(hud_current_t.Load(int3(p, 0)).rgb) - seen(hud_previous_t.Load(int3(p, 0)).rgb));

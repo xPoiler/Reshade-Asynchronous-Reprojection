@@ -30,9 +30,12 @@ struct Read { std::size_t first, count; };
 std::vector<Found> g_found;                                        // (the matrices of what was read this frame)
 std::unordered_map<std::uint64_t, Read> g_read;                    // (ranges read this frame)
 std::unordered_set<std::uint64_t> g_labelled;                      // (a range under a slot, a value under a key: once)
-struct Mapped { std::uint8_t* data = nullptr; std::uint64_t size = 0; std::uint32_t heap = 0; };
+// (copy: Direct3D 11's, what was last written to it, its version counted - a buffer is written again and again in a frame, each time for the draws after)
+struct Mapped { std::uint8_t* data = nullptr; std::uint64_t size = 0; std::uint32_t heap = 0, version = 0; bool copy = false; };
 std::unordered_map<std::uint64_t, Mapped> g_mapped;                // (Direct3D 12: upload buffers, mapped for reading; data 0: unreadable, or gone)
 std::unordered_map<std::uint64_t, std::pair<std::uint8_t*, std::uint64_t>> g_writing;  // (Direct3D 11: the buffer being filled)
+std::unordered_map<std::uint64_t, std::vector<std::uint8_t>> g_copies;                 // (Direct3D 11: what each constant buffer was last filled with)
+std::uint64_t g_copied_bytes = 0;                                  // (Direct3D 11, for the log)
 std::uint64_t g_bytes = 0, g_ranges = 0;
 std::atomic<bool> g_budget_spent{false};
 std::uint32_t g_rotate = 0;
@@ -263,10 +266,10 @@ Mapped mapped(device* dev, resource buffer) {
 }
 void read_range(const buffer_range& r, std::uint32_t slot) {  // (under the lock)
     if (!r.buffer.handle) return;
-    const std::uint64_t id = r.buffer.handle ^ (r.offset * 0x9E3779B97F4A7C15ull);
-    if (!g_labelled.insert(id ^ (std::uint64_t(slot) * 0xC2B2AE3D27D4EB4Full)).second) return;  // (a range under a slot: once a frame)
     const auto it = g_mapped.find(r.buffer.handle);  // (a buffer no view was seen being written for is none of ours: it may be gone by now)
     if (it == g_mapped.end() || !it->second.data || r.offset >= it->second.size) return;
+    const std::uint64_t id = r.buffer.handle ^ (r.offset * 0x9E3779B97F4A7C15ull) ^ (std::uint64_t(it->second.version) * 0xD6E8FEB86659FD93ull);
+    if (!g_labelled.insert(id ^ (std::uint64_t(slot) * 0xC2B2AE3D27D4EB4Full)).second) return;  // (a range under a slot: once a frame)
     const std::uint8_t* data = it->second.data + r.offset;
     const std::uint64_t there = std::min(it->second.size - r.offset, kRangeBytes);
     read_held(data, r.size == UINT64_MAX ? there : std::min(r.size, there), slot);
@@ -274,26 +277,29 @@ void read_range(const buffer_range& r, std::uint32_t slot) {  // (under the lock
     auto seen = g_read.find(id);
     if (seen == g_read.end()) {
         Read read{g_found.size(), 0};
-        scan(data, std::min(r.size == UINT64_MAX ? kUnsizedBytes : r.size, there));
+        scan(data, std::min(r.size == UINT64_MAX ? (it->second.copy ? there : kUnsizedBytes) : r.size, there));  // (a copy's size is what was written)
         read.count = g_found.size() - read.first;
         seen = g_read.emplace(id, read).first;
     }
     label(seen->second, slot);
 }
-void on_push_descriptors(command_list* cmd, shader_stage, pipeline_layout layout, uint32_t param, const descriptor_table_update& update) {
+void on_push_descriptors(command_list* cmd, shader_stage stage, pipeline_layout layout, uint32_t param, const descriptor_table_update& update) {
     if (cmd) g_pushed_kind[std::uint32_t(update.type) & 15].fetch_add(update.count, std::memory_order_relaxed);
     if (!cmd || update.type != descriptor_type::constant_buffer || !update.descriptors) return;
     device* dev = cmd->get_device();
-    if (dev->get_api() != device_api::d3d12 || (g_budget_spent.load(std::memory_order_relaxed) && !g_held_count.load(std::memory_order_relaxed))) return;
+    // (Direct3D 11: every constant buffer is bound this way, *SetConstantBuffers, by stage; what it holds is the copy kept at its last write)
+    const bool d3d11 = dev->get_api() == device_api::d3d11;
+    if ((!d3d11 && dev->get_api() != device_api::d3d12) || (g_budget_spent.load(std::memory_order_relaxed) && !g_held_count.load(std::memory_order_relaxed))) return;
+    Timed timed;
     const auto* ranges = static_cast<const buffer_range*>(update.descriptors);
-    const std::uint32_t base = mix(mix(2, layout_of(layout)), param);
+    const std::uint32_t base = d3d11 ? mix(mix(mix(6, layout_of(layout)), param), std::uint32_t(stage)) : mix(mix(2, layout_of(layout)), param);
     bool any = false;
     for (uint32_t i = 0; i < update.count && !any; ++i) any = wanted(mix(base, update.binding + i));
     if (!any) return;
     std::unique_lock<std::mutex> lock(g_mutex, std::try_to_lock);
     if (!lock) return;
     for (uint32_t i = 0; i < update.count; ++i) {
-        if (ranges[i].buffer.handle) g_pushed_heap[mapped(dev, ranges[i].buffer).heap & 7].fetch_add(1, std::memory_order_relaxed);  // (bound now: it exists)
+        if (ranges[i].buffer.handle && !d3d11) g_pushed_heap[mapped(dev, ranges[i].buffer).heap & 7].fetch_add(1, std::memory_order_relaxed);  // (bound now: it exists)
         if (ranges[i].size == UINT64_MAX) g_unsized.fetch_add(1, std::memory_order_relaxed);
         else if (ranges[i].size >= kRangeBytes) g_large.fetch_add(1, std::memory_order_relaxed);
         if (wanted(mix(base, update.binding + i))) read_range(ranges[i], mix(base, update.binding + i));
@@ -392,7 +398,22 @@ void on_bind_tables(command_list* cmd, shader_stage, pipeline_layout layout, uin
         }
     }
 }
-// Direct3D 11: constants are written through a map: read as the game finishes.
+// Direct3D 11: constants are written through a map or an update: a copy kept as the game finishes, read where it is bound (the key needs the slot: by the buffer's size
+// alone RE2's camera was off 15-131 times the motion).
+// (under the lock) What a constant buffer was filled with, from offset on, kept for its binds.
+void keep(resource res, const std::uint8_t* data, std::uint64_t offset, std::uint64_t size) {
+    if (offset >= kRangeBytes) return;
+    size = std::min(size, kRangeBytes - offset);
+    std::vector<std::uint8_t>& copy = g_copies[res.handle];
+    if (copy.size() < offset + size) copy.resize(offset + size);
+    std::memcpy(copy.data() + offset, data, size);
+    g_copied_bytes += size;
+    Mapped& m = g_mapped[res.handle];
+    m.data = copy.data();
+    m.size = copy.size();
+    m.copy = true;
+    ++m.version;
+}
 void on_map(device* dev, resource res, uint64_t, uint64_t size, map_access access, void** data) {
     if (dev->get_api() != device_api::d3d11 || !data || !*data || access == map_access::read_only) return;
     const resource_desc desc = dev->get_resource_desc(res);
@@ -402,29 +423,29 @@ void on_map(device* dev, resource res, uint64_t, uint64_t size, map_access acces
 }
 void on_unmap(device* dev, resource res) {
     if (dev->get_api() != device_api::d3d11) return;
+    Timed timed;
     std::lock_guard<std::mutex> lock(g_mutex);
     const auto it = g_writing.find(res.handle);
     if (it == g_writing.end()) return;
-    const std::uint32_t slot = mix(3, std::uint32_t(std::min(it->second.second, kRangeBytes)));  // (no slot known here: by the buffer's size)
-    if (wanted(slot)) read_now(it->second.first, it->second.second, slot);
+    keep(res, it->second.first, 0, it->second.second);
     g_writing.erase(it);
 }
-bool on_update_buffer(device* dev, const void* data, resource dest, uint64_t, uint64_t size) {
+bool on_update_buffer(device* dev, const void* data, resource dest, uint64_t offset, uint64_t size) {
     if (dev->get_api() != device_api::d3d11 || !data) return false;
     const resource_desc desc = dev->get_resource_desc(dest);
     if (desc.type != resource_type::buffer || (desc.usage & resource_usage::constant_buffer) == 0) return false;
-    const std::uint32_t slot = mix(4, std::uint32_t(std::min(size, kRangeBytes)));
-    if (!wanted(slot)) return false;
+    Timed timed;
     std::lock_guard<std::mutex> lock(g_mutex);
-    read_now(static_cast<const std::uint8_t*>(data), size, slot);
+    keep(dest, static_cast<const std::uint8_t*>(data), offset, size == UINT64_MAX ? desc.buffer.size - offset : size);
     return false;
 }
 void on_destroy(device* dev, resource res) {
     std::lock_guard<std::mutex> lock(g_mutex);
     const auto it = g_mapped.find(res.handle);
     if (it == g_mapped.end()) return;
-    if (it->second.data) dev->unmap_buffer_region(res);
+    if (it->second.data && !it->second.copy) dev->unmap_buffer_region(res);
     it->second = Mapped{};  // (kept: views to it are still listed)
+    g_copies.erase(res.handle);
 }
 }  // namespace
 
@@ -448,8 +469,10 @@ std::uint32_t take(MatrixCandidate* out, std::uint32_t capacity, const volatile 
         {
             const double all = double(g_ticks.load()), searching = double(g_ticks_searching.exchange(0)), tick_ms = 1000.0 / double(g_frequency.QuadPart);
             const std::uint64_t searched = g_search_frames.exchange(0);
-            std::snprintf(text, sizeof(text), "XPAR: camera search: frames searched whole %llu of 300, the hooks %.2f ms on each of them, %.2f ms on each of the others; searched from read %u of %u",
-                          static_cast<unsigned long long>(searched), searched ? searching * tick_ms / double(searched) : 0.0, searched < 300 ? (all - searching) * tick_ms / double(300 - searched) : 0.0, g_window, g_reads_last);
+            std::snprintf(text, sizeof(text), "XPAR: camera search: frames searched whole %llu of 300, the hooks %.2f ms on each of them, %.2f ms on each of the others; searched from read %u of %u; constants kept (Direct3D 11) %llu KB a frame",
+                          static_cast<unsigned long long>(searched), searched ? searching * tick_ms / double(searched) : 0.0, searched < 300 ? (all - searching) * tick_ms / double(300 - searched) : 0.0, g_window, g_reads_last,
+                          static_cast<unsigned long long>(g_copied_bytes / 300 / 1024));
+            g_copied_bytes = 0;
             reshade::log::message(reshade::log::level::info, text);
         }
         const auto list = [](std::atomic<std::uint64_t>* values, int count) {

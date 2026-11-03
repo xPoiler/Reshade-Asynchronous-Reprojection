@@ -149,6 +149,7 @@ void finish(command_list* cmd) {  // (under the lock)
     }
     g_bound.erase(it);
 }
+void census_pass(device* dev, resource r);
 void on_bind(command_list* cmd, uint32_t n, const resource_view* rtvs, resource_view) {
     if (g_search && !g_paused.load(std::memory_order_relaxed) && cmd && rtvs) {
         device* dev = cmd->get_device();
@@ -157,6 +158,7 @@ void on_bind(command_list* cmd, uint32_t n, const resource_view* rtvs, resource_
             if (!rtvs[i].handle) continue;
             const resource r = dev->get_resource_from_view(rtvs[i]);
             if (!r.handle) continue;
+            census_pass(dev, r);  // (Direct3D: every target bound to draw into, for the log)
             note_target(dev, r);
         }
     }
@@ -241,7 +243,7 @@ void on_present(command_queue* queue, swapchain* chain, const rect*, const rect*
     write_files(dev);
     g_grabs.clear(); g_seen.clear(); g_bound.clear(); g_order = 0;
 }
-// The motion search's census (Vulkan: what the game writes, and how, for the log - a target that never shows as a barrier from writing to reading is never tried):
+// The motion search's census (what the game draws into, and on Vulkan how - a target that never shows as a barrier from writing to reading is never tried):
 // by format and size, the images seen in render passes, in barriers, and whether they can be copied.
 struct Census { std::uint32_t passes = 0, written = 0, read_after = 0, copyable = 0; };
 std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>, Census> g_census;
@@ -252,6 +254,7 @@ void count_census(const resource_desc& d, std::uint32_t Census::* what) {
     ++(c.*what);
     if ((d.usage & resource_usage::copy_source) != 0) ++c.copyable;
 }
+void census_pass(device* dev, resource r) { count_census(dev->get_resource_desc(r), &Census::passes); }
 void take_vulkan(command_list* cmd, device* dev, resource r, resource_usage state, std::uint32_t id);
 // Vulkan: a target drawn in a render pass is done at the end of that pass. The game's barrier out of drawing can come as late as the next frame: Enshrouded's motion
 // reached XPAR a frame behind its picture and depth (colour fitted the next frame's motion in 26 of 34 frames, with DLSS its own in all), and all that warped from it

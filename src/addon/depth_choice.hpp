@@ -21,8 +21,8 @@ void unregister_depth_choice_events();
 // Once per frame from when the feed is wanted (its wait included): the depth buffers the game binds are
 // noted from then on, so that they are known when the feed starts.
 void track_depth_buffers();
-// Depth buffers the game bound per frame, over the last 60 frames (while track_depth_buffers runs): a 3D scene binds
-// them 20 times a frame or more, a menu or a video hardly does (as empty_depth_verdict's "busy").
+// Depth buffers the game bound per frame, over the last 60 frames (while track_depth_buffers runs): none in a menu or a
+// video (Dark Souls), and a scene's count differs by game - 11-15 in Dark Souls' world - so not a test of a scene by itself.
 double depth_binds_per_frame();
 enum class DepthChoice { kUnavailable, kChoosing, kSettled };
 // Once per frame while the feed runs (reshade_finish_effects), with XPAR.fx's probe texture and the
