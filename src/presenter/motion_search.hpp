@@ -45,10 +45,27 @@ public:
         if (used.size() < kCells) return false;
         ++calls_;
         Candidate& k = candidates_[candidate];
-        // The clear value: looked for on frames that move (a still picture can hold one value anywhere, a real target's zero).
+        // The clear value: looked for on frames that move (a still picture can hold one value anywhere, a real target's zero). A target is cleared when one value
+        // holds most of the picture on most of its moving frames, not on one: Enshrouded's whole motion held (0, 0) on most of it on 2 frames of 204 (8% on the
+        // others) and was taken for one drawn only on what moves - the rest refilled from the picture, and it shook. Dark Souls: 9 of 9, DOOM 141 of 161.
         if (moving(used)) {
             const Sample* most = majority(used);
-            if (most && (!k.partial || std::memcmp(k.clear, most->c, sizeof(k.clear)) != 0)) {
+            // (and for the log: the share of the clear value then known)
+            Census& c = census_[candidate];
+            ++c.moving;
+            if (most) ++c.majority;
+            const float* value = most ? most->c : k.partial ? k.clear : nullptr;
+            if (value) {
+                std::size_t same = 0;
+                for (const Sample* s : used) same += std::memcmp(s->c, value, sizeof(s->c)) ? 0 : 1;
+                c.shares.push_back(float(same) / float(used.size()));
+            } else c.shares.push_back(0.0f);
+            const bool cleared = c.majority * 2 > c.moving;
+            if (!cleared && k.partial) {
+                // (no longer most of its frames: judged again as a whole, from the start)
+                k = Candidate{};
+                relative_.erase(candidate);
+            } else if (cleared && most && (!k.partial || std::memcmp(k.clear, most->c, sizeof(k.clear)) != 0)) {
                 // (first seen, or another value: what was counted before was judged on cells it never drew - from the start. A value that changes is not a clear value; the
                 // target is judged again on that one, and anything that is not motion stays far from it)
                 k = Candidate{};
@@ -309,7 +326,21 @@ public:
         for (const Candidate* k : tracks(candidate)) most = std::max(most, k->frames);
         return most;
     }
-    void reset() { candidates_.clear(); relative_.clear(); }
+    // For the log (measured, not used): moving frames seen, those with one value on most of the picture, and that value's share - median, lowest tenth.
+    struct ClearCensus { int moving = 0, majority = 0; float median = 0, low = 0; };
+    ClearCensus clear_census(std::uint32_t candidate) const {
+        ClearCensus out;
+        const auto it = census_.find(candidate);
+        if (it == census_.end() || it->second.shares.empty()) return out;
+        out.moving = it->second.moving;
+        out.majority = it->second.majority;
+        std::vector<float> v = it->second.shares;
+        std::sort(v.begin(), v.end());
+        out.median = v[v.size() / 2];
+        out.low = v[v.size() / 10];
+        return out;
+    }
+    void reset() { candidates_.clear(); relative_.clear(); census_.clear(); }
 
 private:
 
@@ -448,6 +479,8 @@ private:
     std::map<std::uint32_t, Candidate> candidates_;
     std::map<std::uint32_t, Candidate> relative_;  // (targets with a clear value: what they draw against the motion on top of the scenery's)
     std::uint64_t calls_ = 0;
+    struct Census { int moving = 0, majority = 0; std::vector<float> shares; };
+    std::map<std::uint32_t, Census> census_;
 };
 
 }  // namespace fw

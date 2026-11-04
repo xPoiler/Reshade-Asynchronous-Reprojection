@@ -60,8 +60,9 @@ static MatrixCandidate candidate(std::uint32_t key, const Matrix& m, bool column
     std::memcpy(c.m, stored.data(), sizeof(c.m));
     return c;
 }
-// The camera takes turns between two places, among a light's camera, an object's matrix, and another view in the same place.
-static void run(bool columns, bool depth_turned, float far_away) {
+// The camera takes turns between two places, among a light's camera, an object's matrix, and another view in the same place. ahead: each frame's values are
+// the next frame's camera (DOOM Eternal binds frame N+1's constants before N is shown).
+static void run(bool columns, bool depth_turned, float far_away, bool ahead) {
     CameraSearch search;
     std::mt19937 rng(5);
     const auto camera = [&](int t) { return view_projection(0.02f * t + 0.1f * std::sin(t * 0.2f), 0.1f * std::sin(t * 0.13f), far_away + 0.05f * std::sin(t * 0.3f), far_away + 0.03f * t); };
@@ -71,24 +72,26 @@ static void run(bool columns, bool depth_turned, float far_away) {
         f.push_back(candidate(6, view_projection(std::sin(t * 1.7f), std::cos(t * 0.9f), t * 0.7f, 2), columns));  // (wanders)
         const std::uint32_t place = t / 4 % 2 ? 77 : 78;
         f.push_back(candidate(place, view_projection(1.0f + t * 0.3f, 0.2f, 1, 1), columns));                      // (another view, first in that place)
-        f.push_back(candidate(place, camera(t), columns));
+        f.push_back(candidate(place, camera(ahead ? t + 1 : t), columns));
         return f;
     };
-    for (int t = 1; t < 60; ++t) search.judge(frame(t - 1), frame(t), motion(camera(t), camera(t - 1), rng, depth_turned), kW, kH);
+    for (int t = 2; t < 60; ++t) search.judge(frame(t - 2), frame(t - 1), frame(t), motion(camera(t), camera(t - 1), rng, depth_turned), kW, kH);
     const auto places = search.places();
     EXPECT(!places.empty(), "columns %d turned %d far %g: no place", int(columns), int(depth_turned), far_away);
     for (const std::uint32_t k : places) EXPECT(k == 77 || k == 78, "columns %d turned %d far %g: place %u taken", int(columns), int(depth_turned), far_away, k);
     EXPECT(search.depth_turned() == depth_turned, "columns %d turned %d far %g: depth the wrong way round", int(columns), int(depth_turned), far_away);
+    EXPECT(search.ahead() == ahead, "columns %d turned %d far %g ahead %d: the values' frame taken wrong", int(columns), int(depth_turned), far_away, int(ahead));
 }
 static void nothing_without_a_camera() {
     CameraSearch search;
     std::mt19937 rng(9);
     Matrix before = view_projection(0, 0, 0, 0);
-    std::vector<MatrixCandidate> last = {candidate(5, view_projection(0.4f, 0.1f, 3, 3), false)};
+    std::vector<MatrixCandidate> last = {candidate(5, view_projection(0.4f, 0.1f, 3, 3), false)}, last2 = last;
     for (int t = 1; t < 60; ++t) {
         const Matrix now = view_projection(0.03f * t, 0, 0, 0);
         const std::vector<MatrixCandidate> f = {candidate(5, view_projection(0.4f, 0.1f, 3, 3), false)};
-        search.judge(last, f, motion(now, before, rng, false), kW, kH);
+        search.judge(last2, last, f, motion(now, before, rng, false), kW, kH);
+        last2 = last;
         last = f;
         before = now;
     }
@@ -105,6 +108,19 @@ static void predicts_the_camera() {
     for (std::size_t i = 0; i < measured.size(); ++i)
         if ((measured[i].mx != 0 || measured[i].my != 0) && std::hypot(measured[i].mx - predicted[i].mx, measured[i].my - predicted[i].my) > 3) ++off;
     EXPECT(off == 0, "%d points off", off);
+}
+
+// A TAA jitter in both matrices (clip x and y moved by a part of a pixel, new each frame): the prediction is the camera's motion alone, as the game's vectors are.
+static void jitter_left_out() {
+    std::mt19937 rng(13);
+    const Matrix before = view_projection(0.1f, 0.02f, 0, 0), now = view_projection(0.13f, 0.03f, 0.02f, 0.05f);
+    const auto jittered = [](Matrix m, double jx, double jy) { for (int c = 0; c < 4; ++c) { m[c] += float(jx * 2 / kW * m[12 + c]); m[4 + c] += float(jy * 2 / kH * m[12 + c]); } return m; };
+    std::vector<CameraSearch::Point> clean = motion(now, before, rng, false), predicted = clean;
+    EXPECT(CameraSearch::predict(0, now, before, clean, kW, kH) && CameraSearch::predict(0, jittered(now, 0.4, -0.3), jittered(before, -0.4, 0.3), predicted, kW, kH), "no prediction");
+    int off = 0;  // (against the pair without jitter: 0.8 px apart in x, 0.6 in y with it left in)
+    for (std::size_t i = 0; i < clean.size(); ++i)
+        if (std::hypot(clean[i].mx - predicted[i].mx, clean[i].my - predicted[i].my) > 0.05) ++off;
+    EXPECT(off == 0, "%d points off by the jitter", off);
 }
 
 // What a found matrix says of its camera (turn, move, field of view), put through the estimator's own camera model, moves each point as the matrices do.
@@ -133,10 +149,12 @@ static void camera_of_the_matrix() {
 
 int main() {
     predicts_the_camera();
+    jitter_left_out();
     camera_of_the_matrix();
     for (int columns = 0; columns < 2; ++columns)
         for (int turned = 0; turned < 2; ++turned)
-            for (const float far_away : {0.0f, 5000.0f}) run(columns != 0, turned != 0, far_away);
+            for (const float far_away : {0.0f, 5000.0f})
+                for (const bool ahead : {false, true}) run(columns != 0, turned != 0, far_away, ahead);
     nothing_without_a_camera();
     if (g_failures) { std::printf("%d failed\n", g_failures); return 1; }
     std::printf("camera search ok\n");

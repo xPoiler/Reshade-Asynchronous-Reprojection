@@ -256,6 +256,11 @@ void count_census(const resource_desc& d, std::uint32_t Census::* what) {
 }
 void census_pass(device* dev, resource r) { count_census(dev->get_resource_desc(r), &Census::passes); }
 void take_vulkan(command_list* cmd, device* dev, resource r, resource_usage state, std::uint32_t id);
+// Vulkan games are not searched: their motion comes from XPAR's own estimate. Found, a Vulkan game's own made it worse in both games seen (2026-11-04):
+// Enshrouded's target, copied right after its only write each frame and handed on frame for frame (stamped and checked on a recording), held the frame
+// before's motion or none on most frames - walking juddered, turns shook, and with the estimate neither; DOOM Eternal's is drawn only on what moves (60%
+// of the picture cleared) and threw the camera estimate off (26 degrees, 600 px). The code stays for when a Vulkan game's target can be trusted.
+constexpr bool kVulkanSearch = false;  // (tried again 2026-11-04 with the game's camera found: the shake went, the scenery juddered on Enshrouded's vectors - a net loss)
 // Vulkan: a target drawn in a render pass is done at the end of that pass. The game's barrier out of drawing can come as late as the next frame: Enshrouded's motion
 // reached XPAR a frame behind its picture and depth (colour fitted the next frame's motion in 26 of 34 frames, with DLSS its own in all), and all that warped from it
 // shook. End of the pass (the event comes before the pass has ended, nothing can be copied there): the first thing on that command buffer after it.
@@ -277,7 +282,7 @@ void after_pass(command_list* cmd, device* dev) {
 bool on_census_pass(command_list* cmd, uint32_t n, const render_pass_render_target_desc* rts, const render_pass_depth_stencil_desc*, render_pass_flags) {
     if (!g_search || g_paused.load(std::memory_order_relaxed) || !cmd || !rts) return false;
     device* dev = cmd->get_device();
-    if (dev->get_api() != device_api::vulkan) return false;
+    if (!kVulkanSearch || dev->get_api() != device_api::vulkan) return false;
     after_pass(cmd, dev);
     std::lock_guard<std::mutex> lock(g_search_mutex);
     for (uint32_t i = 0; i < n; ++i) {
@@ -300,7 +305,7 @@ bool on_end_pass(command_list* cmd) {
 void on_close_list(command_list* cmd) {
     if (!g_search || !cmd || g_paused.load(std::memory_order_relaxed)) return;
     device* dev = cmd->get_device();
-    if (dev->get_api() == device_api::vulkan) after_pass(cmd, dev);
+    if (kVulkanSearch && dev->get_api() == device_api::vulkan) after_pass(cmd, dev);
 }
 // Vulkan: the copy, in the command buffer the game's barrier was recorded on.
 void take_vulkan(command_list* cmd, device* dev, resource r, resource_usage state, std::uint32_t id) {
@@ -328,7 +333,7 @@ void on_barrier(command_list* cmd, uint32_t n, const resource* resources, const 
     if (!g_search || g_paused.load(std::memory_order_relaxed) || !cmd || !resources || !before || !after) return;
     device* dev = cmd->get_device();
     const bool vulkan = dev->get_api() == device_api::vulkan;
-    if (!vulkan && dev->get_api() != device_api::d3d12) return;
+    if ((vulkan && !kVulkanSearch) || (!vulkan && dev->get_api() != device_api::d3d12)) return;
     if (vulkan) after_pass(cmd, dev);
     constexpr auto kWriting = resource_usage::render_target | resource_usage::unordered_access;
     constexpr auto kReading = resource_usage::shader_resource_pixel | resource_usage::shader_resource_non_pixel;

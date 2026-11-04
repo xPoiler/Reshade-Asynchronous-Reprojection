@@ -608,11 +608,11 @@ struct MotionVectorScale {
 struct CameraSearchWorker {
     std::atomic<bool> busy{false};
     std::vector<CameraSearch::Point> points;
-    std::vector<MatrixCandidate> before, now;
+    std::vector<MatrixCandidate> before2, before, now;
     double w = 1, h = 1;
     CameraSearch search;
     std::atomic<std::uint32_t> places[CameraSearch::kPlaces] = {};
-    std::atomic<bool> turned{false};
+    std::atomic<bool> turned{false}, ahead{false};
     std::atomic<int> held_state{0};
     HANDLE wake = nullptr;
     void start() {
@@ -622,15 +622,16 @@ struct CameraSearchWorker {
             std::thread([this] {
                 for (;;) {
                     WaitForSingleObject(wake, INFINITE);
-                    search.judge(before, now, points, w, h);
+                    search.judge(before2, before, now, points, w, h);
                     const auto best = search.places();
                     turned.store(search.depth_turned(), std::memory_order_release);
+                    ahead.store(search.ahead(), std::memory_order_release);
                     held_state.store(search.held_state(), std::memory_order_release);
                     for (std::size_t k = 0; k < CameraSearch::kPlaces; ++k) places[k].store(k < best.size() ? best[k] : 0, std::memory_order_release);
                     if (search.judged() % 300 == 0) {
                         const CameraSearch::Seen s = search.seen();
-                        logf("camera search: %d pairs of frames judged, %zu places win; of the last %d: a frame's best value %.2f (median), %d reached %.2f; places in both frames %.0f, pairs tried %.0f (medians)",
-                             search.judged(), best.size(), s.frames, s.top, s.winning, CameraSearch::kWin, s.paired, s.tried);
+                        logf("camera search: %d pairs of frames judged, %zu places win%s; of the last %d: a frame's best value %.2f (median), %d reached %.2f; places in both frames %.0f, pairs tried %.0f (medians)",
+                             search.judged(), best.size(), search.ahead() ? " (values a frame ahead)" : "", s.frames, s.top, s.winning, CameraSearch::kWin, s.paired, s.tried);
                     }
                     busy.store(false, std::memory_order_release);
                 }
@@ -956,6 +957,8 @@ void render_thread() {
     bool camera_dumped = false;
     std::vector<std::uint8_t> camera_bytes;
     std::vector<MatrixCandidate> camera_previous;  // (last frame's)
+    std::vector<MatrixCandidate> camera_previous2;  // (the frame's before that, when the frames follow: for values a frame ahead - CameraSearch::judge)
+    std::vector<MatrixCandidate> camera_cur, camera_cur_last;  // (the values this frame's camera is judged from, and those of the frame before them)
     std::uint64_t camera_last_frame = 0, camera_used = 0, camera_used_before = 0, camera_moving = 0, camera_none = 0, camera_capped = 0;
     std::map<std::uint32_t, int> camera_from;  // (the places the used frames came from, for the log)
     bool camera_found = false, camera_have_last = false;
@@ -965,6 +968,10 @@ void render_thread() {
     CameraSearch::Motion camera_motion{};
     double camera_ms_sum = 0;
     std::uint64_t camera_followed = 0;
+    // (CameraUse=1: whether the camera in use agreed with the last frame that moved - 1 yes, 2 no, 0 not known. What tells the add-on to search whole frames: the search's own
+    // score of the place held fell under kWin on 100-210 frames of 300 in Enshrouded, against motion estimated from the pictures, while the camera used agreed on 282 of 300 -
+    // a whole frame searched each time at 4-6.5 ms in the hooks, for nothing)
+    LONG camera_use_state = 0;
     std::vector<CameraSearch::Point> camera_points, camera_some;
     std::vector<float> camera_errors;
     double intake_ms = 4.0;  // how long taking in a new game frame takes (GPU span, smoothed)
@@ -1153,8 +1160,10 @@ void render_thread() {
                             motion_search.steadiness(s.motion_candidate, close, roughly);
                             float now = 0, before = 0;
                             motion_search.timing(s.motion_candidate, now, before);
-                            logf("motion search: candidate %u, %d moving frames, best channels %.2f and %.2f (%.2f needed), frames near their scale %.2f %.2f, roughly %.2f %.2f, follows this frame %.2f, the one before %.2f%s", s.motion_candidate, counted, q[0], q[1], MotionSearch::kQuality, close[0], close[1], roughly[0], roughly[1], now, before,
-                                 !motion_search.partial(s.motion_candidate) ? "" : motion_search.on_top(s.motion_candidate) ? "; cleared where nothing is drawn, best as motion on top of the camera's" : "; cleared where nothing is drawn, best as the whole motion");
+                            const MotionSearch::ClearCensus cc = motion_search.clear_census(s.motion_candidate);
+                            logf("motion search: candidate %u, %d moving frames, best channels %.2f and %.2f (%.2f needed), frames near their scale %.2f %.2f, roughly %.2f %.2f, follows this frame %.2f, the one before %.2f%s; one value on most of the picture on %d of %d moving frames, the clear value's share median %.2f, lowest tenth %.2f", s.motion_candidate, counted, q[0], q[1], MotionSearch::kQuality, close[0], close[1], roughly[0], roughly[1], now, before,
+                                 !motion_search.partial(s.motion_candidate) ? "" : motion_search.on_top(s.motion_candidate) ? "; cleared where nothing is drawn, best as motion on top of the camera's" : "; cleared where nothing is drawn, best as the whole motion",
+                                 cc.majority, cc.moving, cc.median, cc.low);
                         }
                         MotionSearch::Found f = motion_search.decide();
                         if (!f.found && s.motion_candidate < 256 && motion_search.ruled_out(s.motion_candidate))
@@ -1234,8 +1243,12 @@ void render_thread() {
                             const LONG key = static_cast<LONG>(camera_worker.places[k].load(std::memory_order_acquire));
                             if (sh.camera_held[k] != key) InterlockedExchange(&sh.camera_held[k], key);
                         }
-                        if (const LONG state = camera_worker.held_state.load(std::memory_order_acquire); sh.camera_held_state != state) InterlockedExchange(&sh.camera_held_state, state);
+                        // (and on a frame that does not move, nothing to search for: the search judges only frames that move. A miss before standing still kept Enshrouded
+                        // searching whole frames all through it - 164 of 300)
+                        if (const LONG worker = camera_worker.held_state.load(std::memory_order_acquire), state = camera_use && camera_use_state && worker ? (camera_moving_now ? camera_use_state : 1) : worker; sh.camera_held_state != state)
+                            InterlockedExchange(&sh.camera_held_state, state);
                         if (camera_count && camera_follows && camera_moving_now && !camera_worker.busy.load(std::memory_order_acquire)) {
+                            camera_worker.before2 = camera_previous2;
                             camera_worker.before = camera_previous;
                             camera_worker.now.assign(m.matrix, m.matrix + camera_count);
                             camera_worker.points = camera_some;
@@ -1260,7 +1273,11 @@ void render_thread() {
                         // A camera found (CameraUse=1): the estimate is given the motion that camera alone makes, not what the pictures or the game's vectors show. Every value
                         // of the places that win, with what that place held in the frame before, and the one that agrees best with the motion measured - and none if none agrees:
                         // a place holds other views too (a shadow's, a reflection's), and turns of 38 degrees from one frame to the next threw the whole picture across the screen.
-                        if (camera_use && !m.camera.reset && camera_follows && camera_count && camera_some.size() >= 32) {
+                        // (values a frame ahead: this frame's camera came with the frame before, its last with the one before that)
+                        const bool camera_ahead = camera_worker.ahead.load(std::memory_order_acquire);
+                        if (camera_ahead) { camera_cur = camera_previous; camera_cur_last = camera_previous2; }
+                        else { camera_cur.assign(m.matrix, m.matrix + camera_count); camera_cur_last = camera_previous; }
+                        if (camera_use && !m.camera.reset && camera_follows && !camera_cur.empty() && camera_some.size() >= 32) {
                             std::uint32_t places[CameraSearch::kPlaces];
                             for (std::size_t k = 0; k < CameraSearch::kPlaces; ++k) places[k] = camera_worker.places[k].load(std::memory_order_acquire);
                             const auto wanted = [&](std::uint32_t key) { for (const std::uint32_t k : places) if (k == key) return true; return false; };
@@ -1283,23 +1300,23 @@ void render_thread() {
                             // 0.7 ms a frame). All of them only when none of those agrees.
                             const MatrixCandidate* known = nullptr;
                             if (camera_have_last)
-                                for (const MatrixCandidate& l : camera_previous)
+                                for (const MatrixCandidate& l : camera_cur_last)
                                     if (l.key == camera_last.key && std::memcmp(l.m, camera_last.m, sizeof(l.m)) == 0) { known = &l; break; }
                             if (known)
-                                for (std::uint32_t i = 0; i < camera_count; ++i)
-                                    if (m.matrix[i].key == known->key) judge(m.matrix[i], *known);
+                                for (const MatrixCandidate& c : camera_cur)
+                                    if (c.key == known->key) judge(c, *known);
                             // Otherwise each value of the places with the one of the frame before nearest to it: a camera changes little from one frame to the next, a
                             // shadow's or a reflection's view held in the same place does not look like it. Every pair, cut at 128, never got to the camera once Dark Souls'
                             // places held 400-600 pairs a frame: missed on 289-300 frames of 300, and with no camera the frame before, lost for good.
                             if (!best || best_error > limit) {
                                 best = best_last = nullptr;
                                 best_error = 1e30f;
-                                for (std::uint32_t i = 0; i < camera_count && pairs < 128; ++i) {
-                                    const MatrixCandidate& c = m.matrix[i];
+                                for (std::size_t i = 0; i < camera_cur.size() && pairs < 128; ++i) {
+                                    const MatrixCandidate& c = camera_cur[i];
                                     if (!c.key || !wanted(c.key)) continue;
                                     const MatrixCandidate* nearest = nullptr;
                                     double least = 0;
-                                    for (const MatrixCandidate& l : camera_previous) {
+                                    for (const MatrixCandidate& l : camera_cur_last) {
                                         if (l.key != c.key) continue;
                                         double apart = 0, size = 0;
                                         for (int e = 0; e < 16; ++e) { apart += double(c.m[e] - l.m[e]) * (c.m[e] - l.m[e]); size += double(c.m[e]) * c.m[e]; }
@@ -1322,6 +1339,7 @@ void render_thread() {
                             }
                             // (only frames that move count, here and in the menu: on a still frame any matrix agrees, it says nothing)
                             if (camera_moving_now) {
+                                camera_use_state = agrees ? 1 : 2;
                                 ++camera_moving;
                                 camera_used += agrees ? 1 : 0;
                                 camera_none += pairs == 0 ? 1 : 0;
@@ -1347,6 +1365,7 @@ void render_thread() {
                                 }
                             }
                         }
+                        if (camera_follows) camera_previous2.swap(camera_previous); else camera_previous2.clear();
                         camera_previous.assign(m.matrix, m.matrix + camera_count);
                         camera_last_frame = m.frame_id;
                         const double t1 = now_seconds();

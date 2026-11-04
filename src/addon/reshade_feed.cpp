@@ -170,7 +170,7 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
     // No motion vectors: the presenter estimates them from the picture, in uv; this makes them pixels of the depth.
     cam.mvec_scale[0] = static_cast<float>(w);
     cam.mvec_scale[1] = static_cast<float>(h);
-    // (development, MotionSearch=1: the game's own motion, once found - see mv_probe::motion_step. Direct3D 11, 12 and Vulkan)
+    // (development, MotionSearch=1: the game's own motion, once found - see mv_probe::motion_step. Direct3D 11 and 12; Vulkan not searched, see kVulkanSearch)
     Shared* sh = p->shared();
     const mv_probe::MotionStep search = mv_probe::motion_step(sh->motion_found != 0, sh->motion_candidate, w, sh->motion_ruled_out);
     if (search.lost) { InterlockedExchange(&sh->motion_found, 0); InterlockedIncrement(&sh->motion_restarts); }

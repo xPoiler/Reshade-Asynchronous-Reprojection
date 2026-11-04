@@ -26,42 +26,53 @@ public:
     static constexpr int kWinsNeeded = 3;
     static constexpr std::size_t kPairs = 4000;   // (a frame at most: 1000 matrices, each with what its place held)
 
-    // One frame that moved, with the one before it: which places hold a value that predicts it. Slow: on its own thread.
-    void judge(const std::vector<MatrixCandidate>& before, const std::vector<MatrixCandidate>& now, const std::vector<Point>& points, double w, double h) {
-        std::unordered_map<std::uint32_t, std::vector<const MatrixCandidate*>> last;
-        for (const MatrixCandidate& c : before) last[c.key].push_back(&c);
-        std::unordered_map<std::uint32_t, float> best[2];
+    // One frame that moved, with the frames before it: which places hold a value that predicts it. Slow: on its own thread.
+    // A frame ahead: what a game binds before a frame is shown can be the next frame's already - DOOM Eternal fills and binds frame N+1's constants before
+    // N is presented, so the values handed with N are N+1's camera: with the frame they came with they scored 0.28, with the next 0.86 (a recorded run,
+    // 2026-11-04); Enshrouded's are its own frame's (0.97). Both are judged - the pair of the two frames before against this frame's motion, too - and the
+    // way that wins more is the game's, as the depth's way round is.
+    void judge(const std::vector<MatrixCandidate>& before2, const std::vector<MatrixCandidate>& before, const std::vector<MatrixCandidate>& now, const std::vector<Point>& points, double w, double h) {
+        std::unordered_map<std::uint32_t, float> best[2][2];  // [ahead][turned]
         std::size_t pairs = 0;
-        for (const MatrixCandidate& c : now) {
-            const auto it = last.find(c.key);
-            if (it == last.end() || !(c.flags & 1)) continue;
-            for (const MatrixCandidate* l : it->second) {
-                if (pairs++ >= kPairs) break;
-                for (int turned = 0; turned < 2; ++turned) {
-                    const float q = quality(form_of(c, turned != 0), matrix_of(c), matrix_of(*l), points, w, h);
-                    if (const auto b = best[turned].find(c.key); b == best[turned].end() || q > b->second) best[turned][c.key] = q;
+        for (int ahead = 0; ahead < 2; ++ahead) {
+            const std::vector<MatrixCandidate>& cur = ahead ? before : now;
+            std::unordered_map<std::uint32_t, std::vector<const MatrixCandidate*>> last;
+            for (const MatrixCandidate& c : ahead ? before2 : before) last[c.key].push_back(&c);
+            std::size_t tried = 0;
+            for (const MatrixCandidate& c : cur) {
+                const auto it = last.find(c.key);
+                if (it == last.end() || !(c.flags & 1)) continue;
+                for (const MatrixCandidate* l : it->second) {
+                    if (tried++ >= kPairs) break;
+                    for (int turned = 0; turned < 2; ++turned) {
+                        const float q = quality(form_of(c, turned != 0), matrix_of(c), matrix_of(*l), points, w, h);
+                        if (const auto b = best[ahead][turned].find(c.key); b == best[ahead][turned].end() || q > b->second) best[ahead][turned][c.key] = q;
+                    }
                 }
             }
+            pairs += std::min(tried, kPairs);
         }
         // (did the places that win so far predict this frame? If not, the add-on searches whole frames until one does)
         const std::vector<std::uint32_t> held = places();
-        const auto& by = best[depth_turned() ? 1 : 0];
+        const auto& by = best[ahead() ? 1 : 0][depth_turned() ? 1 : 0];
         bool hit = false;
         for (const std::uint32_t key : held) if (const auto b = by.find(key); b != by.end() && b->second >= kWin) hit = true;
         held_state_ = held.empty() ? 0 : hit ? 1 : 2;
         float top = -1;
-        for (int turned = 0; turned < 2; ++turned)
-            for (const auto& [key, q] : best[turned]) { top = std::max(top, q); if (q >= kWin) ++wins_[turned][key]; }
+        for (int ahead = 0; ahead < 2; ++ahead)
+            for (int turned = 0; turned < 2; ++turned)
+                for (const auto& [key, q] : best[ahead][turned]) { top = std::max(top, q); if (q >= kWin) ++wins_[ahead][turned][key]; }
         tops_.push_back(top);
-        paired_.push_back(float(best[0].size()));
-        tried_.push_back(float(std::min(pairs, kPairs)));
+        paired_.push_back(float(best[0][0].size()));
+        tried_.push_back(float(pairs));
         // (the old fades: places change with the scene)
-        if (++judged_ % 200 == 0) for (auto& w2 : wins_) for (auto it = w2.begin(); it != w2.end();) { it->second /= 2; it = it->second ? std::next(it) : w2.erase(it); }
+        if (++judged_ % 200 == 0) for (auto& w1 : wins_) for (auto& w2 : w1) for (auto it = w2.begin(); it != w2.end();) { it->second /= 2; it = it->second ? std::next(it) : w2.erase(it); }
     }
-    // The places that win most, the depth as it wins.
-    bool depth_turned() const { return total(1) > total(0); }
+    // The places that win most, as they win: the depth's way round, and whether the values are the next frame's.
+    bool depth_turned() const { const int a = ahead() ? 1 : 0; return total(a, 1) > total(a, 0); }
+    bool ahead() const { return std::max(total(1, 0), total(1, 1)) > std::max(total(0, 0), total(0, 1)); }
     std::vector<std::uint32_t> places() const {
-        const auto& wins = wins_[depth_turned() ? 1 : 0];
+        const auto& wins = wins_[ahead() ? 1 : 0][depth_turned() ? 1 : 0];
         std::vector<std::pair<int, std::uint32_t>> order;
         for (const auto& [key, n] : wins) if (n >= kWinsNeeded) order.push_back({n, key});
         std::sort(order.rbegin(), order.rend());
@@ -194,10 +205,22 @@ private:
         for (int y = 0; y < 4; ++y) for (int x = 0; x < 4; ++x) out[y * 4 + x] = a[y][x + 4];
         return true;
     }
+    // A projection's jitter (TAA's sub-pixel offset, new every frame) is the part of clip x and y along the forward row, as is an off-centre projection's centre: taken out of
+    // both, a pair predicts the camera's motion alone. With it, standing still in Cyberpunk shook back and forth by the jitter: the motion vectors the prediction stands in
+    // for carry none.
+    static Exact dejittered(Exact e) {
+        const double ww = e[12] * e[12] + e[13] * e[13] + e[14] * e[14];
+        if (!(ww > 0)) return e;
+        for (int r = 0; r < 2; ++r) {
+            const double k = (e[r * 4] * e[12] + e[r * 4 + 1] * e[13] + e[r * 4 + 2] * e[14]) / ww;
+            for (int c = 0; c < 4; ++c) e[r * 4 + c] -= k * e[12 + c];
+        }
+        return e;
+    }
     static bool to_last(int form, const Matrix& now, const Matrix& last, Exact& out) {  // (this frame's clip space to the last frame's)
         Exact inverted;
-        if (!inverse(exact(now, (form & 1) != 0), inverted)) return false;
-        const Exact before = exact(last, (form & 1) != 0);
+        if (!inverse(dejittered(exact(now, (form & 1) != 0)), inverted)) return false;
+        const Exact before = dejittered(exact(last, (form & 1) != 0));
         out = Exact{};
         for (int y = 0; y < 4; ++y) for (int x = 0; x < 4; ++x) for (int k = 0; k < 4; ++k) out[y * 4 + x] += before[y * 4 + k] * inverted[k * 4 + x];
         return true;
@@ -210,9 +233,9 @@ private:
         my = -(py / pw - y) * 0.5 * h;
         return std::isfinite(mx) && std::isfinite(my);
     }
-    long long total(int turned) const { long long n = 0; for (const auto& [key, wins] : wins_[turned]) n += wins; return n; }
+    long long total(int ahead, int turned) const { long long n = 0; for (const auto& [key, wins] : wins_[ahead][turned]) n += wins; return n; }
 
-    std::map<std::uint32_t, int> wins_[2];  // (by the depth's way round)
+    std::map<std::uint32_t, int> wins_[2][2];  // (by whether the values are the next frame's, and the depth's way round)
     int judged_ = 0;
     int held_state_ = 0;
     std::vector<float> tops_, paired_, tried_;

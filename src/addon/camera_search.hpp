@@ -1,4 +1,4 @@
-// The game's side of the camera search (presenter/camera_search.hpp, [FrameWarp] CameraSearch=1, Direct3D 11 and 12): every constant buffer the game fills or binds
+// The game's side of the camera search (presenter/camera_search.hpp, [FrameWarp] CameraSearch=1, Direct3D 11 and 12; Vulkan through the game's mapped memory): every constant buffer the game fills or binds
 // is looked through for what can be a camera's matrix, and those of this frame go to the presenter with the frame. Only read: nothing of the game's is changed.
 #pragma once
 #include "shared/protocol.hpp"
