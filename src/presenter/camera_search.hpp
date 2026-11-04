@@ -9,6 +9,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iterator>
 #include <map>
 #include <unordered_map>
@@ -30,7 +31,9 @@ public:
     // A frame ahead: what a game binds before a frame is shown can be the next frame's already - DOOM Eternal fills and binds frame N+1's constants before
     // N is presented, so the values handed with N are N+1's camera: with the frame they came with they scored 0.28, with the next 0.86 (a recorded run,
     // 2026-11-04); Enshrouded's are its own frame's (0.97). Both are judged - the pair of the two frames before against this frame's motion, too - and the
-    // way that wins more is the game's, as the depth's way round is.
+    // way that predicts the frames better is the game's: a frame's best value one way less the other's, summed. Not the wins: walking at an even pace a
+    // frame moves as the one before did, both ways win it, and which won more was chance - Enshrouded's were taken for the next frame's for a while, the
+    // camera a frame late, the scenery juddering (a recorded walk, 2026-11-04). Such frames add next to nothing to the sum; those where the motion changes decide.
     void judge(const std::vector<MatrixCandidate>& before2, const std::vector<MatrixCandidate>& before, const std::vector<MatrixCandidate>& now, const std::vector<Point>& points, double w, double h) {
         std::unordered_map<std::uint32_t, float> best[2][2];  // [ahead][turned]
         std::size_t pairs = 0;
@@ -58,6 +61,11 @@ public:
         bool hit = false;
         for (const std::uint32_t key : held) if (const auto b = by.find(key); b != by.end() && b->second >= kWin) hit = true;
         held_state_ = held.empty() ? 0 : hit ? 1 : 2;
+        float way_top[2] = {-1, -1};
+        for (int ahead = 0; ahead < 2; ++ahead)
+            for (int turned = 0; turned < 2; ++turned)
+                for (const auto& [key, q] : best[ahead][turned]) way_top[ahead] = std::max(way_top[ahead], q);
+        if (!best[0][0].empty() && !best[1][0].empty()) lead_ += double(way_top[0]) - double(way_top[1]);
         float top = -1;
         for (int ahead = 0; ahead < 2; ++ahead)
             for (int turned = 0; turned < 2; ++turned)
@@ -66,11 +74,12 @@ public:
         paired_.push_back(float(best[0][0].size()));
         tried_.push_back(float(pairs));
         // (the old fades: places change with the scene)
-        if (++judged_ % 200 == 0) for (auto& w1 : wins_) for (auto& w2 : w1) for (auto it = w2.begin(); it != w2.end();) { it->second /= 2; it = it->second ? std::next(it) : w2.erase(it); }
+        if (++judged_ % 200 == 0) lead_ /= 2;
+        if (judged_ % 200 == 0) for (auto& w1 : wins_) for (auto& w2 : w1) for (auto it = w2.begin(); it != w2.end();) { it->second /= 2; it = it->second ? std::next(it) : w2.erase(it); }
     }
     // The places that win most, as they win: the depth's way round, and whether the values are the next frame's.
     bool depth_turned() const { const int a = ahead() ? 1 : 0; return total(a, 1) > total(a, 0); }
-    bool ahead() const { return std::max(total(1, 0), total(1, 1)) > std::max(total(0, 0), total(0, 1)); }
+    bool ahead() const { return lead_ < 0; }
     std::vector<std::uint32_t> places() const {
         const auto& wins = wins_[ahead() ? 1 : 0][depth_turned() ? 1 : 0];
         std::vector<std::pair<int, std::uint32_t>> order;
@@ -81,6 +90,9 @@ public:
         return out;
     }
     int judged() const { return judged_; }
+    // (diagnostics: the sum ahead() goes by, and the wins each way - by which the values' frame was taken until 2026-11-04)
+    double lead() const { return lead_; }
+    long long wins(int ahead) const { return std::max(total(ahead, 0), total(ahead, 1)); }
     int held_state() const { return held_state_; }  // (Shared::camera_held_state)
     // (diagnostics, since the last call: a frame's best value (median), frames where one reached kWin, places with a value in both frames and pairs tried (medians))
     struct Seen { float top, paired, tried; int winning, frames; };
@@ -173,6 +185,76 @@ public:
         const float size = median(sizes);
         return size > 0 ? 1.0f - median(errors) / size : 0.0f;
     }
+    // CameraUse, each frame: the value of the places that win, with what that place held the frame before, that agrees best with the motion measured. A place
+    // holds other views too (a shadow's, a reflection's), and turns of 38 degrees from one frame to the next threw the whole picture across the screen.
+    // Values a frame ahead: this frame's camera came with the frame before, its last with the one before that. Both ways are tried on every frame and the one
+    // that agrees best is taken: whose frame the values bound before a frame is shown are can change while a game runs - Enshrouded's were its own frame's for
+    // hundreds of frames, then the next's, the way that fitted off by 0.03-0.07 of the motion and the other by 0.3-0.4 (a walk logged frame by frame,
+    // 2026-11-04); one way for the whole run, the camera was a frame late through every other stretch and the scenery juddered. The search's way (ahead())
+    // is tried first: the cut at kPickPairs falls on the other.
+    static constexpr int kPickPairs = 128;
+    struct Pick { const MatrixCandidate* now = nullptr; const MatrixCandidate* last = nullptr; float error = 1e30f; bool ahead = false; int pairs = 0; };
+    // ways[ahead]: {this frame's values, their last} - {now, before} and {before, before2}. last_used: the value the camera was found in last frame, or null.
+    // limit: the error that still agrees. scratch: room for the points predicted.
+    static Pick pick(const std::vector<MatrixCandidate>* const ways[2][2], bool ahead_first, const MatrixCandidate* last_used, const std::uint32_t* places, std::size_t place_count,
+                     bool turned, const std::vector<Point>& points, double w, double h, float limit, std::vector<Point>& scratch, std::vector<float>& errors) {
+        Pick best;
+        bool way = false;
+        const auto judge = [&](const MatrixCandidate& c, const MatrixCandidate& l) {
+            ++best.pairs;
+            scratch = points;
+            if (!predict(form_of(c, turned), matrix_of(c), matrix_of(l), scratch, w, h)) return;
+            errors.clear();
+            for (std::size_t k = 0; k < scratch.size(); ++k) errors.push_back(std::hypot(scratch[k].mx - points[k].mx, scratch[k].my - points[k].my));
+            const float e = median(errors);
+            if (e < best.error) { best.error = e; best.now = &c; best.last = &l; best.ahead = way; }
+        };
+        // Last frame's camera known: its value, among the values before, with this frame's values of its place - a few pairs, not 128 (AC6: 0.7 ms a frame).
+        // Not among them: the values' frame changed, last frame's value is among this way's own, and each of the place's is tried with its nearest.
+        if (last_used)
+            for (int i = 0; i < 2; ++i) {
+                way = (i == 0) == ahead_first;
+                const std::vector<MatrixCandidate>& cur = *ways[way][0];
+                const std::vector<MatrixCandidate>& cur_last = *ways[way][1];
+                const MatrixCandidate* known = nullptr;
+                for (const MatrixCandidate& l : cur_last)
+                    if (l.key == last_used->key && std::memcmp(l.m, last_used->m, sizeof(l.m)) == 0) { known = &l; break; }
+                for (const MatrixCandidate& c : cur)
+                    if (c.key == last_used->key)
+                        if (const MatrixCandidate* l = known ? known : nearest_of(c, cur_last)) judge(c, *l);
+            }
+        // Otherwise each value of the places with the one of the frame before nearest to it: a camera changes little from one frame to the next, a shadow's
+        // or a reflection's view held in the same place does not look like it. Every pair, cut at 128, never got to the camera once Dark Souls' places held
+        // 400-600 pairs a frame: missed on 289-300 frames of 300, and with no camera the frame before, lost for good.
+        if (!best.now || best.error > limit) {
+            const int tried = best.pairs;
+            best = Pick{};
+            best.pairs = tried;
+            for (int i = 0; i < 2; ++i) {
+                way = (i == 0) == ahead_first;
+                const std::vector<MatrixCandidate>& cur = *ways[way][0];
+                const std::vector<MatrixCandidate>& cur_last = *ways[way][1];
+                for (std::size_t k = 0; k < cur.size() && best.pairs < kPickPairs; ++k) {
+                    const MatrixCandidate& c = cur[k];
+                    if (!c.key || std::find(places, places + place_count, c.key) == places + place_count) continue;
+                    if (const MatrixCandidate* nearest = nearest_of(c, cur_last)) judge(c, *nearest);
+                }
+            }
+        }
+        return best;
+    }
+    static const MatrixCandidate* nearest_of(const MatrixCandidate& c, const std::vector<MatrixCandidate>& last) {
+        const MatrixCandidate* nearest = nullptr;
+        double least = 0;
+        for (const MatrixCandidate& l : last) {
+            if (l.key != c.key) continue;
+            double apart = 0, size = 0;
+            for (int e = 0; e < 16; ++e) { apart += double(c.m[e] - l.m[e]) * (c.m[e] - l.m[e]); size += double(c.m[e]) * c.m[e]; }
+            apart /= std::max(size, 1e-12);
+            if (!nearest || apart < least) { nearest = &l; least = apart; }
+        }
+        return nearest;
+    }
     static float median(std::vector<float>& v) {
         std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
         return v[v.size() / 2];
@@ -235,6 +317,7 @@ private:
     }
     long long total(int ahead, int turned) const { long long n = 0; for (const auto& [key, wins] : wins_[ahead][turned]) n += wins; return n; }
 
+    double lead_ = 0;  // (how much better this frame's values predicted it than the frame before's, summed: below 0, the values are the next frame's)
     std::map<std::uint32_t, int> wins_[2][2];  // (by whether the values are the next frame's, and the depth's way round)
     int judged_ = 0;
     int held_state_ = 0;

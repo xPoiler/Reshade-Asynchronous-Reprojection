@@ -260,7 +260,10 @@ void take_vulkan(command_list* cmd, device* dev, resource r, resource_usage stat
 // Enshrouded's target, copied right after its only write each frame and handed on frame for frame (stamped and checked on a recording), held the frame
 // before's motion or none on most frames - walking juddered, turns shook, and with the estimate neither; DOOM Eternal's is drawn only on what moves (60%
 // of the picture cleared) and threw the camera estimate off (26 degrees, 600 px). The code stays for when a Vulkan game's target can be trusted.
-constexpr bool kVulkanSearch = false;  // (tried again 2026-11-04 with the game's camera found: the shake went, the scenery juddered on Enshrouded's vectors - a net loss)
+// (tried again 2026-11-04 with the game's camera found: the shake went, the scenery juddered. Its vectors held the frame before's motion on most frames, not
+// as handed on: the copy's command buffer went to the present's queue, before the present, on 300 of 300 frames - the target itself is behind. A late target
+// is now refused where its timing shows - MotionSearch::late - but Enshrouded's was taken before that was known.)
+constexpr bool kVulkanSearch = false;
 // Vulkan: a target drawn in a render pass is done at the end of that pass. The game's barrier out of drawing can come as late as the next frame: Enshrouded's motion
 // reached XPAR a frame behind its picture and depth (colour fitted the next frame's motion in 26 of 34 frames, with DLSS its own in all), and all that warped from it
 // shook. End of the pass (the event comes before the pass has ended, nothing can be copied there): the first thing on that command buffer after it.

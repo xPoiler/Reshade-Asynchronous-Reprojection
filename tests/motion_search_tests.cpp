@@ -141,7 +141,7 @@ static void no_motion_through_plain_turns() {
     EXPECT(!search.decide().found, "a target without motion followed the turns");
 }
 
-// Motion that reaches XPAR a frame late follows the turn of the frame before: said, and still found (it is all there may be).
+// Motion that reaches XPAR a frame late follows the turn of the frame before: told, and not taken (the picture's own motion is better).
 static void late_motion_is_told_and_found() {
     MotionSearch search;
     Scene scene;
@@ -154,6 +154,7 @@ static void late_motion_is_told_and_found() {
         previous = f;
     }
     EXPECT(search.late(7), "late motion not told");
+    EXPECT(!search.decide().found, "late motion taken");
     MotionSearch on_time;
     Scene again;
     for (int t = 0; t < 80; ++t) on_time.add(9, plain_turn(again, t, true, 0));

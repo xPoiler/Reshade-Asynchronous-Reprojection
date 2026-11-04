@@ -6,8 +6,10 @@
 // Within a frame a plain turn shows nothing: the whole picture moves alike, and the offset takes all of it. So each axis is also fitted across frames, on the
 // frames' medians: a motion channel follows the turn, both ways, through one scale and one offset.
 // A game can keep last frame's motion too, for its temporal passes: that follows the turn as well, a frame behind, and warps everything a frame off. Fitted against
-// the turn of the frame before as well, for the log: a target that follows that one better reaches XPAR a frame late. Never a reason to drop it: Enshrouded's
-// only motion target was dropped so, and the search found nothing.
+// the turn of the frame before as well: a target shown to follow that one better reaches XPAR a frame late, and is not taken - the picture's own motion is
+// better. Enshrouded's only target (Vulkan) followed the frame before 0.85-0.93 against its own 0.69-0.76; taken, the frame before's camera fitted its vectors
+// on 189-268 frames of 300 and the pictures' motion on 0-3, and the scenery juddered; on the picture's motion it was smooth (2026-11-04). Until the timing is
+// known - turns both ways - nothing changes: Armored Core, Dark Souls and both Resident Evils were taken before, on time.
 // Some games draw vectors only for what moves on its own - characters, grass - and leave the rest at the value the target was cleared to:
 // their TAA takes the scenery's motion from depth and the camera (Dark Souls Remastered: (1, 1) on 91.5% of the picture). Such a target is
 // told by that value: one value, bit for bit, on most of a moving picture is never motion. It is judged on what it draws, against the
@@ -213,6 +215,7 @@ public:
                 }
         };
         for (const auto& [id, k] : candidates_) {
+            if (late(id)) continue;
             if (k.frames >= kFramesNeeded) consider(id, k, false, -1);
             const auto own = relative_.find(id);
             if (own != relative_.end() && own->second.frames >= kFramesNeeded) consider(id, own->second, false, -1);
@@ -221,6 +224,7 @@ public:
         // How good a fit can get depends on how good the picture's motion is, not only on the target: Enshrouded's own stayed at 0.58 and 0.62 over 2500 frames, every other
         // target at ~0. So over many frames: far above all the others that were tried, at a steady scale.
         for (const auto& [id, k] : candidates_) {
+            if (late(id)) continue;
             float others = 0;
             int tried = 0;
             for (const auto& [other, o] : candidates_) {
@@ -250,7 +254,7 @@ public:
         f.full = full >= on_top;
         return f;
     }
-    // Follows the frame before better than this one, on the axis that moved most.
+    // Follows the frame before better than this one, on the axis that moved most. (False until both are known.)
     bool late(std::uint32_t candidate) const {
         float now = 0, before = 0;
         timing(candidate, now, before);

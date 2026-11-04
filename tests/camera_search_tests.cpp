@@ -82,6 +82,75 @@ static void run(bool columns, bool depth_turned, float far_away, bool ahead) {
     EXPECT(search.depth_turned() == depth_turned, "columns %d turned %d far %g: depth the wrong way round", int(columns), int(depth_turned), far_away);
     EXPECT(search.ahead() == ahead, "columns %d turned %d far %g ahead %d: the values' frame taken wrong", int(columns), int(depth_turned), far_away, int(ahead));
 }
+// Walking at an even pace, every fourth frame half a step (Enshrouded's pacing): the frames that move as the one before did are won both ways; the others decide.
+static void even_walk(bool ahead) {
+    CameraSearch search;
+    std::mt19937 rng(11);
+    const auto step = [](int t) { float z = 0; for (int i = 1; i <= t; ++i) z += i % 4 ? 0.06f : 0.03f; return z; };
+    const auto camera = [&](int t) { return view_projection(0.05f, 0.02f, 0.0f, 3.0f + step(t)); };
+    const auto frame = [&](int t) {
+        std::vector<MatrixCandidate> f;
+        f.push_back(candidate(5, view_projection(0.4f, 0.1f, 3, 3), false));
+        f.push_back(candidate(77, camera(ahead ? t + 1 : t), false));
+        return f;
+    };
+    for (int t = 2; t < 60; ++t) search.judge(frame(t - 2), frame(t - 1), frame(t), motion(camera(t), camera(t - 1), rng, false), kW, kH);
+    EXPECT(search.ahead() == ahead, "an even walk, ahead %d: the values' frame taken wrong", int(ahead));
+}
+// CameraSearch::pick, frame by frame as CameraUse runs it: the camera's values on time, a frame ahead, or changing between the two every 50 frames (Enshrouded),
+// in a place that also holds a shadow's view, with motion measured to half a pixel. Each frame the pair taken must give the camera's own motion: on frames
+// where the other way's would be a pixel or more off, it must be the right way.
+static void pick_each_frame(int mode) {  // 0 on time, 1 ahead, 2 changing
+    std::mt19937 rng(21 + mode);
+    const auto camera = [](int t) { float z = 0; for (int i = 1; i <= t; ++i) z += i % 4 ? 0.06f : 0.02f; return view_projection(0.3f * std::sin(t * 0.11f), 0.05f * std::sin(t * 0.07f), 0.0f, z); };
+    const auto ahead_at = [&](int t) { return mode == 1 || (mode == 2 && t / 50 % 2 == 1); };
+    const auto frame = [&](int t) {
+        std::vector<MatrixCandidate> f;
+        f.push_back(candidate(77, view_projection(1.0f + t * 0.3f, 0.2f, 1, 1), false));  // (a shadow's view, in the same place)
+        f.push_back(candidate(77, camera(ahead_at(t) ? t + 1 : t), false));
+        f.push_back(candidate(5, view_projection(0.4f, 0.1f, 3, 3), false));
+        return f;
+    };
+    const std::uint32_t places[CameraSearch::kPlaces] = {77};
+    std::vector<MatrixCandidate> before2 = frame(0), before = frame(1);
+    MatrixCandidate last{};
+    bool have_last = false;
+    int decisive = 0, wrong = 0, missed = 0, off = 0, unknowable = 0;
+    std::vector<CameraSearch::Point> scratch;
+    std::vector<float> errors;
+    const auto apart = [](const std::vector<CameraSearch::Point>& a, const std::vector<CameraSearch::Point>& b) {
+        std::vector<float> d;
+        for (std::size_t k = 0; k < a.size(); ++k) d.push_back(std::hypot(a[k].mx - b[k].mx, a[k].my - b[k].my));
+        return CameraSearch::median(d);
+    };
+    for (int t = 2; t < 400; ++t) {
+        const std::vector<MatrixCandidate> now = frame(t);
+        const std::vector<CameraSearch::Point> measured = motion(camera(t), camera(t - 1), rng, false);
+        const std::vector<MatrixCandidate>* const ways[2][2] = {{&now, &before}, {&before, &before2}};
+        const CameraSearch::Pick p = CameraSearch::pick(ways, mode == 1, have_last ? &last : nullptr, places, 1, false, measured, kW, kH, 2.0f, scratch, errors);
+        const bool agrees = p.now && p.error <= 2.0f;
+        have_last = agrees;
+        if (agrees) last = *p.now;
+        // (which way holds the camera's own pair: this frame's values with the frame before's, or the frame before's with the one before that. Going ahead,
+        // one frame's camera is never bound, and on the two frames after neither way holds it)
+        const bool way_on = !ahead_at(t) && !ahead_at(t - 1), way_ahead = ahead_at(t - 1) && ahead_at(t - 2);
+        if (!way_on && !way_ahead) { ++unknowable; before2 = before; before = now; continue; }
+        if (!agrees) { ++missed; before2 = before; before = now; continue; }
+        // (the camera's own motion over these points, the pair taken's, and the frame before's - what the other way would give)
+        std::vector<CameraSearch::Point> right = measured, taken = measured, stale = measured;
+        CameraSearch::predict(0, camera(t), camera(t - 1), right, kW, kH);
+        CameraSearch::predict(0, CameraSearch::matrix_of(*p.now), CameraSearch::matrix_of(*p.last), taken, kW, kH);
+        CameraSearch::predict(0, camera(t - 1), camera(t - 2), stale, kW, kH);
+        if (apart(taken, right) > 0.5f) ++off;
+        if (apart(right, stale) >= 1.0f) { ++decisive; wrong += p.ahead != way_ahead; }
+        before2 = before; before = now;
+    }
+    std::printf("pick, mode %d: %d frames decided by the way (%d wrong), missed %d, off the camera's motion by more than half a pixel %d, neither way the camera's %d (of 398)\n",
+                mode, decisive, wrong, missed, off, unknowable);
+    EXPECT(decisive > 50, "pick mode %d: too few frames tell the ways apart (%d) - the test says nothing", mode, decisive);
+    EXPECT(wrong == 0, "pick mode %d: the wrong way taken on %d of %d frames", mode, wrong, decisive);
+    EXPECT(missed == 0 && off == 0, "pick mode %d: missed %d, off %d", mode, missed, off);
+}
 static void nothing_without_a_camera() {
     CameraSearch search;
     std::mt19937 rng(9);
@@ -155,6 +224,9 @@ int main() {
         for (int turned = 0; turned < 2; ++turned)
             for (const float far_away : {0.0f, 5000.0f})
                 for (const bool ahead : {false, true}) run(columns != 0, turned != 0, far_away, ahead);
+    even_walk(false);
+    even_walk(true);
+    for (int mode = 0; mode < 3; ++mode) pick_each_frame(mode);
     nothing_without_a_camera();
     if (g_failures) { std::printf("%d failed\n", g_failures); return 1; }
     std::printf("camera search ok\n");
