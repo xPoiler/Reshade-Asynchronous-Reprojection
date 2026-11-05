@@ -41,6 +41,7 @@ struct IngestedSource {
     // HUD learning (the add-on's hud_learn): where the final picture differs from a copy taken at a candidate point.
     bool has_probe = false;
     std::uint32_t hud_candidate = 0;
+    bool has_stencil = false;  // the game's stencil on the depth's grid, in kPStencil (StencilMask=1, development - see stencil_character)
     std::uint32_t hud_learned = 0;  // the UI coverage is the learned point's (1), or empty: it did not draw (2)
 };
 
@@ -51,6 +52,7 @@ struct RecordedFrame {
     std::uint64_t tag = 0;
     std::uint32_t cw = 0, ch = 0, dw = 0, dh = 0;
     std::vector<std::uint8_t> colour, depth, motion, ui;
+    std::vector<std::uint8_t> stencil;  // (StencilMask=1: the game's stencil on the depth's grid, R8 - empty without; stencil_<i>.bin)
 };
 
 // HUD detection frames: learned from, skipped for too few telling pixels, or held back by the
@@ -168,7 +170,10 @@ public:
     enum IntakePass { kPassStart, kPassIngest, kPassAnalyze, kPassObjects, kPassHud, kPassCharacter, kPassMask, kPassMemory,
                       kPassWarpStart, kPassWarpObjects, kPassWarpClaim, kPassWarpLean, kPassWarpRest, kPassWarpFix,
                       // (XPAR's own motion estimate by part - stamped only with set_flow_stamps, dev/warp_replay FW_FLOW_TIMES)
-                      kPassFlowStart, kPassFlowPyramid, kPassFlowSolve, kPassFlowFill, kPassFlowOut, kPassKinds };
+                      kPassFlowStart, kPassFlowPyramid, kPassFlowSolve, kPassFlowFill, kPassFlowOut,
+                      // (the motion analysis and the follow share apart - stamped only with set_share_stamps, dev/seq_replay FW_TIMES:
+                      // kPassAnalyzeOnly ends analyze_motion, kPassShareOnly the share before its own-motion part, then kPassAnalyze)
+                      kPassAnalyzeOnly, kPassShareOnly, kPassKinds };
     struct PassTimes { double ms[kPassKinds] = {}; std::uint32_t frames = 0, warps = 0; };
     void pass_stamp(IntakePass pass);
     PassTimes take_pass_times() { const PassTimes t = pass_times_; pass_times_ = {}; return t; }
@@ -228,6 +233,19 @@ public:
     void analyze_motion(const IngestedSource& src, const float clip_to_prev_clip[16], float scale_x, float scale_y, bool scale_valid,
                         bool depth_inverted = true, bool near_rule = true, bool turn_rule = false, std::uint64_t frame = 0,
                         float floor_pivot_depth = 0.0f);
+    // StencilMask=1 (development, plan_character_coordinates.md option 2): the player's character from the game's depth-stencil, after
+    // analyze_motion. The stencil values that mark characters are learned from the analysis (the share of each value's pixels it finds
+    // attached to the camera); their pixels outline the characters, and the player's is the one the analysis finds attached while the camera
+    // turns - or, still, last frame's (moved along the motion vectors). Its pixels are attached; the analysis' attached pixels beside it,
+    // unmarked, are not. scale: the analysis' (raw -> uv). character_source(): 1 while the stencil gives the character (the panel says it).
+    void stencil_character(const IngestedSource& src, const float view_to_clip[16], const float clip_to_prev[16], float scale_x, float scale_y,
+                           bool scale_valid, bool depth_inverted = true);
+    std::uint32_t character_source() const { return sten_found_ ? 1u : 0u; }
+    std::string stencil_report() const {  // (development: the values taken, turning, found)
+        std::string t = "values";
+        for (int v = 0; v < 256; ++v) if ((sten_set_[v >> 5] >> (v & 31)) & 1u) t += " " + std::to_string(v);
+        return t + (sten_turning_ ? ", turning" : ", still") + (sten_found_ ? ", found" : ", not found");
+    }
     // The XPAR warp by forward splat (cs_warp_claim) instead of the search alone.
     void set_warp_splat(bool on) { warp_splat_ = on; }
     // The motion analysis holds what stays on screen only where the camera rig carries it (see cs_analyze, flag 2048):
@@ -309,6 +327,7 @@ public:
     void set_projection_changed(bool on) { projection_changed_ = on; }
     void set_zoom_freeze(bool on) { zoom_freeze_ = on; }
     void set_flow_stamps(bool on) { flow_stamps_ = on; }  // (development: see kPassFlowStart)
+    void set_share_stamps(bool on) { share_stamps_ = on; }  // (development: see kPassAnalyzeOnly)
     void set_ui8_force(bool on) { ui8_force_ = on; }  // (development: the HUD-less picture's layer in 8 bits whatever the picture)
     void set_orbit_kind(bool on) { orbit_kind_ = on; }  // (under the orbit, carried by the analysis too - on by default: see cs_share_up, flag 64)
     void set_orbit_centre_turn(bool on) { orbit_centre_turn_ = on; }  // (the orbit's centre measured against the turn: see share_measure_at, flag 512)
@@ -386,7 +405,9 @@ public:
     // the layer, or the option turned off).
     int layer_trust() const { return layer_trust_; }
     double layer_drawn_over_share() const { return layer_covered_ ? double(layer_drawn_over_) / double(layer_covered_) : 0.0; }
-    void reset_layer_trust() { layer_trust_ = 0; layer_covered_ = layer_drawn_over_ = layer_frames_ = 0; }
+    void reset_layer_trust() { layer_trust_ = 0; layer_covered_ = layer_drawn_over_ = layer_frames_ = 0; layer_taken_ = false; }
+    // (frames without the layer show no HUD: checked, or taken unchecked - see build_no_warp_mask's hidden)
+    bool layer_hides_hud() const { return layer_trust_ == 1 || (layer_trust_ == 0 && layer_taken_); }
     // (for the log while it runs: frames checked, the share of the screen the layer covers on them, of it drawn over)
     std::uint64_t layer_frames_checked() const { return layer_frames_; }
     double layer_cover_share() const { return layer_frames_ && layer_frame_samples_ > 0 ? double(layer_covered_) / (double(layer_frames_) * layer_frame_samples_) : 0.0; }
@@ -461,7 +482,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     };
-    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPHudLearned, kPHudTiles, kPWarpClaims, kPStill, kPGrowA, kPGrowB, kPProbe, kPProbeTilesA, kPProbeTilesB, kPShareA, kPShareB, kPShareT, kPShare, kPRetDirtyA, kPRetDirtyB, kPShareT2, kPShareHalf, kPRecColour, kPRecUi, kPShareResid, kPOwnMove, kPPaths, kPShareSeam, kPAttHist, kPMemVis, kPUiTiles, kPWarpBeside, kPWarpHeld, kPLowScene, kPMaskRaw, kPMemF0, kPMemF1, kPMemFZ0, kPMemFZ1, kPGunMove, kPMemRatio, kPMotionProbe, kPMotionGame, kPCount };
+    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPHudLearned, kPHudTiles, kPWarpClaims, kPStill, kPGrowA, kPGrowB, kPProbe, kPProbeTilesA, kPProbeTilesB, kPShareA, kPShareB, kPShareT, kPShare, kPRetDirtyA, kPRetDirtyB, kPShareT2, kPShareHalf, kPRecColour, kPRecUi, kPShareResid, kPOwnMove, kPPaths, kPShareSeam, kPAttHist, kPMemVis, kPUiTiles, kPWarpBeside, kPWarpHeld, kPLowScene, kPMaskRaw, kPMemF0, kPMemF1, kPMemFZ0, kPMemFZ1, kPGunMove, kPMemRatio, kPMotionProbe, kPMotionGame, kPStencil, kPStenCellsA, kPStenCellsB, kPStenMask, kPStenGrowA, kPStenGrowB, kPStenAge, kPStenLumaA, kPStenLumaB, kPStenElig, kPStenFringeA, kPStenFringeB, kPCount };
 
     bool create_pipelines(std::string& error);
     std::string shader_report_;
@@ -583,13 +604,14 @@ private:
     std::uint64_t last_warp_serial_ = ~0ull;
     std::array<std::pair<PrivateId, bool>, 18> warp_srv_ = {};  // (the warp table's SRVs as last set - set_x_srv)
     float claims_matrix_[16] = {};
-    bool orbit_centre_turn_ = false, orbit_kind_ = true, share_orbit_ = false, projection_changed_ = false, zoom_freeze_ = true, ui8_force_ = false, flow_stamps_ = false;
+    bool orbit_centre_turn_ = false, orbit_kind_ = true, share_orbit_ = false, projection_changed_ = false, zoom_freeze_ = true, ui8_force_ = false, flow_stamps_ = false, share_stamps_ = false;
     bool behind_own_share_ = false;
     bool share_resid_built_ = false, shown_share_resid_ = false;
     struct RecSlot {
-        ComPtr<ID3D12Resource> buffer[4];  // colour, depth, motion, coverage
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT foot[4] = {};
-        std::uint32_t width[4] = {}, height[4] = {};
+        ComPtr<ID3D12Resource> buffer[5];  // colour, depth, motion, coverage, stencil
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT foot[5] = {};
+        std::uint32_t width[5] = {}, height[5] = {};
+        bool has_stencil = false;
         std::uint64_t tag = 0, fence = 0;
         int context = 0;
         bool has_ui = false;
@@ -603,6 +625,7 @@ private:
     std::uint32_t detection_idle_ = 0;  // game frames since the HUD was last detected (build_no_warp_mask)
     std::uint32_t scene_idle_ = 0;      // game frames since the upscaler's output last came (ingest)
     ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_own_warp_reset_, cs_own_warp_lean_, cs_own_warp_args_, cs_own_warp_rest_, cs_warp_claims_clear_, cs_warp_claim_, cs_warp_beside_, cs_warp_held_, cs_own_warp_up_, cs_mask_smooth_, cs_memory_, cs_mem_ratio_, cs_mem_relight_, cs_gun_motion_, cs_mem_vis_, cs_hudless_ui_, cs_hudless_keep_, cs_ui_tiles_, cs_layer_unblend_, cs_layer_seam_clear_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_, cs_camera_fill_, cs_probe_tiles_, cs_probe_clear_, cs_probe_score_, cs_share_measure_, cs_share_blur_, cs_share_bins_, cs_share_final_, cs_share_up_, cs_share_seam_, cs_att_hist_, cs_rec_down_, cs_share_resid_, cs_resid_blur_, cs_own_up_;
+    ComPtr<ID3D12PipelineState> cs_sten_clear_, cs_sten_hist_, cs_sten_cells_, cs_sten_flood_, cs_sten_apply_, cs_sten_count_, cs_sten_grow_init_, cs_sten_grow_, cs_sten_age_, cs_sten_close_, cs_sten_comp_clear_, cs_sten_comp_count_, cs_sten_comp_max_, cs_sten_prune_, cs_sten_luma_, cs_sten_elig_, cs_sten_fringe_, cs_sten_fringe_apply_;
     // Sight reticles (option): the passes, which history texture holds the latest layer, and whether the layer was
     // built for the frame taken in last / the shown one (see cs_ret_layer).
     ComPtr<ID3D12PipelineState> cs_ret_cells_, cs_ret_enclose_, cs_ret_layer_, cs_ret_align_, cs_ret_pick_, cs_ret_args_, cs_ret_shift_;
@@ -672,6 +695,7 @@ private:
     int layer_trust_ = 0;
     bool layer_cover_only_[kRing] = {};  // (that readback: the coverage alone - see build_no_warp_mask)
     bool layer_full_ = false;            // ...the latest one read back: 90% of the screen or more
+    bool layer_taken_ = false;           // ...one read back with some of it, under 90%: taken as the HUD, unchecked
     std::uint64_t layer_covered_ = 0, layer_drawn_over_ = 0, layer_frames_ = 0;
     double layer_frame_samples_ = 0;  // samples per frame (every second pixel each way)
     // Textures released once the GPU is past them (no waiting: no hitch), see retire.
@@ -689,6 +713,16 @@ private:
     ComPtr<ID3D12Resource> partials_, sums_, fit_readback_;
     UINT partial_groups_ = 0;
     bool fit_pending_[kRing] = {};
+    // (stencil_character: the histogram of stencil values - all pixels, attached ones - and its readback; the values' sums kept over frames,
+    // the values taken as the character's, whether it was found lately)
+    ComPtr<ID3D12Resource> sten_hist_, sten_readback_, sten_comp_;  // (sten_comp_: the player's pieces - see cs_sten_prune)
+    UINT sten_comp_n_ = 0;
+    bool sten_flip_ = false, sten_fringe_valid_ = false;  // (the fringe's brightness and verdict: this frame's and the one before - see cs_sten_elig)
+    bool sten_pending_[kRing] = {};
+    double sten_n_[256] = {}, sten_a_[256] = {}, sten_total_ = 0;
+    std::uint32_t sten_set_[8] = {};
+    bool sten_found_ = false, sten_ingested_ = false, sten_turning_ = false, sten_prev_ = false;
+    void sten_learn(const std::uint32_t* counts);
     std::uint64_t fit_frame_[kRing] = {};
     bool fit_ready_ = false;
     bool keep_previous_ = false, previous_valid_ = false, previous_from_hudless_ = false, ingested_ = false, last_had_hudless_ = false;

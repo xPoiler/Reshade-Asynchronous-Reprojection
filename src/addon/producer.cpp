@@ -175,7 +175,139 @@ int Producer::slot_for_frame(std::uint64_t frame, bool create) {
     return -1;
 }
 
+void Producer::stencil_dump(std::uint64_t frame, std::uint32_t k, ID3D12Resource* source, D3D12_RESOURCE_STATES state, ID3D12GraphicsCommandList* list) {
+    if (stencil_dumps_ >= 160) return;
+    const auto desc = source->GetDesc();
+    const DXGI_FORMAT f = desc.Format;
+    stencil_format_ = unsigned(f);
+    if (f != DXGI_FORMAT_R32G8X24_TYPELESS && f != DXGI_FORMAT_D32_FLOAT_S8X24_UINT && f != DXGI_FORMAT_R24G8_TYPELESS && f != DXGI_FORMAT_D24_UNORM_S8_UINT) return;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+    UINT rows = 0; UINT64 row_bytes = 0, total = 0;
+    device_->GetCopyableFootprints(&desc, 1, 1, 0, &fp, &rows, &row_bytes, &total);  // (subresource 1: the stencil plane)
+    if (!total || total == UINT64_MAX) return;
+    D3D12_HEAP_PROPERTIES rb{}; rb.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = total; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    StencilRead r;
+    if (FAILED(device_->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&r.buffer)))) return;
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition = {source, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, state, D3D12_RESOURCE_STATE_COPY_SOURCE};
+    if (state != D3D12_RESOURCE_STATE_COPY_SOURCE) list->ResourceBarrier(1, &b);
+    D3D12_TEXTURE_COPY_LOCATION dst{r.buffer.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+    dst.PlacedFootprint = fp;
+    D3D12_TEXTURE_COPY_LOCATION src{source, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+    src.SubresourceIndex = 1;
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+    if (state != D3D12_RESOURCE_STATE_COPY_SOURCE) list->ResourceBarrier(1, &b);
+    r.after = fence_value_ + 2; r.frame = frame; r.k = k; r.w = fp.Footprint.Width; r.h = fp.Footprint.Height; r.pitch = fp.Footprint.RowPitch; r.offset = fp.Offset;
+    stencil_reads_.push_back(std::move(r));
+    ++stencil_dumps_;
+}
+
+void Producer::stencil_collect() {
+    if (!fence_ || stencil_reads_.empty()) return;
+    const auto done = fence_->GetCompletedValue();
+    for (auto it = stencil_reads_.begin(); it != stencil_reads_.end();) {
+        if (it->after > done) { ++it; continue; }
+        void* data = nullptr;
+        // (the whole buffer: its last row is only as long as the row, not the pitch - a range of pitch x rows ran past its end and every Map was refused)
+        if (FAILED(it->buffer->Map(0, nullptr, &data)) || !data) ++stencil_failed_;
+        else {
+            // (beside the game's exe: an add-on loaded from a copy elsewhere - Requiem's _storage_ - has no logs folder beside it)
+            wchar_t exe[MAX_PATH]{};
+            GetModuleFileNameW(nullptr, exe, MAX_PATH);
+            std::wstring path = exe;
+            path = path.substr(0, path.find_last_of(L"\\/")) + L"\\FrameWarp\\logs\\stencil_" + std::to_wstring(it->frame) + L"_" + std::to_wstring(it->k) + L".bin";
+            if (FILE* f = _wfopen(path.c_str(), L"wb")) {
+                const std::uint32_t head[2] = {it->w, it->h};
+                std::fwrite(head, sizeof(head), 1, f);
+                const auto* bytes = static_cast<const std::uint8_t*>(data) + it->offset;
+                for (std::uint32_t y = 0; y < it->h; ++y) std::fwrite(bytes + std::uint64_t(y) * it->pitch, 1, it->w, f);
+                std::fclose(f);
+                ++stencil_written_;
+            }
+            D3D12_RANGE none{0, 0};
+            it->buffer->Unmap(0, &none);
+        }
+        it = stencil_reads_.erase(it);
+    }
+}
+
+// StencilMask=1: the stencil plane (subresource 1) of a depth-stencil the game just stopped drawing into, in the depth-write state it was
+// bound in, into stencil_stage_ (a buffer in its placed footprint - copies between the planes and other textures are not certain on every
+// driver; into a buffer is how the dumps read it). The latest copy before the depth tag is the one handed over (stencil_hand).
+void Producer::stencil_stage(ID3D12Resource* source, ID3D12GraphicsCommandList* list) {
+    if (!ready() || !source || !list || vk_ || d11_) return;
+    const auto desc = source->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+    UINT rows = 0; UINT64 row_bytes = 0, total = 0;
+    device_->GetCopyableFootprints(&desc, 1, 1, 0, &fp, &rows, &row_bytes, &total);
+    if (!total || total == UINT64_MAX) return;
+    if (!stencil_stage_ || stencil_stage_bytes_ < total) {
+        if (stencil_stage_) retired_.push_back({stencil_stage_, nullptr, fence_value_ + 1, {}, {}});
+        stencil_stage_.Reset();
+        D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = total; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&stencil_stage_)))) {
+            stencil_stage_.Reset(); stencil_stage_bytes_ = 0; return;
+        }
+        stencil_stage_bytes_ = total;
+    }
+    D3D12_RESOURCE_BARRIER b[2]{};
+    b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b[0].Transition = {source, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE};
+    list->ResourceBarrier(1, b);
+    D3D12_TEXTURE_COPY_LOCATION dst{stencil_stage_.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+    dst.PlacedFootprint = fp;
+    D3D12_TEXTURE_COPY_LOCATION src{source, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+    src.SubresourceIndex = 1;
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    std::swap(b[0].Transition.StateBefore, b[0].Transition.StateAfter);
+    // (the buffer back to common from the copy-destination state it was promoted to: the depth tag's copy reads it, maybe on this list)
+    b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b[1].Transition = {stencil_stage_.Get(), 0, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON};
+    list->ResourceBarrier(2, b);
+    stencil_fp_ = fp;
+    stencil_staged_ = true;
+}
+
+// The stencil staged since the last depth tag into the slot's kStencil (R8): only at the depth's own size - the presenter reads it on the
+// depth's grid.
+void Producer::stencil_hand(int slot, ID3D12GraphicsCommandList* list, const D3D12_RESOURCE_DESC& depth) {
+    stencil_staged_ = false;
+    if (!stencil_stage_ || stencil_fp_.Footprint.Width != depth.Width || stencil_fp_.Footprint.Height != depth.Height) return;
+    D3D12_RESOURCE_DESC d = depth;
+    d.Format = DXGI_FORMAT_R8_UNORM;
+    if (!ensure_texture(slot, kStencil, d)) return;
+    auto& t = textures_[slot][kStencil];
+    D3D12_RESOURCE_BARRIER b[2]{};
+    b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b[0].Transition = {t.resource.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST};
+    list->ResourceBarrier(1, b);
+    D3D12_TEXTURE_COPY_LOCATION dst{t.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+    dst.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION src{stencil_stage_.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+    src.PlacedFootprint = stencil_fp_;
+    src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8_UNORM;
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    std::swap(b[0].Transition.StateBefore, b[0].Transition.StateAfter);
+    b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b[1].Transition = {stencil_stage_.Get(), 0, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON};
+    list->ResourceBarrier(2, b);
+    auto& info = shared_->slots[slot].tex[kStencil];
+    info.width = static_cast<std::uint32_t>(t.desc.Width); info.height = t.desc.Height;
+    info.format = t.desc.Format; info.generation = t.generation;
+    info.ext_x = info.ext_y = 0; info.ext_w = info.width; info.ext_h = info.height;
+    info.valid = 1;
+}
+
 void Producer::collect_retired() {
+    stencil_collect();
     if (!fence_) return;
     const auto done = fence_->GetCompletedValue();
     for (auto it = retired_.begin(); it != retired_.end();) {
@@ -454,6 +586,7 @@ void Producer::on_tag(std::uint64_t frame, Tex kind, ID3D12Resource* source, D3D
     const int timed = time_begin(list, kind == kDepth ? kTDepth : kind == kMotion ? kTMotion : kTOtherTag);
     copy_into(list, source, state, t.resource.Get());
     time_end(list, timed);
+    if (kind == kDepth && stencil_staged_) stencil_hand(slot, list, desc);  // (StencilMask=1, development)
     tl_tagging = false;
     slot_list_[slot] = tl_tag_list ? tl_tag_list : reinterpret_cast<std::uint64_t>(list);
     auto& info = shared_->slots[slot].tex[kind];

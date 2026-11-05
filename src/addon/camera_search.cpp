@@ -7,6 +7,7 @@
 #include <smmintrin.h>
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -100,6 +101,22 @@ std::uint64_t g_bytes = 0, g_ranges = 0;
 std::atomic<bool> g_budget_spent{false};
 std::uint32_t g_rotate = 0;
 std::vector<MatrixCandidate> g_raw;
+// (CameraDump=2, development - plan_character_coordinates.md, Phase 0: every frame searched, and the object matrices too - an object's
+// place in the world, rotation and uniform scale with a move, which no camera's shape passes - flags 4, 2 when stored in columns. Only
+// for the dump: they go after the camera's values, and the presenter's camera search never sees them)
+int g_dump = 0;
+std::vector<MatrixCandidate> g_raw_objects;
+std::size_t g_found_objects = 0;
+// (CameraDump=2, round 2: no budget and no window - the whole frame read, up to kDumpRangeBytes of each range; Direct3D 12's buffer views
+// too - root ones, and those in tables - where objects' and bones' transforms are kept; and every value found written by the add-on itself,
+// logs/camera_values.bin, by frame: the 2048 the presenter is sent cannot hold them. Started once a camera place is held - the game is being played)
+constexpr std::uint64_t kDumpRangeBytes = 1u << 20;
+constexpr std::size_t kDumpValues = 1u << 16;
+constexpr std::uint64_t kDumpFileBytes = 3ull << 30;
+FILE* g_values_file = nullptr;
+std::uint64_t g_values_bytes = 0;
+bool g_values_started = false;
+std::uint64_t g_dump_srv_views = 0, g_dump_root_views = 0, g_dump_root_read = 0;
 // Places found: held like a found motion buffer. The presenter sends back the keys that win; a key is mix(slot, offset), and mix can be undone, so wherever a slot is bound
 // the offset each key would have there is known, and those 64 bytes are read every frame - past the budget, past 4 KB of a buffer without a size, first in what is sent.
 // While places are held the rest is searched only when they stop predicting the motion (Shared::camera_held_state): the camera can take turns between places (AC6,
@@ -132,6 +149,7 @@ std::atomic<std::uint32_t> g_held_slots{0};
 std::atomic<std::uint64_t> g_held_mask{0};
 std::uint64_t bit_of(std::uint32_t slot) { return 1ull << ((slot * 0x9E3779B1u) >> 26); }
 bool wanted(std::uint32_t slot) {
+    if (g_dump == 2) return true;
     if (g_searching.load(std::memory_order_relaxed) && !g_budget_spent.load(std::memory_order_relaxed)) return true;
     if (!(g_held_mask.load(std::memory_order_relaxed) & bit_of(slot))) return false;
     const std::uint32_t n = g_held_slots.load(std::memory_order_acquire);
@@ -496,6 +514,58 @@ bool can_be_camera(const float* m) {
     return std::fabs(m[0] - 1) < 0.5f && std::fabs(m[5] - 1) < 0.5f && std::fabs(m[10] - 1) < 0.5f && std::fabs(m[15] - 1) < 0.5f;
 }
 bool unit_length(float x, float y, float z) { return std::fabs(std::sqrt(x * x + y * y + z * z) - 1.0f) < 0.01f; }
+std::uint64_t value_of(const float* m);
+std::uint32_t object_form(const float* m);
+std::uint32_t mix(std::uint32_t a, std::uint32_t b);
+// (CameraDump=2, under the lock) A range's values for the add-on's file: the camera's shape (flags 1 / 3) and objects' (4 / 6), whatever the
+// search's budget and window - the search itself goes on as without the dump, and what the presenter is sent stays the same (round 2's
+// first build read the frame whole for the search too: the 2048 sent were the frame's first five buffers, the camera never in them, and the
+// camera shook)
+std::vector<MatrixCandidate> g_dump_found;
+std::unordered_set<std::uint64_t> g_dump_seen;
+std::uint64_t g_dump_bytes = 0, g_dump_ranges = 0;
+void dump_read(const std::uint8_t* data, std::uint64_t size, std::uint32_t slot) {
+    size = std::min(size, kDumpRangeBytes);
+    if (size < 64 || g_dump_found.size() >= kDumpValues) return;
+    g_dump_bytes += size; ++g_dump_ranges;
+    static thread_local std::vector<float> local;
+    if (local.size() < kDumpRangeBytes / 4) local.resize(kDumpRangeBytes / 4);
+    wc_copy(local.data(), data, size);
+    for (std::uint64_t offset = 0; offset + 64 <= size && g_dump_found.size() < kDumpValues; offset += 16) {
+        const float* m = local.data() + offset / 4;
+        std::uint32_t flags = 0;
+        if (can_be_camera(m)) {
+            if (unit_length(m[12], m[13], m[14])) flags = 1;
+            else if (unit_length(m[3], m[7], m[11])) flags = 3;
+        } else {
+            flags = object_form(m);
+        }
+        if (!flags) continue;
+        // (each place in memory once a frame: a ring of constants bound at many places gave its values again under each - round 2's first
+        // run filled the 65536 from 7 bindings)
+        if (!g_dump_seen.insert(reinterpret_cast<std::uintptr_t>(data) + offset).second) continue;
+        const std::uint32_t key = mix(slot, std::uint32_t(offset));
+        MatrixCandidate c{};
+        c.key = key; c.flags = flags;
+        std::memcpy(c.m, m, sizeof(c.m));
+        g_dump_found.push_back(c);
+    }
+}
+// An object's matrix (CameraDump=2): the three rows of a 3x4 - or the three columns of a 4x4 stored in columns, its move in the last
+// one - at right angles and of one length, finite, not the identity left in place. 4: the move in m[3], m[7], m[11]; 6: in m[12..14].
+// (The tolerance only sorts what is dumped: the dump is read offline)
+std::uint32_t object_form(const float* m) {
+    for (int i = 0; i < 16; ++i) if (!std::isfinite(m[i]) || std::fabs(m[i]) > 1e6f) return 0;
+    const float* r[3] = {m, m + 4, m + 8};
+    const auto dot = [](const float* a, const float* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+    const float s0 = dot(r[0], r[0]), s1 = dot(r[1], r[1]), s2 = dot(r[2], r[2]);
+    if (s0 < 1e-4f || s0 > 1e4f || std::fabs(s1 - s0) > 0.02f * s0 || std::fabs(s2 - s0) > 0.02f * s0) return 0;
+    if (std::fabs(dot(r[0], r[1])) > 0.02f * s0 || std::fabs(dot(r[0], r[2])) > 0.02f * s0 || std::fabs(dot(r[1], r[2])) > 0.02f * s0) return 0;
+    const bool columns = m[3] == 0.0f && m[7] == 0.0f && m[11] == 0.0f && m[15] == 1.0f;
+    const float tx = columns ? m[12] : m[3], ty = columns ? m[13] : m[7], tz = columns ? m[14] : m[11];
+    if (tx == 0.0f && ty == 0.0f && tz == 0.0f && m[0] == 1.0f && m[5] == 1.0f && m[10] == 1.0f) return 0;
+    return columns ? 6u : 4u;
+}
 std::uint64_t value_of(const float* m) {
     std::uint64_t value = 14695981039346656037ull;
     const auto* bytes = reinterpret_cast<const std::uint8_t*>(m);
@@ -516,12 +586,21 @@ void scan(const std::uint8_t* data, std::uint64_t size) {
     wc_copy(local, data, size);  // (at once: written-combined memory is read in one go, and the game writes on)
     for (std::uint64_t offset = 0; offset + 64 <= size; offset += 16) {
         const float* m = local + offset / 4;
-        if (!can_be_camera(m)) continue;
+        if (!can_be_camera(m)) {
+            if (g_dump == 2 && g_found_objects < kMatrixCandidates * 2)
+                if (const std::uint32_t form = object_form(m)) {
+                    Found f{std::uint32_t(offset), form, value_of(m), {}};
+                    std::memcpy(f.m, m, sizeof(f.m));
+                    g_found.push_back(f);
+                    ++g_found_objects;
+                }
+            continue;
+        }
         // Every value of the shape, however many a place holds in a frame, in the order they came. Clip w is the distance along the view, so one row of world to clip - the last,
         // or the last column when stored the other way round - is the camera's forward: length 1. (Keeping the first of a place, those that stay, 64 of them: Cyberpunk's
         // camera comes around the 900th, and not always first in its place: with those it was in what the presenter got on 12% of the frames that move, with none 75%.)
         const bool rows = unit_length(m[12], m[13], m[14]);
-        if (g_found.size() >= kMatrixCandidates * 4 || (!rows && !unit_length(m[3], m[7], m[11]))) continue;
+        if (g_found.size() - g_found_objects >= kMatrixCandidates * 4 || (!rows && !unit_length(m[3], m[7], m[11]))) continue;
         Found f{std::uint32_t(offset), rows ? 1u : 3u, value_of(m), {}};
         std::memcpy(f.m, m, sizeof(f.m));
         g_found.push_back(f);
@@ -529,15 +608,17 @@ void scan(const std::uint8_t* data, std::uint64_t size) {
 }
 // (under the lock) What a range holds, under a slot.
 void label(const Read& read, std::uint32_t slot) {
-    for (std::size_t i = read.first; i < read.first + read.count && g_raw.size() < kMatrixCandidates; ++i) {
+    for (std::size_t i = read.first; i < read.first + read.count; ++i) {
         const Found& f = g_found[i];
+        std::vector<MatrixCandidate>& to = (f.flags & 4) ? g_raw_objects : g_raw;
+        if (to.size() >= kMatrixCandidates) continue;
         const std::uint32_t key = mix(slot, f.offset);
         if (!g_labelled.insert(f.value ^ (std::uint64_t(key) * 0x9E3779B97F4A7C15ull)).second) continue;
         MatrixCandidate c{};
         c.key = key;
         c.flags = f.flags;
         std::memcpy(c.m, f.m, sizeof(c.m));
-        g_raw.push_back(c);
+        to.push_back(c);
     }
 }
 // (under the lock) The places held, wherever this slot would have them in what is bound to it.
@@ -566,6 +647,7 @@ void read_held(const std::uint8_t* data, std::uint64_t size, std::uint32_t slot)
 // (under the lock) What was bound or written just now, seen once.
 void read_now(const std::uint8_t* data, std::uint64_t size, std::uint32_t slot) {
     read_held(data, std::min(size, kRangeBytes), slot);
+    if (g_dump == 2) dump_read(data, size, slot);
     if (!g_searching.load(std::memory_order_relaxed) || !in_window()) return;
     Read read{g_found.size(), 0};
     scan(data, size);
@@ -622,6 +704,10 @@ void read_range(const buffer_range& r, std::uint32_t slot) {  // (under the lock
     const std::uint8_t* data = it->second.data + r.offset;
     const std::uint64_t there = std::min(it->second.size - r.offset, kRangeBytes);
     read_held(data, r.size == UINT64_MAX ? there : std::min(r.size, there), slot);
+    if (g_dump == 2) {
+        const std::uint64_t whole = std::min(it->second.size - r.offset, kDumpRangeBytes);
+        dump_read(data, r.size == UINT64_MAX ? std::min(whole, kRangeBytes) : std::min(r.size, whole), slot);  // (no size: a constant buffer's most, 64 KB)
+    }
     if (!g_searching.load(std::memory_order_relaxed) || !in_window()) return;
     auto seen = g_read.find(id);
     if (seen == g_read.end()) {
@@ -632,14 +718,47 @@ void read_range(const buffer_range& r, std::uint32_t slot) {  // (under the lock
     }
     label(seen->second, slot);
 }
+// (CameraDump=2) Direct3D 12's root buffer views (SetGraphicsRootShaderResourceView): where engines keep objects' and bones' transforms.
+// Which form ReShade hands them in is not documented for root views: a view first (its description says), else a range whose buffer is checked
+// to be a resource before anything is asked of it.
+bool is_resource(std::uint64_t handle) {
+    __try { return handle && reinterpret_cast<ID3D12Resource*>(handle)->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+void dump_root_views(device* dev, pipeline_layout layout, uint32_t param, const descriptor_table_update& update) {
+    std::unique_lock<std::mutex> lock(g_mutex, std::try_to_lock);
+    if (!lock) return;
+    g_dump_root_views += update.count;
+    const std::uint32_t base = mix(mix(9, layout_of(layout)), param);
+    for (uint32_t i = 0; i < update.count && i < 1; ++i) {  // (a root view is one)
+        buffer_range r{};
+        const resource_view view = static_cast<const resource_view*>(update.descriptors)[i];
+        const resource_view_desc vd = view.handle ? dev->get_resource_view_desc(view) : resource_view_desc{};
+        if (vd.type == resource_view_type::buffer) {
+            r.buffer = dev->get_resource_from_view(view);
+            r.offset = vd.buffer.offset;
+            r.size = vd.format == format::unknown ? std::uint64_t(vd.buffer.structured.count) * vd.buffer.structured.stride : vd.buffer.size;
+        } else {
+            r = *static_cast<const buffer_range*>(update.descriptors);
+            if (!is_resource(r.buffer.handle)) continue;
+        }
+        const Mapped m = mapped(dev, r.buffer);
+        if (!m.data || r.offset >= m.size) continue;
+        ++g_dump_root_read;
+        const std::uint64_t whole = std::min(m.size - r.offset, kDumpRangeBytes);
+        dump_read(m.data + r.offset, r.size == UINT64_MAX || r.size == 0 ? whole : std::min(r.size, whole), mix(base, i));
+    }
+}
 void on_push_descriptors(command_list* cmd, shader_stage stage, pipeline_layout layout, uint32_t param, const descriptor_table_update& update) {
     if (cmd) g_pushed_kind[std::uint32_t(update.type) & 15].fetch_add(update.count, std::memory_order_relaxed);
+    if (cmd && update.descriptors && g_dump == 2 && update.type == descriptor_type::buffer_shader_resource_view && cmd->get_device()->get_api() == device_api::d3d12)
+        dump_root_views(cmd->get_device(), layout, param, update);
     if (!cmd || !holds_ranges(update.type) || !update.descriptors) return;
     device* dev = cmd->get_device();
     // (Direct3D 11: every constant buffer is bound this way, *SetConstantBuffers, by stage; what it holds is the copy kept at its last write)
     const bool d3d11 = dev->get_api() == device_api::d3d11, vulkan = dev->get_api() == device_api::vulkan;
     if (update.type != descriptor_type::constant_buffer && !vulkan) return;
-    if ((!d3d11 && !vulkan && dev->get_api() != device_api::d3d12) || (g_budget_spent.load(std::memory_order_relaxed) && !g_held_count.load(std::memory_order_relaxed))) return;
+    if ((!d3d11 && !vulkan && dev->get_api() != device_api::d3d12) || (g_dump != 2 && g_budget_spent.load(std::memory_order_relaxed) && !g_held_count.load(std::memory_order_relaxed))) return;
     Timed timed(kPush);
     const auto* ranges = static_cast<const buffer_range*>(update.descriptors);
     const std::uint32_t base = d3d11 ? mix(mix(mix(6, layout_of(layout)), param), std::uint32_t(stage)) : mix(mix(2, layout_of(layout)), param);
@@ -670,7 +789,9 @@ bool on_update_tables(device* dev, uint32_t count, const descriptor_table_update
         tally(g_written, update.count);
         tally(g_written_kind[std::uint32_t(update.type) & 15], update.count);
         // (Vulkan: storage buffers too - Enshrouded has 3 uniform buffers and writes ten thousand storage buffer descriptors a frame)
-        const bool views = update.type == descriptor_type::constant_buffer || (vulkan && holds_ranges(update.type));
+        // (CameraDump=2: Direct3D 12's buffer views - structured, raw - too, as ranges)
+        const bool srvs = g_dump == 2 && !vulkan && (update.type == descriptor_type::shader_resource_view || update.type == descriptor_type::buffer_shader_resource_view);
+        const bool views = update.type == descriptor_type::constant_buffer || (vulkan && holds_ranges(update.type)) || srvs;
         Heap* h = heap_of(heap.handle, views);
         if (!h) continue;
         const auto* ranges = static_cast<const buffer_range*>(update.descriptors);
@@ -679,12 +800,25 @@ bool on_update_tables(device* dev, uint32_t count, const descriptor_table_update
             buffer_range* to = view_at(h, offset + i, views);
             if (!to) continue;
             if (!views) { to->buffer = {0}; continue; }
-            if (!vulkan && ranges[i].buffer.handle && ranges[i].buffer.handle != known) {
-                std::lock_guard<std::mutex> lock(g_mutex);
-                mapped(dev, ranges[i].buffer);
-                known = ranges[i].buffer.handle;
+            buffer_range range{};
+            if (srvs) {
+                const resource_view view = static_cast<const resource_view*>(update.descriptors)[i];
+                if (!view.handle) { to->buffer = {0}; continue; }
+                const resource_view_desc vd = dev->get_resource_view_desc(view);
+                if (vd.type != resource_view_type::buffer) { to->buffer = {0}; continue; }
+                range.buffer = dev->get_resource_from_view(view);
+                range.offset = vd.buffer.offset;
+                range.size = vd.format == format::unknown ? std::uint64_t(vd.buffer.structured.count) * vd.buffer.structured.stride : vd.buffer.size;
+                ++g_dump_srv_views;
+            } else {
+                range = ranges[i];
             }
-            *to = ranges[i];
+            if (!vulkan && range.buffer.handle && range.buffer.handle != known) {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                mapped(dev, range.buffer);
+                known = range.buffer.handle;
+            }
+            *to = range;
         }
     }
     return false;
@@ -717,7 +851,7 @@ bool on_copy_tables(device* dev, uint32_t count, const descriptor_table_copy* co
     return false;
 }
 void on_bind_tables(command_list* cmd, shader_stage, pipeline_layout layout, uint32_t first, uint32_t count, const descriptor_table* tables, uint32_t dynamic_count, const uint32_t*) {
-    if (!cmd || !tables || (g_budget_spent.load(std::memory_order_relaxed) && !g_held_count.load(std::memory_order_relaxed))) return;
+    if (!cmd || !tables || (g_dump != 2 && g_budget_spent.load(std::memory_order_relaxed) && !g_held_count.load(std::memory_order_relaxed))) return;
     device* dev = cmd->get_device();
     if (dev->get_api() != device_api::d3d12 && dev->get_api() != device_api::vulkan) return;
     // (Vulkan's dynamic offsets are not added: none in either game measured - counted, for the one that has them)
@@ -812,15 +946,63 @@ void on_destroy(device* dev, resource res) {
 }
 }  // namespace
 
-std::uint32_t take(MatrixCandidate* out, std::uint32_t capacity, const volatile long* held, long held_state) {
+std::uint32_t take(MatrixCandidate* out, std::uint32_t capacity, const volatile long* held, long held_state, std::uint64_t frame) {
     if (!g_on) return 0;
     std::lock_guard<std::mutex> lock(g_mutex);
     // (the places held first: the rest is cut at the capacity)
     const std::uint32_t h = std::uint32_t(std::min<std::size_t>(g_held_found.size(), capacity));
     std::copy(g_held_found.begin(), g_held_found.begin() + h, out);
-    const std::uint32_t n = h + std::uint32_t(std::min<std::size_t>(g_raw.size(), capacity - h));
+    // (CameraDump=2: every value found this frame to logs/camera_values.bin - 'XPAV', count, frame, the values - once a place is held)
+    if (g_dump == 2 && frame) {
+        if (!g_values_started && g_held_count.load(std::memory_order_relaxed)) {
+            g_values_started = true;
+            // (beside the add-on, else beside the game's exe; the path and the error said - the first try could not open it, unexplained)
+            std::string said;
+            for (int where = 0; where < 2 && !g_values_file; ++where) {
+                HMODULE self = nullptr;
+                wchar_t path[MAX_PATH]{};
+                if (where == 0 && !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&take), &self)) continue;
+                if (!GetModuleFileNameW(self, path, MAX_PATH)) continue;
+                std::wstring file = path;
+                file = file.substr(0, file.find_last_of(L"\\/")) + L"\\FrameWarp\\logs\\camera_values.bin";
+                g_values_file = _wfsopen(file.c_str(), L"wb", _SH_DENYNO);
+                const int error = errno;
+                char one[700];
+                std::snprintf(one, sizeof(one), " %ls (%s)", file.c_str(), g_values_file ? "opened" : std::strerror(error));
+                said += one;
+            }
+            reshade::log::message(reshade::log::level::info, (std::string("XPAR: camera search: CameraDump=2, every value found to") + said).c_str());
+        }
+        if (g_values_file) {
+            const std::uint32_t head[2] = {0x56415058u, std::uint32_t(g_dump_found.size())};
+            std::fwrite(head, sizeof(head), 1, g_values_file);
+            std::fwrite(&frame, sizeof(frame), 1, g_values_file);
+            std::fwrite(g_dump_found.data(), sizeof(MatrixCandidate), g_dump_found.size(), g_values_file);
+            g_values_bytes += 16 + std::uint64_t(head[1]) * sizeof(MatrixCandidate);
+            if (g_values_bytes > kDumpFileBytes) {
+                std::fclose(g_values_file);
+                g_values_file = nullptr;
+                reshade::log::message(reshade::log::level::info, "XPAR: camera search: logs/camera_values.bin written (3 GB)");
+            }
+        }
+        static std::uint32_t dump_frames = 0;
+        if (++dump_frames % 300 == 0) {
+            char text[300];
+            std::size_t objects = 0;
+            for (const MatrixCandidate& c : g_dump_found) objects += (c.flags & 4) ? 1 : 0;
+            std::snprintf(text, sizeof(text), "XPAR: camera search, CameraDump=2: this frame %llu KB in %llu ranges, %zu values, %zu of them object matrices; buffer views so far: %llu in tables, %llu root (%llu read)",
+                          static_cast<unsigned long long>(g_dump_bytes / 1024), static_cast<unsigned long long>(g_dump_ranges), g_dump_found.size(), objects,
+                          static_cast<unsigned long long>(g_dump_srv_views), static_cast<unsigned long long>(g_dump_root_views), static_cast<unsigned long long>(g_dump_root_read));
+            reshade::log::message(reshade::log::level::info, text);
+        }
+    }
+    // (CameraDump=2: the objects' after the camera's values, in at most half the room left)
+    const std::size_t room = capacity - h, objects_least = std::min(g_raw_objects.size(), room / 2);
+    const std::uint32_t n = h + std::uint32_t(std::min(g_raw.size(), room - objects_least));
     std::copy(g_raw.begin(), g_raw.begin() + (n - h), out + h);
-    if (g_budget_spent) { g_spent_frames.fetch_add(1, std::memory_order_relaxed); for (std::uint32_t i = 0; i < n; ++i) out[i].flags |= 8; }  // (for the dump: this frame was cut short)
+    const std::uint32_t objects = std::uint32_t(std::min(g_raw_objects.size(), std::size_t(capacity - n)));
+    std::copy(g_raw_objects.begin(), g_raw_objects.begin() + objects, out + n);
+    if (g_budget_spent) { g_spent_frames.fetch_add(1, std::memory_order_relaxed); for (std::uint32_t i = 0; i < n + objects; ++i) out[i].flags |= 8; }  // (for the dump: this frame was cut short)
     if (g_said < 60 && ++g_rotate % 300 == 150) {
         ++g_said;
         char text[1400];
@@ -882,6 +1064,9 @@ std::uint32_t take(MatrixCandidate* out, std::uint32_t capacity, const volatile 
         g_ticks = 0; g_written = 0; g_copied = 0; g_bound = 0; g_skipped = 0;
     }
     g_raw.clear();
+    g_raw_objects.clear();
+    g_found_objects = 0;
+    g_dump_found.clear(); g_dump_seen.clear(); g_dump_bytes = g_dump_ranges = 0;
     const bool held_read = !g_held_found.empty();
     g_held_found.clear();
     std::uint32_t count = 0, before[kHeld];
@@ -903,14 +1088,14 @@ std::uint32_t take(MatrixCandidate* out, std::uint32_t capacity, const volatile 
     g_reads_last = g_read_index;
     g_read_index = g_full_at = 0;
     // (nothing read from the places held - their slots are found again only by a search, and with nothing sent the presenter judges nothing: its last word stays)
-    g_searching = !count || held_state == 2 || !held_read || (held_state == 0 && ++frames % kSearchEvery < kSearchFrames);
+    g_searching = g_dump == 2 || !count || held_state == 2 || !held_read || (held_state == 0 && ++frames % kSearchEvery < kSearchFrames);
     if (g_searching) { g_search_frames.fetch_add(1, std::memory_order_relaxed); g_search_frames_parts.fetch_add(1, std::memory_order_relaxed); }
     g_found.clear();
     g_read.clear();
     g_labelled.clear();
     g_bytes = g_ranges = 0;
     g_budget_spent = false;
-    return n;
+    return n + objects;
 }
 
 void init() {
@@ -918,6 +1103,9 @@ void init() {
     size_t size = sizeof(value);
     g_on = reshade::get_config_value(nullptr, "FrameWarp", "CameraSearch", value, &size) && value[0] == '1';
     if (!g_on) return;
+    size = sizeof(value);
+    value[0] = 0;
+    if (reshade::get_config_value(nullptr, "FrameWarp", "CameraDump", value, &size)) g_dump = value[0] - '0';
     QueryPerformanceFrequency(&g_frequency);
     {
         LARGE_INTEGER a, b;

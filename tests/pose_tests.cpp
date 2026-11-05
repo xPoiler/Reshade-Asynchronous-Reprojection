@@ -15,6 +15,27 @@ static CameraBasis camera_at(double yaw, double pitch) {
     return apply_rotation(c, kUp, yaw, pitch, c.pos);
 }
 
+// An over-the-shoulder camera: it turns round a pivot beside and below the view axis (RE Requiem: ~4.3 units to the side at 16.9).
+// The measured pivot must land on it - the side and lift too, not only the distance.
+static void orbit_pivot_off_axis() {
+    PoseModel model;
+    PoseSettings ps;
+    ps.use_measured_orbit = true;
+    model.configure(ps);
+    const Vec3 pivot{500.0, -200.0, 150.0};
+    const double dist = 16.9, side = -4.3, lift = -1.5;
+    for (int i = 0; i < 400; ++i) {
+        const double t = i / 60.0;
+        const double yaw = 0.8 * std::sin(t * 2.1), pitch = 0.15 * std::sin(t * 1.3);
+        CameraBasis c = camera_at(yaw, pitch);
+        c.pos = pivot - c.fwd * dist - c.right * side - c.up * lift;
+        model.add_source(i + 1, t, t + 0.02, c, false, t + 0.02);
+    }
+    const double off = length(model.orbit_pivot() - pivot);
+    EXPECT(model.orbit() > 0 && off < 0.05 * dist, "off-axis pivot: distance %.2f side %.2f lift %.2f, %.2f from the true pivot", model.orbit(),
+           model.orbit_side(), model.orbit_lift(), off);
+}
+
 static void rotation_conventions() {
     const CameraBasis base = camera_at(0, 0);
     const CameraBasis turned = apply_rotation(base, kUp, 0.3, 0.0, base.pos);
@@ -420,6 +441,36 @@ static void controller_stick() {
     EXPECT(with_stick.first < without.first * 0.5, "the held stick predicts the camera clearly better than without it");
 }
 
+// Mouse and controller in one session (3 s of each in turn), with scripted camera swings now and then (a grab: the game turns
+// the camera 2 rad/s for half a second while the mouse barely moves). Both gains are learned, and the swings do not pull the
+// mouse gain up: stick stretches have no mouse counts and must not be taken for the game's own camera.
+static void mixed_input_and_swings() {
+    PoseModel model;
+    Game g; g.model = &model;
+    g.stick_gain_x = 2.5; g.stick_gain_y = -1.2;
+    for (int i = 0; i < 40000; ++i) {
+        const double phase = std::fmod(g.t, 6.0);
+        const bool stick = phase >= 3.0, swing = std::fmod(g.t, 13.0) < 0.5 && !stick;
+        g.sx = stick ? stick_x(g.t) : 0.0; g.sy = stick ? stick_y(g.t) : 0.0;
+        g.self_turn = swing ? 2.0 : 0.0;
+        const long dx = stick ? 0 : swing ? (report(g.t) ? 1 : 0) : pattern_x(g.t), dy = stick || swing ? 0 : pattern_y(g.t);
+        g.step(dx, dy);
+        if (i == 20000) model.fit();
+    }
+    model.fit();
+    const auto& x = model.params(0);
+    const auto& y = model.params(1);
+    std::printf("  mixed input: mouse gain yaw %g pitch %g (true %g %g), stick yaw %.2f curve %.0f, pitch %.2f curve %.0f rad/s (true %.2f %.2f, "
+                "curve %.0f)\n", x.gain, y.gain, g.gain_x, g.gain_y, x.stick_gain, x.stick_power, y.stick_gain, y.stick_power, g.stick_gain_x,
+                g.stick_gain_y, g.stick_power);
+    EXPECT(std::fabs(x.gain / g.gain_x - 1.0) < 0.2, "mouse yaw gain with stick play and swings (%g, true %g)", x.gain, g.gain_x);
+    EXPECT(std::fabs(x.stick_gain / g.stick_gain_x - 1.0) < 0.25, "stick yaw gain with mouse play (%.2f, true %.2f)", x.stick_gain, g.stick_gain_x);
+    // (the pitch stick held about half way: judged through the curve tried, its movement fell short for the squared curve and the
+    // straight one won - gain 0.52 of 1.20)
+    EXPECT(std::fabs(y.stick_gain / g.stick_gain_y - 1.0) < 0.25 && y.stick_power == g.stick_power, "stick pitch gain and curve with mouse play "
+           "(%.2f curve %.0f, true %.2f curve %.0f)", y.stick_gain, y.stick_power, g.stick_gain_y, g.stick_power);
+}
+
 // The presenter fits on a worker thread: same parameters as the fit done right away, mouse and stick.
 static void worker_fit_matches() {
     auto run = [](bool async_fit, bool stick) {
@@ -459,6 +510,8 @@ int main() {
     mouse_ignored_in_menus();
     gain_survives_menus();
     controller_stick();
+    mixed_input_and_swings();
+    orbit_pivot_off_axis();
     worker_fit_matches();
     if (failures) { std::printf("%d failure(s)\n", failures); return 1; }
     std::printf("pose tests passed\n");

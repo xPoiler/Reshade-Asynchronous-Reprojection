@@ -10,6 +10,9 @@ namespace fw {
 // motion vectors: a frame an upscaler gives them (a DLSS or FSR call, Streamline depth) ends the feed
 // at once, and it comes back 600 frames after the last one (the upscaler switched off in the game).
 void install_reshade_feed(Producer* producer);
+// (StencilDump=1, development: see reshade_feed.cpp)
+void register_stencil_dump_events();
+void unregister_stencil_dump_events();
 // addon_event::reshade_finish_effects / reshade_reloaded_effects.
 void on_reshade_finish_effects(reshade::api::effect_runtime* runtime, reshade::api::command_list* cmd_list,
                                reshade::api::resource_view rtv, reshade::api::resource_view rtv_srgb);

@@ -119,6 +119,26 @@ public:
         while (!open_frames_.empty() && open_frames_.front() <= frame) open_frames_.erase(open_frames_.begin());
     }
     // Records a copy of one tagged buffer for `frame` into the game's command list.
+    // (StencilDump=1: the stencil of the depth buffer ReShade hands its effects - the game's own, with its stencil plane; an upscaler's depth is a copy without)
+    // (the game's depth-stencil as the game stops drawing into it - snapshot k of frame - see reshade_feed.cpp's stencil hooks)
+    void dump_stencil(std::uint64_t frame, std::uint32_t k, ID3D12Resource* depth, D3D12_RESOURCE_STATES state, ID3D12GraphicsCommandList* list) {
+        std::lock_guard lock(mutex_);
+        ++stencil_frames_;
+        if (ready() && depth && list && device_) stencil_dump(frame, k, depth, state, list);
+    }
+    void collect_stencil() { std::lock_guard lock(mutex_); stencil_collect(); }
+    // StencilMask=1 (development): the game's depth-stencil's stencil as the game stops drawing into it, every frame - handed to the
+    // presenter with the depth (kStencil, see on_tag)
+    void stage_stencil(ID3D12Resource* depth, ID3D12GraphicsCommandList* list) { std::lock_guard lock(mutex_); stencil_stage(depth, list); }
+    // (for the log: copies made, waiting, written; the GPU's fence against ours; the last depth's format)
+    std::string stencil_status() {
+        std::lock_guard lock(mutex_);
+        char t[200];
+        std::snprintf(t, sizeof(t), "calls %llu, copies %d, waiting %zu, written %d, not mapped %d, fence %llu of %llu, depth format %u",
+                      (unsigned long long)stencil_frames_, stencil_dumps_, stencil_reads_.size(), stencil_written_, stencil_failed_,
+                      (unsigned long long)(fence_ ? fence_->GetCompletedValue() : 0), (unsigned long long)fence_value_, stencil_format_);
+        return t;
+    }
     void on_tag(std::uint64_t frame, Tex kind, ID3D12Resource* source, D3D12_RESOURCE_STATES state,
                 std::uint32_t ext_x, std::uint32_t ext_y, std::uint32_t ext_w, std::uint32_t ext_h,
                 ID3D12GraphicsCommandList* list);
@@ -343,6 +363,23 @@ private:
     std::uint64_t fence_value_ = 0;
     Texture textures_[kSlots][kTexCount];
     std::vector<Retired> retired_;
+    // (StencilDump=1, development - plan_character_coordinates.md: the depth's stencil, every 60th frame up to 40, to logs/stencil_<frame>.bin:
+    // whether the game marks its characters there. Read back once the GPU is past it)
+    struct StencilRead { Microsoft::WRL::ComPtr<ID3D12Resource> buffer; std::uint64_t after = 0, frame = 0; std::uint32_t w = 0, h = 0, pitch = 0, k = 0; std::uint64_t offset = 0; };
+    std::vector<StencilRead> stencil_reads_;
+    int stencil_dumps_ = 0, stencil_tags_ = 0;
+    std::uint64_t stencil_frames_ = 0;
+    int stencil_written_ = 0, stencil_failed_ = 0;
+    unsigned stencil_format_ = 0;
+    void stencil_dump(std::uint64_t frame, std::uint32_t k, ID3D12Resource* source, D3D12_RESOURCE_STATES state, ID3D12GraphicsCommandList* list);
+    void stencil_collect();
+    // (StencilMask=1: the stencil kept for the frame's depth tag - its plane's footprint; staged: copied since the last tag)
+    Microsoft::WRL::ComPtr<ID3D12Resource> stencil_stage_;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT stencil_fp_{};
+    std::uint64_t stencil_stage_bytes_ = 0;
+    bool stencil_staged_ = false;
+    void stencil_stage(ID3D12Resource* source, ID3D12GraphicsCommandList* list);
+    void stencil_hand(int slot, ID3D12GraphicsCommandList* list, const D3D12_RESOURCE_DESC& depth);
     std::uint64_t pending_present_frame_ = 0;  // from the PCL present-start marker
     bool have_present_marker_ = false;
     std::uint64_t sim_start_frame_[64]{};

@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 87;
+constexpr std::uint32_t kVersion = 88;
 // (four: the presenter taking one in, one ready, and the add-on writing two - a game that starts its next frame before
 // the last one is presented (its tags and constants come first: Cyberpunk, Enshrouded) has two being written. Three
 // slots, 2026-10-28, dropped 43-55% of their frames before the presenter saw them - the reprojection fed at half the
@@ -24,10 +24,12 @@ constexpr int kSlots = 4;
 // kHudProbe: HUD learning (hud_learn.hpp) - where the final picture differs from a copy of it taken at one candidate point
 // of the frame (R8, 1 differs), for scoring only (SlotMeta::hud_candidate).
 // kMotionProbe: the motion search (motion_search.hpp) - one of the game's render targets, tried as its motion vectors.
-enum Tex : int { kBackbuffer = 0, kHudless, kUi, kDepth, kMotion, kScene, kGen0, kGen1, kGen2, kHudProbe, kMotionProbe, kTexCount };
+// kStencil: the stencil of the game's depth-stencil (R8, StencilMask=1, development - see Producer::stencil_stage): where the game marks its
+// characters, for the character mask (Renderer::stencil_character).
+enum Tex : int { kBackbuffer = 0, kHudless, kUi, kDepth, kMotion, kScene, kGen0, kGen1, kGen2, kHudProbe, kMotionProbe, kStencil, kTexCount };
 constexpr int kMaxGenerated = 3;
 inline const char* tex_name(int t) {
-    static const char* n[] = {"backbuffer", "hudless", "ui", "depth", "motion", "scene", "gen0", "gen1", "gen2", "hudprobe", "motionprobe"};
+    static const char* n[] = {"backbuffer", "hudless", "ui", "depth", "motion", "scene", "gen0", "gen1", "gen2", "hudprobe", "motionprobe", "stencil"};
     return t >= 0 && t < kTexCount ? n[t] : "?";
 }
 
@@ -212,6 +214,9 @@ struct PresenterStatus {
     // behaving like a HUD (0: none) - the add-on learns again.
     std::uint32_t hud_learn_pick, hud_learn_fail;
     std::uint32_t waiting_for_model;  // 1: the game's own frames shown while the camera model learns (Settings::wait_for_model)
+    // Where the character mask comes from (the panel says it): 0 estimated from the motion, 1 the game's depth-stencil marks the character
+    // (StencilMask=1, development - Renderer::stencil_character)
+    std::uint32_t character_source;
 };
 
 struct HookStats {

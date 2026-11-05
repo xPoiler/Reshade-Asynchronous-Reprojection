@@ -151,7 +151,7 @@ struct SequenceRecorder {
                     if (it != lines.end()) { line = std::move(it->second); lines.erase(lines.begin(), std::next(it)); }
                 }
                 if (line.empty()) continue;
-                bytes += f.colour.size() + f.depth.size() + f.motion.size() + f.ui.size();
+                bytes += f.colour.size() + f.depth.size() + f.motion.size() + f.ui.size() + f.stencil.size();
                 clip.emplace_back(std::move(line), std::move(f));
                 if (bytes > kRecMaxBytes) active = false;
                 continue;
@@ -189,6 +189,12 @@ struct SequenceRecorder {
                 for (int k = 0; k < 4; ++k) if (!blocks[k]->empty()) std::fwrite(blocks[k]->data(), 1, blocks[k]->size(), out);
                 std::fclose(out);
                 written += sizeof(head) + sizeof(sizes) + sizes[0] + sizes[2] + sizes[4] + sizes[6];
+            }
+            // (StencilMask=1: the game's stencil on the depth's grid, a byte a pixel - seq_replay reads it when it is there)
+            if (!f.stencil.empty() && _wfopen_s(&out, (dir / (L"stencil_" + std::to_wstring(i) + L".bin")).c_str(), L"wb") == 0 && out) {
+                std::fwrite(f.stencil.data(), 1, f.stencil.size(), out);
+                std::fclose(out);
+                written += f.stencil.size();
             }
             clip[i].second = RecordedFrame{};  // (its memory back as soon as it is written)
         }
@@ -311,7 +317,7 @@ void open_recordings() {
         }
         g_app.csv_outputs = open_csv(L"outputs.csv",
             "qpc,source_frame,warped,yaw,pitch,horizon_ms,gpu_ms,mark,t_submit,t_gpu_start,t_gpu_end,last_present,present_count,present_refresh,"
-            "sync_refresh,sync_qpc,stats_hr,t_wake,cam_x,cam_y,cam_z,cam_fx,cam_fy,cam_fz,orbit_used,orbit_learned,orbit_consistent");
+            "sync_refresh,sync_qpc,stats_hr,t_wake,cam_x,cam_y,cam_z,cam_fx,cam_fy,cam_fz,orbit_used,orbit_learned,orbit_consistent,orbit_side,orbit_lift");
     }
     g_recording.store(true, std::memory_order_release);
 }
@@ -1239,7 +1245,10 @@ void render_thread() {
                         const double t0 = now_seconds();
                         // The camera search (camera_search.hpp). What moved is compared with the motion measured, before CameraUse puts anything in its place: judged against
                         // what it predicts itself, it scored 1.00 whatever it was. On its own thread: over 20 ms a frame in the intake was a shake when running in Cyberpunk.
-                        const std::uint32_t camera_count = std::min(m.matrices, kMatrixCandidates);
+                        const std::uint32_t camera_all = std::min(m.matrices, kMatrixCandidates);
+                        // (CameraDump=2: the objects' matrices come after the camera's values - flags 4 - for the dump alone)
+                        std::uint32_t camera_count = camera_all;
+                        while (camera_count && (m.matrix[camera_count - 1].flags & 4)) --camera_count;
                         camera_some.clear();
                         for (std::size_t i = 0; i < motion_samples.size(); i += 8) if (motion_samples[i].valid > 0.5f) { const MotionSample& p = motion_samples[i]; camera_some.push_back({p.x, p.y, p.mx, p.my, p.depth}); }
                         std::vector<float> camera_values;
@@ -1265,13 +1274,15 @@ void render_thread() {
                             camera_worker.start();
                         }
                         // (CameraDump=1: every candidate of each frame and the motion measured, for dev/camera_dump.py: what pairs with what can be tried on it without the game)
-                        if (camera_dump && camera_count && !camera_dumped) {
-                            const std::uint32_t head[4] = {0x4D414358u, camera_count, static_cast<std::uint32_t>(camera_some.size()), 0};
+                        // (only frames that moved, with the motion to judge by: started at once, the dumps of Cyberpunk and Requiem were their loading and menus,
+                        // 320 MB without a point. The last word: 1 when the motion is XPAR's estimate, not the game's vectors)
+                        if (camera_dump && camera_all && !camera_dumped && camera_some.size() >= 32 && camera_moving_now) {
+                            const std::uint32_t head[4] = {0x4D414358u, camera_all, static_cast<std::uint32_t>(camera_some.size()), s.motion_estimated ? 1u : 0u};
                             const double place[3] = {double(m.frame_id), rw, rh};
                             const auto put = [&](const void* data, std::size_t bytes) { const auto* b = static_cast<const std::uint8_t*>(data); camera_bytes.insert(camera_bytes.end(), b, b + bytes); };
                             put(head, sizeof(head)); put(place, sizeof(place));
                             put(camera_some.data(), camera_some.size() * sizeof(CameraSearch::Point));
-                            put(m.matrix, camera_count * sizeof(MatrixCandidate));
+                            put(m.matrix, camera_all * sizeof(MatrixCandidate));
                             if (camera_bytes.size() > 320u * 1024 * 1024) {
                                 camera_dumped = true;
                                 if (FILE* f = _wfsopen((g_app.data_dir / L"logs" / L"camera_dump.bin").c_str(), L"wb", _SH_DENYNO)) { std::fwrite(camera_bytes.data(), 1, camera_bytes.size(), f); std::fclose(f); }
@@ -1502,6 +1513,31 @@ void render_thread() {
                 renderer.analyze_motion(s, cam.clip_to_prev_clip, float(mv_scale.scale(0, s.depth_rect.w)),
                                         float(mv_scale.scale(1, s.depth_rect.h)), mv_scale.valid, cam.depth_inverted != 0,
                                         settings.near_camera_rule != 0, settings.turn_rule != 0, m.frame_id, floor_pivot_depth);
+                // (StencilMask=1, development: the character from the game's stencil - see Renderer::stencil_character)
+                static const bool stencil_mask = GetEnvironmentVariableW(L"FW_STENCIL_MASK", nullptr, 0) != 0;
+                if (stencil_mask)
+                    renderer.stencil_character(s, cam.view_to_clip, cam.clip_to_prev_clip, float(mv_scale.scale(0, s.depth_rect.w)), float(mv_scale.scale(1, s.depth_rect.h)),
+                                               mv_scale.valid, cam.depth_inverted != 0);
+                sh.presenter.character_source = stencil_mask ? renderer.character_source() : 0u;
+                if (stencil_mask) {  // (development: how often the stencil came, and the character was found - and each switch, why)
+                    static std::uint64_t last_frame = 0;
+                    static int frames = 0, without = 0, found = 0, gaps = 0;
+                    static bool was_found = false;
+                    ++frames;
+                    if (!s.has_stencil) ++without;
+                    if (last_frame && m.frame_id != last_frame + 1) ++gaps;
+                    last_frame = m.frame_id;
+                    const bool now = renderer.character_source() == 1;
+                    if (now) ++found;
+                    if (now != was_found)
+                        logf("stencil: %s at frame %llu (stencil %s, %s)", now ? "found" : "lost", static_cast<unsigned long long>(m.frame_id),
+                             s.has_stencil ? "in" : "missing", renderer.stencil_report().c_str());
+                    was_found = now;
+                    if (frames == 300) {
+                        logf("stencil: of 300 frames taken in, %d without the stencil, %d found, %d after a game frame skipped", without, found, gaps);
+                        frames = without = found = gaps = 0;
+                    }
+                }
                 renderer.score_hud_probe(s, cam.clip_to_prev_clip);  // (HUD learning: see hud_learn.hpp)
                 sh.presenter.hud_learn_pick = renderer.hud_learn_pick();
                 sh.presenter.hud_learn_fail = renderer.hud_learn_fail();
@@ -1641,7 +1677,7 @@ void render_thread() {
                         sh.presenter.layer_trust = std::uint32_t(trust);
                     }
                     // (for the panel: where the HUD comes from - a checked layer the game hides counts as its HUD layer)
-                    const bool own_layer = (s.has_ui && !s.has_hudless && trust != 2) || (!s.has_ui && !s.has_hudless && trust == 1);
+                    const bool own_layer = (s.has_ui && !s.has_hudless && trust != 2) || (!s.has_ui && !s.has_hudless && renderer.layer_hides_hud() && (trust == 1 || !s.has_scene));
                     sh.presenter.hud_source = !hud_mask ? (game_has_hud_layers ? 1u : 0u) : s.has_hudless && !s.has_ui ? 2u
                                               : own_layer ? (s.hud_learned ? 7u : 3u)
                                               : settings.hud_from_scene && s.has_scene ? (settings.hud_from_scene == 2 ? 5u : 4u) : 6u;
@@ -2292,12 +2328,12 @@ void render_thread() {
             // (the displayed camera too: position and forward, in the game's world; and the orbit pivot - the distance the turn
             // is predicted around, the one measured, the one the recent turns agree on - see PoseModel::orbit)
             const auto& dc = applied.camera;
-            wr(g_app.csv_outputs, "%lld,%llu,%d,%.6f,%.6f,%.4f,%.3f,%d,%lld,%lld,%lld,%u,%u,%u,%u,%lld,%ld,%lld,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f,%.4f,%.4f,%.4f\n",
+            wr(g_app.csv_outputs, "%lld,%llu,%d,%.6f,%.6f,%.4f,%.3f,%d,%lld,%lld,%lld,%u,%u,%u,%u,%lld,%ld,%lld,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
                          qpc_now(), static_cast<unsigned long long>(source_frame), same_picture ? 2 : int(warped), applied.yaw, applied.pitch,
                          applied.horizon * 1000.0, renderer.last_gpu_ms(), mark, tm.submit, tm.gpu_start, tm.gpu_end, pstats.last_present_count,
                          pstats.present_count, pstats.present_refresh, pstats.sync_refresh, pstats.sync_qpc, static_cast<long>(pstats.hr), wake_qpc,
                          dc.pos.x, dc.pos.y, dc.pos.z, dc.fwd.x, dc.fwd.y, dc.fwd.z, g_app.model.orbit(), g_app.model.learned_orbit(),
-                         g_app.model.consistent_orbit());
+                         g_app.model.consistent_orbit(), g_app.model.orbit_side(), g_app.model.orbit_lift());
         }
         record_timeline(sh, settings);
         // (a refresh: a present, or with pacing a refresh that keeps the same picture - not the 1 ms polls of the

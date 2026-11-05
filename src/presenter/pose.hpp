@@ -485,6 +485,11 @@ public:
         if (settings_.orbit_distance > 0) return settings_.orbit_distance;
         return settings_.use_measured_orbit ? orbit_used_ : 0.0;
     }
+    // The pivot's offset beside (right) and above (up) the view axis, with the measured pivot only (a manual distance is on the axis).
+    double orbit_side() const { return settings_.orbit_distance <= 0 && settings_.use_measured_orbit ? orbit_side_used_ : 0.0; }
+    double orbit_lift() const { return settings_.orbit_distance <= 0 && settings_.use_measured_orbit ? orbit_lift_used_ : 0.0; }
+    // The point the turn is predicted around (the camera itself without an orbit).
+    Vec3 orbit_pivot() const { return src_.basis.pos + src_.basis.fwd * orbit() + src_.basis.right * orbit_side() + src_.basis.up * orbit_lift(); }
     double learned_orbit() const { return orbit_fit_; }
     // The measured pivot when the recent turns agree on one (0: they do not - a first-person camera).
     double consistent_orbit() const { return orbit_consistent_; }
@@ -495,7 +500,8 @@ public:
     void reset_history() {
         frames_.clear(); since_fit_ = 0; up_ = WorldUp{}; have_source_ = false; follows_ = true;
         blend_[0] = blend_[1] = 0; blend_pos_ = {}; velocity_ = {};
-        orbit_num_ = orbit_den_ = orbit_fit_ = 0; orbit_samples_.clear(); orbit_consistent_ = orbit_used_ = 0; orbit_active_ = false;
+        orbit_num_ = orbit_den_ = orbit_fit_ = 0; orbit_samples_.clear(); orbit_moves_.clear(); orbit_consistent_ = orbit_used_ = 0; orbit_active_ = false;
+        orbit_side_consistent_ = orbit_lift_consistent_ = orbit_side_used_ = orbit_lift_used_ = 0;
         intervals_.clear(); frame_interval_ = 0; latencies_.clear();
     }
 
@@ -516,6 +522,7 @@ public:
 
         // Yaw is unwrapped against the previous frame; only consecutive, cut-free frames feed the fit.
         Frame f{id, t, {0, elevation(camera.fwd, world_up)}, gate_ && camera_trusted_, camera.fwd, false, camera.pos, epoch};
+        f.right = camera.right; f.up = camera.up;
         if (!frames_.empty()) {
             const Frame& prev = frames_.back();
             const double dyaw = yaw_between(prev.fwd, camera.fwd, world_up);
@@ -560,7 +567,8 @@ public:
                     const Vec3 rest = moved - u * r;
                     if (1.0 - dot(rest, rest) / mm >= 0.9) {
                         orbit_samples_.push_back(r);
-                        if (orbit_samples_.size() > 60) orbit_samples_.pop_front();
+                        orbit_moves_.push_back({a.right - f.right, a.up - f.up, u, moved});
+                        if (orbit_samples_.size() > 60) { orbit_samples_.pop_front(); orbit_moves_.pop_front(); }
                     }
                 }
                 if (orbit_samples_.size() >= 60) {
@@ -570,11 +578,46 @@ public:
                     orbit_active_ = median > 0 && spread < (orbit_active_ ? 0.25 : 0.15);
                     orbit_consistent_ = orbit_active_ ? median : 0.0;
                     if (orbit_active_) orbit_seen_t_ = t;
+                    // The pivot beside and above the view axis (an over-the-shoulder camera turns round the character, not round
+                    // the point straight ahead): least squares over the same turns, pos_b - pos_a = (B_a - B_b) (side, lift,
+                    // distance), the distance held at the median above. RE Requiem's recordings (seq_10..12): one pivot (-4.3, ~0,
+                    // 16.9) explains ~100% of the turns' moves, the axis alone 92-96%; Leon then 2-9 px off a turn's frame at 4K
+                    // instead of ~10. (A yaw turn alone says nothing about the lift - the 1e-6 keeps the solve defined and it at 0.)
+                    double side = 0, lift = 0, dist = median;
+                    if (orbit_active_) {
+                        // (normal equations of the three together; a small pull towards the axis pivot (0, 0, median) keeps them
+                        // defined when a direction is not turned in - a yaw alone says nothing of the lift)
+                        double n[3][3] = {}, b[3] = {};
+                        for (const OrbitMove& o : orbit_moves_) {
+                            const Vec3 c[3] = {o.d_right, o.d_up, o.d_fwd};
+                            for (int i = 0; i < 3; ++i) { b[i] += dot(c[i], o.moved); for (int j = 0; j < 3; ++j) n[i][j] += dot(c[i], c[j]); }
+                        }
+                        const double reg = 1e-6 * (n[0][0] + n[1][1] + n[2][2]) + 1e-30;
+                        for (int i = 0; i < 3; ++i) n[i][i] += reg;
+                        b[2] += reg * median;
+                        const double det = n[0][0] * (n[1][1] * n[2][2] - n[1][2] * n[2][1]) - n[0][1] * (n[1][0] * n[2][2] - n[1][2] * n[2][0]) +
+                                           n[0][2] * (n[1][0] * n[2][1] - n[1][1] * n[2][0]);
+                        if (std::fabs(det) > 1e-300) {
+                            double x[3];
+                            for (int k = 0; k < 3; ++k) {  // (Cramer)
+                                double m[3][3];
+                                for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) m[i][j] = j == k ? b[i] : n[i][j];
+                                x[k] = (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+                                        m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])) / det;
+                            }
+                            if (x[2] > 0) { side = x[0]; lift = x[1]; dist = x[2]; }
+                        }
+                    }
+                    orbit_side_consistent_ = side; orbit_lift_consistent_ = lift;
+                    orbit_consistent_ = orbit_active_ ? dist : 0.0;
                 }
-                orbit_used_ += (orbit_consistent_ - orbit_used_) * std::clamp(src_.dt / 0.3, 0.0, 1.0);
+                const double glide = std::clamp(src_.dt / 0.3, 0.0, 1.0);
+                orbit_used_ += (orbit_consistent_ - orbit_used_) * glide;
+                orbit_side_used_ += ((orbit_active_ ? orbit_side_consistent_ : 0.0) - orbit_side_used_) * glide;
+                orbit_lift_used_ += ((orbit_active_ ? orbit_lift_consistent_ : 0.0) - orbit_lift_used_) * glide;
             }
             // Translation the orbit does not explain (walking, camera lag) becomes a velocity.
-            const Vec3 residual = (moved - u * orbit()) * (1.0 / src_.dt);
+            const Vec3 residual = (moved - u * orbit() - (a.right - f.right) * orbit_side() - (a.up - f.up) * orbit_lift()) * (1.0 / src_.dt);
             const double a_v = std::clamp(src_.dt / 0.05, 0.0, 1.0);
             velocity_ = velocity_ + (residual - velocity_) * a_v;
             for (int k = 0; k < 2; ++k) { src_.w[k] = (f.theta[k] - a.theta[k]) / src_.dt; src_.prev_theta[k] = a.theta[k]; }
@@ -635,7 +678,7 @@ public:
         if (r > 0) {
             double th[2];
             theta_at(tau, th);
-            const Vec3 pv = src_.basis.pos + src_.basis.fwd * r;
+            const Vec3 pv = orbit() > 0 ? orbit_pivot() : src_.basis.pos + src_.basis.fwd * r + src_.basis.right * orbit_side_used_ + src_.basis.up * orbit_lift_used_;
             moved = moved - (apply_rotation(src_.basis, world_up, th[0] - src_.theta[0], th[1] - src_.theta[1], pv).pos - src_.basis.pos);
             if (orbit() <= 0) moved = moved + (apply_rotation(src_.basis, world_up, delta[0], delta[1], pv).pos - src_.basis.pos);
         }
@@ -674,8 +717,7 @@ public:
             }
             const double fade = std::exp(-(now - blend_t_) / std::max(settings_.blend_tau, 1e-4));
             for (int k = 0; k < 2; ++k) delta[k] = theta[k] - src_.theta[k] + blend_[k] * fade;
-            const Vec3 pivot = src_.basis.pos + src_.basis.fwd * orbit();
-            out.camera = apply_rotation(src_.basis, up_.get(), delta[0], delta[1], pivot);
+            out.camera = apply_rotation(src_.basis, up_.get(), delta[0], delta[1], orbit_pivot());
             // (the position as below, not at the turn's time: the two ways round here took turns from one game frame to the next
             // as the displayed time crossed the newest frame, a frame's movement apart - RE2's scenery wobbled walking, up to 8
             // units back and forth a refresh, and a turn starting after a pause smeared across the screen, 2026-10-30)
@@ -716,8 +758,7 @@ public:
             blended[k] = blend_[k] * fade;
             delta[k] += blended[k];
         }
-        const Vec3 pivot = src_.basis.pos + src_.basis.fwd * orbit();
-        out.camera = apply_rotation(src_.basis, up_.get(), delta[0], delta[1], pivot);
+        out.camera = apply_rotation(src_.basis, up_.get(), delta[0], delta[1], orbit_pivot());
         out.camera.pos = out.camera.pos + shown_movement(delta) + blend_pos_ * std::exp(-(now - blend_t_) / std::max(settings_.blend_tau, 1e-4));
         out.yaw = delta[0]; out.pitch = delta[1]; out.horizon = h;
         // The input's part (the follow share's two parts, see Settings::share_from_input): the mouse and the stick, and the
@@ -914,6 +955,50 @@ private:
                 s = e + 1;
             }
         }
+        // ...and the other way round: half-second stretches where the camera turned four times what the mouse explains or more - a
+        // camera the game moves itself while the mouse barely moves: Requiem's grab swung it 60 degrees in half a second against a
+        // few counts of mouse; fitted on, the yaw gain more than doubled and the camera shook with every turn until a minute of
+        // turning brought it back. Judged against the turn per count typical of this history (the median over the stretches with
+        // the most mouse movement), not the model's gain: a gain learned too small took every real turn for one of these and
+        // could never grow again. (Four times, a quarter degree: stopgaps, as the rule above.)
+        if (!frames.empty()) {
+            MouseCursor m0{job.mouse_t, job.mouse_v[0]}, m1{job.mouse_t, job.mouse_v[1]};
+            struct Stretch { std::size_t s, e; double counts, turned; bool stick; };
+            // (the right stick moved during the stretch or held from before it - the no-input rule's test: a turn the stick explains is
+            // no camera of the game's own, and judged by the mouse alone every stick turn was one)
+            auto stick_moved = [&](double t0, double t1) {
+                const auto first = std::upper_bound(job.stick_t.begin(), job.stick_t.end(), t0) - job.stick_t.begin();
+                for (std::ptrdiff_t j = std::max<std::ptrdiff_t>(first - 1, 0); j < std::ptrdiff_t(job.stick_t.size()) && job.stick_t[j] <= t1; ++j)
+                    if (std::fabs(job.stick_v[0][j]) > 0.15 || std::fabs(job.stick_v[1][j]) > 0.15) return true;
+                return false;
+            };
+            std::vector<Stretch> stretches;
+            std::size_t s = 0;
+            while (s < frames.size()) {
+                std::size_t e = s;
+                while (e + 1 < frames.size() && frames[e + 1].consecutive && frames[e + 1].t - frames[s].t <= 0.5) ++e;
+                if (e > s) {
+                    const double x = m0.sum(frames[s].t, frames[e].t, frames[e].t, 0.0), y = m1.sum(frames[s].t, frames[e].t, frames[e].t, 0.0);
+                    const double dx = frames[e].theta[0] - frames[s].theta[0], dy = frames[e].theta[1] - frames[s].theta[1];
+                    stretches.push_back({s, e, std::sqrt(x * x + y * y), std::sqrt(dx * dx + dy * dy), stick_moved(frames[s].t, frames[e].t)});
+                }
+                s = e + 1;
+            }
+            std::vector<double> counts;
+            for (const Stretch& st : stretches) if (st.counts > 0) counts.push_back(st.counts);
+            if (counts.size() >= 8) {
+                std::nth_element(counts.begin(), counts.begin() + counts.size() / 2, counts.end());
+                const double busy = counts[counts.size() / 2];
+                std::vector<double> ratios;
+                for (const Stretch& st : stretches) if (st.counts >= busy && st.counts > 0 && !st.stick) ratios.push_back(st.turned / st.counts);
+                if (!ratios.empty()) std::nth_element(ratios.begin(), ratios.begin() + ratios.size() / 2, ratios.end());
+                const double typical = ratios.empty() ? 0.0 : ratios[ratios.size() / 2], quarter_degree = 0.25 * 3.14159265358979 / 180.0;
+                if (typical > 0)
+                    for (const Stretch& st : stretches)
+                        if (!st.stick && st.turned >= quarter_degree && st.turned > 4.0 * typical * st.counts)
+                            for (std::size_t i = st.s; i <= st.e; ++i) frames[i].gate = false;
+            }
+        }
         // Frames where the camera turned with no input at all for half a second before (a car's steering, a camera turning by
         // itself) are left out too: no input explains them, and they pulled the smoothing and delay - and with them the gain -
         // off (Cyberpunk while driving: yaw gain 10x too small, pitch to 0). A smoothed camera finishing the input's turn is
@@ -971,6 +1056,10 @@ private:
                         if (pi > 0 && !stick_used) break;  // (no stick input: the curve does not matter)
                         MouseCursor mc{job.mouse_t, job.mouse_v[k]};
                         StickCursor sc{job.stick_t, curved[pi]};
+                        // (enough stick movement to trust a gain: judged on the deflection itself, the same for every curve. Through
+                        // the curve tried, a stick held about half way - 0.5, squared 0.25 - fell under it for the squared and cubed
+                        // curves only: they went without the stick, the straight one won by default and the gain came out at 40%)
+                        StickCursor raw{job.stick_t, curved[0]};
                         double suy = 0, suu = 0, syy = 0, excitation = 0, hold = 0;
                         double svy = 0, svv = 0, suv = 0, stick_excitation = 0;
                         int n = 0;
@@ -984,7 +1073,8 @@ private:
                             suy += u * y; suu += u * u; syy += y * y; excitation += std::fabs(u);
                             if (stick_used) {
                                 const double v = sc.sum(b.t + d, c.t + d, c.t + d, tau);
-                                svy += v * y; svv += v * v; suv += u * v; stick_excitation += std::fabs(v);
+                                svy += v * y; svv += v * v; suv += u * v;
+                                stick_excitation += std::fabs(pi == 0 ? v : raw.sum(b.t + d, c.t + d, c.t + d, tau));
                             }
                             hold += (c.theta[k] - b.theta[k]) * (c.theta[k] - b.theta[k]);
                             ++n;
@@ -1085,6 +1175,7 @@ private:
         bool consecutive = false;
         Vec3 pos{};
         std::uint32_t epoch = 0;
+        Vec3 right{}, up{};
     };
     struct Source {
         double t = 0;
@@ -1111,6 +1202,9 @@ private:
     double orbit_num_ = 0, orbit_den_ = 0, orbit_fit_ = 0;
     std::deque<double> orbit_samples_;            // per-frame pivot distances of clear turns the pivot explains
     double orbit_consistent_ = 0, orbit_used_ = 0;  // the agreed pivot (0: none), and the one in use (glides to it)
+    struct OrbitMove { Vec3 d_right, d_up, d_fwd, moved; };  // (each sample's basis change a -> b and move: the pivot's offset fit)
+    std::deque<OrbitMove> orbit_moves_;
+    double orbit_side_consistent_ = 0, orbit_lift_consistent_ = 0, orbit_side_used_ = 0, orbit_lift_used_ = 0;
     bool orbit_active_ = false;
     double orbit_seen_t_ = 0;  // (the last source time a consistent pivot was measured - orbited_within)
     int since_fit_ = 0;

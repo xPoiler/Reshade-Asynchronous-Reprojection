@@ -7,6 +7,9 @@
 #include <reshade.hpp>
 #include <d3d12.h>
 #include <algorithm>
+#include <atomic>
+#include <mutex>
+#include <unordered_map>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -56,6 +59,80 @@ void set_status(const char* text) { std::snprintf(g.status, sizeof(g.status), "%
 }  // namespace
 
 void install_reshade_feed(Producer* producer) { g_producer = producer; mv_probe::set_producer(producer); }
+
+// StencilDump=1 (development, plan_character_coordinates.md option 2): whether the game marks its characters in its depth's stencil. The
+// depth an upscaler is handed and the one ReShade gives effects are copies without it (Requiem: format 41 both): the stencil is only in the
+// game's own depth-stencil while it draws. So every 60th frame, each time the game stops drawing into a depth-stencil with a stencil plane
+// (another bound in its place on that list), up to 8 times a frame, its stencil is copied there - in the depth-write state it was bound in.
+namespace {
+std::mutex g_stencil_mutex;
+std::unordered_map<std::uint64_t, std::uint64_t> g_stencil_bound;  // (list -> the depth-stencil resource bound on it)
+std::atomic<std::uint64_t> g_stencil_frame{0};
+std::atomic<std::uint32_t> g_stencil_taken{0};
+bool stencil_on() {
+    static std::atomic<int> on{-1};
+    static std::atomic<std::uint64_t> checked{0};
+    const std::uint64_t f = g_stencil_frame.load(std::memory_order_relaxed);
+    if (on.load() < 0 || f - checked.load() > 60) { on = GetEnvironmentVariableW(L"FW_STENCIL_DUMP", nullptr, 0) ? 1 : 0; checked = f; }
+    return on.load() == 1;
+}
+// (StencilMask=1, development: every frame, the stencil kept for the presenter's character mask - see Producer::stencil_stage)
+std::atomic<std::uint32_t> g_stencil_staged{0};
+bool stencil_mask_on() {
+    static std::atomic<int> on{-1};
+    static std::atomic<std::uint64_t> checked{0};
+    const std::uint64_t f = g_stencil_frame.load(std::memory_order_relaxed);
+    if (on.load() < 0 || f - checked.load() > 60) { on = GetEnvironmentVariableW(L"FW_STENCIL_MASK", nullptr, 0) ? 1 : 0; checked = f; }
+    return on.load() == 1;
+}
+void on_stencil_bind(command_list* cmd, uint32_t, const resource_view*, resource_view dsv) {
+    if (!cmd || !g_producer || cmd->get_device()->get_api() != device_api::d3d12) return;
+    const bool dump = stencil_on(), mask = stencil_mask_on();
+    if (!dump && !mask) return;
+    const std::uint64_t frame = g_stencil_frame.load(std::memory_order_relaxed);
+    device* dev = cmd->get_device();
+    const std::uint64_t now = dsv.handle ? dev->get_resource_from_view(dsv).handle : 0;
+    std::uint64_t before = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_stencil_mutex);
+        auto& b = g_stencil_bound[cmd->get_native()];
+        before = b; b = now;
+    }
+    if (!before || before == now) return;
+    auto* res = reinterpret_cast<ID3D12Resource*>(before);
+    const D3D12_RESOURCE_DESC d = res->GetDesc();
+    if (d.Format != DXGI_FORMAT_R32G8X24_TYPELESS && d.Format != DXGI_FORMAT_D32_FLOAT_S8X24_UINT && d.Format != DXGI_FORMAT_R24G8_TYPELESS && d.Format != DXGI_FORMAT_D24_UNORM_S8_UINT) return;
+    if (d.Width < 640) return;
+    // (at most 4 a frame: the latest before the depth tag is handed over - Requiem's 5 snapshots a frame were alike)
+    if (mask && g_stencil_staged.fetch_add(1) < 4)
+        g_producer->stage_stencil(res, reinterpret_cast<ID3D12GraphicsCommandList*>(cmd->get_native()));
+    if (!dump || frame % 60 != 30) return;
+    const std::uint32_t k = g_stencil_taken.fetch_add(1);
+    if (k >= 8) return;
+    g_producer->dump_stencil(frame, k, res, D3D12_RESOURCE_STATE_DEPTH_WRITE, reinterpret_cast<ID3D12GraphicsCommandList*>(cmd->get_native()));
+}
+void on_stencil_present(command_queue*, swapchain*, const rect*, const rect*, uint32_t, const rect*) {
+    g_stencil_frame.fetch_add(1, std::memory_order_relaxed);
+    g_stencil_taken = 0;
+    g_stencil_staged = 0;
+    if (g_producer && stencil_on()) g_producer->collect_stencil();
+}
+}  // namespace
+// (only with StencilDump=1 or StencilMask=1 - their keys reach the environment as the presenter is started, so this is called again
+// then: off, nothing is hooked, not even a callback on the game's every depth-stencil bind)
+namespace { bool g_stencil_events = false; }
+void register_stencil_dump_events() {
+    if (g_stencil_events || (!GetEnvironmentVariableW(L"FW_STENCIL_DUMP", nullptr, 0) && !GetEnvironmentVariableW(L"FW_STENCIL_MASK", nullptr, 0))) return;
+    reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(on_stencil_bind);
+    reshade::register_event<reshade::addon_event::present>(on_stencil_present);
+    g_stencil_events = true;
+}
+void unregister_stencil_dump_events() {
+    if (!g_stencil_events) return;
+    reshade::unregister_event<reshade::addon_event::present>(on_stencil_present);
+    reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(on_stencil_bind);
+    g_stencil_events = false;
+}
 const char* reshade_feed_status() { return g.status; }
 
 void on_reshade_reloaded_effects(effect_runtime*) { g.scanned = false; }  // (every handle from before is gone)
@@ -78,6 +155,16 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
     // to go (Cyberpunk 2077 with FSR frame generation and DLSS not running: nothing shown at all).
     const bool wanted = p->shared()->settings.enabled && !p->game_depth_seen() && !p->generation_active();
     if (!g.scanned) scan(runtime);
+    if (GetEnvironmentVariableW(L"FW_STENCIL_DUMP", nullptr, 0)) {
+        static unsigned stencil_said = 0;
+        if (++stencil_said % 300 == 1) {
+            resource_view view{0}, unused_view{0};
+            if (g.depth.handle) runtime->get_texture_binding(g.depth, &view, &unused_view);
+            const std::string text = "XPAR: StencilDump: api " + std::to_string(int(dev->get_api())) + ", XPAR_Depth " + std::to_string(g.depth.handle != 0) +
+                                     ", bound " + std::to_string(view.handle != 0) + ", " + p->stencil_status();
+            reshade::log::message(reshade::log::level::info, text.c_str());
+        }
+    }
     if (wanted) track_depth_buffers(); else release_depth_choice(runtime);
     // (an upscaler's data now: nothing of the search stays - its scale, its timing, its hooks at work on every target. Found again if the feed comes back)
     if (!wanted) {
@@ -222,7 +309,7 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
     // before - every picture paired with the depth and motion of the frame before it (Enshrouded: colour fitted the next index's motion in 27 of 27 frames).
     {
         static MatrixCandidate matrices[kMatrixCandidates];
-        if (const std::uint32_t count = camera_search::take(matrices, kMatrixCandidates, sh ? sh->camera_held : nullptr, sh ? sh->camera_held_state : 0)) p->set_matrices(frame, matrices, count);
+        if (const std::uint32_t count = camera_search::take(matrices, kMatrixCandidates, sh ? sh->camera_held : nullptr, sh ? sh->camera_held_state : 0, frame)) p->set_matrices(frame, matrices, count);
     }
     p->on_present_marker(frame);
     char text[200];

@@ -4236,6 +4236,411 @@ RWTexture2D<float2> cf_motion_u : register(u0);
     cf_motion_u[id.xy] = (float2(prev.x / prev.w * 0.5 + 0.5, 0.5 - prev.y / prev.w * 0.5) - uv) / mv_scale;
 }
 
+// The character from the game's stencil (StencilMask=1, development - Renderer::stencil_character). The stencil comes as R8 (value / 255);
+// the values taken as characters' are bits in wmat (16 a number, as its value: bits as a float's could be flushed as denormals), wproj the
+// projection's depth terms; wh0.y 1: last frame's mask (kPStenMask) is this one's predecessor.
+// Games mark what is drawn in their stencil - Requiem: 1 clothes and gear, 3 skin, every character alike (its enemies too). The marks give
+// the characters' outlines; which of them is the player's comes from the analysis (attached to the camera, while it turns) or, still,
+// from the frame before (its mask moved along the motion vectors).
+Texture2D<float> sc_stencil_t : register(t0);
+Texture2D<float4> sc_b_t : register(t1);       // (hist: the analysis' pixels; cells, apply: depth, .x)
+Texture2D<float4> sc_c_t : register(t2);       // (cells: the analysis' pixels; apply, count: the cells; flood: unused)
+Texture2D<float2> sc_motion_t : register(t3);  // (cells: the motion vectors)
+Texture2D<float> sc_prev_t : register(t4);     // (cells: last frame's mask)
+Texture2D<float4> sc_flood_t : register(t5);   // (flood, grow: the cells / half grid before this step; grow init: the analysis' pixels; apply: the half grid)
+RWStructuredBuffer<uint> sc_hist_u : register(u0);
+RWTexture2D<float4> sc_out_u : register(u0);
+RWTexture2D<float> sc_mask_u : register(u1);
+RWStructuredBuffer<uint> sc_sums_u : register(u1);  // (cells: the histogram's sums - [513] attached, [514] all)
+uint sc_value(int2 p) { return uint(round(sc_stencil_t.Load(int3(p, 0)) * 255.0)); }
+static const float kStenCarried = 1048576.0;  // (a start's label: carried over from last frame's mask only - see cs_sten_prune)
+bool sc_marked(uint v) { const uint word = v >> 4; return ((uint(wmat[word >> 2][word & 3]) >> (v & 15)) & 1u) != 0; }
+groupshared uint sc_gs_n[256], sc_gs_a[256], sc_gs_r, sc_gs_att, sc_gs_scen, sc_gs_inf, sc_gs_prev, sc_gs_near, sc_gs_far;
+[numthreads(64, 1, 1)] void cs_sten_clear(uint3 id : SV_DispatchThreadID) {
+    if (id.x < 520) sc_hist_u[id.x] = 0;
+}
+// Each value's pixels, and those of them the analysis found attached to the camera (w 2): [0, 256) all, [256, 512) attached.
+[numthreads(16, 16, 1)] void cs_sten_hist(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+    sc_gs_n[gi] = 0; sc_gs_a[gi] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    if (all(id.xy >= rect.xy) && all(id.xy < rect.xy + rect.zw)) {
+        const uint v = sc_value(int2(id.xy));
+        InterlockedAdd(sc_gs_n[v], 1);
+        if (sc_b_t.Load(int3(id.xy, 0)).w > 1.5) InterlockedAdd(sc_gs_a[v], 1);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (sc_gs_n[gi]) { InterlockedAdd(sc_hist_u[gi], sc_gs_n[gi]); InterlockedAdd(sc_hist_u[514], sc_gs_n[gi]); }
+    if (sc_gs_a[gi]) { InterlockedAdd(sc_hist_u[256 + gi], sc_gs_a[gi]); InterlockedAdd(sc_hist_u[513], sc_gs_a[gi]); }
+}
+// Per 8x8 cell (x): -1 no marked pixel, 0 marked, 1 the player's to start from - three quarters of its marked pixels attached by the
+// analysis, or (wh0.y) where last frame's mask was (along the motion vectors) - unless the camera turns and the analysis finds at most a
+// quarter of them attached: it follows the scenery, not the camera. (y, z: the nearest and farthest marked pixels' view distances; w: the
+// start's label - the cell's index + 1, kStenCarried more where it starts only from last frame's mask: see cs_sten_prune)
+[numthreads(8, 8, 1)] void cs_sten_cells(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex, uint3 gid : SV_GroupID) {
+    if (gi == 0) { sc_gs_r = 0; sc_gs_att = 0; sc_gs_scen = 0; sc_gs_inf = 0; sc_gs_prev = 0; sc_gs_near = 0x7f7fffff; sc_gs_far = 0; }
+    GroupMemoryBarrierWithGroupSync();
+    if (all(id.xy >= rect.xy) && all(id.xy < rect.xy + rect.zw) && sc_marked(sc_value(int2(id.xy)))) {
+        InterlockedAdd(sc_gs_r, 1);
+        if (sc_c_t.Load(int3(id.xy, 0)).w > 1.5) InterlockedAdd(sc_gs_att, 1);
+        // (the game's motion vector against the camera's alone - where the pixel would be from its distance and the camera's move - and
+        // against staying in place on the screen, carried with the camera: nearer the first, it follows the scenery. Only where the
+        // camera's move shifts it a pixel or more: under that the vectors can not tell the two apart - a stopgap)
+        if (flags & 1) {
+            const float2 uv0 = (float2(id.xy - rect.xy) + 0.5) / float2(rect.zw);
+            const float4 pv = mul(float4(uv0.x * 2 - 1, 1 - uv0.y * 2, sc_b_t.Load(int3(id.xy, 0)).x, 1), clip_to_prev);
+            if (pv.w > 0) {
+                const float2 px = float2(rect.zw);
+                const float2 cam = float2(pv.x / pv.w * 0.5 + 0.5, 0.5 - pv.y / pv.w * 0.5);
+                const float2 game = uv0 + sc_motion_t.Load(int3(min(id.xy, mv_size - 1), 0)) * mv_scale;
+                if (length((cam - uv0) * px) >= 1.0) {
+                    InterlockedAdd(sc_gs_inf, 1);
+                    if (length((game - cam) * px) < length((game - uv0) * px)) InterlockedAdd(sc_gs_scen, 1);
+                }
+            }
+        }
+        const float w = view_w(sc_b_t.Load(int3(id.xy, 0)).x);
+        if (w > 0) { InterlockedMin(sc_gs_near, asuint(w)); InterlockedMax(sc_gs_far, asuint(w)); }
+        if (wh0.y > 0.5) {
+            float2 uv = (float2(id.xy - rect.xy) + 0.5) / float2(rect.zw);
+            if (flags & 1) uv += sc_motion_t.Load(int3(min(id.xy, mv_size - 1), 0)) * mv_scale;
+            const int2 q = int2(rect.xy) + int2(floor(uv * float2(rect.zw)));
+            if (all(q >= int2(rect.xy)) && all(q < int2(rect.xy + rect.zw)) && sc_prev_t.Load(int3(q, 0)) > 0.5) InterlockedAdd(sc_gs_prev, 1);
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (gi != 0 || any(gid.xy >= out_size)) return;
+    const uint r = sc_gs_r;
+    float state = -1;
+    if (r > 0 && sc_gs_near != 0x7f7fffff) {
+        // (the camera turns: the analysis finds 0.2% of the picture attached this frame - a stopgap. Not the frames before it: read back
+        // late, a turn just stopped vetoed every cell, and the player was lost on each stop)
+        const bool turning = float(sc_sums_u[513]) >= 0.002 * float(max(sc_sums_u[514], 1u));
+        const bool attached = 4 * sc_gs_att >= 3 * r, before = 4 * sc_gs_prev >= 3 * r, scenery = turning && 4 * sc_gs_att <= r;
+        state = attached || (before && !scenery) ? 1 : 0;
+        // (nor spread into where the camera's move tells - half of its marked pixels or more - and three quarters of those follow the
+        // scenery: the dead enemies on the floor beside the player, at its distance and touching it on the screen, were joined to it
+        // frame after frame - and a body in a tank behind its head through them. The analysis' own verdict - not attached, not moving on
+        // its own - took the player himself for scenery in small turns and dropped him)
+        if (state < 0.5 && 2 * sc_gs_inf >= r && 4 * sc_gs_scen >= 3 * sc_gs_inf) state = -1;
+    }
+    const float label = state > 0.5 ? float(gid.y * out_size.x + gid.x + 1) + (sc_gs_att * 4 >= 3 * r ? 0.0 : kStenCarried) : 0.0;
+    sc_out_u[gid.xy] = state > -0.5 ? float4(state, asfloat(sc_gs_near), asfloat(sc_gs_far), label) : float4(-1, 0, 0, 0);
+}
+// One step of the player's cells spreading over the marked ones next to them at their distance: where their distances meet (within 15%: a
+// gap in depth - an enemy in front of or behind the player - stops it). Ranges, not the nearest points: a back seen at a slant close to
+// the camera changed more than 15% from cell to cell, and the spread stopped in a straight line across it.
+static const int2 kStenDirs[8] = {int2(-1, -1), int2(0, -1), int2(1, -1), int2(-1, 0), int2(1, 0), int2(-1, 1), int2(0, 1), int2(1, 1)};
+bool sc_joined(float4 a, float4 b) { return b.x > 0.5 && b.y <= 1.15 * a.z && a.y <= 1.15 * b.z; }
+// (each group spreads within its 16x16 cells until nothing changes - 32 rounds at most; across groups one cell a pass: a character
+// crossing the picture in a few passes - one cell a pass, 46 of them did not reach a back's far side)
+groupshared float4 sc_gs_cell[18 * 18];
+groupshared uint sc_gs_changed;
+[numthreads(16, 16, 1)] void cs_sten_flood(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID, uint gi : SV_GroupIndex) {
+    for (uint k = gi; k < 18 * 18; k += 256) {
+        const int2 q = int2(gid.xy) * 16 + int2(k % 18, k / 18) - 1;
+        sc_gs_cell[k] = all(q >= 0) && all(q < int2(out_size)) ? sc_flood_t.Load(int3(q, 0)) : float4(-1, 0, 0, 0);
+    }
+    const uint at = (gt.y + 1) * 18 + gt.x + 1;
+    [loop] for (int round = 0; round < 32; ++round) {
+        if (gi == 0) sc_gs_changed = 0;
+        GroupMemoryBarrierWithGroupSync();
+        float4 v = sc_gs_cell[at];
+        // (the smallest label of the player's cells it joins: one label for each piece - see cs_sten_prune)
+        float best = v.x > 0.5 ? v.w : 0;
+        if (v.x > -0.5)
+            [unroll] for (int d = 0; d < 8; ++d) {
+                const float4 n = sc_gs_cell[at + kStenDirs[d].y * 18 + kStenDirs[d].x];
+                if (sc_joined(v, n) && n.w > 0 && (best <= 0 || n.w < best)) best = n.w;
+            }
+        const bool now = best > 0 && (v.x < 0.5 || best < v.w);
+        GroupMemoryBarrierWithGroupSync();
+        if (now) { v.x = 1; v.w = best; sc_gs_cell[at] = v; sc_gs_changed = 1; }
+        GroupMemoryBarrierWithGroupSync();
+        const bool more = sc_gs_changed != 0;
+        GroupMemoryBarrierWithGroupSync();
+        if (!more) break;
+    }
+    const int2 p = int2(gid.xy) * 16 + int2(gt.xy);
+    if (all(p < int2(out_size))) sc_out_u[p] = sc_gs_cell[at];
+}
+// The player's pieces (cells joined by the spread, one label each): what last frame's mask alone starts is kept only joined to a start the
+// analysis finds attached this frame - or, where there is none (the camera still: nothing found attached anywhere), the biggest piece. A
+// piece carried over by itself is something that was joined to the player and no longer is: an enemy's arm that touched the player in a
+// grab stayed where the player had been, carried from mask to mask, while the player walked on. sc_comp_u: [0] the biggest carried
+// piece's cells, [1] a piece started this frame, [2 + i] the cells of the piece labelled i + 1.
+RWStructuredBuffer<uint> sc_comp_u : register(u1);
+uint sc_piece(float label) { return uint(label >= kStenCarried ? label - kStenCarried : label) - 1; }
+[numthreads(64, 1, 1)] void cs_sten_comp_clear(uint3 id : SV_DispatchThreadID) {
+    if (id.x < out_size.x * out_size.y + 2) sc_comp_u[id.x] = 0;
+}
+[numthreads(8, 8, 1)] void cs_sten_comp_count(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= out_size)) return;
+    const float4 v = sc_c_t.Load(int3(id.xy, 0));
+    if (v.x < 0.5 || v.w <= 0) return;
+    uint ignored;
+    InterlockedAdd(sc_comp_u[2 + sc_piece(v.w)], 1, ignored);
+    if (v.w < kStenCarried) InterlockedOr(sc_comp_u[1], 1, ignored);
+}
+[numthreads(8, 8, 1)] void cs_sten_comp_max(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= out_size)) return;
+    const float4 v = sc_c_t.Load(int3(id.xy, 0));
+    if (v.x < 0.5 || v.w < kStenCarried) return;
+    uint ignored;
+    InterlockedMax(sc_comp_u[0], sc_comp_u[2 + sc_piece(v.w)], ignored);
+}
+[numthreads(8, 8, 1)] void cs_sten_prune(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= out_size)) return;
+    float4 v = sc_out_u[id.xy];
+    if (v.x < 0.5 || v.w < kStenCarried) return;
+    if (sc_comp_u[1] == 0 && sc_comp_u[2 + sc_piece(v.w)] >= sc_comp_u[0]) return;
+    v.x = 0; v.w = 0;
+    sc_out_u[id.xy] = v;
+}
+// The fringe the game draws over the picture without depth, stencil or motion of its own - Requiem's hair: thin strands blended over
+// what is behind, 5-20 px around the head, in every buffer the scenery behind them. Held, the head stood while they slid off with the
+// scenery. Only the picture tells them apart: grown from the player's pixels (cs_sten_fringe) over those whose colour stayed in place on
+// the screen (now against the frame before at the same spot) clearly better - half the difference or less - than it followed the
+// scenery's motion there (against the frame before where the motion vector says it was). Where the scenery's motion is under a pixel the
+// two can not be told apart: last frame's verdict stands (wh1.y 1: there is one). Stopgaps: the half; within 3 cells of the player's.
+Texture2D<float4> sf_colour_t : register(t6);       // (cs_sten_luma: the game's picture)
+Texture2D<float> sf_luma_now_t : register(t7);      // (cs_sten_elig: the picture's brightness at the render grid, this frame...)
+Texture2D<float> sf_luma_prev_t : register(t8);     // (...and the frame before)
+Texture2D<float> sf_fringe_prev_t : register(t9);   // (cs_sten_elig: last frame's fringe)
+Texture2D<float> sf_elig_t : register(t10);         // (cs_sten_fringe: which pixels the fringe may take)
+Texture2D<float> sf_fringe_t : register(t11);       // (cs_sten_fringe_apply: this frame's fringe)
+RWTexture2D<float> sf_out_u : register(u0);
+[numthreads(8, 8, 1)] void cs_sten_luma(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= grid)) return;
+    uint cw_, ch_;
+    sf_colour_t.GetDimensions(cw_, ch_);
+    const float2 uv = (float2(id.xy) + 0.5) / float2(grid);
+    const int2 q = min(int2(uv * float2(cw_, ch_)), int2(cw_, ch_) - 1);
+    sf_out_u[id.xy] = dot(max(sf_colour_t.Load(int3(q, 0)).rgb, 0), float3(0.299, 0.587, 0.114));
+}
+groupshared uint sf_gs_near;
+[numthreads(8, 8, 1)] void cs_sten_elig(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex, uint3 gid : SV_GroupID) {
+    if (gi == 0) {
+        uint cw_, ch_;
+        sc_c_t.GetDimensions(cw_, ch_);
+        uint near = 0;
+        for (int y = -3; y <= 3 && !near; ++y)
+            for (int x = -3; x <= 3 && !near; ++x) {
+                const int2 q = int2(gid.xy) + int2(x, y);
+                if (all(q >= 0) && all(q < int2(cw_, ch_)) && sc_c_t.Load(int3(q, 0)).x > 0.5) near = 1;
+            }
+        sf_gs_near = near;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (any(id.xy >= grid)) return;
+    float e = 0;
+    if (sf_gs_near && sc_prev_t.Load(int3(id.xy, 0)) < 0.5) {
+        const float2 shift = (flags & 1) ? sc_motion_t.Load(int3(min(id.xy, mv_size - 1), 0)) * mv_scale * float2(grid) : float2(0, 0);
+        if (length(shift) >= 1.0) {
+            float stay = 0, scenery = 0;
+            [unroll] for (int y = -1; y <= 1; ++y)
+                [unroll] for (int x = -1; x <= 1; ++x) {
+                    const int2 a = clamp(int2(id.xy) + int2(x, y), int2(0, 0), int2(grid) - 1);
+                    const int2 b = clamp(int2(round(float2(a) + shift)), int2(0, 0), int2(grid) - 1);
+                    const float n = sf_luma_now_t.Load(int3(a, 0));
+                    stay += abs(n - sf_luma_prev_t.Load(int3(a, 0)));
+                    scenery += abs(n - sf_luma_prev_t.Load(int3(b, 0)));
+                }
+            e = stay <= 0.5 * scenery && scenery > 0 ? 1 : 0;
+        } else {
+            e = wh1.y > 0.5 && sf_fringe_prev_t.Load(int3(id.xy, 0)) > 0.5 ? 1 : 0;
+        }
+    }
+    sf_out_u[id.xy] = e;
+}
+// (each group of 16x16 grows over a window 16 px wider each way: a fringe pixel up to about that far from the player's pixels outside it)
+groupshared uint sf_gs[48 * 48];
+groupshared uint sf_gs_changed, sf_gs_any;
+[numthreads(16, 16, 1)] void cs_sten_fringe(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID, uint gi : SV_GroupIndex) {
+    if (gi == 0) sf_gs_any = 0;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint k = gi; k < 48 * 48; k += 256) {
+        const int2 q = int2(gid.xy) * 16 + int2(k % 48, k / 48) - 16;
+        uint s = 0;
+        if (all(q >= 0) && all(q < int2(grid))) {
+            if (sc_prev_t.Load(int3(q, 0)) > 0.5) s = 2;
+            else if (sf_elig_t.Load(int3(q, 0)) > 0.5) s = 1;
+        }
+        sf_gs[k] = s;
+        if (s == 1) sf_gs_any = 1;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    const int2 p = int2(gid.xy) * 16 + int2(gt.xy);
+    if (sf_gs_any) {
+        [loop] for (int round = 0; round < 96; ++round) {
+            if (gi == 0) sf_gs_changed = 0;
+            GroupMemoryBarrierWithGroupSync();
+            for (uint k = gi; k < 48 * 48; k += 256) {
+                if (sf_gs[k] != 1) continue;
+                const int x = int(k % 48), y = int(k / 48);
+                bool reached = false;
+                [unroll] for (int d = 0; d < 8; ++d) {
+                    const int2 n = int2(x, y) + kStenDirs[d];
+                    if (all(n >= 0) && all(n < 48) && sf_gs[n.y * 48 + n.x] == 2) reached = true;
+                }
+                if (reached) { sf_gs[k] = 2; sf_gs_changed = 1; }
+            }
+            GroupMemoryBarrierWithGroupSync();
+            const bool more = sf_gs_changed != 0;
+            GroupMemoryBarrierWithGroupSync();
+            if (!more) break;
+        }
+    }
+    if (any(p >= int2(grid))) return;
+    sf_out_u[p] = sf_gs_any && sf_gs[(gt.y + 16) * 48 + gt.x + 16] == 2 && sc_prev_t.Load(int3(p, 0)) < 0.5 ? 1 : 0;
+}
+[numthreads(8, 8, 1)] void cs_sten_fringe_apply(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= grid) || sf_fringe_t.Load(int3(id.xy, 0)) < 0.5) return;
+    float4 o = sc_out_u[id.xy];
+    if (o.w < 0.5 || o.w > 1.5) { o.w = 2; sc_out_u[id.xy] = o; }
+}
+// The player's cells counted, for Renderer::character_source ([512]).
+[numthreads(8, 8, 1)] void cs_sten_count(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= out_size)) return;
+    if (sc_c_t.Load(int3(id.xy, 0)).x > 0.5) InterlockedAdd(sc_hist_u[512], 1);
+}
+// How long (game frames in a row) each cell has held pixels the analysis finds attached away from the player (2 cells or more from its
+// cells): something carried with the camera stays where it is on the screen; what the analysis holds for a moment as the player moves
+// through the scenery does not. (wh1.x 1: from nothing - the ages are new.) sc_c_t: the cells; sc_flood_t: the analysis' pixels.
+RWTexture2D<float> sc_age_u : register(u0);
+Texture2D<float> sc_age_t : register(t3);
+groupshared uint sc_gs_held;
+[numthreads(8, 8, 1)] void cs_sten_age(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex, uint3 gid : SV_GroupID) {
+    if (gi == 0) sc_gs_held = 0;
+    GroupMemoryBarrierWithGroupSync();
+    if (all(id.xy >= rect.xy) && all(id.xy < rect.xy + rect.zw) && sc_flood_t.Load(int3(id.xy, 0)).w > 1.5) InterlockedAdd(sc_gs_held, 1);
+    GroupMemoryBarrierWithGroupSync();
+    if (gi != 0 || any(gid.xy >= out_size)) return;
+    bool near = false;
+    for (int y = -2; y <= 2 && !near; ++y)
+        for (int x = -2; x <= 2 && !near; ++x) {
+            const int2 q = int2(gid.xy) + int2(x, y);
+            if (all(q >= 0) && all(q < int2(out_size))) near = sc_c_t.Load(int3(q, 0)).x > 0.5;
+        }
+    const float before = wh1.x > 0.5 ? 0 : sc_age_u[gid.xy];
+    sc_age_u[gid.xy] = sc_gs_held > 0 && !near ? min(before + 1, 1000.0) : 0;
+}
+// Gaps in the player (sc_prev_t: its pixels, as cs_sten_apply left them): an unmarked pixel with most of its 8 neighbours the player's
+// is - hair drawn dithered (Requiem: a pixel of hair, a pixel of the wall behind) came out speckled; the scenery around the player is
+// never surrounded by it. One moving on its own stays so.
+[numthreads(8, 8, 1)] void cs_sten_close(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= grid) || any(id.xy < rect.xy) || any(id.xy >= rect.xy + rect.zw)) return;
+    if (sc_prev_t.Load(int3(id.xy, 0)) > 0.5 || sc_marked(sc_value(int2(id.xy)))) return;
+    uint n = 0;
+    [unroll] for (int d = 0; d < 8; ++d) {
+        const int2 q = clamp(int2(id.xy) + kStenDirs[d], int2(rect.xy), int2(rect.xy + rect.zw) - 1);
+        if (sc_prev_t.Load(int3(q, 0)) > 0.5) ++n;
+    }
+    if (n < 5) return;
+    float4 o = sc_out_u[id.xy];
+    if (o.w < 0.5 || o.w > 1.5) { o.w = 2; sc_out_u[id.xy] = o; }
+}
+// A pixel of the player: marked, in the player's cells.
+bool sc_player(int2 p) {
+    return sc_c_t.Load(int3(p / 8, 0)).x > 0.5 && view_w(sc_b_t.Load(int3(p, 0)).x) > 0 && sc_marked(sc_value(p));
+}
+// The floor under a character (as floor_at, on this pass' depth): closer down the screen, evenly, by at least 60% of its depth value per
+// screen height - growing over it from the feet is refused.
+bool sc_floor(int2 p) {
+    const int k = max(1, int(round(float(rect.w) / 190.0)));
+    const int2 lo = int2(rect.xy), hi = int2(rect.xy + rect.zw) - 1;
+    const float a = sc_b_t.Load(int3(clamp(p - int2(0, k), lo, hi), 0)).x;
+    const float c = sc_b_t.Load(int3(clamp(p, lo, hi), 0)).x;
+    const float b = sc_b_t.Load(int3(clamp(p + int2(0, k), lo, hi), 0)).x;
+    const float slope = (b - a) / float(2 * k) * float(rect.w);
+    return (flags & 16) && slope > 0 && slope > 0.6 * max(c, 1e-6) && abs(b - 2 * c + a) < 0.25 * abs(b - a);
+}
+// What the game leaves unmarked on its characters (Requiem: hair) grows from the player's pixels, on a half grid (x: 1 the player's, 0 may
+// join, -1 not; y its view distance): a pixel may join when it is not marked (another character's are not grown into), not floor, and
+// the analysis finds it attached or it was the player's last frame (along the motion vectors) - the wall the player leans on does
+// neither. sc_prev_t: last frame's mask; sc_motion_t, sc_c_t: the cells.
+[numthreads(8, 8, 1)] void cs_sten_grow_init(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= out_size)) return;
+    const int2 p = int2(id.xy) * 2;
+    float state = -1, w = 0;
+    if (all(p >= int2(rect.xy)) && all(p < int2(rect.xy + rect.zw))) {
+        w = view_w(sc_b_t.Load(int3(p, 0)).x);
+        if (w > 0) {
+            if (sc_player(p)) state = 1;
+            else if (!sc_marked(sc_value(p)) && !sc_floor(p)) {
+                bool joins = sc_flood_t.Load(int3(p, 0)).w > 1.5;
+                if (!joins && wh0.y > 0.5) {
+                    float2 uv = (float2(p - int2(rect.xy)) + 0.5) / float2(rect.zw);
+                    if (flags & 1) uv += sc_motion_t.Load(int3(min(uint2(p), mv_size - 1), 0)) * mv_scale;
+                    const int2 q = int2(rect.xy) + int2(floor(uv * float2(rect.zw)));
+                    joins = all(q >= int2(rect.xy)) && all(q < int2(rect.xy + rect.zw)) && sc_prev_t.Load(int3(q, 0)) > 0.5;
+                }
+                if (joins) state = 0;
+            }
+        }
+    }
+    sc_out_u[id.xy] = float4(state, w, 0, 0);
+}
+// (as cs_sten_flood: 16x16 a group until nothing changes, one across groups a pass; joined at the same distance, within 5% from one half
+// grid pixel to the next - the edge of a head against the wall behind it is a jump of several times; a stopgap)
+[numthreads(16, 16, 1)] void cs_sten_grow(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID, uint gi : SV_GroupIndex) {
+    for (uint k = gi; k < 18 * 18; k += 256) {
+        const int2 q = int2(gid.xy) * 16 + int2(k % 18, k / 18) - 1;
+        sc_gs_cell[k] = all(q >= 0) && all(q < int2(out_size)) ? sc_flood_t.Load(int3(q, 0)) : float4(-1, 0, 0, 0);
+    }
+    const uint at = (gt.y + 1) * 18 + gt.x + 1;
+    [loop] for (int round = 0; round < 32; ++round) {
+        if (gi == 0) sc_gs_changed = 0;
+        GroupMemoryBarrierWithGroupSync();
+        float4 v = sc_gs_cell[at];
+        bool now = false;
+        if (abs(v.x) < 0.5)
+            [unroll] for (int d = 0; d < 8; ++d) {
+                const float4 n = sc_gs_cell[at + kStenDirs[d].y * 18 + kStenDirs[d].x];
+                now = now || (n.x > 0.5 && abs(n.y - v.y) <= 0.05 * v.y);
+            }
+        GroupMemoryBarrierWithGroupSync();
+        if (now) { v.x = 1; sc_gs_cell[at] = v; sc_gs_changed = 1; }
+        GroupMemoryBarrierWithGroupSync();
+        const bool more = sc_gs_changed != 0;
+        GroupMemoryBarrierWithGroupSync();
+        if (!more) break;
+    }
+    const int2 p = int2(gid.xy) * 16 + int2(gt.xy);
+    if (all(p < int2(out_size))) sc_out_u[p] = sc_gs_cell[at];
+}
+// The analysis' pixels (sc_out_u, kPObject) changed: the player's - marked in its cells, or grown into (sc_flood_t: the half grid; at the
+// distance of the half grid pixel it grew from, within 5%) - are attached (one moving on its own stays so); an attached one beside them
+// (within 2 cells) that is not is the scenery seen around the player - not. Away from the player, while it is found (wh0.z), what the
+// analysis holds only where it has held for fewer than wh0.w game frames in a row (sc_age_t, the cells) is not held either; otherwise the
+// analysis stands. sc_mask_u: the player's pixels, for the next frame.
+[numthreads(8, 8, 1)] void cs_sten_apply(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= grid)) return;
+    bool player = false;
+    if (all(id.xy >= rect.xy) && all(id.xy < rect.xy + rect.zw)) {
+        const int2 cell = int2(id.xy) / 8;
+        player = sc_player(int2(id.xy));
+        if (!player && !sc_marked(sc_value(int2(id.xy)))) {
+            uint gw, gh; sc_flood_t.GetDimensions(gw, gh);
+            const float4 g = sc_flood_t.Load(int3(min(uint2(id.xy) / 2, uint2(gw, gh) - 1), 0));
+            const float w = view_w(sc_b_t.Load(int3(id.xy, 0)).x);
+            player = g.x > 0.5 && w > 0 && abs(w - g.y) <= 0.05 * g.y;
+        }
+        float4 o = sc_out_u[id.xy];
+        if (player) {
+            if (o.w < 0.5 || o.w > 1.5) { o.w = 2; sc_out_u[id.xy] = o; }
+        } else if (o.w > 1.5) {
+            bool near = false;
+            for (int y = -2; y <= 2 && !near; ++y)
+                for (int x = -2; x <= 2 && !near; ++x) {
+                    const int2 q = cell + int2(x, y);
+                    if (all(q >= 0) && all(q < int2(out_size))) near = sc_c_t.Load(int3(q, 0)).x > 0.5;
+                }
+            if (near || (wh0.z > 0.5 && sc_age_t.Load(int3(cell, 0)) < wh0.w)) { o.w = 0; sc_out_u[id.xy] = o; }
+        }
+    }
+    sc_mask_u[id.xy] = player ? 1 : 0;
+}
+
 // Debug view on the warped output: masked pixels magenta, HUD score still below the threshold green
 // (learned HUD only, flag 1: with the upscaler's output there is nothing being learned).
 Texture2D<unorm float> tint_mask_t : register(t0);
@@ -4276,7 +4681,7 @@ RWTexture2D<float4> rec_ui_u : register(u1);
 constexpr std::uint32_t kNoMotion = 0xFFFFu;  // (motion_channels_: no motion this frame)
 // Descriptor layout in the shader-visible heap.
 constexpr UINT kSrcSrv = 0;         // + slot * kTexCount + kind: shared textures
-constexpr UINT kPrivMax = 96;       // private textures at most
+constexpr UINT kPrivMax = 112;      // private textures at most
 constexpr UINT kPrivUav = 48;       // + private id
 constexpr UINT kPrivSrv = kPrivUav + kPrivMax;  // + private id
 // Compute pass tables (6 SRVs t0-t5, 2 UAVs u0-u1 each).
@@ -4332,7 +4737,9 @@ constexpr UINT kW = kXCamFillUav + 2;
 enum WTable : UINT { kWWarp, kWShown, kWJoinInit, kWJoinAB, kWJoinBA, kWJoinFinal,
                      kWGenDepth0, kWGenDepth1, kWGenDepth2, kWGenUi0, kWGenUi1, kWGenUi2, kWClaim,
                      kWStill, kWHoldInit, kWHoldAB, kWHoldBA, kWHoldFinal, kWHoldFill, kWHoldFillFinal, kWGrowInit, kWGrowAB, kWGrowBA,
-                     kWGrowFinal, kWWarpArgs, kWShareMeasure, kWShareH, kWShareV, kWShareBins, kWShareUp, kWShareResid, kWResidBlurH, kWResidBlurV, kWOwnUp, kWSeamH, kWSeamV, kWAttHist, kWBeside, kWHeld, kWWarpUp, kWTables };
+                     kWGrowFinal, kWWarpArgs, kWShareMeasure, kWShareH, kWShareV, kWShareBins, kWShareUp, kWShareResid, kWResidBlurH, kWResidBlurV, kWOwnUp, kWSeamH, kWSeamV, kWAttHist, kWBeside, kWHeld, kWWarpUp,
+                     kWStenHist, kWStenCells, kWStenFloodAB, kWStenFloodBA, kWStenApply, kWStenCount,
+                     kWStenGrowInit, kWStenGrowAB, kWStenGrowBA, kWStenAge, kWStenClose, kWStenComp, kWStenPrune, kWStenLuma, kWStenElig, kWStenFringe, kWStenFringeApply, kWTables };
 constexpr UINT kWSrv(UINT table) { return kW + table * kWTableSize; }
 constexpr UINT kWUav(UINT table) { return kW + table * kWTableSize + kWSrvCount; }
 constexpr UINT kHeapSize = kW + kWTables * kWTableSize;
@@ -4862,7 +5269,9 @@ bool Renderer::create_pipelines(std::string& error) {
     }
     struct { const char* entry; ComPtr<ID3D12PipelineState>* pso; } ws[] = {
         {"cs_own_warp", &cs_own_warp_}, {"cs_own_warp_reset", &cs_own_warp_reset_}, {"cs_own_warp_lean", &cs_own_warp_lean_}, {"cs_own_warp_args", &cs_own_warp_args_}, {"cs_own_warp_rest", &cs_own_warp_rest_}, {"cs_warp_claims_clear", &cs_warp_claims_clear_}, {"cs_warp_claim", &cs_warp_claim_}, {"cs_warp_beside", &cs_warp_beside_}, {"cs_warp_held", &cs_warp_held_}, {"cs_own_warp_up", &cs_own_warp_up_}, {"cs_gen_depth", &cs_gen_depth_}, {"cs_gen_unui", &cs_gen_unui_}, {"cs_obj_join_init", &cs_obj_join_init_}, {"cs_obj_join", &cs_obj_join_}, {"cs_obj_join_final", &cs_obj_join_final_}, {"cs_still", &cs_still_}, {"cs_hold_fill", &cs_hold_fill_}, {"cs_grow_init", &cs_grow_init_}, {"cs_grow_clear", &cs_grow_clear_}, {"cs_grow", &cs_grow_}, {"cs_grow_final", &cs_grow_final_}, {"cs_share_measure", &cs_share_measure_}, {"cs_share_blur", &cs_share_blur_}, {"cs_share_bins", &cs_share_bins_}, {"cs_share_final", &cs_share_final_}, {"cs_share_up", &cs_share_up_}, {"cs_share_seam", &cs_share_seam_}, {"cs_att_hist", &cs_att_hist_}, {"cs_share_resid", &cs_share_resid_}, {"cs_resid_blur", &cs_resid_blur_}, {"cs_own_up", &cs_own_up_},
-        {"cs_copy4", &cs_copy4_}};
+        {"cs_copy4", &cs_copy4_},
+        {"cs_sten_clear", &cs_sten_clear_}, {"cs_sten_hist", &cs_sten_hist_}, {"cs_sten_cells", &cs_sten_cells_}, {"cs_sten_flood", &cs_sten_flood_},
+        {"cs_sten_apply", &cs_sten_apply_}, {"cs_sten_count", &cs_sten_count_}, {"cs_sten_grow_init", &cs_sten_grow_init_}, {"cs_sten_grow", &cs_sten_grow_}, {"cs_sten_age", &cs_sten_age_}, {"cs_sten_close", &cs_sten_close_}, {"cs_sten_comp_clear", &cs_sten_comp_clear_}, {"cs_sten_comp_count", &cs_sten_comp_count_}, {"cs_sten_comp_max", &cs_sten_comp_max_}, {"cs_sten_prune", &cs_sten_prune_}, {"cs_sten_luma", &cs_sten_luma_}, {"cs_sten_elig", &cs_sten_elig_}, {"cs_sten_fringe", &cs_sten_fringe_}, {"cs_sten_fringe_apply", &cs_sten_fringe_apply_}};
     for (auto& x : ws) {
         auto code = compile(x.entry, "cs_5_0", error, kShadersX);
         if (!code) return false;
@@ -5155,6 +5564,245 @@ void Renderer::analyze_motion(const IngestedSource& src, const float clip_to_pre
 // The projection's depth terms (row vectors: clip z = vz a + b, clip w = vz c + e) for view_w in the shaders.
 static void projection_terms(const float view_to_clip[16], float out[4]) {
     out[0] = view_to_clip[10]; out[1] = view_to_clip[14]; out[2] = view_to_clip[11]; out[3] = view_to_clip[15];
+}
+
+// StencilMask=1: which stencil values mark characters, from a frame's histogram (cs_sten_hist) - the share of each value's pixels the
+// analysis finds attached to the camera, summed over frames (fading, ~30 frames). Only frames where the analysis finds anything attached
+// (a turn: still, it finds nothing) count, fading over ~200 of them (the clothes of a player among enemies went from 0 to 1 attached frame to
+// frame). Stopgaps: the least size (0.1% of the picture - a lamp's 0.05% marked apart was taken), the frames' (0.2% attached).
+void Renderer::sten_learn(const std::uint32_t* counts) {
+    double all = 0, attached = 0;
+    for (int v = 0; v < 256; ++v) { all += counts[v]; attached += counts[256 + v]; }
+    // (found: the player's cells this frame - 4 at least; a stopgap)
+    sten_found_ = counts[512] >= 4;
+    sten_turning_ = all > 0 && attached >= 0.002 * all;
+    if (!sten_turning_) return;
+    for (int v = 0; v < 256; ++v) {
+        sten_n_[v] = sten_n_[v] * 0.995 + counts[v];
+        sten_a_[v] = sten_a_[v] * 0.995 + counts[256 + v];
+    }
+    sten_total_ = sten_total_ * 0.995 + all;
+    // (the scenery's value: the least attached of those big enough - Requiem: 0, never attached, against 0.4-1.0 for the characters'
+    // values. Not the most common one: a close-up of the character in a scripted sequence made its clothes the most common, they were
+    // dropped and taken again frame after frame. A value is the characters' at a quarter attached; kept while clearly more attached than
+    // the scenery's, 4 times and 1% at least - the clothes of a player among enemies were attached none of 100 frames in a row. Stopgaps)
+    double scenery = 1;
+    for (int v = 0; v < 256; ++v)
+        if (sten_n_[v] >= 0.001 * sten_total_) scenery = std::min(scenery, sten_a_[v] / sten_n_[v]);
+    for (int v = 0; v < 256; ++v) {
+        const bool in = (sten_set_[v >> 5] >> (v & 31)) & 1u;
+        const double share = sten_n_[v] > 0 ? sten_a_[v] / sten_n_[v] : 0;
+        const bool keep = sten_n_[v] >= 0.001 * sten_total_ && share > (in ? std::max(4 * scenery, 0.01) : std::max(4 * scenery, 0.25));
+        if (keep) sten_set_[v >> 5] |= 1u << (v & 31);
+        else sten_set_[v >> 5] &= ~(1u << (v & 31));
+    }
+}
+
+void Renderer::stencil_character(const IngestedSource& src, const float view_to_clip[16], const float clip_to_prev[16], float scale_x,
+                                  float scale_y, bool scale_valid, bool depth_inverted) {
+    const bool had = sten_prev_;
+    sten_prev_ = false;
+    if (!src.has_stencil || !src.has_depth || !src.has_motion) { sten_found_ = false; return; }
+    const auto& object = private_[kPObject];
+    if (!object.texture || !private_[kPStencil].texture || object.width != private_[kPStencil].width || object.height != private_[kPStencil].height ||
+        object.width != private_[kPDepth].width || object.height != private_[kPDepth].height) { sten_found_ = false; return; }
+    const UINT w = object.width, h = object.height, cw = (w + 7) / 8, ch = (h + 7) / 8;
+    if (!sten_hist_) {
+        D3D12_HEAP_PROPERTIES def{}; def.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC bd{}; bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = 2080; bd.Height = 1;
+        bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&sten_hist_)))) return;
+        D3D12_HEAP_PROPERTIES rbh{}; rbh.Type = D3D12_HEAP_TYPE_READBACK;
+        bd.Width = kRing * 2080; bd.Flags = D3D12_RESOURCE_FLAG_NONE;
+        if (FAILED(device_->CreateCommittedResource(&rbh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&sten_readback_)))) {
+            sten_hist_.Reset(); return;
+        }
+    }
+    const bool fresh_mask = !private_[kPStenMask].texture || private_[kPStenMask].width != w || private_[kPStenMask].height != h;
+    const UINT hw = (w + 1) / 2, hh = (h + 1) / 2;
+    if (!ensure_private(kPStenCellsA, cw, ch, DXGI_FORMAT_R32G32B32A32_FLOAT) || !ensure_private(kPStenCellsB, cw, ch, DXGI_FORMAT_R32G32B32A32_FLOAT) ||
+        !ensure_private(kPStenMask, w, h, DXGI_FORMAT_R8_UNORM) || !ensure_private(kPStenGrowA, hw, hh, DXGI_FORMAT_R32G32_FLOAT) ||
+        !ensure_private(kPStenGrowB, hw, hh, DXGI_FORMAT_R32G32_FLOAT)) return;
+    const bool fresh_age = !private_[kPStenAge].texture || private_[kPStenAge].width != cw || private_[kPStenAge].height != ch;
+    if (!ensure_private(kPStenAge, cw, ch, DXGI_FORMAT_R32_FLOAT)) return;
+    XConstants c{};
+    const Rect2 r = src.depth_rect.w ? src.depth_rect : Rect2{0, 0, w, h};
+    c.rect[0] = r.x; c.rect[1] = r.y; c.rect[2] = std::min(r.w, w - r.x); c.rect[3] = std::min(r.h, h - r.y);
+    c.grid[0] = w; c.grid[1] = h;
+    c.mv_size[0] = private_[kPMotion].width; c.mv_size[1] = private_[kPMotion].height;
+    c.mv_scale[0] = scale_x; c.mv_scale[1] = scale_y;
+    c.flags = scale_valid ? 1u : 0u;
+    c.out_size[0] = cw; c.out_size[1] = ch;
+    std::memcpy(c.clip_to_prev, clip_to_prev, sizeof(c.clip_to_prev));
+    if (depth_inverted) c.flags |= 16u;  // (the floor test - see sc_floor)
+    XConstants g = c;  // (the half grid's passes)
+    g.out_size[0] = hw; g.out_size[1] = hh;
+    float wc[kWConstants] = {};
+    for (int k = 0; k < 16; ++k) wc[k] = float((sten_set_[k >> 1] >> ((k & 1) * 16)) & 0xFFFFu);
+    projection_terms(view_to_clip, wc + 16);
+    wc[20] = sten_turning_ ? 1.0f : 0.0f;
+    wc[21] = had && !fresh_mask ? 1.0f : 0.0f;
+    wc[22] = sten_found_ ? 1.0f : 0.0f;
+    // (held away from the player: only after 20 game frames in a row in the same place - a stopgap)
+    wc[23] = 20.0f;
+    wc[24] = fresh_age ? 1.0f : 0.0f;
+    auto table = [&](UINT t, std::initializer_list<PrivateId> srvs) {
+        for (UINT k = 0; k < kWSrvCount; ++k) set_x_srv(kWSrv(t) + k, kPDepth);
+        UINT k = 0;
+        for (const PrivateId id : srvs) set_x_srv(kWSrv(t) + k++, id);
+    };
+    D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
+    ud.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; ud.Format = DXGI_FORMAT_UNKNOWN;
+    ud.Buffer.NumElements = 520; ud.Buffer.StructureByteStride = 4;  // ([0, 512) the histogram, [512] the player's cells, [513] [514] its sums)
+    // The histogram (sten_learn, read back a few frames later).
+    table(kWStenHist, {kPStencil, kPObject});
+    device_->CreateUnorderedAccessView(sten_hist_.Get(), nullptr, &ud, cpu(kWUav(kWStenHist) + 0));
+    device_->CreateUnorderedAccessView(sten_hist_.Get(), nullptr, &ud, cpu(kWUav(kWStenHist) + 1));
+    w_dispatch(cs_sten_clear_.Get(), &c, wc, kWStenHist, 9, 1);
+    D3D12_RESOURCE_BARRIER uav{}; uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; uav.UAV.pResource = sten_hist_.Get();
+    list_->ResourceBarrier(1, &uav);
+    w_dispatch(cs_sten_hist_.Get(), &c, wc, kWStenHist, (w + 15) / 16, (h + 15) / 16);
+    bool any = false;
+    for (auto bits : sten_set_) any = any || bits;
+    if (any) {
+        // The cells, the player's spread over the marked ones (an even number of steps: back in A), the analysis changed.
+        table(kWStenCells, {kPStencil, kPDepth, kPObject, kPMotion, kPStenMask});
+        set_x_uav(kWUav(kWStenCells) + 0, kPStenCellsA);
+        device_->CreateUnorderedAccessView(sten_hist_.Get(), nullptr, &ud, cpu(kWUav(kWStenCells) + 1));
+        list_->ResourceBarrier(1, &uav);
+        transition(private_[kPStenCellsA], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        w_dispatch(cs_sten_cells_.Get(), &c, wc, kWStenCells, cw, ch);
+        transition(private_[kPStenCellsA], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        table(kWStenFloodAB, {kPDepth, kPDepth, kPDepth, kPDepth, kPDepth, kPStenCellsA});
+        set_x_uav(kWUav(kWStenFloodAB) + 0, kPStenCellsB); set_x_uav(kWUav(kWStenFloodAB) + 1, kPStenCellsB);
+        table(kWStenFloodBA, {kPDepth, kPDepth, kPDepth, kPDepth, kPDepth, kPStenCellsB});
+        set_x_uav(kWUav(kWStenFloodBA) + 0, kPStenCellsA); set_x_uav(kWUav(kWStenFloodBA) + 1, kPStenCellsA);
+        // (passes: across the picture's groups of 16x16 cells and back - see cs_sten_flood)
+        const UINT steps = ((std::max(cw, ch) + 15) / 16 * 2 + 2) & ~1u;
+        for (UINT k = 0; k < steps; ++k) {
+            const bool ab = (k & 1) == 0;
+            auto& to = private_[ab ? kPStenCellsB : kPStenCellsA];
+            transition(to, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            w_dispatch(cs_sten_flood_.Get(), &c, wc, ab ? kWStenFloodAB : kWStenFloodBA, (cw + 15) / 16, (ch + 15) / 16);
+            transition(to, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+        // The pieces carried over by themselves dropped (see cs_sten_prune).
+        const UINT pieces = cw * ch + 2;
+        if (!sten_comp_ || sten_comp_n_ != pieces) {
+            D3D12_HEAP_PROPERTIES def{}; def.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC bd{}; bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = UINT64(pieces) * 4; bd.Height = 1;
+            bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            static std::vector<ComPtr<ID3D12Resource>> replaced;  // (a size change: the old one may still be in flight - kept)
+            if (sten_comp_) replaced.push_back(sten_comp_);
+            sten_comp_.Reset();
+            if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&sten_comp_)))) return;
+            sten_comp_n_ = pieces;
+        }
+        D3D12_UNORDERED_ACCESS_VIEW_DESC pd = ud;
+        pd.Buffer.NumElements = pieces;
+        table(kWStenComp, {kPDepth, kPDepth, kPStenCellsA});
+        device_->CreateUnorderedAccessView(sten_comp_.Get(), nullptr, &pd, cpu(kWUav(kWStenComp) + 0));
+        device_->CreateUnorderedAccessView(sten_comp_.Get(), nullptr, &pd, cpu(kWUav(kWStenComp) + 1));
+        table(kWStenPrune, {kPDepth});
+        set_x_uav(kWUav(kWStenPrune) + 0, kPStenCellsA);
+        device_->CreateUnorderedAccessView(sten_comp_.Get(), nullptr, &pd, cpu(kWUav(kWStenPrune) + 1));
+        D3D12_RESOURCE_BARRIER comp{}; comp.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; comp.UAV.pResource = sten_comp_.Get();
+        w_dispatch(cs_sten_comp_clear_.Get(), &c, wc, kWStenComp, (pieces + 63) / 64, 1);
+        list_->ResourceBarrier(1, &comp);
+        w_dispatch(cs_sten_comp_count_.Get(), &c, wc, kWStenComp, (cw + 7) / 8, (ch + 7) / 8);
+        list_->ResourceBarrier(1, &comp);
+        w_dispatch(cs_sten_comp_max_.Get(), &c, wc, kWStenComp, (cw + 7) / 8, (ch + 7) / 8);
+        list_->ResourceBarrier(1, &comp);
+        transition(private_[kPStenCellsA], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        w_dispatch(cs_sten_prune_.Get(), &c, wc, kWStenPrune, (cw + 7) / 8, (ch + 7) / 8);
+        transition(private_[kPStenCellsA], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        // What the game leaves unmarked grown from the player (half grid; ping-pong, an even number of passes: back in A).
+        table(kWStenGrowInit, {kPStencil, kPDepth, kPStenCellsA, kPMotion, kPStenMask, kPObject});
+        set_x_uav(kWUav(kWStenGrowInit) + 0, kPStenGrowA); set_x_uav(kWUav(kWStenGrowInit) + 1, kPStenGrowA);
+        transition(private_[kPStenGrowA], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        w_dispatch(cs_sten_grow_init_.Get(), &g, wc, kWStenGrowInit, (hw + 7) / 8, (hh + 7) / 8);
+        transition(private_[kPStenGrowA], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        table(kWStenGrowAB, {kPDepth, kPDepth, kPDepth, kPDepth, kPDepth, kPStenGrowA});
+        set_x_uav(kWUav(kWStenGrowAB) + 0, kPStenGrowB); set_x_uav(kWUav(kWStenGrowAB) + 1, kPStenGrowB);
+        table(kWStenGrowBA, {kPDepth, kPDepth, kPDepth, kPDepth, kPDepth, kPStenGrowB});
+        set_x_uav(kWUav(kWStenGrowBA) + 0, kPStenGrowA); set_x_uav(kWUav(kWStenGrowBA) + 1, kPStenGrowA);
+        for (UINT k = 0; k < 4; ++k) {  // (4 passes: 64 half grid pixels across groups at least - 128 rendered)
+            const bool ab = (k & 1) == 0;
+            auto& to = private_[ab ? kPStenGrowB : kPStenGrowA];
+            transition(to, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            w_dispatch(cs_sten_grow_.Get(), &g, wc, ab ? kWStenGrowAB : kWStenGrowBA, (hw + 15) / 16, (hh + 15) / 16);
+            transition(to, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+        table(kWStenAge, {kPStencil, kPDepth, kPStenCellsA, kPDepth, kPDepth, kPObject});
+        set_x_uav(kWUav(kWStenAge) + 0, kPStenAge); set_x_uav(kWUav(kWStenAge) + 1, kPStenAge);
+        transition(private_[kPStenAge], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        w_dispatch(cs_sten_age_.Get(), &c, wc, kWStenAge, cw, ch);
+        transition(private_[kPStenAge], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        table(kWStenApply, {kPStencil, kPDepth, kPStenCellsA, kPStenAge, kPDepth, kPStenGrowA});
+        set_x_uav(kWUav(kWStenApply) + 0, kPObject); set_x_uav(kWUav(kWStenApply) + 1, kPStenMask);
+        transition(private_[kPObject], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        transition(private_[kPStenMask], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        w_dispatch(cs_sten_apply_.Get(), &c, wc, kWStenApply, (w + 7) / 8, (h + 7) / 8);
+        transition(private_[kPStenMask], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        table(kWStenClose, {kPStencil, kPDepth, kPDepth, kPDepth, kPStenMask});
+        set_x_uav(kWUav(kWStenClose) + 0, kPObject); set_x_uav(kWUav(kWStenClose) + 1, kPObject);
+        D3D12_RESOURCE_BARRIER object_written{}; object_written.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; object_written.UAV.pResource = private_[kPObject].texture.Get();
+        list_->ResourceBarrier(1, &object_written);
+        w_dispatch(cs_sten_close_.Get(), &c, wc, kWStenClose, (w + 7) / 8, (h + 7) / 8);
+        // The fringe drawn over the picture without depth (see cs_sten_elig): this frame's brightness, which pixels may join, grown from
+        // the player, held.
+        const auto& colour = private_[kPBackbuffer];
+        const bool fresh_fringe = !private_[kPStenLumaA].texture || private_[kPStenLumaA].width != w || private_[kPStenLumaA].height != h;
+        // (development only, FW_STEN_FRINGE: in replay it held a 10-20 px halo of scenery beside the player and missed the strands it was
+        // for - the colour's stay-or-follow test is too noisy at the player's edge)
+        static const bool fringe_on = std::getenv("FW_STEN_FRINGE") != nullptr;
+        if (fringe_on && colour.texture && ensure_private(kPStenLumaA, w, h, DXGI_FORMAT_R16_FLOAT) && ensure_private(kPStenLumaB, w, h, DXGI_FORMAT_R16_FLOAT) &&
+            ensure_private(kPStenElig, w, h, DXGI_FORMAT_R8_UNORM) && ensure_private(kPStenFringeA, w, h, DXGI_FORMAT_R8_UNORM) &&
+            ensure_private(kPStenFringeB, w, h, DXGI_FORMAT_R8_UNORM)) {
+            if (fresh_fringe) sten_fringe_valid_ = false;
+            sten_flip_ = !sten_flip_;
+            const PrivateId luma_now = sten_flip_ ? kPStenLumaB : kPStenLumaA, luma_prev = sten_flip_ ? kPStenLumaA : kPStenLumaB;
+            const PrivateId fringe_now = sten_flip_ ? kPStenFringeB : kPStenFringeA, fringe_prev = sten_flip_ ? kPStenFringeA : kPStenFringeB;
+            wc[25] = sten_fringe_valid_ ? 1.0f : 0.0f;
+            table(kWStenLuma, {kPDepth, kPDepth, kPDepth, kPDepth, kPDepth, kPDepth, kPBackbuffer});
+            set_x_uav(kWUav(kWStenLuma) + 0, luma_now); set_x_uav(kWUav(kWStenLuma) + 1, luma_now);
+            transition(private_[luma_now], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            w_dispatch(cs_sten_luma_.Get(), &c, wc, kWStenLuma, (w + 7) / 8, (h + 7) / 8);
+            transition(private_[luma_now], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            if (sten_fringe_valid_) {
+                table(kWStenElig, {kPDepth, kPDepth, kPStenCellsA, kPMotion, kPStenMask, kPDepth, kPDepth, luma_now, luma_prev, fringe_prev});
+                set_x_uav(kWUav(kWStenElig) + 0, kPStenElig); set_x_uav(kWUav(kWStenElig) + 1, kPStenElig);
+                transition(private_[kPStenElig], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                w_dispatch(cs_sten_elig_.Get(), &c, wc, kWStenElig, (w + 7) / 8, (h + 7) / 8);
+                transition(private_[kPStenElig], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                table(kWStenFringe, {kPDepth, kPDepth, kPDepth, kPDepth, kPStenMask, kPDepth, kPDepth, kPDepth, kPDepth, kPDepth, kPStenElig});
+                set_x_uav(kWUav(kWStenFringe) + 0, fringe_now); set_x_uav(kWUav(kWStenFringe) + 1, fringe_now);
+                transition(private_[fringe_now], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                w_dispatch(cs_sten_fringe_.Get(), &c, wc, kWStenFringe, (w + 15) / 16, (h + 15) / 16);
+                transition(private_[fringe_now], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                table(kWStenFringeApply, {kPDepth, kPDepth, kPDepth, kPDepth, kPDepth, kPDepth, kPDepth, kPDepth, kPDepth, kPDepth, kPDepth, fringe_now});
+                set_x_uav(kWUav(kWStenFringeApply) + 0, kPObject); set_x_uav(kWUav(kWStenFringeApply) + 1, kPObject);
+                list_->ResourceBarrier(1, &object_written);
+                w_dispatch(cs_sten_fringe_apply_.Get(), &c, wc, kWStenFringeApply, (w + 7) / 8, (h + 7) / 8);
+            }
+            sten_fringe_valid_ = true;
+        }
+        transition(private_[kPObject], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        table(kWStenCount, {kPDepth, kPDepth, kPStenCellsA});
+        device_->CreateUnorderedAccessView(sten_hist_.Get(), nullptr, &ud, cpu(kWUav(kWStenCount) + 0));
+        device_->CreateUnorderedAccessView(sten_hist_.Get(), nullptr, &ud, cpu(kWUav(kWStenCount) + 1));
+        list_->ResourceBarrier(1, &uav);
+        w_dispatch(cs_sten_count_.Get(), &c, wc, kWStenCount, (cw + 7) / 8, (ch + 7) / 8);
+        sten_prev_ = true;
+    }
+    auto to_copy = transition_barrier(sten_hist_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list_->ResourceBarrier(1, &to_copy);
+    list_->CopyBufferRegion(sten_readback_.Get(), UINT64(frame_index_) * 2080, sten_hist_.Get(), 0, 2080);
+    std::swap(to_copy.Transition.StateBefore, to_copy.Transition.StateAfter);
+    list_->ResourceBarrier(1, &to_copy);
+    sten_pending_[frame_index_] = true;
 }
 
 bool Renderer::has_generated() const {
@@ -5507,6 +6155,7 @@ void Renderer::follow_share(const IngestedSource& src, const float clip_to_prev_
         transition(private_[kPShare], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
     share_built_ = true;
+    if (share_stamps_) pass_stamp(kPassShareOnly);
     // What the characters do on their own, per cell (cs_share_resid): with the measuring pass's constants (this frame's
     // camera motion, its flags) against the shares just made.
     if (ensure_private(kPShareResid, cw, ch, DXGI_FORMAT_R16G16B16A16_FLOAT)) {
@@ -5594,8 +6243,14 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
     const bool cover_only = layer_here && layer_trust_ == 0 && !scene_here;
     const bool from_layer = layer_here && !(cover_only && layer_full_);
     // A frame without it once it has been checked (layer_trust_ 1): the game hides its HUD (Requiem, when not needed) -
-    // no HUD, nothing to detect (detecting brought back lights taken for HUD, and its cost).
-    const bool hidden = hud && !from_hudless && !from_layer && !src.has_hudless && layer_trust_ == 1;
+    // no HUD, nothing to detect (detecting brought back lights taken for HUD, and its cost). The same where it can not be
+    // checked but has been taken as the HUD (layer_taken_: a frame of it measured, covering under 90%): taken as the HUD
+    // when it is there, its absence is no HUD too. Detecting instead took for HUD what stays put on the screen while the
+    // camera turns - the scenery's edge right beside a third-person character, edges along the turn (Requiem without an
+    // upscaler's output: lines of held pixels along Leon's shoulder and on walls). A layer always over the whole screen
+    // (RE4's) is never taken: detected, as before.
+    const bool hidden = hud && !from_hudless && !from_layer && !src.has_hudless &&
+                        (layer_trust_ == 1 || (layer_trust_ == 0 && layer_taken_ && !scene_here));
     // Checking the layer (see cs_layer_check): with the upscaler's output, not on a frame that starts the score over.
     const bool check = from_layer && layer_trust_ == 0 && !reset && scene_here;
     if (cover_only && !layer_pending_[frame_index_]) {
@@ -7026,6 +7681,16 @@ ID3D12GraphicsCommandList* Renderer::begin(int context) {
             fit_readback_->Unmap(0, &none);
         }
     }
+    if (sten_pending_[frame_index_] && sten_readback_) {
+        sten_pending_[frame_index_] = false;
+        std::uint32_t* v = nullptr;
+        D3D12_RANGE range{frame_index_ * 2080, frame_index_ * 2080 + 2080};
+        if (SUCCEEDED(sten_readback_->Map(0, &range, reinterpret_cast<void**>(&v)))) {
+            sten_learn(v + frame_index_ * 520);
+            D3D12_RANGE none{0, 0};
+            sten_readback_->Unmap(0, &none);
+        }
+    }
     if (hud_scene_pending_[frame_index_] && hud_readback_) {
         hud_scene_pending_[frame_index_] = false;
         std::uint32_t* v = nullptr;
@@ -7135,6 +7800,7 @@ ID3D12GraphicsCommandList* Renderer::begin(int context) {
             if (layer_cover_only_[frame_index_]) {
                 // (coverage alone - a layer that can not be checked: see build_no_warp_mask)
                 layer_full_ = double(v[frame_index_ * 2]) >= 0.9 * frame;
+                if (v[frame_index_ * 2] && !layer_full_) layer_taken_ = true;
                 layer_cover_only_[frame_index_] = false;
             } else if (layer_trust_ == 0 && v[frame_index_ * 2] && double(v[frame_index_ * 2]) < 0.5 * frame) {
                 layer_covered_ += v[frame_index_ * 2]; layer_drawn_over_ += v[frame_index_ * 2 + 1];
@@ -7564,6 +8230,14 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
         ensure_private(kPDepth, dp.width, dp.height, DXGI_FORMAT_R32_FLOAT);
         ensure_private(kPMotion, dp.width, dp.height, DXGI_FORMAT_R16G16_FLOAT);
         convert(sources[kDepth], static_cast<DXGI_FORMAT>(dp.format), slot, kDepth, kPDepth, dp.width, dp.height);
+        // (StencilMask=1, development: the game's stencil, on the depth's grid - see stencil_character)
+        const auto& st = m.tex[kStencil];
+        sten_ingested_ = false;
+        if (sources[kStencil] && st.width == dp.width && st.height == dp.height && ensure_private(kPStencil, dp.width, dp.height, DXGI_FORMAT_R8_UNORM)) {
+            convert(sources[kStencil], static_cast<DXGI_FORMAT>(st.format), slot, kStencil, kPStencil, dp.width, dp.height);
+            out.has_stencil = true;
+            sten_ingested_ = true;
+        }
         const auto& mv = m.tex[kMotion];
         motion_channels_ = m.motion_channels;
         if (sources[kMotion] && shared.motion_partial && ensure_private(kPMotionGame, dp.width, dp.height, DXGI_FORMAT_R16G16_FLOAT)) {
@@ -7912,7 +8586,7 @@ void Renderer::release_stash() {
 }
 
 std::string Renderer::memory_report() {
-    static const char* const kNames[] = {"Backbuffer", "Hudless", "Ui", "Depth", "Motion", "ZeroUi", "Output", "Object", "ObjKindA", "ObjKindB", "Gen0", "Gen1", "Gen2", "GenZ0", "GenZ1", "GenZ2", "Previous", "HudScore", "Mask", "Scene", "Attached", "World", "Fill", "Mem0", "Mem1", "MemZ0", "MemZ1", "RampRows", "Ramp", "WarpMask", "HudKind", "StashColor", "StashDepth", "StashMotion", "StashHudless", "Stash2Color", "Stash2Hudless", "Stash2Depth", "Stash2Motion", "LumaA", "LumaB", "Feat", "FlowA", "FlowB", "RetCells", "RetEncl", "RetA", "RetB", "RetLayer", "HudLearned", "HudTiles", "WarpClaims", "Still", "GrowA", "GrowB", "Probe", "ProbeTilesA", "ProbeTilesB", "ShareA", "ShareB", "ShareT", "Share", "RetDirtyA", "RetDirtyB", "ShareT2", "ShareHalf", "RecColour", "RecUi", "ShareResid", "OwnMove", "Paths", "ShareSeam", "AttHist", "MemVis", "UiTiles", "WarpBeside", "WarpHeld", "LowScene", "MaskRaw", "MemF0", "MemF1", "MemFZ0", "MemFZ1", "GunMove", "MemRatio", "MotionProbe", "MotionGame"};
+    static const char* const kNames[] = {"Backbuffer", "Hudless", "Ui", "Depth", "Motion", "ZeroUi", "Output", "Object", "ObjKindA", "ObjKindB", "Gen0", "Gen1", "Gen2", "GenZ0", "GenZ1", "GenZ2", "Previous", "HudScore", "Mask", "Scene", "Attached", "World", "Fill", "Mem0", "Mem1", "MemZ0", "MemZ1", "RampRows", "Ramp", "WarpMask", "HudKind", "StashColor", "StashDepth", "StashMotion", "StashHudless", "Stash2Color", "Stash2Hudless", "Stash2Depth", "Stash2Motion", "LumaA", "LumaB", "Feat", "FlowA", "FlowB", "RetCells", "RetEncl", "RetA", "RetB", "RetLayer", "HudLearned", "HudTiles", "WarpClaims", "Still", "GrowA", "GrowB", "Probe", "ProbeTilesA", "ProbeTilesB", "ShareA", "ShareB", "ShareT", "Share", "RetDirtyA", "RetDirtyB", "ShareT2", "ShareHalf", "RecColour", "RecUi", "ShareResid", "OwnMove", "Paths", "ShareSeam", "AttHist", "MemVis", "UiTiles", "WarpBeside", "WarpHeld", "LowScene", "MaskRaw", "MemF0", "MemF1", "MemFZ0", "MemFZ1", "GunMove", "MemRatio", "MotionProbe", "MotionGame", "Stencil", "StenCellsA", "StenCellsB", "StenMask", "StenGrowA", "StenGrowB", "StenAge", "StenLumaA", "StenLumaB", "StenElig", "StenFringeA", "StenFringeB"};
     static_assert(sizeof(kNames) / sizeof(kNames[0]) == kPCount, "a name for every private texture");
     struct Item { std::string name; double mb; };
     std::vector<Item> items;
@@ -7978,7 +8652,7 @@ std::uint32_t Renderer::warp_rest_blocks() {
 bool Renderer::read_back(int which, std::vector<std::uint16_t>& pixels, std::uint32_t& w, std::uint32_t& h) {
     static const PrivateId kWhich[] = {kPBackbuffer, kPOutput, kPScene, kPDepth, kPMotion, kPObject, kPMask, kPHudScore, kPWorld, kPFill,
                                        kPStashColor, kPStashDepth, kPStashMotion, kPFlowB, kPStashHudless, kPStash2Color, kPStash2Hudless,
-                                       kPStash2Depth, kPStash2Motion, kPHudless, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPUi, kPWarpMask, kPRetLayer, kPDepth, kPDepth, kPDepth, kPHudLearned, kPHudTiles, kPHudKind, kPShare, kPRetEncl, kPAttached, kPMem0, kPPaths};
+                                       kPStash2Depth, kPStash2Motion, kPHudless, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPUi, kPWarpMask, kPRetLayer, kPDepth, kPDepth, kPDepth, kPHudLearned, kPHudTiles, kPHudKind, kPShare, kPRetEncl, kPAttached, kPMem0, kPPaths, kPStenCellsA, kPStenMask};
     if (which < 0 || which >= int(std::size(kWhich))) return false;
     // (the sight reticles' layer: the history texture written last)
     // (the background memory: the one written last)
@@ -8040,6 +8714,13 @@ bool Renderer::read_back(int which, std::vector<std::uint16_t>& pixels, std::uin
             }
             continue;
         }
+        if (desc.Format == DXGI_FORMAT_R32G32B32A32_FLOAT) {
+            for (std::uint32_t x = 0; x < w * 4; ++x) {
+                float v32; std::memcpy(&v32, row + std::size_t(x) * 4, 4);
+                out[x] = to_half(v32);
+            }
+            continue;
+        }
         if (desc.Format == DXGI_FORMAT_R16G16_FLOAT) {
             for (std::uint32_t x = 0; x < w; ++x) {
                 std::memcpy(out + std::size_t(x) * 4, row + std::size_t(x) * 4, 4);
@@ -8077,7 +8758,7 @@ bool Renderer::read_back(int which, std::vector<std::uint16_t>& pixels, std::uin
 bool Renderer::write_back(int which, const std::vector<std::uint16_t>& pixels, std::uint32_t w, std::uint32_t h) {
     static const PrivateId kWhich[] = {kPBackbuffer, kPOutput, kPScene, kPDepth, kPMotion, kPObject, kPMask, kPHudScore, kPWorld, kPFill,
                                        kPStashColor, kPStashDepth, kPStashMotion, kPFlowB, kPStashHudless, kPStash2Color, kPStash2Hudless,
-                                       kPStash2Depth, kPStash2Motion, kPHudless, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPUi, kPWarpMask, kPRetLayer, kPDepth, kPDepth, kPDepth, kPHudLearned, kPHudTiles, kPHudKind, kPShare, kPRetEncl, kPAttached, kPMem0, kPPaths};
+                                       kPStash2Depth, kPStash2Motion, kPHudless, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPUi, kPWarpMask, kPRetLayer, kPDepth, kPDepth, kPDepth, kPHudLearned, kPHudTiles, kPHudKind, kPShare, kPRetEncl, kPAttached, kPMem0, kPPaths, kPStenCellsA, kPStenMask};
     if (which < 0 || which >= int(std::size(kWhich)) || pixels.size() < std::size_t(w) * h * 4) return false;
     auto& p = kWhich[which] == kPMem0 ? private_[kPMem0 + std::max(mem_shown_, 0)]
             : split_ && shown_id(kWhich[which]) ? front_[kWhich[which]] : private_[kWhich[which]];
@@ -8157,9 +8838,10 @@ bool Renderer::record_frame(std::uint64_t tag, bool ui) {
     const bool ui_colour = ui && private_[kPUi].format != DXGI_FORMAT_R8_UNORM;
     if (!ensure_private(kPRecColour, cw, ch, DXGI_FORMAT_R11G11B10_FLOAT) ||
         !ensure_private(kPRecUi, cw, ch, ui_colour ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R8_UNORM)) return false;
-    // (the read-back buffers, made again when a size changes)
-    const PrivateId ids[4] = {kPRecColour, kPDepth, kPMotion, kPRecUi};
-    for (int k = 0; k < 4; ++k) {
+    // (the read-back buffers, made again when a size changes; the stencil only when taken in this frame)
+    const PrivateId ids[5] = {kPRecColour, kPDepth, kPMotion, kPRecUi, kPStencil};
+    const int planes = sten_ingested_ && private_[kPStencil].texture ? 5 : 4;
+    for (int k = 0; k < planes; ++k) {
         const auto desc = private_[ids[k]].texture->GetDesc();
         UINT64 total = 0;
         device_->GetCopyableFootprints(&desc, 0, 1, 0, &r.foot[k], nullptr, nullptr, &total);
@@ -8183,7 +8865,7 @@ bool Renderer::record_frame(std::uint64_t tag, bool ui) {
     XConstants c{};
     c.grid[0] = cw; c.grid[1] = ch; c.out_size[0] = c0.width; c.out_size[1] = c0.height; c.groups_x = f; c.flags = (ui ? 1u : 0u) | (ui_colour ? 2u : 0u);
     x_dispatch(cs_rec_down_.Get(), &c, t, t + kXSrvCount, (cw + 7) / 8, (ch + 7) / 8);
-    for (int k = 0; k < 4; ++k) {
+    for (int k = 0; k < planes; ++k) {
         auto& src = private_[ids[k]];
         const auto before = src.state;
         transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -8193,6 +8875,7 @@ bool Renderer::record_frame(std::uint64_t tag, bool ui) {
         list_->CopyTextureRegion(&dst, 0, 0, 0, &from, nullptr);
         transition(src, k == 0 || k == 3 ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : before);
     }
+    r.has_stencil = planes == 5;
     r.tag = tag; r.has_ui = ui; r.context = context_; r.fence = 0;
     r.state.store(1, std::memory_order_release);
     return true;
@@ -8209,11 +8892,11 @@ bool Renderer::take_recorded(RecordedFrame& out) {
     if (idx < 0) return false;
     RecSlot& r = rec_[idx];
     if (fences_[r.context]->GetCompletedValue() < r.fence) return false;
-    static const std::uint32_t kBytes[4] = {4, 4, 4, 1};
-    std::vector<std::uint8_t>* dst[4] = {&out.colour, &out.depth, &out.motion, &out.ui};
-    for (int k = 0; k < 4; ++k) {
+    static const std::uint32_t kBytes[5] = {4, 4, 4, 1, 1};
+    std::vector<std::uint8_t>* dst[5] = {&out.colour, &out.depth, &out.motion, &out.ui, &out.stencil};
+    for (int k = 0; k < 5; ++k) {
         dst[k]->clear();
-        if (k == 3 && !r.has_ui) continue;
+        if ((k == 3 && !r.has_ui) || (k == 4 && !r.has_stencil)) continue;
         std::uint8_t* mapped = nullptr;
         if (FAILED(r.buffer[k]->Map(0, nullptr, reinterpret_cast<void**>(&mapped)))) { r.state.store(0, std::memory_order_release); return false; }
         const std::uint32_t bytes = k == 3 && r.foot[k].Footprint.Format == DXGI_FORMAT_R8G8B8A8_UNORM ? 4u : kBytes[k];

@@ -125,6 +125,7 @@ void launch_presenter() {
         const wchar_t text[2] = {static_cast<wchar_t>(c), 0};
         SetEnvironmentVariableW(key.wenv, c ? text : nullptr);
     }
+    fw::register_stencil_dump_events();  // (StencilDump/StencilMask: hooked only when one is on - see reshade_feed.cpp)
     DWORD error = ERROR_FILE_NOT_FOUND;
     for (const auto& path : candidates) {
         if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
@@ -943,6 +944,8 @@ void draw_overlay(effect_runtime*) {
         const bool mask = s.no_warp_mask != 0, attached = s.keep_attached != 0;
         if (attached) {
             if (p.mv_scale_x == 0.0f) ImGui::TextDisabled("Character/weapon: starts after a few seconds of turning the camera");
+            else if (alive) ImGui::TextDisabled(p.character_source == 1 ? "Character: found through the game's depth buffer"
+                                                                        : "Character: estimated from the motion");
             bool near_rule = s.near_camera_rule != 0;
             if (ImGui::Checkbox("Keep near-camera motion still (weapon animations, hands)", &near_rule)) {
                 s.near_camera_rule = near_rule;
@@ -1156,6 +1159,7 @@ void register_callbacks() {
     reshade::register_event<reshade::addon_event::reshade_finish_effects>(fw::on_reshade_finish_effects);
     reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(fw::on_reshade_reloaded_effects);
     fw::register_depth_choice_events();
+    fw::register_stencil_dump_events();
     fw::ui_probe::init();
     fw::mv_probe::init();
     fw::camera_search::init();
@@ -1228,6 +1232,7 @@ void unregister_callbacks() {
     reshade::unregister_event<reshade::addon_event::finish_present>(on_finish_present);
     fw::frame_cap_shutdown();
     fw::unregister_depth_choice_events();
+    fw::unregister_stencil_dump_events();
     fw::camera_search::shutdown();
     fw::mv_probe::shutdown();
     fw::ui_probe::shutdown();
