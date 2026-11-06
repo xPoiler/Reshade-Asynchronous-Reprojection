@@ -24,9 +24,10 @@ inline constexpr DevKey kDevKeys[] = {
     {"EdgeDitherNoBand", "FW_DITHER_NO_BAND", L"FW_DITHER_NO_BAND", '1', false},
     {"MaskSmooth", "FW_MASK_SMOOTH", L"FW_MASK_SMOOTH", '1', false},
     {"DitherHoles", "FW_DITHER_HOLES", L"FW_DITHER_HOLES", '1', false},
-    {"CameraUse", "FW_CAMERA_USE", L"FW_CAMERA_USE", '1', false},
+    {"CameraUse", "FW_CAMERA_USE", L"FW_CAMERA_USE", '1', true},  // (on by default since 2.2: CameraUse=0 turns it off)
     {"CameraDump", "FW_CAMERA_DUMP", L"FW_CAMERA_DUMP", '2', false},  // (2: object matrices too, every frame searched - see camera_search.cpp g_dump)
     {"StencilDump", "FW_STENCIL_DUMP", L"FW_STENCIL_DUMP", '1', false},
+    {"MotionReference", "FW_MOTION_REF", L"FW_MOTION_REF", '1', false},  // (what moves with the screen by the game's vectors - Renderer::set_motion_reference)
     {"StencilMask", "FW_STENCIL_MASK", L"FW_STENCIL_MASK", '1', false},  // (the character from the game's stencil - Renderer::stencil_character)  // (the depth's stencil, every 60th frame - see Producer::stencil_dump)
 };
 

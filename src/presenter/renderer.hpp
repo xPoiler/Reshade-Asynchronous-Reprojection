@@ -53,6 +53,7 @@ struct RecordedFrame {
     std::uint32_t cw = 0, ch = 0, dw = 0, dh = 0;
     std::vector<std::uint8_t> colour, depth, motion, ui;
     std::vector<std::uint8_t> stencil;  // (StencilMask=1: the game's stencil on the depth's grid, R8 - empty without; stencil_<i>.bin)
+    bool output = false;  // (record_output: what the warp showed for game frame `tag` - colour alone, the picture's recorded size)
 };
 
 // HUD detection frames: learned from, skipped for too few telling pixels, or held back by the
@@ -359,6 +360,9 @@ public:
     void set_dither_holes(bool on) { dither_holes_ = on; }  // (development: what no frame has dithered - see ow_scene_from)
     void set_share_scenery(bool on) { share_scenery_ = on; }  // (see cs_share_up, flag 262144)
     void set_held_between(bool on, float frames_back) { held_between_ = on; held_back_ = frames_back; }
+    // MotionReference (development, FW_MOTION_REF): what moves with the screen, not the world, by the game's vectors against the
+    // camera alone - kept off the camera's warp and shown along its own motion between game frames (cs_ref_pick)
+    void set_motion_reference(bool on) { motion_ref_ = on; }
     // (for the log: warps since the last call, of them with the weapon moved, the frames back on those, and why not otherwise)
     struct HeldStats { unsigned warps = 0, shifted = 0, off = 0, no_texture = 0, no_mask = 0, at_zero = 0, sums = 0; double back = 0; };
     HeldStats take_held_stats() { const HeldStats s = held_stats_; held_stats_ = {}; return s; }
@@ -372,8 +376,10 @@ public:
     void set_outlines_held(bool on) { outlines_held_ = on; }  // (the mask's outlines and sights, 0.95: held, or warped as carried)
     void set_own_depth_blind(bool on) { own_depth_blind_ = on; }  // (own motion spread over a character at any distance)
     // Sequence recording (development, see record_frame): queue the frame just taken in; collect finished ones.
-    static constexpr int kRecSlots = 6;
+    static constexpr int kRecSlots = 10;
     bool record_frame(std::uint64_t tag, bool ui);
+    // (and what the warp just drew, shrunk as the frame's picture is - after own_warp, on the refresh's list: tag, the game frame shown)
+    bool record_output(std::uint64_t tag);
     bool take_recorded(RecordedFrame& out);
     bool recording_in_flight() const { for (const auto& r : rec_) if (r.state.load() != 0) return true; return false; }  // (debug: the warp writes the way it found each pixel - see ow_path)
     void set_warp_stop(int stage) { warp_stop_ = stage; }
@@ -482,7 +488,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     };
-    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPHudLearned, kPHudTiles, kPWarpClaims, kPStill, kPGrowA, kPGrowB, kPProbe, kPProbeTilesA, kPProbeTilesB, kPShareA, kPShareB, kPShareT, kPShare, kPRetDirtyA, kPRetDirtyB, kPShareT2, kPShareHalf, kPRecColour, kPRecUi, kPShareResid, kPOwnMove, kPPaths, kPShareSeam, kPAttHist, kPMemVis, kPUiTiles, kPWarpBeside, kPWarpHeld, kPLowScene, kPMaskRaw, kPMemF0, kPMemF1, kPMemFZ0, kPMemFZ1, kPGunMove, kPMemRatio, kPMotionProbe, kPMotionGame, kPStencil, kPStenCellsA, kPStenCellsB, kPStenMask, kPStenGrowA, kPStenGrowB, kPStenAge, kPStenLumaA, kPStenLumaB, kPStenElig, kPStenFringeA, kPStenFringeB, kPCount };
+    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPHudLearned, kPHudTiles, kPWarpClaims, kPStill, kPGrowA, kPGrowB, kPProbe, kPProbeTilesA, kPProbeTilesB, kPShareA, kPShareB, kPShareT, kPShare, kPRetDirtyA, kPRetDirtyB, kPShareT2, kPShareHalf, kPRecColour, kPRecUi, kPShareResid, kPOwnMove, kPPaths, kPShareSeam, kPAttHist, kPMemVis, kPUiTiles, kPWarpBeside, kPWarpHeld, kPLowScene, kPMaskRaw, kPMemF0, kPMemF1, kPMemFZ0, kPMemFZ1, kPGunMove, kPMemRatio, kPMotionProbe, kPMotionGame, kPStencil, kPStenCellsA, kPStenCellsB, kPStenMask, kPStenGrowA, kPStenGrowB, kPStenAge, kPStenLumaA, kPStenLumaB, kPStenElig, kPStenFringeA, kPStenFringeB, kPDepthVA, kPDepthVB, kPMemMask, kPShareSm, kPShareSmA, kPRecOut, kPCount };
 
     bool create_pipelines(std::string& error);
     std::string shader_report_;
@@ -595,7 +601,7 @@ private:
     bool beside_valid_ = false, beside_kept_ = false;
     bool lowres_between_ = false, mask_smooth_ = false, claims_beside_held_ = false;
     int beside_moved_ = 0;
-    bool edge_dither_band_ = true, att_absolute_ = false, held_between_ = false, gun_built_ = false;
+    bool edge_dither_band_ = true, att_absolute_ = false, held_between_ = false, gun_built_ = false, motion_ref_ = false, ref_built_ = false, ref_frac_built_ = false;
     float held_back_ = 0;
     bool mem_relight_ = false, share_scenery_ = true, dither_holes_ = false;
     std::uint32_t motion_channels_ = 0, srv_motion_channels_ = 0;  // (SlotMeta::motion_channels now, and in the view made)
@@ -615,6 +621,7 @@ private:
         std::uint64_t tag = 0, fence = 0;
         int context = 0;
         bool has_ui = false;
+        bool output = false;  // (record_output: colour alone)
         std::atomic<int> state{0};  // 0 free, 1 queued on a list, 2 submitted (its fence known) - see take_recorded
     };
     RecSlot rec_[kRecSlots];
@@ -624,7 +631,7 @@ private:
     bool learning_stalled_ = true;
     std::uint32_t detection_idle_ = 0;  // game frames since the HUD was last detected (build_no_warp_mask)
     std::uint32_t scene_idle_ = 0;      // game frames since the upscaler's output last came (ingest)
-    ComPtr<ID3D12PipelineState> cs_attached_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_own_warp_reset_, cs_own_warp_lean_, cs_own_warp_args_, cs_own_warp_rest_, cs_warp_claims_clear_, cs_warp_claim_, cs_warp_beside_, cs_warp_held_, cs_own_warp_up_, cs_mask_smooth_, cs_memory_, cs_mem_ratio_, cs_mem_relight_, cs_gun_motion_, cs_mem_vis_, cs_hudless_ui_, cs_hudless_keep_, cs_ui_tiles_, cs_layer_unblend_, cs_layer_seam_clear_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_, cs_camera_fill_, cs_probe_tiles_, cs_probe_clear_, cs_probe_score_, cs_share_measure_, cs_share_blur_, cs_share_bins_, cs_share_final_, cs_share_up_, cs_share_seam_, cs_att_hist_, cs_rec_down_, cs_share_resid_, cs_resid_blur_, cs_own_up_;
+    ComPtr<ID3D12PipelineState> cs_attached_, cs_ref_pick_, cs_ref_frac_, cs_depth_vec_, cs_mem_mask_, cs_share_weights_, cs_ref_raw_, cs_share_rows_, cs_share_cols_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_own_warp_reset_, cs_own_warp_lean_, cs_own_warp_args_, cs_own_warp_rest_, cs_warp_claims_clear_, cs_warp_claim_, cs_warp_beside_, cs_warp_held_, cs_own_warp_up_, cs_mask_smooth_, cs_memory_, cs_mem_ratio_, cs_mem_relight_, cs_gun_motion_, cs_mem_vis_, cs_hudless_ui_, cs_hudless_keep_, cs_ui_tiles_, cs_layer_unblend_, cs_layer_seam_clear_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_, cs_camera_fill_, cs_probe_tiles_, cs_probe_clear_, cs_probe_score_, cs_share_measure_, cs_share_blur_, cs_share_bins_, cs_share_final_, cs_share_up_, cs_share_seam_, cs_att_hist_, cs_rec_down_, cs_share_resid_, cs_resid_blur_, cs_own_up_;
     ComPtr<ID3D12PipelineState> cs_sten_clear_, cs_sten_hist_, cs_sten_cells_, cs_sten_flood_, cs_sten_apply_, cs_sten_count_, cs_sten_grow_init_, cs_sten_grow_, cs_sten_age_, cs_sten_close_, cs_sten_comp_clear_, cs_sten_comp_count_, cs_sten_comp_max_, cs_sten_prune_, cs_sten_luma_, cs_sten_elig_, cs_sten_fringe_, cs_sten_fringe_apply_;
     // Sight reticles (option): the passes, which history texture holds the latest layer, and whether the layer was
     // built for the frame taken in last / the shown one (see cs_ret_layer).

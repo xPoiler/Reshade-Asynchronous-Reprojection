@@ -94,8 +94,6 @@ struct Settings {
     std::uint32_t use_mouse;       // raw mouse drives rotation
     std::uint32_t use_ui_tags;     // pass HUD-less + UI to Latewarp (HUD stays still)
     float rotation_extrapolation;  // 0..1, non-mouse (residual) angular velocity extrapolation
-    float translation_extrapolation;  // unused since 2026-10-30: movement is interpolated, not predicted (PoseModel::position_at)
-    float orbit_distance;          // world units in front of the camera to orbit around (0 = first person)
     float max_horizon_ms;          // clamp for extrapolation
     std::uint32_t reset_calibration;  // incremented by UI
     std::uint32_t manual_gain;     // 1: use manual gains below instead of learned
@@ -109,7 +107,6 @@ struct Settings {
                                    // 6: the lowest latency that uncovers nothing the game has not rendered (now .. one game frame back)
     float present_lead_ms;         // render this long before the next vblank (0: right after the previous one)
     std::uint32_t gpu_priority;    // presenter GPU scheduling class: 0 realtime (default), 1 high, 2 normal
-    std::uint32_t moving_objects;  // unused since 2026-10-30 (XPAR's own frame generation, removed)
     std::uint32_t no_warp_mask;    // games without HUD layers: detect the HUD and keep it unwarped
     std::uint32_t show_mask;       // debug: tint the no-warp mask (magenta) and the HUD score still learning (green)
     std::uint32_t floor_release;   // option, on by default (saved per game): while turns are predicted around a measured orbit pivot, the
@@ -130,8 +127,6 @@ struct Settings {
     std::uint32_t use_controller;      // the controller's right stick drives rotation too (option, on by default, saved per game)
     std::uint32_t present_lead_auto;   // default on: the present lead follows the measured warp time (present_lead_ms unused)
     std::uint32_t edge_fill;           // own warp, what a turn uncovers past the frame's edge: 0 extended edge pixels, 1 soft, 2 dithered (default; saved per game)
-    std::uint32_t orbit_mode;          // turning around a pivot: 0 measured (camera estimated from the game's own motion vectors), 1 off (default since 2026-10-22),
-                                       // 2 manual (orbit_distance); saved per game
     float edge_limit_pct;              // Auto latency "camera as of now": the most of the screen's width (percent) the warp may uncover
                                        // beyond what the regular Auto latency uncovers lately (0: no more than it; saved per game)
     std::uint32_t edge_unlimited;      // ...or no limit at all (saved per game)
@@ -144,15 +139,12 @@ struct Settings {
                                        // held, and the character's limbs with it (Renderer::hold_characters; saved per game)
     std::uint32_t hud_learn;           // default on: learn where the game draws its HUD (hud_learn.hpp) and take the HUD from there
     std::uint32_t hud_relearn;         // incremented by the panel: learn again
-    std::uint32_t wait_for_model;      // off (no option, not saved, since 2026-10-22 - more problems than it solved, user): the game's
-                                       // own frames until the camera model explains a fifth of the camera's motion on both axes
     std::uint32_t follow_share;        // default on: the character/weapon by how much of the camera's turn each spot follows
                                        // (Renderer::follow_share) instead of held whole (hold_characters, the stretch; saved per game)
     std::uint32_t share_from_input;    // default on: ...measured against the turn the input explains (what the warp applies), not
                                        // the game camera's whole turn (a car's steering, a gun's own animation; saved per game)
     std::uint32_t memory_resolution;   // background memory: 0 the picture's own resolution, 1 half (default), 2 a quarter - less
                                        // video memory and GPU time, softer where it fills (saved per game)
-    std::uint32_t turns_only;          // unused since 2026-10-30 ("Camera turns only": movement is interpolated now)
 };
 
 // Presenter status, displayed by the add-on UI.
@@ -200,7 +192,7 @@ struct PresenterStatus {
     // the last 5 s, ours included: 1 = nothing queued ahead of it; 0: not measured).
     float present_lead_ms;
     float presents_queued;
-    std::uint32_t orbit_in_use;  // turns are predicted around the measured orbit pivot right now (Orbit pivot: Measured, consistent)
+    std::uint32_t orbit_in_use;  // turns are predicted around the measured orbit pivot right now (the game's own camera, a consistent orbit)
     // Where the HUD of the frames taken in comes from (the panel says it): 0 none (not kept still, or not known yet),
     // 1 the game's HUD layers (HUD-less picture + UI layer), 2 the game's HUD-less picture, 3 the game's own HUD layer
     // (found by the add-on), 4 the upscaler's output, 5 the upscaler's output + camera motion check, 6 learned, 7 the HUD point
@@ -213,7 +205,6 @@ struct PresenterStatus {
     // HUD learning: the presenter's pick of the candidates scored so far (0: none yet), and the learned point that stopped
     // behaving like a HUD (0: none) - the add-on learns again.
     std::uint32_t hud_learn_pick, hud_learn_fail;
-    std::uint32_t waiting_for_model;  // 1: the game's own frames shown while the camera model learns (Settings::wait_for_model)
     // Where the character mask comes from (the panel says it): 0 estimated from the motion, 1 the game's depth-stencil marks the character
     // (StencilMask=1, development - Renderer::stencil_character)
     std::uint32_t character_source;
@@ -342,6 +333,8 @@ struct Shared {
     // ...and calls the game made to its frame generation (DLSS FG evaluations, FSR frame generation
     // dispatches): frame generation is on even where ReShade sees only the rendered frames' presents.
     volatile LONG generation_calls;
+    // 1: the game runs on Vulkan (the add-on, at its present) - the measured orbit pivot is never used there (main.cpp measured_orbit).
+    volatile LONG game_vulkan;
     // The motion search's result, written by the presenter (motion_search.hpp): the add-on then hands that target over as the motion.
     volatile LONG motion_found;
     std::uint32_t motion_candidate, motion_channel_x, motion_channel_y;

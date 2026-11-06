@@ -8,12 +8,20 @@
 
 #include "ReShade.fxh"
 
-// Up to 1440p the depth is handed over as large as the picture; above, at half of it (the rest of XPAR
-// works at the resolution a game would render at before upscaling).
+// The depth is handed over at the size of the game's own depth buffer - the resolution it renders at before
+// upscaling - set here by the add-on (XPAR_FEED_W/H), never larger than the picture: larger only costs every
+// pass after it, with nothing in it the game's depth did not have. Until the add-on has set it: as large as
+// the picture up to 1440p, half of it above.
 #if BUFFER_HEIGHT > 1440
     #define XPAR_FEED_DIV 2
 #else
     #define XPAR_FEED_DIV 1
+#endif
+#ifndef XPAR_FEED_W
+    #define XPAR_FEED_W (BUFFER_WIDTH / XPAR_FEED_DIV)
+#endif
+#ifndef XPAR_FEED_H
+    #define XPAR_FEED_H (BUFFER_HEIGHT / XPAR_FEED_DIV)
 #endif
 
 // Set by the add-on when the depth comes the other way round (ReShade's RESHADE_DEPTH_INPUT_IS_REVERSED
@@ -23,7 +31,7 @@ uniform bool XPAR_Flip < hidden = true; > = false;
 // as far away, and XPAR warps the camera's turns only (they need no depth).
 uniform bool XPAR_Far < hidden = true; > = false;
 
-texture XPAR_Depth { Width = BUFFER_WIDTH / XPAR_FEED_DIV; Height = BUFFER_HEIGHT / XPAR_FEED_DIV; Format = R32F; };
+texture XPAR_Depth { Width = XPAR_FEED_W; Height = XPAR_FEED_H; Format = R32F; };
 
 // A game that draws each frame into the next of two depth buffers: ReShade binds the one chosen, the add-on binds the other here. Which of them this
 // frame drew into is seen in them: a few points of each are kept from the last frame (XPAR_Seen), and the second one is read when the chosen one did not

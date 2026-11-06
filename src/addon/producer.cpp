@@ -36,20 +36,18 @@ void default_settings(Settings& s) {
     s = Settings{};
     s.enabled = 1; s.use_mouse = 1; s.use_ui_tags = 1;
     s.warp_engine = 1;  // XPAR's own engine (NVIDIA Latewarp is the alternative)
-    s.rotation_extrapolation = 1.0f; s.translation_extrapolation = 1.0f;
-    s.orbit_distance = 0.0f; s.max_horizon_ms = 100.0f;
+    s.rotation_extrapolation = 1.0f;
+    s.max_horizon_ms = 100.0f;
     s.prediction_ms = -16.0f;  // manual value, used when auto is off
     s.present_lead_ms = 6.0f;  // manual value, used when the automatic lead is off
     s.present_lead_auto = 1;
     s.frame_cap = 1;  // prevent GPU queueing, standing aside while the game's Reflex is on
-    s.orbit_mode = 1;  // off (2026-10-22, user): the measured pivot wanders when the camera does more than orbit - Enshrouded's and Dawnwalker's character juddered
     s.floor_release = 1;  // the ground around the character moves with a measured orbit (acts only while one is in use)
     s.hold_reticles = 1;  // sight reticles drawn without depth move with the gun (acts only inside a sight's window)
     s.game_hud_layers = 1;  // the HUD from the game's own HUD layer / final picture where found
     s.warp_splat = 1;  // the XPAR warp by forward splat
     s.hold_characters = 1;  // whole characters held
     s.hud_learn = 1;  // learn where the game draws its HUD
-    s.wait_for_model = 0;  // (off, no option since 2026-10-22, user: more problems than it solved - see Settings::wait_for_model)
     s.follow_share = 1;  // the character/weapon by the share of the turn it follows
     s.share_from_input = 1;  // ...of the turn the input explains
     s.edge_limit_pct = 0.0f;  // camera as of now: no more of the edge uncovered than Auto's
@@ -62,7 +60,6 @@ void default_settings(Settings& s) {
     s.stretch_width = 1;
     s.background_memory = 1;  // what the warp uncovers comes from the scenery last seen there (XPAR engine)  // hold what stays nearly still on screen while the camera turns (orbit cameras)
     s.memory_resolution = 1;  // (the background memory at half the picture's resolution: full fills seamlessly, ~4x the video memory)
-    s.turns_only = 0;  // (the camera's turn and its movement both reprojected)
     s.hud_from_scene = 2;  // HUD from the upscaler's output + camera-motion check (learned HUD without an upscaler output)
     s.auto_prediction = 6;     // default: the lowest latency without edge fill (now .. one game frame back); 3: Auto - 1/2 game frame, 1/4 in games
                                // without HUD layers (shorter warps hide mask misses), 1 without DLSS/FSR (XPAR's own motion); 1: full, 2: half, 4: quarter
@@ -480,6 +477,8 @@ void Producer::on_constants(std::uint64_t frame, const Camera& camera) {
     // frame-to-frame motion. Integrate it into an absolute position on every frame (even frames that
     // never reach the presenter) so translation - e.g. a third-person orbit - is known.
     Camera cam = camera;
+    // (an upscaler's frame without the game's camera: the feed's frames come before the game gives depth, not counted - game_depth_seen)
+    if (camera.estimated && game_depth_seen()) estimated_upscaler_qpc_ = qpc_now();
     if (!camera.estimated) {
         // The previous frame's zoom and near plane (they change while aiming in some games); the jitter
         // terms stay the current frame's, so games whose projection only jitters behave exactly as before.
@@ -546,6 +545,12 @@ void Producer::set_matrices(std::uint64_t frame, const MatrixCandidate* matrices
     count = std::min(count, kMatrixCandidates);
     std::copy(matrices, matrices + count, shared_->slots[slot].matrix);
     shared_->slots[slot].matrices = count;
+}
+
+void Producer::set_present_matrices(const MatrixCandidate* matrices, std::uint32_t count) {
+    std::lock_guard lock(mutex_);
+    present_matrix_count_ = std::min(count, kMatrixCandidates);
+    std::copy(matrices, matrices + present_matrix_count_, present_matrices_);
 }
 
 void Producer::set_motion_meta(std::uint64_t frame, std::uint32_t candidate, std::uint32_t channels) {
@@ -660,6 +665,12 @@ int Producer::present_slot() {
     if (slot < 0) { InterlockedIncrement(&shared_->presents_without_frame); return -1; }
     InterlockedExchange(&shared_->presents_without_frame, 0);
     auto& m = shared_->slots[slot];
+    // (the camera search's values for an upscaler's frame without the game's camera - set_present_matrices; the feed's frames carry their own)
+    if (present_matrix_count_ && m.camera.estimated && !m.matrices) {
+        std::copy(present_matrices_, present_matrices_ + present_matrix_count_, m.matrix);
+        m.matrices = present_matrix_count_;
+    }
+    present_matrix_count_ = 0;
     close_frames(m.frame_id);  // (without present markers: the frame presented closes here)
     // Frames older than the one being presented will never be presented: release them.
     for (int i = 0; i < kSlots; ++i)

@@ -40,6 +40,14 @@ public:
     // last two seconds: the ReShade feed (reshade_feed.hpp) stays out. Not for the session: DLSS or FSR
     // switched off in the game's settings leaves the feed as the only source, from then on.
     void note_game_depth() { game_depth_qpc_ = qpc_now(); }
+    // An upscaler's frame with no camera of the game's (an estimated one: NGX without Streamline, FSR without it) within the last
+    // second: the camera search runs then too, its values going with the frame presented (set_present_matrices).
+    bool upscaler_camera_estimated() const {
+        const std::int64_t last = estimated_upscaler_qpc_.load();
+        return last && shared_ && game_depth_seen() && qpc_now() - last < shared_->qpc_frequency;
+    }
+    // The camera search's values for the frame the next present closes (an upscaler's frame: its own frame numbers, not the feed's).
+    void set_present_matrices(const MatrixCandidate* matrices, std::uint32_t count);
     bool game_depth_seen() const {
         const std::int64_t last = game_depth_qpc_.load();
         return last && shared_ && qpc_now() - last < shared_->qpc_frequency * 2;
@@ -239,6 +247,9 @@ private:
     std::vector<std::uint64_t> open_frames_;  // started rendering, not presented, oldest first
     std::uint64_t last_upscaled_ = 0;
     std::atomic<std::int64_t> game_depth_qpc_{0};
+    std::atomic<std::int64_t> estimated_upscaler_qpc_{0};
+    MatrixCandidate present_matrices_[kMatrixCandidates]{};
+    std::uint32_t present_matrix_count_ = 0;
     std::atomic<std::int64_t> feed_qpc_{0};
     void note_frame(std::uint64_t f) { std::uint64_t h = highest_frame_.load(); while (f > h && !highest_frame_.compare_exchange_weak(h, f)) {} }
     std::uint64_t last_counted_frame_ = 0;  // frames_total counts each rendered frame once

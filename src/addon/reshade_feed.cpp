@@ -165,10 +165,22 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
             reshade::log::message(reshade::log::level::info, text.c_str());
         }
     }
-    if (wanted) track_depth_buffers(); else release_depth_choice(runtime);
-    // (an upscaler's data now: nothing of the search stays - its scale, its timing, its hooks at work on every target. Found again if the feed comes back)
+    // The camera search also while an upscaler gives depth and motion but not the game's camera (NGX or FSR without Streamline): the camera is
+    // estimated there otherwise. Its values go with the frame the present closes (Producer::set_present_matrices). Paused once the game's own
+    // camera comes (Streamline), and while frame generation runs (its frames are not the game's).
+    const bool upscaler_search = p->shared()->settings.enabled && !wanted && !p->generation_active() && p->upscaler_camera_estimated();
+    if (wanted) { track_depth_buffers(); camera_search::resume(); } else release_depth_choice(runtime);
+    if (upscaler_search) {
+        camera_search::resume();
+        Shared* ush = p->shared();
+        static MatrixCandidate upscaler_matrices[kMatrixCandidates];
+        const std::uint32_t count = camera_search::take(upscaler_matrices, kMatrixCandidates, ush->camera_held, ush->camera_held_state);
+        if (count) p->set_present_matrices(upscaler_matrices, count);
+    }
+    // (an upscaler's data now: nothing of the motion search stays - its scale, its timing, its hooks at work on every target. Found again if the feed comes back)
     if (!wanted) {
         mv_probe::pause();
+        if (!upscaler_search) camera_search::pause();
         if (p->shared()->motion_found) { InterlockedExchange(&p->shared()->motion_found, 0); InterlockedIncrement(&p->shared()->motion_restarts); }
     }
     // (why the feed has not started, every 300 frames while it has not: a game that stays without depth says what holds it)
@@ -213,6 +225,42 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
     // than an unrelated buffer's depth, which moves parts of the picture by distances that are not there.
     // (An older XPAR.fx without the switch: the depth is not published until it is known, as before.)
     const bool usable = depth_usable() && !choosing;
+    // The depth handed over at the size of the game's depth buffer, once the one that belongs to the picture is chosen (XPAR.fx's
+    // XPAR_FEED_W/H; the effect is rebuilt with it, from the next frames on): it is the size the game renders at before upscaling.
+    // Half of a 4K picture before, 1920x1080, for a game rendering at 1280x720 (Cyberpunk, XeSS Ultra Performance): every pass of the
+    // presenter's on 2.25 times the pixels the game's depth had - depth and motion 1.3 ms a game frame, 0.11 ms with DLSS's own depth.
+    // Never larger than it was before (XPAR.fx's XPAR_FEED_DIV: the picture up to 1440p, half of it above): the depth chosen can be one
+    // the size of the picture - Cyberpunk, XeSS, a 3840x2160 one chosen after a scene change - and at 4K every slot and pass of the
+    // presenter's went with it: 2 GB of an 8 GB card's budget of 1.3, XPAR aside for good, the game freezing.
+    // (The cap also before a buffer is chosen: a size saved in the preset larger than it is brought down at once.)
+    {
+        uint32_t sw = 0, shh = 0;
+        runtime->get_screenshot_width_and_height(&sw, &shh);
+        const uint32_t div = shh > 1440 ? 2 : 1;
+        const uint32_t cap_w = sw ? sw / div : w, cap_h = shh ? shh / div : h;
+        uint32_t fw_ = std::min(w, cap_w), fh_ = std::min(h, cap_h);
+        if (usable && bound_view.handle) {
+            const resource_desc gd = dev->get_resource_desc(dev->get_resource_from_view(bound_view));
+            std::uint32_t rw = gd.texture.width, rh = gd.texture.height;
+            // (the render resolution, when the scene's depth chosen is the picture's size - a copy at the upscaled size, Cyberpunk's 3840x2160
+            // beside its 1280x720: depth_choice.hpp. Not otherwise: a buffer below the picture's size is the game's own, and smaller ones of the
+            // same scene are its reductions - Enshrouded's 640x360 beside its 1280x720, handed over at a quarter before this)
+            if (sw && shh && gd.texture.width >= sw && gd.texture.height >= shh) scene_depth_size(rw, rh);
+            fw_ = std::min(rw, cap_w); fh_ = std::min(rh, cap_h);
+        }
+        static uint32_t asked_w = 0, asked_h = 0;
+        if (fw_ >= 64 && fh_ >= 64 && (fw_ != w || fh_ != h) && (fw_ != asked_w || fh_ != asked_h)) {
+            asked_w = fw_; asked_h = fh_;
+            char v[16];
+            std::snprintf(v, sizeof(v), "%u", fw_);
+            runtime->set_preprocessor_definition_for_effect("XPAR.fx", "XPAR_FEED_W", v);
+            std::snprintf(v, sizeof(v), "%u", fh_);
+            runtime->set_preprocessor_definition_for_effect("XPAR.fx", "XPAR_FEED_H", v);
+            char text[200];
+            std::snprintf(text, sizeof(text), "XPAR: ReShade feed: depth handed over at the game's depth buffer's size, %ux%u (was %ux%u, the picture %ux%u)", fw_, fh_, w, h, sw, shh);
+            reshade::log::message(reshade::log::level::info, text);
+        }
+    }
     const bool oriented = usable && depth_orientation_ready(runtime, cmd_list, probe_view, g.flip);
     const bool far_only = !oriented;
     // Nothing goes to the presenter before the game draws a 3D scene - 600 frames of it in a row: its menus at the start of a session are no
@@ -225,6 +273,7 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
         const bool scene = depth_binds_per_frame() > 0.0 && (oriented || (!choosing && !depth_usable()));
         g.waited = scene ? g.waited + 1 : 0;
         if (g.waited == 600) {
+            choose_depth_again(runtime);
             char text[200];
             std::snprintf(text, sizeof(text), "XPAR: no DLSS or FSR data, a 3D scene drawn (%.0f depth buffers bound a frame, its depth %s): the ReShade feed starts",
                           depth_binds_per_frame(), oriented ? "read" : "not told apart - handed over as far away");

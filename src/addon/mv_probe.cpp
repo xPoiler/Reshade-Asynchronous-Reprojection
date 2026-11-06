@@ -263,6 +263,8 @@ void take_vulkan(command_list* cmd, device* dev, resource r, resource_usage stat
 // (tried again 2026-11-04 with the game's camera found: the shake went, the scenery juddered. Its vectors held the frame before's motion on most frames, not
 // as handed on: the copy's command buffer went to the present's queue, before the present, on 300 of 300 frames - the target itself is behind. A late target
 // is now refused where its timing shows - MotionSearch::late - but Enshrouded's was taken before that was known.)
+// (searched again 2026-11-06 with the right depth and the camera found: Enshrouded's candidate 11 found and refused by late() - follows the frame
+// before 0.88, its own 0.85. Off again.)
 constexpr bool kVulkanSearch = false;
 // Vulkan: a target drawn in a render pass is done at the end of that pass. The game's barrier out of drawing can come as late as the next frame: Enshrouded's motion
 // reached XPAR a frame behind its picture and depth (colour fitted the next frame's motion in 26 of 34 frames, with DLSS its own in all), and all that warped from it
@@ -471,7 +473,8 @@ void init() {
     size_t size = sizeof(value);
     g_on = reshade::get_config_value(nullptr, "FrameWarp", "MotionProbe", value, &size) && value[0] == '1';
     value[0] = 0; size = sizeof(value);
-    g_search = reshade::get_config_value(nullptr, "FrameWarp", "MotionSearch", value, &size) && value[0] == '1';
+    // (on by default since 2.2; MotionSearch=0 turns it off)
+    g_search = !(reshade::get_config_value(nullptr, "FrameWarp", "MotionSearch", value, &size) && value[0] == '0');
     char target[32] = {};
     size = sizeof(target);
     if (g_search && reshade::get_config_value(nullptr, "FrameWarp", "MotionTarget", target, &size) && std::sscanf(target, "%u:%u", &g_saved_format, &g_saved_width) != 2)

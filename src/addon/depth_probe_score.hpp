@@ -13,6 +13,9 @@ struct DepthProbeScore {
     double coverage = 0, edges = 0, lift = 0, score = 0;
     bool flat = false;    // one depth value everywhere: an empty (cleared) buffer
     double detail = 0;    // how much the picture's brightness varies (standard deviation, 0..1)
+    bool unlit = false;   // depth edges enough, and not one of them with any change of brightness across it: no picture to judge against yet
+                          // (a game fading in from black - Enshrouded's real depth probed on the black picture scored 0, a 640x360 with 1.3% edges probed
+                          // a moment later won, kept all session). An unrelated buffer scores 0.6-1.0 here, never 0.
 };
 inline DepthProbeScore score_depth_probe(const float* px, std::uint32_t w, std::uint32_t h) {
     DepthProbeScore best;
@@ -58,6 +61,7 @@ inline DepthProbeScore score_depth_probe(const float* px, std::uint32_t w, std::
         s.coverage = covered / (double(w) * h);
         s.edges = double(edges) / double(std::max<std::size_t>(edges + others, 1));
         if (edges >= 40 && others >= 40) s.lift = (at_edges / double(edges)) / std::max(elsewhere / double(others), 1e-6);
+        s.unlit = edges >= 40 && at_edges == 0;
         s.score = std::max(s.lift - 1.0, 0.0) * std::min(1.0, s.coverage / 0.5);
         if (s.score > best.score || turned == 0) best = s;
     }

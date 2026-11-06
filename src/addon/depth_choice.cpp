@@ -146,7 +146,7 @@ struct Chooser {
     int round = 0, wait = 0;
     bool copied = false;
     resource chosen{0};
-    bool ours = false, users = false, disabled = false, said_missing = false, said_twins = false;
+    bool ours = false, users = false, disabled = false, said_missing = false;
     std::uint64_t retry_at = 0, retry_after = 120;
     std::vector<std::uint64_t> tried;  // the buffers the last choice was made among
     std::size_t said_candidates = ~std::size_t(0);
@@ -349,6 +349,11 @@ void empty_depth_verdict(std::uint64_t frame) {
     c.restart_needed = true;
 }
 
+// The size the scene's depth is drawn at (scene_depth_size), for the buffer chosen at the time.
+std::uint64_t g_scene_of = 0;
+std::uint32_t g_scene_w = 0, g_scene_h = 0;
+std::vector<std::uint64_t> g_scene_larger;  // the larger buffers the last choice that saw both found holding the same scene
+
 void settle(generic_depth_data* gd, std::uint64_t frame) {
     empty_depth_verdict(frame);
     const Candidate* best = nullptr;
@@ -369,6 +374,30 @@ void settle(generic_depth_data* gd, std::uint64_t frame) {
     if (best && best->sum / best->probes >= kAcceptScore) {
         gd->override_depth_stencil = best->res;
         c.chosen = best->res; c.ours = true; c.retry_after = 120;
+        // The scene's depth at the game's render resolution: of the buffers that hold the same scene (close to the best, as above),
+        // of the same shape, the smallest - Cyberpunk with XeSS keeps it at 1280x720 and at the picture's 3840x2160, scoring
+        // 1.65 and 1.59, either chosen by turns; the feed is handed at the smaller whichever it is (scene_depth_size).
+        // A choice made where only the larger is drawn (Cyberpunk's menus: the 1280x720 ones not bound at all) keeps the size the last choice
+        // that saw both found, for that same larger buffer: otherwise the feed went back to the larger after every menu.
+        const std::uint32_t kept_w = g_scene_w, kept_h = g_scene_h;
+        const bool kept_for_best = std::find(g_scene_larger.begin(), g_scene_larger.end(), best->res.handle) != g_scene_larger.end();
+        const auto same_scene = [&](const Candidate& k) {
+            return k.probes && k.sum / k.probes >= 0.85 * (best->sum / best->probes) && std::uint64_t(k.w) * best->h == std::uint64_t(k.h) * best->w;
+        };
+        g_scene_of = best->res.handle; g_scene_w = best->w; g_scene_h = best->h;
+        std::uint32_t largest = best->w;
+        for (const auto& k : c.cand)
+            if (same_scene(k)) {
+                if (k.w < g_scene_w) { g_scene_w = k.w; g_scene_h = k.h; }
+                largest = std::max(largest, k.w);
+            }
+        if (largest > g_scene_w) {  // (both seen: the larger ones noted)
+            g_scene_larger.clear();
+            for (const auto& k : c.cand)
+                if (same_scene(k) && k.w > g_scene_w) g_scene_larger.push_back(k.res.handle);
+        } else if (kept_for_best && kept_w && kept_w < best->w) {
+            g_scene_w = kept_w; g_scene_h = kept_h;
+        }
         std::snprintf(text, sizeof(text), "XPAR: depth buffer chosen: %ux%u, format %u (score %.2f%s, of %zu tried)", best->w, best->h,
                       unsigned(best->fmt), best->sum / best->probes, best->sum / best->probes < kMinScore ? ": faint, the best there is" : "",
                       std::max(c.tried.size(), c.cand.size()));
@@ -393,7 +422,7 @@ void settle(generic_depth_data* gd, std::uint64_t frame) {
 
 // A game can draw each frame into the next of two depth buffers, the other being last frame's for its temporal passes (Enshrouded). The buffer chosen is then
 // a frame old every other frame: on half of the frames depth and motion disagreed, and the camera fit and the warp with them. Generic Depth stays on the chosen one;
-// its twin - the same size and format, bound as much (a stopgap: within a twentieth) - is copied each frame into a texture of ours, as Generic Depth copies when it
+// its twin - the same size and format, bound the nearest number of times - is copied each frame into a texture of ours, as Generic Depth copies when it
 // cannot read a buffer directly, and XPAR.fx sees which of the two changed.
 effect_runtime* g_runtime = nullptr;
 resource g_twin_copy{0};
@@ -452,22 +481,30 @@ void on_present(command_queue*, swapchain*, const rect*, const rect*, uint32_t, 
     if (g_twin.handle && c.chosen.handle == g_twin_of) return;
     if (g_twin.handle) drop_twin(g_runtime);
     resource twin{0};
+    char text[200] = "";
     {
         const std::uint64_t frame = g_frame.load(std::memory_order_relaxed);
         std::lock_guard<std::mutex> lock(g_mutex);
         const auto chosen = g_seen.find(c.chosen.handle);
         if (chosen == g_seen.end() || chosen->second.binds < 60) return;
-        int like = 0;
+        // (the one of the same size and format in use, bound the nearest number of times - no gate on how near: Enshrouded's pair was bound 111 and 105 times
+        // in one session, past the twentieth asked before, and every other frame's depth was the frame before's (seq_4: 100% identical on alternate frames) -
+        // the character held and let go in turn, a shake. Which of the two to read is decided each frame by XPAR.fx (XPAR_PickPS): the twin only when the chosen
+        // one did not change and it did, so a buffer bound beside it that is not its twin is never read while the chosen one is drawn)
+        std::uint64_t nearest = ~0ull, twin_binds = 0;
         for (const auto& [handle, k] : g_seen)
             if (handle != c.chosen.handle && k.last_frame + 2 >= frame && k.w == chosen->second.w && k.h == chosen->second.h && k.fmt == chosen->second.fmt) {
-                ++like;
-                if (k.binds * 20 >= chosen->second.binds * 19 && chosen->second.binds * 20 >= k.binds * 19) twin = k.res;
+                const std::uint64_t apart = k.binds > chosen->second.binds ? k.binds - chosen->second.binds : chosen->second.binds - k.binds;
+                if (apart < nearest) { nearest = apart; twin = k.res; twin_binds = k.binds; }
             }
-        if (!twin.handle) { if (like) why(1, "XPAR: a second depth buffer like the chosen one, not bound as much: left alone"); return; }
+        if (!twin.handle) return;
+        std::snprintf(text, sizeof(text), "XPAR: a second depth buffer like the chosen one (%ux%u, bound %llu and %llu times): both are read, the one drawn this frame used",
+                      chosen->second.w, chosen->second.h, static_cast<unsigned long long>(chosen->second.binds), static_cast<unsigned long long>(twin_binds));
     }
+    // (outside the lock: binding destroys the texture before, and on_destroy takes it)
     if (bind_twin(g_runtime, twin)) {
         g_twin_of = c.chosen.handle;
-        if (!c.said_twins) { c.said_twins = true; say("XPAR: the game takes turns between depth buffers: both are read"); }
+        say(text);
     }
 }
 void on_begin_effects(effect_runtime*, command_list* cmd_list, resource_view, resource_view) {
@@ -536,9 +573,27 @@ DepthChoice choose_depth_buffer(effect_runtime* runtime, command_list* cmd_list,
         // only when it no longer fits, twice in a row, is the question asked again - games bring small
         // buffers in and out of use all the time, and every question is a second or two without reprojection.
         if (!c.users && !c.verifying) {
-            bool fresh = false;
+            bool fresh = false, fresh_smaller = false;
+            std::uint32_t chosen_w = 0, chosen_h = 0;
             for (const auto& k : in_use)
-                if (std::find(c.tried.begin(), c.tried.end(), k.res.handle) == c.tried.end()) { fresh = true; c.tried.push_back(k.res.handle); }
+                if (k.res.handle == c.chosen.handle) { chosen_w = k.w; chosen_h = k.h; }
+            for (const auto& k : in_use)
+                if (std::find(c.tried.begin(), c.tried.end(), k.res.handle) == c.tried.end()) {
+                    fresh = true; c.tried.push_back(k.res.handle);
+                    // (smaller than the chosen, of its shape: maybe the scene's depth at the game's render resolution, the chosen one
+                    // its copy at the picture's - chosen in a menu, where only that one is drawn (Cyberpunk). Chosen again among both:
+                    // the feed is handed at the smaller - scene_depth_size)
+                    if (chosen_w && fw_ && fh && chosen_w >= fw_ && chosen_h >= fh &&  // (the chosen one the picture's size: see reshade_feed's use)
+                        k.w < chosen_w && std::uint64_t(k.w) * chosen_h == std::uint64_t(k.h) * chosen_w &&
+                        std::find(g_scene_larger.begin(), g_scene_larger.end(), c.chosen.handle) == g_scene_larger.end())
+                        fresh_smaller = true;
+                }
+            if (fresh_smaller) {
+                say("XPAR: a smaller depth buffer of the chosen one's shape came into use: choosing again among both");
+                gd->override_depth_stencil = {0};
+                c.chosen = {0}; c.ours = false; c.retry_after = 120; c.phase = Chooser::kIdle;
+                return DepthChoice::kSettled;
+            }
             if (fresh && in_use.size() >= 2) {
                 if (c.chosen.handle) {
                     c.verifying = true; c.verify_copied = false; c.verify_wait = 1; c.verify_fails = 0;
@@ -663,6 +718,15 @@ DepthChoice choose_depth_buffer(effect_runtime* runtime, command_list* cmd_list,
         Candidate& k = c.cand[c.at];
         if (read_probe(c.reader, px, w, h)) {
             const DepthProbeScore s = score_depth_probe(px.data(), w, h);
+            if (s.unlit) {
+                // (no picture yet where the depth has edges - fading in from black: nothing judged, the choice starts over a little later)
+                char text[160];
+                std::snprintf(text, sizeof(text), "XPAR: depth buffer %ux%u probed on a picture without any brightness across its edges (fading in?): choosing again later", k.w, k.h);
+                say(text);
+                gd->override_depth_stencil = {0};
+                c.chosen = {0}; c.ours = false; c.retry_at = frame + 120; c.phase = Chooser::kSettled;
+                return DepthChoice::kChoosing;
+            }
             k.sum += s.score; ++k.probes;
             c.all_flat = c.all_flat && s.flat;
             c.detail = std::max(c.detail, s.detail);
@@ -746,6 +810,11 @@ bool depth_orientation_ready(effect_runtime* runtime, command_list* cmd_list, re
 bool depth_restart_needed() { return c.restart_needed; }
 
 bool depth_usable() { return c.disabled || c.users || c.chosen.handle != 0; }
+bool scene_depth_size(std::uint32_t& w, std::uint32_t& h) {
+    if (!c.chosen.handle || c.chosen.handle != g_scene_of || !g_scene_w || !g_scene_h) return false;
+    w = g_scene_w; h = g_scene_h;
+    return true;
+}
 
 void track_depth_buffers() {
     g_track = true;
@@ -758,6 +827,13 @@ void track_depth_buffers() {
 }
 
 double depth_binds_per_frame() { return g_track ? g_rate : 0.0; }
+
+void choose_depth_again(effect_runtime* runtime) {
+    if (c.disabled || c.users || !c.ours || c.phase != Chooser::kSettled) return;
+    say("XPAR: the 3D scene is on: the depth buffer chosen again (the choice before it was made while the scene was not shown yet)");
+    if (auto* gd = runtime ? runtime->get_private_data<generic_depth_data>() : nullptr) gd->override_depth_stencil = {0};
+    c.chosen = {0}; c.ours = false; c.verifying = false; c.retry_after = 120; c.phase = Chooser::kIdle;
+}
 
 void release_depth_choice(effect_runtime* runtime) {
     if (!g_track.exchange(false)) return;

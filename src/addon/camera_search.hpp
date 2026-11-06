@@ -8,6 +8,9 @@ namespace fw { class Producer; }
 namespace fw::camera_search {
 void init();
 void shutdown();
+// While the game's camera and motion come from its upscaler (the ReShade feed off): nothing searched, the hooks return at once.
+void pause();
+void resume();
 // The matrices seen since the last call, every value of the shape of a camera, in the order they came (the ReShade feed, once a frame).
 std::uint32_t take(MatrixCandidate* out, std::uint32_t capacity, const volatile long* held, long held_state, std::uint64_t frame = 0);  // (held: 8 keys, the places that win; may be null. held_state: Shared::camera_held_state)
 }

@@ -112,11 +112,18 @@ struct SequenceRecorder {
     std::atomic<std::uint64_t> dropped{0};
     std::mutex mu;
     std::map<std::uint64_t, std::string> lines;  // per game frame: its frames.txt line, until the frame comes back
+    // (what was on the screen: per game frame shown, the first refresh drawn for it - its displays.txt line: the warp's inputs
+    // as the presenter gave them, for seq_replay FW_MATCH to redraw it - until its picture comes back)
+    std::map<std::uint64_t, std::string> out_lines;
     std::string header;
 
     void note(std::uint64_t frame, std::string line) {
         std::lock_guard<std::mutex> lock(mu);
         lines[frame] = std::move(line);
+    }
+    void note_output(std::uint64_t frame, std::string line) {
+        std::lock_guard<std::mutex> lock(mu);
+        out_lines[frame] = std::move(line);
     }
     void start(Renderer& renderer, const std::filesystem::path& root, const std::string& settings_line) {
         std::error_code ec;
@@ -132,6 +139,7 @@ struct SequenceRecorder {
         {
             std::lock_guard<std::mutex> lock(mu);
             lines.clear();
+            out_lines.clear();
         }
         started = now_seconds();
         busy = true; collecting = true; active = true;
@@ -139,7 +147,7 @@ struct SequenceRecorder {
     }
     void run(Renderer& renderer) {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
-        std::vector<std::pair<std::string, RecordedFrame>> clip;
+        std::vector<std::pair<std::string, RecordedFrame>> clip, shown;
         std::size_t bytes = 0;
         for (;;) {
             RecordedFrame f;
@@ -147,8 +155,16 @@ struct SequenceRecorder {
                 std::string line;
                 {
                     std::lock_guard<std::mutex> lock(mu);
-                    const auto it = lines.find(f.tag);
-                    if (it != lines.end()) { line = std::move(it->second); lines.erase(lines.begin(), std::next(it)); }
+                    auto& from = f.output ? out_lines : lines;
+                    const auto it = from.find(f.tag);
+                    if (it != from.end()) { line = std::move(it->second); from.erase(from.begin(), std::next(it)); }
+                }
+                if (f.output) {
+                    if (line.empty()) continue;
+                    bytes += f.colour.size();
+                    shown.emplace_back(std::move(line), std::move(f));
+                    if (bytes > kRecMaxBytes) active = false;
+                    continue;
                 }
                 if (line.empty()) continue;
                 bytes += f.colour.size() + f.depth.size() + f.motion.size() + f.ui.size() + f.stencil.size();
@@ -198,9 +214,30 @@ struct SequenceRecorder {
             }
             clip[i].second = RecordedFrame{};  // (its memory back as soon as it is written)
         }
+        // (what was on the screen: display_<k>.bin - the frame files' header, the colour block alone - and displays.txt)
+        FILE* shown_index = nullptr;
+        if (!shown.empty() && _wfopen_s(&shown_index, (dir / L"displays.txt").c_str(), L"w") == 0 && shown_index) {
+            for (std::size_t i = 0; i < shown.size(); ++i) std::fprintf(shown_index, "display %zu %s\n", i, shown[i].first.c_str());
+            std::fclose(shown_index);
+        }
+        for (std::size_t i = 0; i < shown.size(); ++i) {
+            const RecordedFrame& f = shown[i].second;
+            FILE* out = nullptr;
+            if (_wfopen_s(&out, (dir / (L"display_" + std::to_wstring(i) + L".bin")).c_str(), L"wb") == 0 && out) {
+                const std::uint32_t head[8] = {0x46525746u, 1u, std::uint32_t(f.tag), std::uint32_t(f.tag >> 32), f.cw, f.ch, 0u, 0u};
+                std::uint64_t sizes[8] = {};
+                sizes[0] = sizes[1] = f.colour.size();
+                std::fwrite(head, sizeof(head), 1, out);
+                std::fwrite(sizes, sizeof(sizes), 1, out);
+                std::fwrite(f.colour.data(), 1, f.colour.size(), out);
+                std::fclose(out);
+                written += sizeof(head) + sizeof(sizes) + f.colour.size();
+            }
+            shown[i].second = RecordedFrame{};
+        }
         SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
-        logf("sequence recording written: %zu frames over %.1f s (%llu not recorded: slots full - the clip has gaps there), %.2f GB in %.0f s: %ls",
-             clip.size(), secs, static_cast<unsigned long long>(dropped.load()), double(written) / 1e9, now_seconds() - started - secs, dir.c_str());
+        logf("sequence recording written: %zu frames and %zu shown over %.1f s (%llu not recorded: slots full - the clip has gaps there), %.2f GB in %.0f s: %ls",
+             clip.size(), shown.size(), secs, static_cast<unsigned long long>(dropped.load()), double(written) / 1e9, now_seconds() - started - secs, dir.c_str());
         busy = false;
     }
 };
@@ -620,6 +657,7 @@ struct CameraSearchWorker {
     std::atomic<std::uint32_t> places[CameraSearch::kPlaces] = {};
     std::atomic<bool> turned{false}, ahead{false};
     std::atomic<int> held_state{0};
+    std::atomic<bool> forget{false};  // (set on a change of source: what was learned is dropped before the next judgement)
     HANDLE wake = nullptr;
     void start() {
         busy.store(true, std::memory_order_release);
@@ -628,6 +666,7 @@ struct CameraSearchWorker {
             std::thread([this] {
                 for (;;) {
                     WaitForSingleObject(wake, INFINITE);
+                    if (forget.exchange(false, std::memory_order_acq_rel)) search = CameraSearch{};
                     search.judge(before2, before, now, points, w, h);
                     const auto best = search.places();
                     turned.store(search.depth_turned(), std::memory_order_release);
@@ -896,11 +935,6 @@ void render_thread() {
     // it (Renderer::show_intake): until then the warp keeps the previous one, textures and camera together.
     struct Incoming { IngestedSource s; Camera cam{}; CameraBasis basis{}; bool masked = false; } incoming;
     std::uint32_t last_reset = sh.settings.reset_calibration;
-    // The camera model trusted (Settings::wait_for_model): both axes explain at least kMinFitQuality of the camera's
-    // motion - until then the game's own frames, unwarped, while it learns (an unlearned model turned the view wildly);
-    // then for the session (a dip - a menu with a cursor - does not switch it back), until the model is reset.
-    bool model_ready = false;
-    double wait_start = 0;  // (when the wait began: at most 5 s - see below)
     double stat_start = now_seconds(), last_profile_save = stat_start;
     std::uint32_t stat_frames = 0, stat_sources = 0;
     VblankClock vblank;
@@ -931,6 +965,17 @@ void render_thread() {
     CameraCheck camera_check;        // the game's own camera against its motion vectors
     int poor_estimate_windows = 0;   // ...and, once it was found unusable, whether the estimate does any better
     bool have_source_kind = false, source_was_estimated = false, source_motion_estimated = false;
+    // Turns predicted around the measured orbit pivot (PoseModel::orbit), automatically, while the camera is the game's own - handed over, or
+    // found in its buffers by the camera search and agreeing within the last half second (a stopgap span; flipping per frame would switch the
+    // pivot on and off) - and, within PoseModel, only while the turns agree on one pivot. Estimated cameras: never - the pivot wandered.
+    // Never on Vulkan games (the user, 2026-11-06): Enshrouded's character juddered in turns with the pivot on whatever was tried that day -
+    // its camera exact, a gate on the pivot's miss against the cost of holding the character (the pivot 0.01% off and it still juddered) -
+    // as it had before orbit went off by default on 2026-10-22.
+    // OFF in every game since 2.2 (the user, 2026-11-06, after all seven games): Dark Souls looked pristine without it - with it the
+    // camera's distance changes and the character judders when the pivot is wrong. kMeasuredOrbit = true restores the rule above.
+    constexpr bool kMeasuredOrbit = false;
+    double game_camera_t = -1.0;
+    auto measured_orbit = [&]() { return kMeasuredOrbit && !sh.game_vulkan && have_source_kind && game_camera_t >= 0.0 && now_seconds() - game_camera_t < 0.5; };
     double last_usage_log = 0;
     bool game_has_hud_layers = false, mask_logged = false, source_masked = false, hudless_hud_logged = false, reticles_logged = false;
     bool layer_hud_logged = false;
@@ -958,7 +1003,8 @@ void render_thread() {
     std::uint64_t intake_fence = 0;  // submission carrying the motion samples of the frame in `intake`
     std::vector<MotionSample> motion_samples;
     CameraSearchWorker camera_worker;
-    const bool camera_use = GetEnvironmentVariableW(L"FW_CAMERA_USE", nullptr, 0) != 0;
+    // (on by default since 2.2: off only when CameraUse=0 passes "0")
+    const bool camera_use = [] { wchar_t v[4] = {}; return !(GetEnvironmentVariableW(L"FW_CAMERA_USE", v, 4) && v[0] == L'0'); }();
     const bool camera_dump = GetEnvironmentVariableW(L"FW_CAMERA_DUMP", nullptr, 0) != 0;
     bool camera_dumped = false;
     std::vector<std::uint8_t> camera_bytes;
@@ -969,6 +1015,10 @@ void render_thread() {
     std::map<std::uint32_t, int> camera_from;  // (the places the used frames came from, for the log)
     bool camera_found = false, camera_have_last = false;
     bool camera_followed_now = false;  // (this frame's camera is the game's own, found: the scenery's motion can come from it - Renderer::fill_from_camera)
+    // (this frame's held camera agrees with the motion - also on a frame that does not move, where it is not followed: what keeps
+    // measured_orbit on. By camera_followed_now alone it went off after half a second without turning, and each turn then began
+    // without the pivot and took it up a frame or two in: Enshrouded on the ReShade feed, the orbit 0 <-> ~300 every few seconds)
+    bool camera_agrees_now = false;
     MatrixCandidate camera_last{};  // (the value the camera was found in last frame)
     std::vector<float> camera_errors_now;
     CameraSearch::Motion camera_motion{};
@@ -1218,6 +1268,9 @@ void render_thread() {
                     estimator.reset();
                     mv_scale = MotionVectorScale{};
                     camera_check = CameraCheck{};
+                    // (and the camera search's judge: which places win, which way the depth runs and whether the values are a frame
+                    // ahead were learned against the other source's motion - DOOM, DLSS then none: never found again, 2026-11-06)
+                    camera_worker.forget.store(true, std::memory_order_release);
                     renderer.reset_hud_detection();
                     // (the motion estimated from the picture is not needed with the game's own: its textures go)
                     if (!s.motion_estimated) renderer.release_own_motion();
@@ -1308,6 +1361,7 @@ void render_thread() {
                             const int pairs = picked.pairs;
                             const bool agrees = best && best_error <= limit;
                             camera_have_last = agrees;
+                            camera_agrees_now = agrees;
                             if (agrees) camera_last = *best;
                             // (followed on frames that move only: on a still one any matrix agrees - AC6 took one with a field of view of 174 degrees, kept for the frames after)
                             camera_found = agrees && camera_moving_now && CameraSearch::motion_of(CameraSearch::form_of(*best, turned), CameraSearch::matrix_of(*best), CameraSearch::matrix_of(*best_last), camera_motion);
@@ -1468,6 +1522,8 @@ void render_thread() {
                 frame_times.emplace_back(m.frame_id, source_time);
                 if (frame_times.size() > 8) frame_times.pop_front();
                 g_app.model.set_camera_trusted(!cam.estimated || estimate_trusted);
+                if (!cam.estimated || camera_followed_now || camera_agrees_now) game_camera_t = now_seconds();  // (the game's camera: see measured_orbit)
+                camera_agrees_now = false;
                 if (!cam.estimated) sh.presenter.estimate_unreliable_pct = 0;
                 g_app.model.add_source(m.frame_id, source_time, seconds(qpc_now()), incoming.basis, cam.reset != 0, now_seconds(),
                                        cam.position_epoch);
@@ -1488,7 +1544,11 @@ void render_thread() {
                 // Two independent parts of the no-warp mask: the HUD (only games without HUD layers) and
                 // what moves with the camera (every game: third-person character, first-person weapon).
                 const bool hud_mask = settings.no_warp_mask && !game_has_hud_layers && s.has_depth;
-                const bool attached_mask = settings.keep_attached && s.has_depth && s.has_motion;
+                // (MotionReference, development - FW_MOTION_REF: what moves with the screen by the game's vectors alone, Renderer::set_motion_reference -
+                // held and shown along its own motion between game frames; no follow share, no character hold)
+                static const bool motion_ref = GetEnvironmentVariableW(L"FW_MOTION_REF", nullptr, 0) != 0;
+                renderer.set_motion_reference(motion_ref);
+                const bool attached_mask = (settings.keep_attached || motion_ref) && s.has_depth && s.has_motion;
                 const bool mask = hud_mask || attached_mask;
                 incoming.masked = mask;
                 // Every frame with depth and motion vectors is analysed, whatever is kept still: besides the masks
@@ -1499,7 +1559,7 @@ void render_thread() {
                 // Floor release (debug test): only while turns are predicted around a measured orbit pivot - its depth
                 // value through the frame's projection (row vector: clip = (0, 0, z, 1) * view_to_clip).
                 float floor_pivot_depth = 0.0f;
-                if (settings.floor_release && settings.orbit_mode == 0 && source_was_estimated && !source_motion_estimated && g_app.model.orbit() > 0) {
+                if (settings.floor_release && measured_orbit() && g_app.model.orbit() > 0) {
                     const float* p = cam.view_to_clip;
                     const double z = g_app.model.orbit() * view_z_sign(p);
                     const double cz = z * p[10] + p[14], cw = z * p[11] + p[15];
@@ -1549,11 +1609,10 @@ void render_thread() {
                     rec_share_mode = -1; rec_orbit = false;
                     // (or by the share of the turn each spot follows, Settings::follow_share: against the camera's whole motion
                     // when the warp turns around an orbit, as it does then)
-                    const bool sharing = settings.follow_share != 0 && attached_mask;
+                    const bool sharing = settings.follow_share != 0 && attached_mask && !motion_ref;
                     if (sharing) {
                         if (!was_sharing) renderer.reset_share();
-                        const bool orbit_warp = settings.orbit_mode == 2 ||
-                                                (settings.orbit_mode == 0 && source_was_estimated && !source_motion_estimated && g_app.model.orbit() > 0);
+                        const bool orbit_warp = measured_orbit() && g_app.model.orbit() > 0;
                         // (two shares, Settings::share_from_input: this frame's turn the input's if there was any input since a
                         // little before the frame the motion is measured from - the game's previous frame for its own motion
                         // vectors, the previous one taken for XPAR's estimate - otherwise the rest's: a car's steering, a camera
@@ -1591,7 +1650,7 @@ void render_thread() {
                         wr(g_app.csv_share, "\n");
                     }
                     was_sharing = sharing;
-                    const bool holding = !sharing && settings.hold_characters != 0 && attached_mask && mv_scale.valid;
+                    const bool holding = !sharing && !motion_ref && settings.hold_characters != 0 && attached_mask && mv_scale.valid;
                     if (holding) {
                         if (!was_holding) renderer.reset_still();
                         renderer.hold_characters(s, cam.clip_to_prev_clip, cam.view_to_clip, mv_scale.valid, cam.depth_inverted != 0);
@@ -1621,7 +1680,7 @@ void render_thread() {
                                                 cam.depth_inverted != 0, settings.hud_from_scene == 2,
                                                 settings.hud_fill != 0 && (settings.warp_engine == 1 || !latewarp.ready()),
                                                 settings.warp_engine == 1 || !latewarp.ready() ? static_cast<int>(settings.stretch_width) : 0,
-                                                settings.hold_reticles != 0, settings.follow_share != 0);
+                                                settings.hold_reticles != 0, settings.follow_share != 0 && !motion_ref);
                     // Background memory (option, XPAR engine): the scenery last seen behind held pixels and just
                     // beyond the frame, for what the warp uncovers there.
                     if (settings.background_memory && (settings.warp_engine == 1 || !latewarp.ready())) {
@@ -1888,11 +1947,8 @@ void render_thread() {
                                            ? (source_motion_estimated ? 1u : game_has_hud_layers ? 2u : 4u)
                                                                      : settings.auto_prediction;
         ps.auto_fraction = (fraction == 1 || fraction == 2 || fraction == 4) ? 1.0 / fraction : 0.0;
-        ps.orbit_distance = settings.orbit_mode == 2 ? settings.orbit_distance : 0.0;
-        // (measured orbit: only for a camera estimated from the game's own motion vectors - an upscaler's. Estimated
-        // from the picture (no DLSS or FSR) the pivot wanders: RE2, spread 12-35% against Black Flag's 4%, switched
-        // on and off, and turning on the spot looked steadier there)
-        ps.use_measured_orbit = settings.orbit_mode == 0 && source_was_estimated && !source_motion_estimated;
+        ps.orbit_distance = 0.0;
+        ps.use_measured_orbit = measured_orbit();
         ps.max_horizon = settings.max_horizon_ms / 1000.0;
         ps.manual_gain = settings.manual_gain != 0;
         ps.manual_gain_x = settings.manual_gain_x; ps.manual_gain_y = settings.manual_gain_y;
@@ -1903,8 +1959,6 @@ void render_thread() {
         g_app.model.set_mouse_gate(!cursor_visible);
         if (settings.reset_calibration != last_reset) {
             last_reset = settings.reset_calibration;
-            model_ready = false;
-            wait_start = 0;
             g_app.model.reset_fit();
             std::error_code ec; std::filesystem::remove(g_app.profile_path, ec);
             logf("calibration reset");
@@ -2000,28 +2054,7 @@ void render_thread() {
         Prediction applied{};
         // FrameWarp's own warp engine when chosen, or when Latewarp is not available.
         const bool own_engine = settings.warp_engine == 1 || !latewarp.ready();
-        // (the camera model alone: an estimated camera's field of view is not waited for - in Elden Ring its measurement
-        // almost never passes, and the wait never ended; it keeps learning while warping, as before)
-        if (!model_ready && g_app.model.params(0).quality >= kMinFitQuality && g_app.model.params(1).quality >= kMinFitQuality) {
-            model_ready = true;
-            logf("camera model trusted (yaw quality %.2f, pitch %.2f): warping", g_app.model.params(0).quality, g_app.model.params(1).quality);
-        }
-        // (the wait lasts 5 s at most from the game's first frames - then warped whatever the model, as long as an estimated
-        // camera explains at least a fifth of the last frames: one that fails four in five would turn the view wildly)
-        if (!model_ready && source.valid) {
-            if (wait_start == 0) wait_start = now;
-            int rejected = 0;
-            for (const bool r : estimate_rejects) rejected += r;
-            const bool estimate_ok = !source_was_estimated ||
-                                     (estimate_rejects.size() >= 10 && double(rejected) <= 0.8 * double(estimate_rejects.size()));
-            if (now - wait_start >= 5.0 && estimate_ok) {
-                model_ready = true;
-                logf("camera model wait over after 5 s (yaw quality %.2f, pitch %.2f): warping", g_app.model.params(0).quality, g_app.model.params(1).quality);
-            }
-        }
-        const bool waiting = settings.wait_for_model && !model_ready;
-        sh.presenter.waiting_for_model = waiting ? 1u : 0u;
-        if (source.valid && settings.enabled && !settings.show_original && !waiting && !sh.overlay_open && source.has_depth) {
+        if (source.valid && settings.enabled && !settings.show_original && !sh.overlay_open && source.has_depth) {
             // (paced: the camera as of the planned wake-up, a fixed time before the refresh it is meant for - not
             // the moment the loop got there, which varies by a fraction of a millisecond and would jitter the motion)
             const double t_camera = frame_tick && seconds(frame_tick) <= now ? seconds(frame_tick) : now;
@@ -2164,11 +2197,30 @@ void render_thread() {
                 // a whole game frame back to none as the next one is due)
                 const double interval = g_app.model.frame_interval();
                 const double held_back = !source_has_sim && interval > 0 ? std::clamp(1.0 - (now_seconds() - shown_since) / interval, 0.0, 1.0) : g_app.model.position_frames_back();
-                renderer.set_held_between(generated < 0 && !g_app.model.orbited_within(g_app.model.source_time(), 10.0), float(held_back));
+                // (MotionReference: whatever moves with the screen, a third-person character too - see Renderer::set_motion_reference)
+                static const bool motion_ref_between = GetEnvironmentVariableW(L"FW_MOTION_REF", nullptr, 0) != 0;
+                renderer.set_held_between(generated < 0 && (motion_ref_between || !g_app.model.orbited_within(g_app.model.source_time(), 10.0)), float(held_back));
                 renderer.set_edge_dither(settings.edge_fill == 2);
                 warped = unmoved || renderer.own_warp(source, settings.use_ui_tags != 0, inputs.no_warp_mask != nullptr, m.data(), inputs.depth_inverted,
                                                      settings.background_memory != 0, generated,
                                                      settings.edge_fill == 1, input_part ? m_input.data() : nullptr);
+                // Sequence recording: the first refresh drawn for each game frame shown, as drawn - and its warp's inputs, for
+                // seq_replay FW_MATCH to draw it again from the clip (see Renderer::record_output)
+                static std::uint64_t recorded_shown = 0;
+                if (g_rec.active && warped && !unmoved && shown_frame != recorded_shown && renderer.record_output(shown_frame)) {
+                    recorded_shown = shown_frame;
+                    char line[1600];
+                    int len = std::snprintf(line, sizeof(line), "frame %llu since %.6f held_back %.6f held_between %d generated %d use_ui_tags %d use_mask %d "
+                                            "memory %d soft_edge %d depth_inverted %d source_to_target",
+                                            static_cast<unsigned long long>(shown_frame), now_seconds() - shown_since, held_back,
+                                            int(generated < 0 && (motion_ref_between || !g_app.model.orbited_within(g_app.model.source_time(), 10.0))),
+                                            generated, int(settings.use_ui_tags != 0), int(inputs.no_warp_mask != nullptr),
+                                            int(settings.background_memory != 0), int(settings.edge_fill == 1), int(inputs.depth_inverted));
+                    for (int e = 0; e < 16; ++e) len += std::snprintf(line + len, sizeof(line) - len, " %.9g", m.data()[e]);
+                    len += std::snprintf(line + len, sizeof(line) - len, " input %d", int(input_part));
+                    for (int e = 0; e < 16 && input_part; ++e) len += std::snprintf(line + len, sizeof(line) - len, " %.9g", m_input.data()[e]);
+                    g_rec.note_output(shown_frame, line);
+                }
             } else {
                 warped = latewarp.evaluate(list, inputs, first_eval, view_matrix(p.camera, origin, z_sign),
                                            view_matrix(source_basis, origin, z_sign), projection);
@@ -2309,10 +2361,10 @@ void render_thread() {
                 char header[512];
                 std::snprintf(header, sizeof(header),
                               "settings follow_share %d share_from_input %d keep_attached %d no_warp_mask %d game_hud_layers %d use_ui_tags %d "
-                              "background_memory %d hold_reticles %d stretch_width %d orbit_mode %d warp_engine %d warp_splat %d edge_fill %d\n",
+                              "background_memory %d hold_reticles %d stretch_width %d measured_orbit %d warp_engine %d warp_splat %d edge_fill %d\n",
                               int(settings.follow_share), int(settings.share_from_input), int(settings.keep_attached), int(settings.no_warp_mask),
                               int(settings.game_hud_layers), int(settings.use_ui_tags), int(settings.background_memory), int(settings.hold_reticles),
-                              int(settings.stretch_width), int(settings.orbit_mode), int(settings.warp_engine), int(settings.warp_splat), int(settings.edge_fill));
+                              int(settings.stretch_width), int(measured_orbit()), int(settings.warp_engine), int(settings.warp_splat), int(settings.edge_fill));
                 g_rec.start(renderer, root, header);
                 logf("sequence recording started: %ls", g_rec.dir.c_str());
             } else if (g_rec.active) {
@@ -2490,7 +2542,7 @@ void render_thread() {
             st.tau_x_ms = float(px.tau * 1000.0); st.tau_y_ms = float(py.tau * 1000.0);
             st.latency_ms = float(g_app.model.latency() * 1000.0);
             st.orbit_cm = float(g_app.model.consistent_orbit());
-            st.orbit_in_use = settings.orbit_mode == 0 && source_was_estimated && !source_motion_estimated && g_app.model.orbit() > 0;
+            st.orbit_in_use = measured_orbit() && g_app.model.orbit() > 0;
             st.frame_interval_ms = float(g_app.model.frame_interval() * 1000.0);
             st.effective_prediction_ms = float(g_app.model.effective_prediction() * 1000.0);
             st.mv_scale_x = mv_scale.valid ? float(mv_scale.scale(0, source.depth_rect.w)) : 0.0f;

@@ -1705,6 +1705,194 @@ RWTexture2D<unorm float> att_u : register(u0);
         }
     att_u[pr] = keep ? 1.0 : 0.0;
 }
+// MotionReference (FW_MOTION_REF, development - set_motion_reference): what moves with the screen, not with the world, from the
+// game's own vectors alone - no detection, no shares. A pixel's motion to the previous frame (the game's vector) against where the
+// camera alone takes it there (clip_to_prev at its depth): nearer to staying where it is than to the camera's motion, it moves with
+// the screen - a third-person character turning with the camera, a first-person gun - and is kept off the camera's warp (u0, the
+// attached mask cs_mask holds) and shown along its own motion on screen between game frames (u1, set_held_between's motion,
+// uv per game frame). Only where the camera moves it a render pixel or more: under that both say the same. Widened by a render
+// pixel (the outline blends it with what is behind), the widened pixels with their neighbour's motion. (RE Requiem recordings
+// seq_15-19 and Cyberpunk 2077's seq_1-3, 2026-11-05: Leon aiming and a first-person gun and hands come out whole; Leon walking
+// is partly both)
+Texture2D<float> rp_depth_t : register(t0);
+Texture2D<float2> rp_motion_t : register(t1);
+RWTexture2D<unorm float> rp_att_u : register(u0);
+RWTexture2D<float2> rp_move_u : register(u1);
+// The share of the camera's motion a pixel's own vector shows: its motion projected on the camera's, 0 (stays on the screen) to 1
+// (the world) - not a yes or no: walking, Leon's arm and back moved halfway, and cut either way they tore from the rest of him at
+// random, flipping from pixel to pixel and frame to frame (seq_20, in game). As a share the warp moves each pixel that much of
+// the camera's motion (cs_ref_frac into the stretch's follow - see cs_mask, ow_lands_by), neighbours together as their motion
+// goes together (offline on seq_15-20 and Cyberpunk seq_1-2: position error and tears below both the cut and one choice per
+// object, everywhere). 1 where the camera moves the pixel under a render pixel: there the share tells nothing.
+Texture2D<float2> rp_share_t : register(t2);
+float rp_follow(int2 p, out float2 rest, out float2 off_cam) {
+    rest = 0; off_cam = 0;
+    if (!(flags & 1) || any(p < int2(rect.xy)) || any(p >= int2(rect.xy + rect.zw))) return 1.0;
+    const float2 uv = (float2(p - int2(rect.xy)) + 0.5) / float2(rect.zw);
+    const float4 c = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, rp_depth_t.Load(int3(p, 0)), 1), clip_to_prev);
+    const float2 px = float2(rect.zw);
+    const float2 mv = rp_motion_t.Load(int3(min(p, int2(mv_size) - 1), 0)) * mv_scale;
+    // (behind where the camera was: its motion is nothing the camera explains - share 0, all of it its own, and not scenery. As
+    // share 1 the first-person gun, right in front of the lens, went with the camera at its depth whenever the player walked
+    // backwards - the camera a frame before was ahead of it: the gun thrown 30-40 px and smeared, Cyberpunk seq_4 in game)
+    if (c.w <= 1e-6) { rest = mv; off_cam = float2(2.0, 0.0) / px; return 0.0; }
+    const float2 cam = (float2(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5) - uv) * px;
+    const float cc = dot(cam, cam);
+    float f = (cc < 1.0 || (flags & 2097152)) ? 1.0 : saturate(dot(mv * px, cam) / cc);
+    // (smoothed - cs_share_weights, cs_share_rows/cols: the camera's part of the motion in pixels, smoothed, then read back as the
+    // share of this pixel's camera motion)
+    if ((flags & 8388608) && !(cc < 1.0)) f = saturate(dot(rp_share_t.Load(int3(p, 0)), cam) / cc);
+    rest = mv - f * cam / px;
+    off_cam = mv - cam / px;
+    return f;
+}
+float rp_follow(int2 p, out float2 rest) { float2 off_cam; return rp_follow(p, rest, off_cam); }
+// The rest of each pixel's own motion - what its share of the camera's leaves (u1: kPGunMove, to the previous frame), shown
+// between game frames as the held were (set_held_between, ow_dev 256 and 65536: every pixel, see ow_gun_carried). Nothing is
+// held then: held, the share's 0 moved by all its own motion beside a 0.01 moved by none of it but the camera's share - the
+// lines along Leon's hair and arm in game, seq_21. With the rest a pixel's motion goes on from 0 to 1 without a step; what
+// moves while the camera does not (an enemy walking) is interpolated by it too.
+[numthreads(8, 8, 1)] void cs_ref_pick(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= grid)) return;
+    float2 rest, off_cam;
+    rp_follow(int2(id.xy), rest, off_cam);
+    // (and whether it moves on its own - by a render pixel or more: not scenery, kept out of the background memory - see
+    // cs_mask's flag 32768. Against the camera's whole motion, not its share: the first-person gun, share 0 and still on the
+    // screen, has no rest, and as scenery went into the memory - copies of it in the strip a strafe uncovered beside it,
+    // Cyberpunk seq_6 in game)
+    const bool moves = length(rest * float2(rect.zw)) >= 1.0;
+    rp_att_u[id.xy] = (moves || length(off_cam * float2(rect.zw)) >= 1.0) ? 1.0 : 0.0;
+    // (FW_REST_ALL, development: the rest below a render pixel too - TAA's and the vectors' own noise on still scenery)
+    rp_move_u[id.xy] = (moves || (flags & 4194304)) ? rest : float2(0, 0);
+}
+// ...and every pixel's share, into the follow texture (u0: kPRamp, R8) the warp reads where nothing is held.
+// (a half float, not 8 bits: a share is multiplied by the camera's motion at its pixel - the first-person gun's 1,600-3,800 px a
+// frame in Cyberpunk - and its shares of 0.002-0.01 in steps of 1/255 moved bands of the hand ~10 px apart: tears across it
+// along the bands, going forward - seq_3 in game)
+RWTexture2D<float> rf_share_u : register(u0);
+[numthreads(8, 8, 1)] void cs_ref_frac(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= grid)) return;
+    float2 rest;
+    rf_share_u[id.xy] = rp_follow(int2(id.xy), rest);
+}
+
+// The memory's mask (set_motion_reference): the no-warp mask, and 0.73 - carried, not held - where a pixel moves on its own
+// (cs_ref_pick's u0). Nothing is held then, and the memory took Leon's hair and the suppressor in as scenery and gave them back
+// in the strip they uncovered: a second copy where they had been - seq_21 210, seq_23 162. At output resolution, as the mask.
+Texture2D<float> mm_mask_t : register(t0);
+Texture2D<float> mm_moving_t : register(t1);
+RWTexture2D<unorm float> mm_u : register(u0);
+[numthreads(8, 8, 1)] void cs_mem_mask(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= out_size)) return;
+    const float2 uv = (float2(id.xy) + 0.5) / float2(out_size);
+    const int2 pr = int2(rect.xy) + int2(min(uint2(uv * float2(rect.zw)), rect.zw - 1));
+    mm_u[id.xy] = max(mm_mask_t.Load(int3(id.xy, 0)), mm_moving_t.Load(int3(pr, 0)) > 0.5 ? 0.73 : 0.0);
+}
+// Depth where the game's vectors say otherwise (set_motion_reference): hair is drawn after the depth - Leon's strands carry his
+// motion vectors to 0.1 px up to ~10 px out of his head, over the wall's depth (seq_21 210: 2249 px whose vector is not their depth's
+// camera motion, 90 px apart). Warped at the wall's depth the camera's motion carried them off with the wall each refresh and the
+// next frame put them back - the hair juddered in pure turns. A pixel its own depth does not explain takes the depth of a nearer
+// one with its vector, within a render pixel (below it two motions are one to the warp): jump steps of groups_x, 16 to 1, so it
+// reaches as far as the same motion goes on - one pixel to the next - and no farther.
+Texture2D<float> dv_depth_t : register(t0);
+Texture2D<float2> dv_motion_t : register(t1);
+RWTexture2D<float> dv_depth_u : register(u0);
+float2 dv_cam(int2 p, float z) {
+    const float2 uv = (float2(p - int2(rect.xy)) + 0.5) / float2(rect.zw);
+    const float4 c = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, z, 1), clip_to_prev);
+    return c.w > 1e-6 ? (float2(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5) - uv) * float2(rect.zw) : float2(1e6, 1e6);
+}
+float2 dv_mv(int2 p) { return dv_motion_t.Load(int3(min(p, int2(mv_size) - 1), 0)) * mv_scale * float2(rect.zw); }
+[numthreads(8, 8, 1)] void cs_depth_vec(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= grid)) return;
+    const int2 p = int2(id.xy);
+    const float z = dv_depth_t.Load(int3(p, 0));
+    dv_depth_u[p] = z;
+    if (!(flags & 1) || any(p < int2(rect.xy)) || any(p >= int2(rect.xy + rect.zw))) return;
+    const float2 mv = dv_mv(p);
+    if (length(mv - dv_cam(p, z)) <= 1.0) return;
+    const int step = int(groups_x);
+    float best = z;
+    [unroll] for (int k = 0; k < 9; ++k) {
+        if (k == 4) continue;
+        const int2 q = p + int2(k % 3 - 1, k / 3 - 1) * step;
+        if (any(q < int2(rect.xy)) || any(q >= int2(rect.xy + rect.zw))) continue;
+        const float zq = dv_depth_t.Load(int3(q, 0));
+        if (!((flags & 16) ? zq > best : zq < best)) continue;
+        if (length(dv_mv(q) - mv) <= 1.0) best = zq;
+    }
+    dv_depth_u[p] = best;
+}
+
+// The shares smoothed (set_motion_reference, the default): measured per pixel, the parts of one body took different shares
+// - Leon's shoulder 0.3 beside his back 0.6 - and with the camera shown ahead of where it last moved they split apart by the
+// difference times that motion: the wall's flashlight glow in the gap across his shoulder (seq_23 162, in game). One share for
+// all instead - the whole warp - dragged the first-person gun with every step and turn (Cyberpunk, in game; seq_1 its error
+// x7.7). Here two neighbours that move together - their game vectors within a render pixel - keep shares that move them apart by
+// about a render pixel at most for a frame of the camera's motion: an edge-aware recursive filter (a domain transform) whose
+// reach is that motion at the pixel, cut where the vectors part - the gun against the world, Leon against the wall keep their own.
+// Weights first (u1: right, down), then rows and columns in place on u0, twice.
+// What is smoothed is the camera's part of each pixel's motion in render pixels (share x camera motion), not the share: a share
+// is multiplied by the camera's motion at its pixel, and the first-person gun's is 1,600-3,800 px a frame in Cyberpunk against
+// the world's few - the world's shares of 1 smoothed into the gun beside it (their vectors within a pixel near the screen's
+// centre) moved it hundreds of pixels apart, in vertical stripes, shown with the camera ahead and the gun held back (in game,
+// FW_MATCH on seq_2). In pixels nothing is larger than the motion it came from.
+RWTexture2D<float2> ss_share_u : register(u0);
+RWTexture2D<float2> ss_a_u : register(u1);
+float ss_a(int2 p, float2 m, float2 c, int2 q) {
+    if (any(q < int2(rect.xy)) || any(q >= int2(rect.xy + rect.zw))) return 0.0;
+    const float2 mq = dv_mv(q);
+    if (length(mq - m) > 1.0) return 0.0;
+    const float e = max(max(length(c), length(dv_cam(q, dv_depth_t.Load(int3(q, 0))))), 1.0);
+    return exp(-1.0 / e);
+}
+[numthreads(8, 8, 1)] void cs_share_weights(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= grid)) return;
+    const int2 p = int2(id.xy);
+    if (any(p < int2(rect.xy)) || any(p >= int2(rect.xy + rect.zw))) { ss_a_u[p] = float2(0, 0); return; }
+    const float2 m = dv_mv(p), c = dv_cam(p, dv_depth_t.Load(int3(p, 0)));
+    ss_a_u[p] = float2(ss_a(p, m, c, p + int2(1, 0)), ss_a(p, m, c, p + int2(0, 1)));
+}
+// (the raw share, into u0 as a float - see rp_follow)
+RWTexture2D<float2> sr_raw_u : register(u0);
+[numthreads(8, 8, 1)] void cs_ref_raw(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= grid)) return;
+    float2 rest;
+    const float f = rp_follow(int2(id.xy), rest);
+    const float2 mv = rp_motion_t.Load(int3(min(int2(id.xy), int2(mv_size) - 1), 0)) * mv_scale;
+    sr_raw_u[id.xy] = (mv - rest) * float2(rect.zw);  // (f x the camera's motion, in render pixels)
+}
+Texture2D<float2> ss_a_t : register(t0);
+[numthreads(64, 1, 1)] void cs_share_rows(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= rect.w) return;
+    const int y = int(rect.y + id.x), x0 = int(rect.x), x1 = int(rect.x + rect.z) - 1;
+    float2 v = ss_share_u[int2(x0, y)];
+    [loop] for (int x = x0 + 1; x <= x1; ++x) {
+        const float a = ss_a_t.Load(int3(x - 1, y, 0)).x;
+        v = lerp(ss_share_u[int2(x, y)], v, a);
+        ss_share_u[int2(x, y)] = v;
+    }
+    [loop] for (int x2 = x1 - 1; x2 >= x0; --x2) {
+        const float a = ss_a_t.Load(int3(x2, y, 0)).x;
+        v = lerp(ss_share_u[int2(x2, y)], v, a);
+        ss_share_u[int2(x2, y)] = v;
+    }
+}
+[numthreads(64, 1, 1)] void cs_share_cols(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= rect.z) return;
+    const int x = int(rect.x + id.x), y0 = int(rect.y), y1 = int(rect.y + rect.w) - 1;
+    float2 v = ss_share_u[int2(x, y0)];
+    [loop] for (int y = y0 + 1; y <= y1; ++y) {
+        const float a = ss_a_t.Load(int3(x, y - 1, 0)).y;
+        v = lerp(ss_share_u[int2(x, y)], v, a);
+        ss_share_u[int2(x, y)] = v;
+    }
+    [loop] for (int y2 = y1 - 1; y2 >= y0; --y2) {
+        const float a = ss_a_t.Load(int3(x, y2, 0)).y;
+        v = lerp(ss_share_u[int2(x, y2)], v, a);
+        ss_share_u[int2(x, y2)] = v;
+    }
+}
 
 // Sight reticles (option): a reticle the game draws without depth or motion vectors of its own (a red dot on a
 // sight's glass) has the scenery's behind it, so the warp moves it with the scenery and every game frame snaps it
@@ -2168,7 +2356,10 @@ groupshared uint mask_hud_gs[10 * 10];  // the group's pixels and a 1 px border:
         if (!(flags & 1024)) warp_mask_u[id.xy] = (hud || held) ? float4(1, 0, 0, 0) : float4(0.9 * (1.0 - share.x), share.y, share.z, 0);
         return;
     }
-    if (!keep && (flags & 8)) keep = mask_attached_t.Load(int3(pr, 0)) > 0.5;
+    // (flag 32768 - set_motion_reference: t1 is what moves on its own, cs_ref_pick - not held, every pixel carried along its
+    // motion; the background memory alone leaves it out, cs_mem_mask. Marked in this mask instead - 0.73, carried - Leon's
+    // false edges rose 40-75%, seq_21 and seq_23: the warp reads the mask for more than holding)
+    if (!keep && (flags & 8) && !(flags & 32768)) keep = mask_attached_t.Load(int3(pr, 0)) > 0.5;
     // (1 the HUD, 0.75 the character/weapon: held alike - above 0.5 - except by XPAR frame generation, which keeps
     // only the HUD where it is)
     mask_u[id.xy] = hud ? 1.0 : keep ? 0.75 : 0.0;
@@ -2571,6 +2762,10 @@ bool ow_held(int3 p) {
         if ((flags & 524288) && mv > 0.72 && mv < 0.74) return false;  // (0.73: see cs_mask, flag 8192)
         return true;
     }
+    // (ow_dev 65536 - set_motion_reference: the HUD alone, 1. The mask's x is 0.9 x (1 - share) there, and a share under 1/60 read
+    // as held: the first-person gun's shares of 0.01-0.02 held the hand below that line and warped it above - a tear across it
+    // along the line, going forward - Cyberpunk seq_3 in game)
+    if (uint(threshold + 0.5) & 65536u) return ow_mask_t.Load(p).x > 0.97;
     return ow_mask_t.Load(p).x > 0.885;
 }
 // The share of the warp's motion applied at this spot (the stretch).
@@ -2745,7 +2940,8 @@ float2 ow_gun_carried(float2 s) {
     const float2 g = ow_gun_shift(s);
     if (all(g == 0)) return float2(0, 0);
     const float raw = ow_mask_t.Load(int3(clamp(int2(s * float2(out_size)), int2(0, 0), int2(out_size) - 1), 0)).x;
-    return raw >= 0.65 && raw < 0.9 ? g : float2(0, 0);
+    // (ow_dev 65536 - set_motion_reference: every pixel's rest of its own motion, cs_ref_pick - the HUD alone stays)
+    return raw < 0.9 && (raw >= 0.65 || (uint(threshold + 0.5) & 65536u)) ? g : float2(0, 0);
 }
 float2 ow_lands(float2 s, float3 f) {
     if (!(flags & 128)) return f.xy + ow_gun_carried(s);
@@ -2939,7 +3135,11 @@ bool ow_refine(float2 uv, int2 p, float nk, out float2 s) {
         if (all(abs(miss * float2(out_size)) < 0.25)) break;
     }
     const float3 f = ow_forward_at(s, dp);
-    return f.z > 1e-6 && all(abs((uv - ow_lands_by(s, f, fo, fr, fm) - own) * float2(out_size)) < 0.5) && ow_on_surface(s, nk);
+    // (checked with the motion of the pixel it ended on: read where the steps began only, a step onto the suppressor from the
+    // wall beside it kept the wall's - none - and the suppressor landed twice, with its own motion and without - seq_23 162,
+    // every pixel carrying its rest since set_motion_reference)
+    const float2 own_end = ((flags & 128) ? ow_own(s) : float2(0, 0)) + ow_gun_carried(s);
+    return f.z > 1e-6 && all(abs((uv - ow_lands_by(s, f, fo, fr, fm) - own_end) * float2(out_size)) < 0.5) && ow_on_surface(s, nk);
 }
 // Uncovered at uv: the farthest claimant's surface (the scenery behind), carried on to uv at its own depth - as far as the
 // rendered frame still shows that surface on the way there; beyond, the nearer thing in front hides it: stopped at its
@@ -3040,6 +3240,12 @@ bool ow_mem_fill(float2 uv, float near_n, bool force = false, float far_n = -1e9
     ow_hidden_c = c;
     return true;
 }
+bool ow_behind_same(float2 s, float far_near, bool rest, float2 own0) {
+    if (abs(ow_near(ow_depth(s)) - far_near) > 6.0) return false;
+    if (!rest) return true;
+    const float2 own = ((flags & 128) ? ow_own(s) : float2(0, 0)) + ow_gun_carried(s);
+    return all(abs((own - own0) * float2(out_size)) < 1.0);
+}
 float2 ow_behind(float2 uv, int2 p, float far_near) {
     const float2 s0 = (float2(p) + 0.5) / float2(rect.zw);
     const float far_d = ow_depth(s0);
@@ -3051,24 +3257,30 @@ float2 ow_behind(float2 uv, int2 p, float far_near) {
     // beside her following 0.3-0.5 of the turn)
     const bool own_share = (ow_dev() & 4u) != 0 && (flags & 128);
     const float4 m0 = own_share ? ow_mask_at(s0) : float4(0, 1, 1, 0);
+    // (ow_dev 65536 - set_motion_reference: the far surface's own motion too, read once at its claimant - and what moves
+    // otherwise is not it. Every pixel carrying its own, the steps went under the suppressor, took its motion and its spot
+    // passed for the wall's: the gap it left showed a second suppressor - seq_23 162)
+    const bool rest = (uint(threshold + 0.5) & 65536u) != 0;
+    const float2 own0 = rest ? ((flags & 128) ? ow_own(s0) : float2(0, 0)) + ow_gun_carried(s0) : float2(0, 0);
     [loop] for (int it = 0; it < 4; ++it) {
         const float3 f = ow_forward_at(s, far_d);
         if (f.z <= 1e-6) break;
-        s += uv - (own_share ? ow_lands_by(s, f, saturate(1.0 - m0.x / 0.9), m0.y, m0.z) : ow_lands(s, f));
+        if (rest) s += uv - ((flags & 128) ? ow_lands_by(s, f, saturate(1.0 - ow_mask_at(s).x / 0.9), ow_mask_at(s).y, ow_mask_at(s).z) : f.xy) - own0;
+        else s += uv - (own_share ? ow_lands_by(s, f, saturate(1.0 - m0.x / 0.9), m0.y, m0.z) : ow_lands(s, f));
     }
-    if (all(s >= 0) && all(s <= 1) && abs(ow_near(ow_depth(s)) - far_near) > 6.0) {
+    if (all(s >= 0) && all(s <= 1) && !ow_behind_same(s, far_near, rest, own0)) {
         if (flags & 64) ow_hidden = ow_from_memory_behind(s, far_near, ow_hidden_c);
         float lo = 0, hi = 1;
         [unroll] for (int b = 0; b < 5; ++b) {
             const float m = 0.5 * (lo + hi);
-            if (abs(ow_near(ow_depth(lerp(s0, s, m))) - far_near) <= 6.0) lo = m; else hi = m;
+            if (ow_behind_same(lerp(s0, s, m), far_near, rest, own0)) lo = m; else hi = m;
         }
         // (flag 1048576: mirrored at the far surface's edge - as far before the edge as uv's own spot lies past it, if
         // that is still the far surface: its texture carried on into the gap, meeting the edge with no seam. The edge's
         // last pixel repeated instead drew a streak, and a line where it met the warped scenery - Cyberpunk's hand)
         const float2 e = lerp(s0, s, lo);
         const float2 m = e - (s - e);
-        if ((flags & 1048576) && all(m >= 0) && all(m <= 1) && abs(ow_near(ow_depth(m)) - far_near) <= 6.0) return m;
+        if ((flags & 1048576) && all(m >= 0) && all(m <= 1) && ow_behind_same(m, far_near, rest, own0)) return m;
         s = e;
     }
     return s;
@@ -4674,7 +4886,8 @@ RWTexture2D<float4> rec_ui_u : register(u1);
     rec_colour_u[id.xy] = float4(c / float(f * f), 1);
     u /= float(f * f);
     // (a one-channel texture keeps x: the coverage there)
-    rec_ui_u[id.xy] = (flags & 1) ? ((flags & 2) ? u : u.aaaa) : 0.0;
+    // (flag 4: the warp's output alone - record_output; u1 is the colour's own texture then)
+    if (!(flags & 4)) rec_ui_u[id.xy] = (flags & 1) ? ((flags & 2) ? u : u.aaaa) : 0.0;
 }
 )";
 
@@ -4733,7 +4946,13 @@ constexpr UINT kXGunSrv = kXMemFUav + 2, kXGunUav = kXGunSrv + 6;
 constexpr UINT kXMemRatioSrv = kXGunUav + 2, kXMemRatioUav = kXMemRatioSrv + 6, kXMemRelightSrv = kXMemRatioUav + 2, kXMemRelightUav = kXMemRelightSrv + 6;
 // The scenery's motion from the camera found (cs_camera_fill; 6 + 2).
 constexpr UINT kXCamFillSrv = kXMemRelightUav + 2, kXCamFillUav = kXCamFillSrv + 6;
-constexpr UINT kW = kXCamFillUav + 2;
+// The depth the vectors explain (cs_depth_vec; 5 passes of 6 + 2).
+constexpr UINT kXDepthVec = kXCamFillUav + 2;
+// The memory's mask (cs_mem_mask; 6 + 2).
+constexpr UINT kXMemMaskSrv = kXDepthVec + 5 * 8, kXMemMaskUav = kXMemMaskSrv + 6;
+// The shares smoothed (cs_ref_raw, cs_share_weights, cs_share_rows/cols x2; 6 tables of 6 + 2).
+constexpr UINT kXShareSm = kXMemMaskUav + 2;
+constexpr UINT kW = kXShareSm + 6 * 8;
 enum WTable : UINT { kWWarp, kWShown, kWJoinInit, kWJoinAB, kWJoinBA, kWJoinFinal,
                      kWGenDepth0, kWGenDepth1, kWGenDepth2, kWGenUi0, kWGenUi1, kWGenUi2, kWClaim,
                      kWStill, kWHoldInit, kWHoldAB, kWHoldBA, kWHoldFinal, kWHoldFill, kWHoldFillFinal, kWGrowInit, kWGrowAB, kWGrowBA,
@@ -5241,7 +5460,7 @@ bool Renderer::create_pipelines(std::string& error) {
         {"cs_scene_clear", &cs_scene_clear_}, {"cs_scene_accum", &cs_scene_accum_}, {"cs_scene_finish", &cs_scene_finish_},
         {"cs_scene_tiles", &cs_scene_tiles_}, {"cs_scene_hud", &cs_scene_hud_}, {"cs_scene_fill", &cs_scene_fill_}, {"cs_scene_grey", &cs_scene_grey_},
         {"cs_scene_grey_finish", &cs_scene_grey_finish_}, {"cs_scene_wash", &cs_scene_wash_}, {"cs_scene_wash_finish", &cs_scene_wash_finish_},
-        {"cs_attached", &cs_attached_}, {"cs_probe_tiles", &cs_probe_tiles_}, {"cs_probe_clear", &cs_probe_clear_}, {"cs_probe_score", &cs_probe_score_}, {"cs_memory", &cs_memory_}, {"cs_mem_ratio", &cs_mem_ratio_}, {"cs_mem_relight", &cs_mem_relight_}, {"cs_gun_motion", &cs_gun_motion_}, {"cs_hudless_ui", &cs_hudless_ui_}, {"cs_hudless_keep", &cs_hudless_keep_}, {"cs_ui_tiles", &cs_ui_tiles_}, {"cs_layer_unblend", &cs_layer_unblend_}, {"cs_layer_seam_clear", &cs_layer_seam_clear_}, {"cs_mem_vis", &cs_mem_vis_}, {"cs_ramp_rows", &cs_ramp_rows_}, {"cs_ramp", &cs_ramp_},
+        {"cs_attached", &cs_attached_}, {"cs_probe_tiles", &cs_probe_tiles_}, {"cs_probe_clear", &cs_probe_clear_}, {"cs_probe_score", &cs_probe_score_}, {"cs_memory", &cs_memory_}, {"cs_mem_ratio", &cs_mem_ratio_}, {"cs_mem_relight", &cs_mem_relight_}, {"cs_gun_motion", &cs_gun_motion_}, {"cs_ref_pick", &cs_ref_pick_}, {"cs_ref_frac", &cs_ref_frac_}, {"cs_depth_vec", &cs_depth_vec_}, {"cs_mem_mask", &cs_mem_mask_}, {"cs_share_weights", &cs_share_weights_}, {"cs_ref_raw", &cs_ref_raw_}, {"cs_share_rows", &cs_share_rows_}, {"cs_share_cols", &cs_share_cols_}, {"cs_hudless_ui", &cs_hudless_ui_}, {"cs_hudless_keep", &cs_hudless_keep_}, {"cs_ui_tiles", &cs_ui_tiles_}, {"cs_layer_unblend", &cs_layer_unblend_}, {"cs_layer_seam_clear", &cs_layer_seam_clear_}, {"cs_mem_vis", &cs_mem_vis_}, {"cs_ramp_rows", &cs_ramp_rows_}, {"cs_ramp", &cs_ramp_},
         {"cs_flow_luma", &cs_flow_luma_}, {"cs_flow_feat", &cs_flow_feat_}, {"cs_flow_search", &cs_flow_search_}, {"cs_flow_lk", &cs_flow_lk_},
         {"cs_flow_median", &cs_flow_median_}, {"cs_flow_motion", &cs_flow_motion_}, {"cs_flow_fill", &cs_flow_fill_},
         {"cs_ret_cells", &cs_ret_cells_}, {"cs_ret_enclose", &cs_ret_enclose_}, {"cs_ret_layer", &cs_ret_layer_},
@@ -5532,6 +5751,25 @@ void Renderer::analyze_motion(const IngestedSource& src, const float clip_to_pre
               (floor_pivot_depth > 0 ? 512u : 0u) | (rig_check_ ? 2048u : 0u) | (mem_static_ ? 4096u : 0u);
     c.alpha = floor_pivot_depth;  // (the floor release's pivot depth; alpha is unused by this pass otherwise)
     if (own_motion_) { c.flags |= 2u; c.out_size[0] = std::max(1u, w / 2); c.out_size[1] = std::max(1u, h / 2); }  // (level 0 of the displacements)
+    // (set_motion_reference: the depth the game's vectors explain, before anything reads it - cs_depth_vec, in place of the game's
+    // where its own does not explain its vector. FW_DEPTH_VEC_OFF, development: the game's depth as it is)
+    static const bool depth_vec_off = std::getenv("FW_DEPTH_VEC_OFF") != nullptr;
+    if (motion_ref_ && scale_valid && !depth_vec_off && ensure_private(kPDepthVA, w, h, DXGI_FORMAT_R32_FLOAT) &&
+        ensure_private(kPDepthVB, w, h, DXGI_FORMAT_R32_FLOAT)) {
+        const PrivateId chain[6] = {kPDepth, kPDepthVA, kPDepthVB, kPDepthVA, kPDepthVB, kPDepth};
+        XConstants v = c;
+        for (UINT pass = 0; pass < 5; ++pass) {
+            const UINT srv = kXDepthVec + pass * 8, uav = srv + 6;
+            for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(srv + i, chain[pass]);
+            set_x_srv(srv + 1, kPMotion);
+            set_x_uav(uav + 0, chain[pass + 1]); set_x_uav(uav + 1, chain[pass + 1]);
+            transition(private_[chain[pass]], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            transition(private_[chain[pass + 1]], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            v.groups_x = 16u >> pass;
+            x_dispatch(cs_depth_vec_.Get(), &v, srv, uav, gx, gy);
+        }
+        transition(private_[kPDepth], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
     transition(private_[kPObject], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     x_dispatch(cs_analyze_.Get(), &c, kXAnalyzeSrv, kXAnalyzeUav, gx, gy);
     D3D12_RESOURCE_BARRIER uav{}; uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; uav.UAV.pResource = partials_.Get();
@@ -5546,7 +5784,72 @@ void Renderer::analyze_motion(const IngestedSource& src, const float clip_to_pre
     transition(private_[kPObject], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     // (set_held_between: the attached pixels' mean motion - see cs_gun_sum)
     gun_built_ = false;
-    if (held_between_ && ensure_private(kPGunMove, w, h, DXGI_FORMAT_R16G16_FLOAT)) {
+    ref_built_ = ref_frac_built_ = false;
+    // (set_motion_reference: the attached mask and the motion between game frames both from the game's vectors - cs_ref_pick -
+    // in place of cs_gun_motion here and cs_attached in build_no_warp_mask)
+    if (motion_ref_ && ensure_private(kPGunMove, w, h, DXGI_FORMAT_R16G16_FLOAT) && ensure_private(kPAttached, w, h, DXGI_FORMAT_R8_UNORM)) {
+        for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXGunSrv + i, kPDepth);
+        set_x_srv(kXGunSrv + 1, kPMotion);
+        set_x_uav(kXGunUav + 0, kPAttached); set_x_uav(kXGunUav + 1, kPGunMove);
+        transition(private_[kPAttached], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        transition(private_[kPGunMove], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        // (every pixel the whole camera warp - one image, its order kept - and the rest of its motion between the two frames, flag
+        // 2097152. FW_REF_SHARE, development: each its share instead - parts of one body took different shares and, the camera
+        // shown not as it moved last, split apart: the wall's flashlight glow in the gap across Leon's shoulder, seq_23 162)
+        static const bool ref_share = std::getenv("FW_REF_SHARE") != nullptr, ref_world = std::getenv("FW_REF_WORLD") != nullptr;
+        const std::uint32_t flags0 = c.flags;
+        if (ref_world) c.flags |= 2097152u;
+        // (the default: the shares smoothed - cs_share_weights / rows / cols - then read by cs_ref_pick and cs_ref_frac, t2, flag
+        // 8388608. FW_REF_SHARE: as measured; FW_REF_WORLD: the whole warp)
+        if (!ref_share && !ref_world && ensure_private(kPShareSm, w, h, DXGI_FORMAT_R32G32_FLOAT) &&
+            ensure_private(kPShareSmA, w, h, DXGI_FORMAT_R16G16_FLOAT)) {
+            auto table = [&](UINT n, PrivateId t0, PrivateId u0, PrivateId u1) {
+                const UINT srv = kXShareSm + n * 8;
+                for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(srv + i, t0);
+                if (t0 == kPDepth) set_x_srv(srv + 1, kPMotion);
+                set_x_uav(srv + 6, u0); set_x_uav(srv + 7, u1);
+                return srv;
+            };
+            D3D12_RESOURCE_BARRIER sb{}; sb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; sb.UAV.pResource = private_[kPShareSm].texture.Get();
+            transition(private_[kPShareSm], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            transition(private_[kPShareSmA], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            UINT t = table(0, kPDepth, kPShareSm, kPShareSm);
+            x_dispatch(cs_ref_raw_.Get(), &c, t, t + 6, (w + 7) / 8, (h + 7) / 8);
+            t = table(1, kPDepth, kPShareSm, kPShareSmA);
+            x_dispatch(cs_share_weights_.Get(), &c, t, t + 6, (w + 7) / 8, (h + 7) / 8);
+            transition(private_[kPShareSmA], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            for (UINT k = 0; k < 4; ++k) {
+                list_->ResourceBarrier(1, &sb);
+                t = table(2 + k, kPShareSmA, kPShareSm, kPShareSm);
+                const bool rows = (k & 1) == 0;
+                x_dispatch((rows ? cs_share_rows_ : cs_share_cols_).Get(), &c, t, t + 6, ((rows ? c.rect[3] : c.rect[2]) + 63) / 64, 1);
+            }
+            transition(private_[kPShareSm], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            set_x_srv(kXGunSrv + 2, kPShareSm);
+            c.flags |= 8388608u;
+        }
+        static const bool rest_all = std::getenv("FW_REST_ALL") != nullptr;
+        if (rest_all) c.flags |= 4194304u;
+        x_dispatch(cs_ref_pick_.Get(), &c, kXGunSrv, kXGunUav, (w + 7) / 8, (h + 7) / 8);
+        transition(private_[kPAttached], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        transition(private_[kPGunMove], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        gun_built_ = true;
+        ref_built_ = true;
+        // (the share of every pixel - cs_ref_frac - into the stretch's follow texture; its own passes do not run then, so its slots
+        // are this one's: see build_no_warp_mask)
+        if (ensure_private(kPRamp, w, h, DXGI_FORMAT_R16_FLOAT)) {
+            for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXRampSrv + i, kPDepth);
+            set_x_srv(kXRampSrv + 1, kPMotion);
+            if (c.flags & 8388608u) set_x_srv(kXRampSrv + 2, kPShareSm);
+            set_x_uav(kXRampUav + 0, kPRamp); set_x_uav(kXRampUav + 1, kPRamp);
+            transition(private_[kPRamp], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            x_dispatch(cs_ref_frac_.Get(), &c, kXRampSrv, kXRampUav, (w + 7) / 8, (h + 7) / 8);
+            transition(private_[kPRamp], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            ref_frac_built_ = true;
+        }
+        c.flags = flags0;
+        ++held_stats_.sums;
+    } else if (held_between_ && ensure_private(kPGunMove, w, h, DXGI_FORMAT_R16G16_FLOAT)) {
         for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXGunSrv + i, kPDepth);
         set_x_srv(kXGunSrv + 0, kPObject);
         set_x_srv(kXGunSrv + 1, kPMotion);
@@ -6503,7 +6806,7 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
     // Camera-attached pixels, widened once at render resolution (the mask reads one value per pixel; with the share only
     // for the sight reticles).
     const bool keep_att = attached && keep_attached && (!shared || reticles) && ensure_private(kPAttached, w, h, DXGI_FORMAT_R8_UNORM);
-    if (keep_att) {
+    if (keep_att && !(motion_ref_ && ref_built_ && private_[kPAttached].width == w && private_[kPAttached].height == h)) {  // (set_motion_reference: written by cs_ref_pick)
         for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXAttSrv + i, kPObject);
         set_x_uav(kXAttUav + 0, kPAttached); set_x_uav(kXAttUav + 1, kPAttached);
         transition(private_[kPAttached], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -6631,9 +6934,11 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
     if (!reticle) ret_ran_ = false;
     layer_built_ = reticle;
     // The stretch around them (option): the distance share, in two passes.
-    const bool ramp = keep_att && !shared && stretch > 0 && ensure_private(kPRampRows, w, h, DXGI_FORMAT_R8_UNORM) &&
-                      ensure_private(kPRamp, w, h, DXGI_FORMAT_R8_UNORM);
-    if (ramp) {
+    // (set_motion_reference: the follow texture is every pixel's share of the camera's motion, written with the analysis - cs_ref_frac)
+    const bool ref_follow = motion_ref_ && ref_frac_built_ && keep_att && !shared && private_[kPRamp].width == w && private_[kPRamp].height == h;
+    const bool ramp = ref_follow || (!motion_ref_ && keep_att && !shared && stretch > 0 && ensure_private(kPRampRows, w, h, DXGI_FORMAT_R8_UNORM) &&
+                                     ensure_private(kPRamp, w, h, DXGI_FORMAT_R8_UNORM));
+    if (ramp && !ref_follow) {
         XConstants a = c;
         a.mv_size[0] = static_cast<std::uint32_t>(std::clamp(stretch, 1, 32));
         for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXRowsSrv + i, kPAttached);
@@ -6669,7 +6974,8 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
     const PrivateId mask_out = smooth ? kPMaskRaw : kPMask;
     set_x_uav(kXMaskUav + 0, mask_out); set_x_uav(kXMaskUav + 1, direct ? mask_out : kPWarpMask);
     c.flags = (hud ? 4u : 0u) | (keep_att ? 8u : 0u) | (world ? 64u : 0u) | (ramp ? 128u : 0u) | (confirmed_tiles ? 256u : 0u) |
-              (shared ? 512u : 0u) | (direct ? 1024u : 0u) | (shared && sight_cell ? 2048u : 0u) | (outline_scenery_ ? 4096u : 0u) | (carried_edge_ ? 8192u : 0u) | (outline_wide_ ? 16384u : 0u);
+              (shared ? 512u : 0u) | (direct ? 1024u : 0u) | (shared && sight_cell ? 2048u : 0u) | (outline_scenery_ ? 4096u : 0u) | (carried_edge_ ? 8192u : 0u) | (outline_wide_ ? 16384u : 0u) |
+              (motion_ref_ && ref_built_ && !shared ? 32768u : 0u);
     c.groups_x = sight_cell;
     if (shared && sight_cell) transition(private_[kPRetEncl], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);  // (no layers yet: left as written)
     stretch_built_ = ramp || shared;  // (the warp's follow share: flag 128)
@@ -6929,7 +7235,7 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
     if (held_between_ && held_back_ != 0.0f && shown(kPGunMove).texture && mask) {
         ++held_stats_.shifted; held_stats_.back += held_back_;
         set_x_srv(t + 18, kPGunMove, true);
-        c.threshold = float(static_cast<std::uint32_t>(c.threshold + 0.5f) | 256u);
+        c.threshold = float(static_cast<std::uint32_t>(c.threshold + 0.5f) | 256u | (motion_ref_ ? 65536u : 0u));
         c.alpha = std::clamp(held_back_, -1.0f, 1.0f);  // (negative: ahead - seq_replay FW_GUN_BACK, whose truth lies ahead)
     } else {
         set_x_srv(t + 18, kPDepth, true);
@@ -7320,8 +7626,25 @@ bool Renderer::update_memory(const IngestedSource& src, const float clip_to_prev
     const PrivateId frame = (src.has_hudless || src.scene_derived) && private_[kPHudless].texture ? kPHudless : kPBackbuffer;
     if (frame == kPHudless && src.scene_derived) c.flags |= 2048u;
     const PrivateId seen = frame;
+    // (set_motion_reference: the mask with what moves on its own - cs_mem_mask - for the memory's passes alone)
+    PrivateId mem_mask = kPMask;
+    // (on - FW_MEM_MASK_OFF, development: without it nothing that moves on its own is kept out of the memory under the motion
+    // reference, the first-person gun included - copies of it came back in the strip a strafe uncovered beside it, Cyberpunk seq_6
+    // in game, and along its edges looking up and down, seq_5. Off, on the next-frame score alone: Requiem seq_23's false edges on
+    // the scenery +69%, on Leon +79% - not yet rechecked as shown)
+    static const bool mem_mask_on = std::getenv("FW_MEM_MASK_OFF") == nullptr;
+    if (motion_ref_ && ref_built_ && mem_mask_on && private_[kPAttached].width == dw && private_[kPAttached].height == dh &&
+        ensure_private(kPMemMask, ow, oh, DXGI_FORMAT_R8_UNORM)) {
+        for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXMemMaskSrv + i, kPMask);
+        set_x_srv(kXMemMaskSrv + 1, kPAttached);
+        set_x_uav(kXMemMaskUav + 0, kPMemMask); set_x_uav(kXMemMaskUav + 1, kPMemMask);
+        transition(private_[kPMemMask], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        x_dispatch(cs_mem_mask_.Get(), &c, kXMemMaskSrv, kXMemMaskUav, (ow + 7) / 8, (oh + 7) / 8);
+        transition(private_[kPMemMask], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        mem_mask = kPMemMask;
+    }
     set_x_srv(kXMemSrv + 0, seen);
-    set_x_srv(kXMemSrv + 1, kPMask);
+    set_x_srv(kXMemSrv + 1, mem_mask);
     set_x_srv(kXMemSrv + 2, kPDepth);
     set_x_srv(kXMemSrv + 3, prev ? static_cast<PrivateId>(kPMem0 + r) : seen);
     set_x_srv(kXMemSrv + 4, prev ? static_cast<PrivateId>(kPMemZ0 + r) : kPDepth);
@@ -7334,7 +7657,7 @@ bool Renderer::update_memory(const IngestedSource& src, const float clip_to_prev
     if (!mem_vis_off_ && ensure_private(kPMemVis, c.rect[2], c.rect[3], DXGI_FORMAT_R32_FLOAT)) {
         for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXMemVisSrv + i, kPDepth);
         set_x_srv(kXMemVisSrv + 0, seen);
-        set_x_srv(kXMemVisSrv + 1, kPMask);
+        set_x_srv(kXMemVisSrv + 1, mem_mask);
         set_x_srv(kXMemVisSrv + 5, t5);
         if (mem_static) { set_x_srv(kXMemVisSrv + 3, kPObject); c.flags |= 16384u; }
         set_x_uav(kXMemVisUav + 0, kPMemVis); set_x_uav(kXMemVisUav + 1, kPMemVis);
@@ -7355,7 +7678,7 @@ bool Renderer::update_memory(const IngestedSource& src, const float clip_to_prev
     if (prev && mem_relight_ && ensure_private(kPMemRatio, rw, rh, DXGI_FORMAT_R16G16B16A16_FLOAT)) {
         for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXMemRatioSrv + i, kPDepth);
         set_x_srv(kXMemRatioSrv + 0, seen);
-        set_x_srv(kXMemRatioSrv + 1, kPMask);
+        set_x_srv(kXMemRatioSrv + 1, mem_mask);
         set_x_srv(kXMemRatioSrv + 2, (c.flags & 256u) ? kPMemVis : kPDepth);
         set_x_srv(kXMemRatioSrv + 3, static_cast<PrivateId>(kPMem0 + r));
         set_x_srv(kXMemRatioSrv + 4, static_cast<PrivateId>(kPMemZ0 + r));
@@ -7388,7 +7711,7 @@ bool Renderer::update_memory(const IngestedSource& src, const float clip_to_prev
                 if (mem_last_frame_ < 2) f.flags &= ~2u;
             }
             set_x_srv(kXMemFSrv + 0, seen);
-            set_x_srv(kXMemFSrv + 1, kPMask);
+            set_x_srv(kXMemFSrv + 1, mem_mask);
             set_x_srv(kXMemFSrv + 2, (f.flags & 256u) ? kPMemVis : kPDepth);
             set_x_srv(kXMemFSrv + 3, prev_f ? static_cast<PrivateId>(kPMemF0 + r) : seen);
             set_x_srv(kXMemFSrv + 4, prev_f ? static_cast<PrivateId>(kPMemFZ0 + r) : kPDepth);
@@ -8586,7 +8909,7 @@ void Renderer::release_stash() {
 }
 
 std::string Renderer::memory_report() {
-    static const char* const kNames[] = {"Backbuffer", "Hudless", "Ui", "Depth", "Motion", "ZeroUi", "Output", "Object", "ObjKindA", "ObjKindB", "Gen0", "Gen1", "Gen2", "GenZ0", "GenZ1", "GenZ2", "Previous", "HudScore", "Mask", "Scene", "Attached", "World", "Fill", "Mem0", "Mem1", "MemZ0", "MemZ1", "RampRows", "Ramp", "WarpMask", "HudKind", "StashColor", "StashDepth", "StashMotion", "StashHudless", "Stash2Color", "Stash2Hudless", "Stash2Depth", "Stash2Motion", "LumaA", "LumaB", "Feat", "FlowA", "FlowB", "RetCells", "RetEncl", "RetA", "RetB", "RetLayer", "HudLearned", "HudTiles", "WarpClaims", "Still", "GrowA", "GrowB", "Probe", "ProbeTilesA", "ProbeTilesB", "ShareA", "ShareB", "ShareT", "Share", "RetDirtyA", "RetDirtyB", "ShareT2", "ShareHalf", "RecColour", "RecUi", "ShareResid", "OwnMove", "Paths", "ShareSeam", "AttHist", "MemVis", "UiTiles", "WarpBeside", "WarpHeld", "LowScene", "MaskRaw", "MemF0", "MemF1", "MemFZ0", "MemFZ1", "GunMove", "MemRatio", "MotionProbe", "MotionGame", "Stencil", "StenCellsA", "StenCellsB", "StenMask", "StenGrowA", "StenGrowB", "StenAge", "StenLumaA", "StenLumaB", "StenElig", "StenFringeA", "StenFringeB"};
+    static const char* const kNames[] = {"Backbuffer", "Hudless", "Ui", "Depth", "Motion", "ZeroUi", "Output", "Object", "ObjKindA", "ObjKindB", "Gen0", "Gen1", "Gen2", "GenZ0", "GenZ1", "GenZ2", "Previous", "HudScore", "Mask", "Scene", "Attached", "World", "Fill", "Mem0", "Mem1", "MemZ0", "MemZ1", "RampRows", "Ramp", "WarpMask", "HudKind", "StashColor", "StashDepth", "StashMotion", "StashHudless", "Stash2Color", "Stash2Hudless", "Stash2Depth", "Stash2Motion", "LumaA", "LumaB", "Feat", "FlowA", "FlowB", "RetCells", "RetEncl", "RetA", "RetB", "RetLayer", "HudLearned", "HudTiles", "WarpClaims", "Still", "GrowA", "GrowB", "Probe", "ProbeTilesA", "ProbeTilesB", "ShareA", "ShareB", "ShareT", "Share", "RetDirtyA", "RetDirtyB", "ShareT2", "ShareHalf", "RecColour", "RecUi", "ShareResid", "OwnMove", "Paths", "ShareSeam", "AttHist", "MemVis", "UiTiles", "WarpBeside", "WarpHeld", "LowScene", "MaskRaw", "MemF0", "MemF1", "MemFZ0", "MemFZ1", "GunMove", "MemRatio", "MotionProbe", "MotionGame", "Stencil", "StenCellsA", "StenCellsB", "StenMask", "StenGrowA", "StenGrowB", "StenAge", "StenLumaA", "StenLumaB", "StenElig", "StenFringeA", "StenFringeB", "DepthVA", "DepthVB", "MemMask", "ShareSm", "ShareSmA", "RecOut"};
     static_assert(sizeof(kNames) / sizeof(kNames[0]) == kPCount, "a name for every private texture");
     struct Item { std::string name; double mb; };
     std::vector<Item> items;
@@ -8652,7 +8975,7 @@ std::uint32_t Renderer::warp_rest_blocks() {
 bool Renderer::read_back(int which, std::vector<std::uint16_t>& pixels, std::uint32_t& w, std::uint32_t& h) {
     static const PrivateId kWhich[] = {kPBackbuffer, kPOutput, kPScene, kPDepth, kPMotion, kPObject, kPMask, kPHudScore, kPWorld, kPFill,
                                        kPStashColor, kPStashDepth, kPStashMotion, kPFlowB, kPStashHudless, kPStash2Color, kPStash2Hudless,
-                                       kPStash2Depth, kPStash2Motion, kPHudless, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPUi, kPWarpMask, kPRetLayer, kPDepth, kPDepth, kPDepth, kPHudLearned, kPHudTiles, kPHudKind, kPShare, kPRetEncl, kPAttached, kPMem0, kPPaths, kPStenCellsA, kPStenMask};
+                                       kPStash2Depth, kPStash2Motion, kPHudless, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPUi, kPWarpMask, kPRetLayer, kPDepth, kPDepth, kPDepth, kPHudLearned, kPHudTiles, kPHudKind, kPShare, kPRetEncl, kPAttached, kPMem0, kPPaths, kPStenCellsA, kPStenMask, kPShareSm, kPRamp, kPGunMove};
     if (which < 0 || which >= int(std::size(kWhich))) return false;
     // (the sight reticles' layer: the history texture written last)
     // (the background memory: the one written last)
@@ -8721,6 +9044,14 @@ bool Renderer::read_back(int which, std::vector<std::uint16_t>& pixels, std::uin
             }
             continue;
         }
+        if (desc.Format == DXGI_FORMAT_R32G32_FLOAT) {
+            for (std::uint32_t x = 0; x < w; ++x) {
+                float v2[2]; std::memcpy(v2, row + std::size_t(x) * 8, 8);
+                out[std::size_t(x) * 4] = to_half(v2[0]); out[std::size_t(x) * 4 + 1] = to_half(v2[1]);
+                out[std::size_t(x) * 4 + 2] = 0; out[std::size_t(x) * 4 + 3] = 0x3C00;
+            }
+            continue;
+        }
         if (desc.Format == DXGI_FORMAT_R16G16_FLOAT) {
             for (std::uint32_t x = 0; x < w; ++x) {
                 std::memcpy(out + std::size_t(x) * 4, row + std::size_t(x) * 4, 4);
@@ -8731,11 +9062,12 @@ bool Renderer::read_back(int which, std::vector<std::uint16_t>& pixels, std::uin
         for (std::uint32_t x = 0; x < w; ++x) {
             std::uint32_t v = 0;
             if (desc.Format == DXGI_FORMAT_R8_UNORM) v = row[x];
-            else if (desc.Format == DXGI_FORMAT_R16_UNORM) { std::uint16_t h16; std::memcpy(&h16, row + std::size_t(x) * 2, 2); v = h16; }
+            else if (desc.Format == DXGI_FORMAT_R16_UNORM || desc.Format == DXGI_FORMAT_R16_FLOAT) { std::uint16_t h16; std::memcpy(&h16, row + std::size_t(x) * 2, 2); v = h16; }
             else if (desc.Format == DXGI_FORMAT_R16G16_UNORM) std::memcpy(&v, row + std::size_t(x) * 4, 4);
             else std::memcpy(&v, row + std::size_t(x) * 4, 4);
             float c[4] = {0, 0, 0, 1};
             if (desc.Format == DXGI_FORMAT_R32_FLOAT) std::memcpy(&c[0], &v, 4);
+            else if (desc.Format == DXGI_FORMAT_R16_FLOAT) { out[std::size_t(x) * 4] = std::uint16_t(v); out[std::size_t(x) * 4 + 1] = 0; out[std::size_t(x) * 4 + 2] = 0; out[std::size_t(x) * 4 + 3] = 0x3C00; continue; }
             else if (desc.Format == DXGI_FORMAT_R8_UNORM) c[0] = float(v) / 255.0f;
             else if (desc.Format == DXGI_FORMAT_R16_UNORM) c[0] = float(v) / 65535.0f;
             else if (desc.Format == DXGI_FORMAT_R16G16_UNORM) { c[0] = float(v & 0xFFFFu) / 65535.0f; c[1] = float(v >> 16) / 65535.0f; }
@@ -8758,7 +9090,7 @@ bool Renderer::read_back(int which, std::vector<std::uint16_t>& pixels, std::uin
 bool Renderer::write_back(int which, const std::vector<std::uint16_t>& pixels, std::uint32_t w, std::uint32_t h) {
     static const PrivateId kWhich[] = {kPBackbuffer, kPOutput, kPScene, kPDepth, kPMotion, kPObject, kPMask, kPHudScore, kPWorld, kPFill,
                                        kPStashColor, kPStashDepth, kPStashMotion, kPFlowB, kPStashHudless, kPStash2Color, kPStash2Hudless,
-                                       kPStash2Depth, kPStash2Motion, kPHudless, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPUi, kPWarpMask, kPRetLayer, kPDepth, kPDepth, kPDepth, kPHudLearned, kPHudTiles, kPHudKind, kPShare, kPRetEncl, kPAttached, kPMem0, kPPaths, kPStenCellsA, kPStenMask};
+                                       kPStash2Depth, kPStash2Motion, kPHudless, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPUi, kPWarpMask, kPRetLayer, kPDepth, kPDepth, kPDepth, kPHudLearned, kPHudTiles, kPHudKind, kPShare, kPRetEncl, kPAttached, kPMem0, kPPaths, kPStenCellsA, kPStenMask, kPShareSm, kPRamp, kPGunMove};
     if (which < 0 || which >= int(std::size(kWhich)) || pixels.size() < std::size_t(w) * h * 4) return false;
     auto& p = kWhich[which] == kPMem0 ? private_[kPMem0 + std::max(mem_shown_, 0)]
             : split_ && shown_id(kWhich[which]) ? front_[kWhich[which]] : private_[kWhich[which]];
@@ -8876,7 +9208,62 @@ bool Renderer::record_frame(std::uint64_t tag, bool ui) {
         transition(src, k == 0 || k == 3 ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : before);
     }
     r.has_stencil = planes == 5;
+    r.output = false;
     r.tag = tag; r.has_ui = ui; r.context = context_; r.fence = 0;
+    r.state.store(1, std::memory_order_release);
+    return true;
+}
+
+// Sequence recording (development): what the warp just drew (kPOutput) shrunk by the factor the frame's picture is (record_frame) -
+// the same grid, pixel for pixel, as the picture seq_replay warps - into a read-back slot on this refresh's list; tag: the game
+// frame it showed. seq_replay FW_MATCH redraws the same refresh from the clip and compares the two: a recording whose replay
+// does not match what was on the screen is not to be trusted.
+bool Renderer::record_output(std::uint64_t tag) {
+    const auto& o = private_[kPOutput];
+    const auto& c0 = private_[kPBackbuffer];
+    if (!o.texture || !c0.texture || !cs_rec_down_) return false;
+    int idx = -1;
+    for (int k = 0; k < kRecSlots && idx < 0; ++k) {
+        const int i = (rec_next_ + k) % kRecSlots;
+        if (rec_[i].state.load(std::memory_order_acquire) == 0) idx = i;
+    }
+    if (idx < 0) return false;
+    rec_next_ = (idx + 1) % kRecSlots;
+    RecSlot& r = rec_[idx];
+    const UINT f = std::max(1u, static_cast<UINT>(std::lround(double(c0.height) / 1080.0)));
+    const UINT cw = (o.width + f - 1) / f, ch = (o.height + f - 1) / f;
+    if (!ensure_private(kPRecOut, cw, ch, DXGI_FORMAT_R11G11B10_FLOAT)) return false;
+    const auto desc = private_[kPRecOut].texture->GetDesc();
+    UINT64 total = 0;
+    device_->GetCopyableFootprints(&desc, 0, 1, 0, &r.foot[0], nullptr, nullptr, &total);
+    if (!r.buffer[0] || r.buffer[0]->GetDesc().Width < total) {
+        r.buffer[0].Reset();
+        D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC bd{}; bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = total; bd.Height = 1;
+        bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&r.buffer[0]))))
+            return false;
+    }
+    r.width[0] = static_cast<std::uint32_t>(desc.Width); r.height[0] = desc.Height;
+    const UINT t = kXRec + UINT(idx) * 8;
+    for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(t + i, kPOutput);
+    set_x_uav(t + kXSrvCount, kPRecOut);
+    set_x_uav(t + kXSrvCount + 1, kPRecOut);
+    const auto out_before = private_[kPOutput].state;
+    transition(private_[kPOutput], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    transition(private_[kPRecOut], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    XConstants c{};
+    c.grid[0] = cw; c.grid[1] = ch; c.out_size[0] = o.width; c.out_size[1] = o.height; c.groups_x = f; c.flags = 4u;
+    x_dispatch(cs_rec_down_.Get(), &c, t, t + kXSrvCount, (cw + 7) / 8, (ch + 7) / 8);
+    transition(private_[kPRecOut], D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst{r.buffer[0].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+    dst.PlacedFootprint = r.foot[0];
+    D3D12_TEXTURE_COPY_LOCATION from{private_[kPRecOut].texture.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+    list_->CopyTextureRegion(&dst, 0, 0, 0, &from, nullptr);
+    transition(private_[kPRecOut], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    transition(private_[kPOutput], out_before);
+    r.has_stencil = false; r.has_ui = false; r.output = true;
+    r.tag = tag; r.context = context_; r.fence = 0;
     r.state.store(1, std::memory_order_release);
     return true;
 }
@@ -8896,7 +9283,7 @@ bool Renderer::take_recorded(RecordedFrame& out) {
     std::vector<std::uint8_t>* dst[5] = {&out.colour, &out.depth, &out.motion, &out.ui, &out.stencil};
     for (int k = 0; k < 5; ++k) {
         dst[k]->clear();
-        if ((k == 3 && !r.has_ui) || (k == 4 && !r.has_stencil)) continue;
+        if ((k == 3 && !r.has_ui) || (k == 4 && !r.has_stencil) || (r.output && k > 0)) continue;
         std::uint8_t* mapped = nullptr;
         if (FAILED(r.buffer[k]->Map(0, nullptr, reinterpret_cast<void**>(&mapped)))) { r.state.store(0, std::memory_order_release); return false; }
         const std::uint32_t bytes = k == 3 && r.foot[k].Footprint.Format == DXGI_FORMAT_R8G8B8A8_UNORM ? 4u : kBytes[k];
@@ -8908,7 +9295,8 @@ bool Renderer::take_recorded(RecordedFrame& out) {
         r.buffer[k]->Unmap(0, &none);
     }
     out.tag = r.tag;
-    out.cw = r.width[0]; out.ch = r.height[0]; out.dw = r.width[1]; out.dh = r.height[1];
+    out.cw = r.width[0]; out.ch = r.height[0]; out.dw = r.output ? 0 : r.width[1]; out.dh = r.output ? 0 : r.height[1];
+    out.output = r.output;
     r.state.store(0, std::memory_order_release);
     return true;
 }

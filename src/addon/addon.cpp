@@ -174,8 +174,6 @@ constexpr Persisted kPersisted[] = {
     {"RotationExtrapolation", nullptr, &fw::Settings::rotation_extrapolation},
     {"AutoLatency", &fw::Settings::auto_prediction, nullptr},
     {"LatencySmoothness", nullptr, &fw::Settings::prediction_ms},
-    {"OrbitDistance", nullptr, &fw::Settings::orbit_distance},
-    {"OrbitMode", &fw::Settings::orbit_mode, nullptr},
     {"FloorRelease", &fw::Settings::floor_release, nullptr},
     {"HoldReticles", &fw::Settings::hold_reticles, nullptr},
     {"GameHudLayers", &fw::Settings::game_hud_layers, nullptr},
@@ -490,7 +488,6 @@ void on_init_swapchain(swapchain* sc, bool) {
         shared->settings.near_camera_rule = saved("NearCameraRule") != 0;
         shared->settings.record_diagnostics = saved("RecordDiagnostics") != 0;
         shared->settings.background_memory = saved("BackgroundMemory") != 0;
-        shared->settings.moving_objects = 0;  // (XPAR frame generation: removed 2026-10-30)
         shared->settings.stretch_width = static_cast<std::uint32_t>(std::clamp(saved("StretchWidth"), 0, 32));
         shared->settings.gpu_priority = static_cast<std::uint32_t>(std::clamp(saved("GpuPriority"), 0, 2));
         shared->settings.use_controller = saved("Controller") != 0;
@@ -630,6 +627,7 @@ void on_reshade_present(effect_runtime* runtime) {
     command_queue* queue = runtime->get_command_queue();
     if (!g_producer || !g_producer->ready() || !queue) return;
     if (queue->get_device()->get_api() == device_api::vulkan) {
+        if (!g_producer->shared()->game_vulkan) InterlockedExchange(&g_producer->shared()->game_vulkan, 1);
         if (g_producer->vulkan()) present_vulkan(runtime, queue);
         return;
     }
@@ -698,6 +696,52 @@ void hint(const char* text) {
     ImGui::EndTooltip();
 }
 
+// Which settings the panel shows: true hides one. A hidden setting keeps working at its value - its default, or what
+// ReShade.ini remembers - and "Reset all settings to defaults" still resets it; set its flag to false to show it again.
+// Hidden (2026-11-06, user): what works on its default and has no reason to be touched now. [FrameWarp] ShowAllSettings=1
+// shows them all (development).
+struct HiddenFromUi {
+    bool rotation_extrapolation = true;
+    bool auto_latency = false;
+    bool edge_limit = false;            // (Auto latency "camera as of now")
+    bool latency_smoothness = true;     // (the manual latency slider, Auto latency off)
+    bool floor_release = true;
+    bool max_extrapolation = true;
+    bool manual_mouse_gain = true;
+    bool present_lead = true;
+    bool frame_cap = false;
+    bool gpu_priority = true;
+    bool warp_engine = true;
+    bool forward_splat = true;
+    bool background_memory = true;
+    bool memory_resolution = true;
+    bool edge_fill = false;
+    bool keep_hud_still = true;         // (HUD-less + UI tags)
+    bool keep_still = true;             // (HUD / character / weapon)
+    bool near_camera_rule = true;
+    bool follow_share = true;
+    bool share_from_input = true;
+    bool stretch = true;
+    bool turn_rule = true;              // (keep still what the camera turns around)
+    bool hold_whole_character = true;
+    bool hold_reticles = true;
+    bool find_hud = true;
+    bool game_hud_layers = true;
+    bool hud_learn = true;
+    bool fill_behind_hud = true;
+    bool force_borderless = false;
+    bool invert_warp = true;
+};
+constexpr HiddenFromUi kHiddenFromUi;
+bool shown_in_ui(bool hidden) {
+    static const bool all = [] {
+        char value[8] = {};
+        size_t size = sizeof(value);
+        return reshade::get_config_value(nullptr, "FrameWarp", "ShowAllSettings", value, &size) && value[0] == '1';
+    }();
+    return !hidden || all;
+}
+
 void draw_overlay(effect_runtime*) {
     struct SaveAfter {  // (when the panel is drawn: what was changed in it is remembered)
         ~SaveAfter() { if (g_producer && g_producer->shared()) save_persisted(g_producer->shared()->settings); }
@@ -753,6 +797,16 @@ void draw_overlay(effect_runtime*) {
                            "application. Turn it off in the NVIDIA Control Panel > Manage 3D settings (for all programs, or for\n"
                            "FrameWarpPresenter.exe and this game). Other frame rate limiters can do the same.", p.outside_cap_fps);
     if (fw::reshade_feed_status()[0]) ImGui::TextWrapped("%s", fw::reshade_feed_status());
+    // (the upscaler's path: where the camera comes from - the feed says it in its own status above)
+    else if (alive && g_producer && g_producer->game_depth_seen() && sh.game_camera_check != 1) {
+        if (g_producer->upscaler_camera_estimated()) {
+            const LONG share = sh.camera_share;
+            if (share > 0) ImGui::TextWrapped("Depth and motion vectors from the game's upscaler. Camera found in the game (used on %ld%% of frames).", share);
+            else ImGui::TextWrapped("Depth and motion vectors from the game's upscaler. Camera estimated.");
+        } else {
+            ImGui::TextWrapped("Camera, depth and motion vectors handed over by the game.");
+        }
+    }
     if (sh.game_camera_check == 1)
         ImGui::TextDisabled("Camera: estimated from the motion vectors (the game's own camera data does not match them)");
     if (alive && p.estimate_unreliable_pct)
@@ -776,19 +830,21 @@ void draw_overlay(effect_runtime*) {
             s.use_controller = controller;
             reshade::set_config_value(nullptr, "FrameWarp", "Controller", controller ? "1" : "0");
         }
-        ImGui::SliderFloat("Rotation extrapolation", &s.rotation_extrapolation, 0.0f, 1.0f);
+        if (shown_in_ui(kHiddenFromUi.rotation_extrapolation)) ImGui::SliderFloat("Rotation extrapolation", &s.rotation_extrapolation, 0.0f, 1.0f);
         static const char* const kAutoModes[] = {"Off (manual slider)", "Auto (1/2, 1/4 without HUD layers, 1 without DLSS/FSR)", "1 game frame", "1/2 game frame",
                                                  "1/4 game frame", "Camera as of now (edge-limited)", "Lowest latency without edge fill (default)"};
         static const std::uint32_t kAutoValues[] = {0, 3, 1, 2, 4, 5, 6};
         int auto_index = 0;
         for (int i = 0; i < 7; ++i) if (kAutoValues[i] == s.auto_prediction) auto_index = i;
+        if (shown_in_ui(kHiddenFromUi.auto_latency)) {
         if (ImGui::Combo("Auto latency", &auto_index, kAutoModes, 7)) s.auto_prediction = kAutoValues[auto_index];
         hint("How far behind the newest camera the view is shown. Auto: between the game's last frames (smoothest). "
              "Camera as of now: the lowest latency - the mouse up to this moment - held back only as far as needed to keep "
              "what a fast turn uncovers at the screen's edge under the limit below. Lowest latency without edge fill: the "
              "camera as of now whenever that shows nothing the game has not rendered, down to one game frame back during "
              "fast turns (what the warp reveals then comes from the game's last frames: keep Background memory on).");
-        if (s.auto_prediction == 5) {
+        }
+        if (s.auto_prediction == 5 && shown_in_ui(kHiddenFromUi.edge_limit)) {
             bool unlimited = s.edge_unlimited != 0;
             if (ImGui::Checkbox("No edge limit", &unlimited)) s.edge_unlimited = unlimited;
             hint("Always the camera as of now, however much a fast turn uncovers at the screen's edge.");
@@ -799,38 +855,31 @@ void draw_overlay(effect_runtime*) {
                  "the camera as of now whenever that adds no edge, held back during fast turns.");
         }
         const bool auto_latency = s.auto_prediction != 0;
-        if (auto_latency) {
+        if (auto_latency && shown_in_ui(kHiddenFromUi.auto_latency)) {
             ImGui::SameLine();
             ImGui::TextDisabled("%.1f ms (game frame %.1f ms)", p.effective_prediction_ms, p.frame_interval_ms);
-            ImGui::BeginDisabled();
         }
-        ImGui::SliderFloat("Latency <-> smoothness (ms)", &s.prediction_ms, -40.0f, 30.0f, "%.0f");
-        if (auto_latency) ImGui::EndDisabled();
-        hint("Negative: smoother, adds that much delay | positive: predicts further ahead.");
-        static const char* const kOrbitModes[] = {"Measured", "Off (default)", "Manual"};
-        int orbit_mode = s.orbit_mode <= 2 ? static_cast<int>(s.orbit_mode) : 1;
-        if (ImGui::Combo("Orbit pivot", &orbit_mode, kOrbitModes, 3)) s.orbit_mode = static_cast<std::uint32_t>(orbit_mode);
-        hint("Third-person cameras circle the character: turns are predicted around that point instead of on the spot. "
-             "Measured: in games that give the upscaler (DLSS, FSR) their motion vectors but no camera, the pivot XPAR "
-             "measures, while the turns agree on one; games that send their camera already include the orbit in its "
-             "motion, and motion worked out from the picture is too rough to measure it. Manual: the distance below, in any game.");
-        if (orbit_mode == 2) ImGui::SliderFloat("Orbit distance", &s.orbit_distance, 0.0f, 1000.0f, "%.0f");
+        if (shown_in_ui(kHiddenFromUi.latency_smoothness)) {
+            if (auto_latency) ImGui::BeginDisabled();
+            ImGui::SliderFloat("Latency <-> smoothness (ms)", &s.prediction_ms, -40.0f, 30.0f, "%.0f");
+            if (auto_latency) ImGui::EndDisabled();
+            hint("Negative: smoother, adds that much delay | positive: predicts further ahead.");
+        }
         // (only where a measured orbit is in use: the only place it acts)
-        if (alive && p.orbit_in_use) {
+        if (alive && p.orbit_in_use && shown_in_ui(kHiddenFromUi.floor_release)) {
             bool floor_release = s.floor_release != 0;
             if (ImGui::Checkbox("Let the ground around the character move with the orbit", &floor_release)) s.floor_release = floor_release;
             hint("\"Keep still what the camera turns around\" no longer holds the ground around the character - it barely "
                  "moves on screen in an orbit too, but the warp around the measured pivot moves it right. Only shown, and only "
                  "acting, while turns are predicted around a measured orbit pivot; near the pivot's distance. Remembered per game.");
         }
-        ImGui::SliderFloat("Max extrapolation (ms)", &s.max_horizon_ms, 0.0f, 200.0f, "%.0f");
+        if (shown_in_ui(kHiddenFromUi.max_extrapolation)) ImGui::SliderFloat("Max extrapolation (ms)", &s.max_horizon_ms, 0.0f, 200.0f, "%.0f");
         ImGui::Separator();
         ImGui::Text("Camera model  yaw: %s gain %.3g mrad/count, smoothing %.0f ms, quality %.2f",
                     p.calibrated_x ? "fitted" : "learning", p.gain_x * 1000.0f, p.tau_x_ms, p.fit_quality_x);
         ImGui::Text("            pitch: %s gain %.3g mrad/count, smoothing %.0f ms, quality %.2f",
                     p.calibrated_y ? "fitted" : "learning", p.gain_y * 1000.0f, p.tau_y_ms, p.fit_quality_y);
-        ImGui::Text("Input delay %.0f ms | game latency %.1f ms | measured orbit %s", p.delay_ms, p.latency_ms,
-                    p.orbit_cm > 0.0f ? std::to_string(static_cast<int>(p.orbit_cm + 0.5f)).c_str() : "none (no consistent orbit)");
+        ImGui::Text("Input delay %.0f ms | game latency %.1f ms", p.delay_ms, p.latency_ms);  // (no orbit pivot since 2.2)
         if (!p.controller)
             ImGui::TextDisabled("Controller: none connected (XInput)");
         else if (p.stick_gain_x == 0.0f && p.stick_gain_y == 0.0f)
@@ -840,8 +889,8 @@ void draw_overlay(effect_runtime*) {
                         p.stick_gain_y, p.stick_power_y, s.use_controller ? "" : " (learned, not applied: option off)");
         if (ImGui::Button("Reset camera model")) ++s.reset_calibration;
         bool manual = s.manual_gain != 0;
-        if (ImGui::Checkbox("Manual mouse gain", &manual)) s.manual_gain = manual;
-        if (manual) {
+        if (shown_in_ui(kHiddenFromUi.manual_mouse_gain) && ImGui::Checkbox("Manual mouse gain", &manual)) s.manual_gain = manual;
+        if (manual && shown_in_ui(kHiddenFromUi.manual_mouse_gain)) {
             float gx = s.manual_gain_x * 1000.0f, gy = s.manual_gain_y * 1000.0f;
             if (ImGui::SliderFloat("Yaw mrad/count", &gx, -5.0f, 5.0f, "%.4f")) s.manual_gain_x = gx / 1000.0f;
             if (ImGui::SliderFloat("Pitch mrad/count", &gy, -5.0f, 5.0f, "%.4f")) s.manual_gain_y = gy / 1000.0f;
@@ -850,21 +899,23 @@ void draw_overlay(effect_runtime*) {
     }
 
     if (ImGui::CollapsingHeader("Latency", ImGuiTreeNodeFlags_DefaultOpen)) {
-        bool auto_lead = s.present_lead_auto != 0;
-        if (ImGui::Checkbox("Automatic present lead", &auto_lead)) s.present_lead_auto = auto_lead;
-        hint("Renders each refresh as late as the warp still makes it in time (measured), for the freshest camera.");
-        if (auto_lead && alive && p.present_lead_ms > 0.0f) { ImGui::SameLine(); ImGui::TextDisabled("(now %.1f ms)", p.present_lead_ms); }
-        if (auto_lead) ImGui::BeginDisabled();
-        ImGui::SliderFloat("Present lead (ms)", &s.present_lead_ms, 0.0f, 7.0f, "%.1f");
-        if (auto_lead) ImGui::EndDisabled();
-        hint("Manual: render this long before the next refresh; 0 = right after the previous one.");
+        if (shown_in_ui(kHiddenFromUi.present_lead)) {
+            bool auto_lead = s.present_lead_auto != 0;
+            if (ImGui::Checkbox("Automatic present lead", &auto_lead)) s.present_lead_auto = auto_lead;
+            hint("Renders each refresh as late as the warp still makes it in time (measured), for the freshest camera.");
+            if (auto_lead && alive && p.present_lead_ms > 0.0f) { ImGui::SameLine(); ImGui::TextDisabled("(now %.1f ms)", p.present_lead_ms); }
+            if (auto_lead) ImGui::BeginDisabled();
+            ImGui::SliderFloat("Present lead (ms)", &s.present_lead_ms, 0.0f, 7.0f, "%.1f");
+            if (auto_lead) ImGui::EndDisabled();
+            hint("Manual: render this long before the next refresh; 0 = right after the previous one.");
+        }
         bool cap = s.frame_cap != 0;
-        if (ImGui::Checkbox("Prevent GPU queueing", &cap)) s.frame_cap = cap;
+        if (shown_in_ui(kHiddenFromUi.frame_cap) && ImGui::Checkbox("Prevent GPU queueing", &cap)) s.frame_cap = cap;
         hint("Not a frame rate limit you set: XPAR finds by itself the rate the game's GPU sustains and holds the game just "
              "below it, so no frame waits in the GPU's queue and the game reads input later (what NVIDIA Reflex does). Stands "
              "aside by itself while the game's Reflex is on, and while the GPU is the limit (holding the game back would only "
              "cost frames). Remembered per game.");
-        if (cap) {
+        if (cap && shown_in_ui(kHiddenFromUi.frame_cap)) {
             const fw::FrameCapStatus st = fw::frame_cap_status();
             ImGui::SameLine();
             if (st.reflex)
@@ -886,7 +937,7 @@ void draw_overlay(effect_runtime*) {
                         p.lat_behind_ms, p.lat_display_ms, p.lat_age_ms, p.presents_queued);
         static const char* const kPriorities[] = {"Realtime (default)", "High", "Normal"};
         int priority = s.gpu_priority <= 2 ? static_cast<int>(s.gpu_priority) : 0;
-        if (ImGui::Combo("Presenter GPU priority", &priority, kPriorities, 3)) {
+        if (shown_in_ui(kHiddenFromUi.gpu_priority) && ImGui::Combo("Presenter GPU priority", &priority, kPriorities, 3)) {
             s.gpu_priority = static_cast<std::uint32_t>(priority);
             reshade::set_config_value(nullptr, "FrameWarp", "GpuPriority", priority);
         }
@@ -897,20 +948,27 @@ void draw_overlay(effect_runtime*) {
         // NVIDIA Latewarp is optional: only selectable once the presenter reports it ready.
         const bool latewarp = sh.presenter.latewarp == 2;
         int engine = latewarp && s.warp_engine != 1 ? 0 : 1;
-        ImGui::BeginDisabled(!latewarp);
-        if (ImGui::Combo("Warp engine", &engine, kEngines, 2)) s.warp_engine = static_cast<std::uint32_t>(engine);
-        ImGui::EndDisabled();
+        if (shown_in_ui(kHiddenFromUi.warp_engine)) {
+            ImGui::BeginDisabled(!latewarp);
+            if (ImGui::Combo("Warp engine", &engine, kEngines, 2)) s.warp_engine = static_cast<std::uint32_t>(engine);
+            ImGui::EndDisabled();
+        }
         bool splat = s.warp_splat != 0;
+        if (shown_in_ui(kHiddenFromUi.forward_splat)) {
         if (ImGui::Checkbox("Forward-splat warp (XPAR engine)", &splat)) s.warp_splat = splat;
         hint("Every point of the game's frame is placed where your camera now sees it, the nearest one winning, and what "
              "nothing reaches is filled from the scenery behind: near objects keep their shape and edges are not doubled "
              "when strafing. Off: the earlier warp, which searches from each pixel of the screen. Remembered per game.");
+        }
         bool memory = s.background_memory != 0;
+        if (shown_in_ui(kHiddenFromUi.background_memory)) {
         if (ImGui::Checkbox("Background memory for uncovered areas (XPAR engine)", &memory)) {
             s.background_memory = memory;
             reshade::set_config_value(nullptr, "FrameWarp", "BackgroundMemory", memory ? "1" : "0");
         }
         hint("Beside the character/weapon and at the screen edges: the scenery as last seen there, when recent.");
+        }
+        if (shown_in_ui(kHiddenFromUi.memory_resolution)) {
         ImGui::BeginDisabled(!memory);
         static const char* const kMemoryResolutions[] = {"Full", "1/2 (default)", "1/4"};
         int memory_res = static_cast<int>(std::min<std::uint32_t>(s.memory_resolution, 2));
@@ -920,6 +978,8 @@ void draw_overlay(effect_runtime*) {
              "the character and the screen edges as sharp as the scenery around them, for about 4x the video memory (about "
              "415, 105 and 26 MB at 4K for full, 1/2 and 1/4) and more GPU time; 1/2 and 1/4 are softer where they fill. "
              "Remembered per game.");
+        }
+        if (shown_in_ui(kHiddenFromUi.edge_fill)) {
         static const char* const kEdgeFills[] = {"Extended edge pixels", "Soft", "Dithered (default)"};
         int edge_fill = static_cast<int>(std::min<std::uint32_t>(s.edge_fill, 2));
         if (ImGui::Combo("Uncovered screen edges (XPAR engine)", &edge_fill, kEdgeFills, 3)) s.edge_fill = static_cast<std::uint32_t>(edge_fill);
@@ -927,38 +987,45 @@ void draw_overlay(effect_runtime*) {
              "the scenery along the edge more the further out, slightly less saturated; extended edge pixels repeat the "
              "edge (sharper close to it, streaks further out); dithered shows the game's frame as it is there, mixed into "
              "the warped picture in a fine pattern near the edge - noisy, not smeared. Remembered per game.");
-        if (!latewarp)
+        }
+        if (!latewarp && shown_in_ui(kHiddenFromUi.warp_engine))
             ImGui::TextDisabled("NVIDIA Latewarp is not installed (optional: nvngx_latewarp.dll, NVIDIA GPUs only)");
         bool ui = s.use_ui_tags != 0;
-        if (ImGui::Checkbox("Keep HUD still (HUD-less + UI tags)", &ui)) s.use_ui_tags = ui;
+        if (shown_in_ui(kHiddenFromUi.keep_hud_still) && ImGui::Checkbox("Keep HUD still (HUD-less + UI tags)", &ui)) s.use_ui_tags = ui;
         // What is kept unwarped: the HUD (detected in games without HUD layers) and what moves with the
         // camera (third-person character, first-person weapon).
         static const char* const kKeepStill[] = {"HUD + character/weapon (default)", "HUD only", "Character/weapon only", "Off"};
         int keep = s.no_warp_mask ? (s.keep_attached ? 0 : 1) : (s.keep_attached ? 2 : 3);
-        if (ImGui::Combo("Keep still", &keep, kKeepStill, 4)) {
-            s.no_warp_mask = keep == 0 || keep == 1;
-            s.keep_attached = keep == 0 || keep == 2;
+        if (shown_in_ui(kHiddenFromUi.keep_still)) {
+            if (ImGui::Combo("Keep still", &keep, kKeepStill, 4)) {
+                s.no_warp_mask = keep == 0 || keep == 1;
+                s.keep_attached = keep == 0 || keep == 2;
+            }
+            hint("What moves with the camera (third-person character, first-person weapon) is not warped and moves at the game's "
+                 "frame rate; the HUD is detected in games without HUD layers.");
         }
-        hint("What moves with the camera (third-person character, first-person weapon) is not warped and moves at the game's "
-             "frame rate; the HUD is detected in games without HUD layers.");
         const bool mask = s.no_warp_mask != 0, attached = s.keep_attached != 0;
         if (attached) {
             if (p.mv_scale_x == 0.0f) ImGui::TextDisabled("Character/weapon: starts after a few seconds of turning the camera");
             else if (alive) ImGui::TextDisabled(p.character_source == 1 ? "Character: found through the game's depth buffer"
                                                                         : "Character: estimated from the motion");
             bool near_rule = s.near_camera_rule != 0;
+            if (shown_in_ui(kHiddenFromUi.near_camera_rule)) {
             if (ImGui::Checkbox("Keep near-camera motion still (weapon animations, hands)", &near_rule)) {
                 s.near_camera_rule = near_rule;
                 reshade::set_config_value(nullptr, "FrameWarp", "NearCameraRule", near_rule ? "1" : "0");
             }
             hint("Turn off if the floor near the camera is kept still while strafing.");
+            }
             bool share = s.follow_share != 0;
+            if (shown_in_ui(kHiddenFromUi.follow_share)) {
             if (ImGui::Checkbox("Character/weapon by how much it follows the turn (new)", &share)) s.follow_share = share;
             hint("Each spot is moved by the share of the camera's turn it has followed on screen lately (the character the camera "
                  "orbits or follows: none; the scenery: all of it; the ground around the character: part of it) instead of being "
                  "held or not. No edge for it to split along, and much lighter. The stretch, the orbit rule and holding the whole "
                  "character are not used with it. Remembered per game.");
-            if (share) {
+            }
+            if (share && shown_in_ui(kHiddenFromUi.share_from_input)) {
                 bool from_input = s.share_from_input != 0;
                 if (ImGui::Checkbox("  ...measured against the turn from your input", &from_input)) s.share_from_input = from_input;
                 hint("Measured against the part of the camera's turn your mouse or stick explains - what the warp applies - instead "
@@ -966,44 +1033,52 @@ void draw_overlay(effect_runtime*) {
                      "suddenly disagrees with what it has followed so far counts less. Remembered per game.");
             }
             int stretch = static_cast<int>(std::min(s.stretch_width, 32u));
+            if (shown_in_ui(kHiddenFromUi.stretch)) {
             if (ImGui::SliderInt("Stretch around character/weapon (render px, XPAR engine)", &stretch, 0, 32, stretch ? "%d" : "off")) {
                 s.stretch_width = static_cast<std::uint32_t>(stretch);
                 const std::string value = std::to_string(stretch);
                 reshade::set_config_value(nullptr, "FrameWarp", "StretchWidth", value.c_str());
             }
             hint("The scenery beside it stretches instead of tearing into streaks when strafing or turning.");
+            }
             bool orbited = s.turn_rule != 0;
+            if (shown_in_ui(kHiddenFromUi.turn_rule)) {
             if (ImGui::Checkbox("Keep still what the camera turns around (third-person)", &orbited)) {
                 s.turn_rule = orbited;
                 reshade::set_config_value(nullptr, "FrameWarp", "HoldOrbitedCharacter", orbited ? "1" : "0");
             }
             hint("For over-the-shoulder cameras that circle the character: what barely moves on screen while turning is held.");
+            }
             bool whole = s.hold_characters != 0;
+            if (shown_in_ui(kHiddenFromUi.hold_whole_character)) {
             if (ImGui::Checkbox("Hold the whole character", &whole)) s.hold_characters = whole;
             hint("A character the camera follows - running, its limbs swinging, the camera lagging a little - is held as one: "
                  "what stays in place on screen over several frames while the camera moves, and its moving parts touching it. "
                  "Grass, walls and floor it passes are not (they slide by). Objects followed by turning the camera are not held. "
                  "Remembered per game.");
+            }
             bool reticles = s.hold_reticles != 0;
+            if (shown_in_ui(kHiddenFromUi.hold_reticles)) {
             if (ImGui::Checkbox("Hold sight reticles", &reticles)) s.hold_reticles = reticles;
             hint("For red dot and holographic sights whose reticle skips while turning: the game draws it without depth of its own, "
                  "so it is warped with the scenery behind the glass. Here what is on the glass (reticle, glow, reflections) is "
                  "learned as a layer that moves with the gun, within a few frames of turning, and the warp moves only the scenery "
                  "under it. Sights the game draws with depth are held already. XPAR engine. Remembered per game.");
+            }
         }
         if (mask) {
             static const char* const kHudFind[] = {"Learned from camera motion", "From the upscaler output (DLSS or FSR)",
                                                    "Upscaler output + camera motion check (default)"};
             int find = s.hud_from_scene > 2 ? 2 : int(s.hud_from_scene);
-            if (ImGui::Combo("Find the HUD", &find, kHudFind, 3)) {
+            if (shown_in_ui(kHiddenFromUi.find_hud) && ImGui::Combo("Find the HUD", &find, kHudFind, 3)) {
                 s.hud_from_scene = find;
                 static const char* const kValues[] = {"0", "1", "2"};
                 reshade::set_config_value(nullptr, "FrameWarp", "HudFromDlssOutput", kValues[find]);
             }
             bool layers = s.game_hud_layers != 0;
-            if (ImGui::Checkbox("Use the game's own HUD layer when found", &layers)) s.game_hud_layers = layers;
+            if (shown_in_ui(kHiddenFromUi.game_hud_layers) && ImGui::Checkbox("Use the game's own HUD layer when found", &layers)) s.game_hud_layers = layers;
             bool learn = s.hud_learn != 0;
-            if (ImGui::Checkbox("Learn where the game draws its HUD (where nothing above gives it)", &learn)) s.hud_learn = learn;
+            if (shown_in_ui(kHiddenFromUi.hud_learn) && ImGui::Checkbox("Learn where the game draws its HUD (where nothing above gives it)", &learn)) s.hud_learn = learn;
             if (s.hud_learn && g_producer && g_producer->shared()) {
                 const auto& lh = g_producer->shared()->hooks;
                 if (lh.learn_locked)
@@ -1014,9 +1089,10 @@ void draw_overlay(effect_runtime*) {
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Relearn")) ++s.hud_relearn;
             }
-            hint("Where the game draws its HUD into a layer of its own, or onto its final picture after a step XPAR can catch, the HUD "
-                 "is taken from there: exact, nothing to detect. Off: the HUD is always detected (as chosen above) - for a game "
-                 "where the wrong layer is taken. Direct3D 12 games. Remembered per game.");
+            if (shown_in_ui(kHiddenFromUi.game_hud_layers))
+                hint("Where the game draws its HUD into a layer of its own, or onto its final picture after a step XPAR can catch, the HUD "
+                     "is taken from there: exact, nothing to detect. Off: the HUD is always detected (as chosen above) - for a game "
+                     "where the wrong layer is taken. Direct3D 12 games. Remembered per game.");
             // Where the HUD comes from right now, and the game's own HUD layer if XPAR found one.
             if (g_producer && g_producer->shared()) {
                 const auto& ps = g_producer->shared()->presenter;
@@ -1045,13 +1121,14 @@ void draw_overlay(effect_runtime*) {
                 else
                     ImGui::TextDisabled("Game's HUD layer: not found (the HUD is detected)");
             }
-            if (find == 0)
+            if (!shown_in_ui(kHiddenFromUi.find_hud)) {
+            } else if (find == 0)
                 hint("Learns what stays put while the camera moves; the only choice without an upscaler output.");
             else if (find == 1)
                 hint("Sharper and instant, but in some games it may keep parts of the scenery still; check with the mask view.");
             else if (find == 2)
                 hint("From the upscaler output, minus what is seen moving with the world when the camera turns; check with the mask view.");
-            if (find != 0) {
+            if (find != 0 && shown_in_ui(kHiddenFromUi.fill_behind_hud)) {
                 bool fill = s.hud_fill != 0;
                 if (ImGui::Checkbox("Fill behind the HUD from the upscaler output (XPAR engine)", &fill)) {
                     s.hud_fill = fill;
@@ -1060,17 +1137,19 @@ void draw_overlay(effect_runtime*) {
                 hint("Shows the scenery the HUD covers when the camera turns, instead of a smeared trail.");
             }
         }
-        bool borderless = force_borderless();
-        if (ImGui::Checkbox("Force a borderless window (for games that only run in exclusive fullscreen)", &borderless))
-            reshade::set_config_value(nullptr, "FrameWarp", "ForceBorderless", borderless ? "1" : "0");
-        hint("XPAR can't show over exclusive fullscreen; applies when the game is restarted; remembered for this game.");
+        if (shown_in_ui(kHiddenFromUi.force_borderless)) {
+            bool borderless = force_borderless();
+            if (ImGui::Checkbox("Force a borderless window (for games that only run in exclusive fullscreen)", &borderless))
+                reshade::set_config_value(nullptr, "FrameWarp", "ForceBorderless", borderless ? "1" : "0");
+            hint("XPAR can't show over exclusive fullscreen; applies when the game is restarted; remembered for this game.");
+        }
     }
 
     if (ImGui::CollapsingHeader("Debug")) {
         bool strip = s.overlay_debug != 0;
         if (ImGui::Checkbox("Debug strip (top-left, shows every presented frame)", &strip)) s.overlay_debug = strip;
         bool invert = s.invert_warp != 0;
-        if (ImGui::Checkbox("Invert warp (debug)", &invert)) s.invert_warp = invert;
+        if (shown_in_ui(kHiddenFromUi.invert_warp) && ImGui::Checkbox("Invert warp (debug)", &invert)) s.invert_warp = invert;
         if (s.no_warp_mask || s.keep_attached) {
             bool show = s.show_mask != 0;
             if (ImGui::Checkbox("Show the mask (debug: magenta = kept still; learned HUD: green = being learned)", &show)) s.show_mask = show;

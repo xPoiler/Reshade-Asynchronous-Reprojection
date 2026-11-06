@@ -39,8 +39,15 @@ bool depth_orientation_ready(reshade::api::effect_runtime* runtime, reshade::api
 // Generic Depth this cannot steer: its own choice, as before). False while none stands out - nothing in use,
 // or none whose depth lies on the picture's edges (Cyber Hook: every one reads empty or unrelated).
 bool depth_usable();
+// The size the scene's depth is drawn at - the game's render resolution - when the buffer in use was chosen here: the smallest of the buffers
+// holding the same scene (a game can keep it at its render resolution and at the picture's too). False otherwise.
+bool scene_depth_size(std::uint32_t& w, std::uint32_t& h);
 // ReShade's depth copy setting was switched on (the depth read empty): the game has to be restarted once.
 bool depth_restart_needed();
+// The feed starts (600 frames of a 3D scene): the choice made again, among the buffers of the scene now shown. One made while the game
+// loads can be judged on a picture that is not there yet - Enshrouded, fading in from black: its 1280x720 depth probed on the black
+// picture (brightness changes 0.00x), a 640x360 one with 1.4% edges probed once it showed and chosen, kept the whole session.
+void choose_depth_again(reshade::api::effect_runtime* runtime);
 // The feed stopped (an upscaler gives depth again, XPAR disabled): Generic Depth's own choice again.
 void release_depth_choice(reshade::api::effect_runtime* runtime);
 }

@@ -27,6 +27,10 @@ constexpr std::uint64_t kUnsizedBytes = 4096;       // (a stopgap: Direct3D 12's
 constexpr uint32_t kPageViews = 1024;
 
 bool g_on = false;
+// (paused - pause(): the game's data comes from its upscaler's hooks, the ReShade feed is off and nothing takes what this would find.
+// The hooks then return at once: they run on every descriptor copy and bind of the game's. Map, unmap and destroy keep their
+// bookkeeping safe: see pause)
+std::atomic<bool> g_paused{false};
 // What the game wrote for the GPU to read is write-combined memory, on every API: plain loads from it go to the bus one by one. Read with streaming loads, a
 // cache line at a time (SSE4.1; from ordinary memory they are ordinary loads). Measured before (2026-11-04, hooks' time on frames searched whole): reads 3.6-5.8 ms
 // a frame in DOOM Eternal and 3.7-8.2 in Enshrouded for at most 192 KB; Dark Souls' copies of its constant buffers 0.7-1.3 ms on every frame.
@@ -657,7 +661,7 @@ void read_now(const std::uint8_t* data, std::uint64_t size, std::uint32_t slot) 
 std::uint32_t layout_of(pipeline_layout layout) { return std::uint32_t(layout.handle ^ (layout.handle >> 32)); }
 
 void on_push_constants(command_list* cmd, shader_stage, pipeline_layout layout, uint32_t param, uint32_t first, uint32_t count, const void* values) {
-    if (!cmd || !values || count < 16) return;
+    if (g_paused.load(std::memory_order_relaxed) || !cmd || !values || count < 16) return;
     if (cmd->get_device()->get_api() != device_api::d3d12 && cmd->get_device()->get_api() != device_api::vulkan) return;
     const std::uint32_t slot = mix(mix(mix(1, layout_of(layout)), param), first);
     if (!wanted(slot)) return;
@@ -750,6 +754,7 @@ void dump_root_views(device* dev, pipeline_layout layout, uint32_t param, const 
     }
 }
 void on_push_descriptors(command_list* cmd, shader_stage stage, pipeline_layout layout, uint32_t param, const descriptor_table_update& update) {
+    if (g_paused.load(std::memory_order_relaxed)) return;
     if (cmd) g_pushed_kind[std::uint32_t(update.type) & 15].fetch_add(update.count, std::memory_order_relaxed);
     if (cmd && update.descriptors && g_dump == 2 && update.type == descriptor_type::buffer_shader_resource_view && cmd->get_device()->get_api() == device_api::d3d12)
         dump_root_views(cmd->get_device(), layout, param, update);
@@ -778,6 +783,7 @@ void on_push_descriptors(command_list* cmd, shader_stage stage, pipeline_layout 
 }
 // Direct3D 12: most constants are bound through tables. Which view lies where is noted as the game writes and copies descriptors; what a table holds is read as it is bound.
 bool on_update_tables(device* dev, uint32_t count, const descriptor_table_update* updates) {
+    if (g_paused.load(std::memory_order_relaxed)) return false;
     const bool vulkan = dev->get_api() == device_api::vulkan;
     if (dev->get_api() != device_api::d3d12 && !vulkan) return false;
     Timed timed(kWrite);
@@ -824,6 +830,7 @@ bool on_update_tables(device* dev, uint32_t count, const descriptor_table_update
     return false;
 }
 bool on_copy_tables(device* dev, uint32_t count, const descriptor_table_copy* copies) {
+    if (g_paused.load(std::memory_order_relaxed)) return false;
     if (dev->get_api() != device_api::d3d12 && dev->get_api() != device_api::vulkan) return false;
     Timed timed(kCopy);
     for (uint32_t c = 0; c < count; ++c) {
@@ -851,7 +858,7 @@ bool on_copy_tables(device* dev, uint32_t count, const descriptor_table_copy* co
     return false;
 }
 void on_bind_tables(command_list* cmd, shader_stage, pipeline_layout layout, uint32_t first, uint32_t count, const descriptor_table* tables, uint32_t dynamic_count, const uint32_t*) {
-    if (!cmd || !tables || (g_dump != 2 && g_budget_spent.load(std::memory_order_relaxed) && !g_held_count.load(std::memory_order_relaxed))) return;
+    if (g_paused.load(std::memory_order_relaxed) || !cmd || !tables || (g_dump != 2 && g_budget_spent.load(std::memory_order_relaxed) && !g_held_count.load(std::memory_order_relaxed))) return;
     device* dev = cmd->get_device();
     if (dev->get_api() != device_api::d3d12 && dev->get_api() != device_api::vulkan) return;
     // (Vulkan's dynamic offsets are not added: none in either game measured - counted, for the one that has them)
@@ -911,14 +918,14 @@ void keep(resource res, const std::uint8_t* data, std::uint64_t offset, std::uin
     ++m.version;
 }
 void on_map(device* dev, resource res, uint64_t, uint64_t size, map_access access, void** data) {
-    if (dev->get_api() != device_api::d3d11 || !data || !*data || access == map_access::read_only) return;
+    if (g_paused.load(std::memory_order_relaxed) || dev->get_api() != device_api::d3d11 || !data || !*data || access == map_access::read_only) return;
     const resource_desc desc = dev->get_resource_desc(res);
     if (desc.type != resource_type::buffer || (desc.usage & resource_usage::constant_buffer) == 0) return;
     std::lock_guard<std::mutex> lock(g_mutex);
     g_writing[res.handle] = {static_cast<std::uint8_t*>(*data), size == UINT64_MAX ? desc.buffer.size : size};
 }
 void on_unmap(device* dev, resource res) {
-    if (dev->get_api() != device_api::d3d11) return;
+    if (g_paused.load(std::memory_order_relaxed) || dev->get_api() != device_api::d3d11) return;
     Timed timed(kD3D11);
     std::lock_guard<std::mutex> lock(g_mutex);
     const auto it = g_writing.find(res.handle);
@@ -927,7 +934,7 @@ void on_unmap(device* dev, resource res) {
     g_writing.erase(it);
 }
 bool on_update_buffer(device* dev, const void* data, resource dest, uint64_t offset, uint64_t size) {
-    if (dev->get_api() != device_api::d3d11 || !data) return false;
+    if (g_paused.load(std::memory_order_relaxed) || dev->get_api() != device_api::d3d11 || !data) return false;
     const resource_desc desc = dev->get_resource_desc(dest);
     if (desc.type != resource_type::buffer || (desc.usage & resource_usage::constant_buffer) == 0) return false;
     Timed timed(kD3D11);
@@ -1098,10 +1105,19 @@ std::uint32_t take(MatrixCandidate* out, std::uint32_t capacity, const volatile 
     return n + objects;
 }
 
+void pause() {
+    if (!g_on || g_paused.exchange(true)) return;
+    // (what a map began is forgotten: an unmap after resume() of a map made while paused finds nothing to copy, never a pointer
+    // from before - its buffer may be mapped elsewhere by then)
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_writing.clear();
+}
+void resume() { g_paused.store(false, std::memory_order_relaxed); }
 void init() {
     char value[8] = {};
     size_t size = sizeof(value);
-    g_on = reshade::get_config_value(nullptr, "FrameWarp", "CameraSearch", value, &size) && value[0] == '1';
+    // (on by default since 2.2; CameraSearch=0 turns it off)
+    g_on = !(reshade::get_config_value(nullptr, "FrameWarp", "CameraSearch", value, &size) && value[0] == '0');
     if (!g_on) return;
     size = sizeof(value);
     value[0] = 0;

@@ -1,5 +1,117 @@
 # Changelog
 
+## 2.2.0
+
+FrameWarp now finds the game's own camera and motion vectors by itself: in games without DLSS or FSR, and in games
+whose DLSS or FSR is handed no camera. The picture then moves with the game's exact camera instead of one worked out
+from the picture or from motion vectors. Vulkan games now run without DLSS too, the depth is handed over at the game's
+own render size, and the panel shows only the settings worth touching. The measured orbit pivot is gone: turns are
+predicted on the spot in every game.
+As with every update, the settings remembered per game go back to the defaults (*Record detailed diagnostics*
+stays).
+
+### The game's own camera, found
+
+* **Camera search.** In games that hand FrameWarp no camera, the add-on reads the constant buffers the game fills
+  and keeps every matrix shaped like a camera, together with where it lies. The presenter checks each one against the
+  motion the frames show: a camera predicts the motion at every point from depth alone, with nothing to fit, and a
+  light's, a bone's or an object's matrix does not. The one that fits is followed: the turn, the movement and the
+  field of view are taken straight from it instead of being estimated. Nothing is set per game. It works on DirectX 12,
+  DirectX 11 and Vulkan (on Vulkan through the memory the game keeps mapped).
+* Measured on frames that move: Resident Evil Requiem 93-100%, Dark Souls Remastered 273-300 of 300, Enshrouded
+  287-300 of 300, DOOM Eternal 212-295 of 300, and Armored Core VI, Cyberpunk 2077 and Resident Evil 2 on most of
+  them. Armored Core VI went from 47-49 to 50-51 fps, because estimating the camera from the picture was no longer
+  needed.
+* **Also in games with DLSS or FSR but no camera** (DLSS or FSR called directly, without Streamline: DOOM Eternal,
+  Enshrouded and others): the camera found replaces the one estimated from the upscaler's motion vectors. While the
+  game hands its camera over itself (Streamline), the search is paused.
+* Some games bind the next frame's camera before a frame is shown (DOOM Eternal). On every frame, this frame's values
+  and the frame before's are both tried, and the one that fits the motion is used.
+* The temporal anti-aliasing jitter is taken out of the camera (standing still in Cyberpunk 2077 made the picture
+  shake with it).
+* The places that hold the camera are remembered and read every frame. Whole frames are searched only when the camera
+  stops agreeing with the motion on a frame that moves. Cost: about 5-6 ms of CPU time per frame across the game's
+  threads while a whole frame is searched in Cyberpunk 2077, and much less once the places are held. In a GPU-bound
+  game no frame rate was lost (Cyberpunk 2077: 70 fps with the search on and off).
+* The panel says where the camera comes from: handed over by the game, found (and on how many frames), or estimated.
+* Switching DLSS off mid-session no longer leaves the camera estimated for good (DOOM Eternal): what the search learned
+  from one source is dropped when the source changes.
+* `CameraSearch=0` and `CameraUse=0` under `[FrameWarp]` in the game's `ReShade.ini` turn it off.
+
+### The game's own motion vectors, found
+
+* **Motion search** (DirectX 12 and DirectX 11, games without DLSS or FSR): every large render target the game draws
+  is tried, and each channel is fitted against the motion the pictures show, over turns both ways and across frames.
+  Nothing is assumed about format, channels or units. The game's own motion vectors replace the motion worked out from
+  the picture: exact, and cheaper. With XeSS (or no upscaler), Cyberpunk 2077's depth and motion now cost the
+  presenter what they cost with DLSS (0.11 ms per game frame, from 0.8-1.3 ms).
+* **Games that draw motion vectors only on what moves by itself** (characters, grass), and leave the rest at the
+  value the target was cleared to: Dark Souls Remastered clears 91.5% of its picture. Those are found too. The game's
+  vectors are used where it drew them. Elsewhere, the scenery's motion comes from depth and the game's camera when it
+  was found (as the game's own anti-aliasing does), and from the picture otherwise.
+* A target whose vectors show the frame before's motion is refused.
+* Vulkan games are not searched: Enshrouded's target held the frame before's motion on most frames and the scenery
+  juddered. They use the motion worked out from the picture, with the game's camera when it is found.
+* `MotionSearch=0` under `[FrameWarp]` turns it off.
+
+### Games without DLSS or FSR
+
+* **Vulkan games run without DLSS too**: Enshrouded with its built-in FSR 3 or no upscaler, and DOOM Eternal with DLSS
+  off. The depth goes through the Vulkan transport.
+* **The depth is handed over at the size of the game's own depth buffer**, at most half the picture above 1440p.
+  Cyberpunk 2077 with XeSS gets 1280x720 instead of 1920x1080: less to process, and the game's own pixels.
+* The ReShade feed starts once the game draws a 3D scene, not in the menus at the start of a session. Started there,
+  in a game whose upscaler comes with gameplay, it took video memory before the game loaded its world: Enshrouded on
+  an 8 GB card ran at 6-8 fps for a minute after loading. The depth buffer is chosen again once the scene is shown,
+  and the panel says while the feed waits.
+* **Depth choice fixes:**
+  * A depth buffer checked during a fade-in from black is checked again later, instead of losing to the wrong
+    buffer. Enshrouded chose a 640x360 copy that way for a whole session.
+  * A reduced copy of the depth no longer beats the depth it was reduced from.
+  * Games that draw into two depth buffers in turn have both read, and the one drawn each frame is used. Enshrouded's
+    picture shook because every other frame's depth was the frame before's.
+  * A smaller buffer of the same shape coming into use makes FrameWarp choose again. Opening a menu in Cyberpunk 2077
+    with XeSS no longer moves the feed to the 4K buffer.
+* Each picture stays with its own depth and motion. The estimated camera keeps a model while it explains the frames
+  better, and the field of view is learned from turns and movement together.
+
+### Character and weapon
+
+* **The measured orbit pivot is gone**, and the *Orbit pivot* option with it: turns are predicted on the spot in
+  every game. A wrong pivot changed the camera's distance and made the character judder in turns. With the character
+  moved by its own share of the turn, every tested game looked cleaner without the pivot.
+* The camera model no longer learns from a grab or a cutscene, a half-second that turns far faster than your mouse
+  does. The controller stick's response curve is now chosen correctly for pitch too.
+
+### HUD
+
+* **Faint HUD strokes that give off their own light are held**: Cyberpunk 2077's shotgun crosshair (thin brackets)
+  no longer slides with the scenery. Dark see-through backdrops still move with it.
+* Whether a colour HUD layer is used is decided by most frames over the session. A menu or a screen effect no longer
+  turns it off for seconds (Armored Core VI's crosshair slid and snapped back).
+* HUD detection leaves out characters that move by themselves: a third-person character stays put on screen as the
+  camera turns round it, as a HUD does. Resident Evil 2 showed speckles of HUD over Claire.
+* A HUD layer the game stops drawing is taken as a hidden HUD, not as a frame to learn from.
+
+### Panel
+
+* **Only the settings worth touching are shown**: Auto latency, Prevent GPU queueing, Uncovered screen edges, Force a
+  borderless window, the controller and the debug switches. The others keep working at their defaults (or at what
+  `ReShade.ini` remembers); `ShowAllSettings=1` under `[FrameWarp]` shows them all.
+* Removed: *Orbit pivot* (with its distance), *Camera turns only* and *XPAR frame generation*.
+
+### Performance and video memory
+
+* The warp's checks of what is held near each pixel run once per shown game frame instead of on every refresh. At 4K
+  a refresh between game frames went from 1.82 to 1.17 ms in Armored Core VI, with the output identical byte for
+  byte.
+* The presenter's shaders are compiled when it is built, so a game's first start compiles nothing.
+* The scenery taken out from under a colour HUD layer is kept in the picture's own format: 32 MB less at 4K (twice,
+  with the frame shown).
+* Sight reticle layers are made only for a sight near the screen's centre. Armored Core VI, which has no sights, no
+  longer allocates 128 MB at 4K for them.
+* The camera search's hooks are paused while the game's upscaler hands its camera over.
+
 ## 2.1.0
 
 The HUD now keeps its faint parts: thin lines, glows and see-through plates stay put while the scenery under them
