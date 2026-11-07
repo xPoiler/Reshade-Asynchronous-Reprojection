@@ -248,13 +248,17 @@ void on_present(command_queue* queue, swapchain* chain, const rect*, const rect*
 struct Census { std::uint32_t passes = 0, written = 0, read_after = 0, copyable = 0; };
 std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>, Census> g_census;
 int g_census_frames = 0;
+std::atomic<bool> g_motion_found{false};  // (the presenter has the game's motion: the census - the search's diagnostics - stops)
 void count_census(const resource_desc& d, std::uint32_t Census::* what) {
     if (d.type != resource_type::texture_2d || d.texture.width < 256) return;
     Census& c = g_census[{static_cast<std::uint32_t>(d.texture.format), d.texture.width, d.texture.height}];
     ++(c.*what);
     if ((d.usage & resource_usage::copy_source) != 0) ++c.copyable;
 }
-void census_pass(device* dev, resource r) { count_census(dev->get_resource_desc(r), &Census::passes); }
+void census_pass(device* dev, resource r) {
+    if (g_motion_found.load(std::memory_order_relaxed)) return;  // (each bind of the game's: a description asked for and a map entry - for a log line)
+    count_census(dev->get_resource_desc(r), &Census::passes);
+}
 void take_vulkan(command_list* cmd, device* dev, resource r, resource_usage state, std::uint32_t id);
 // Vulkan games are not searched: their motion comes from XPAR's own estimate. Found, a Vulkan game's own made it worse in both games seen (2026-11-04):
 // Enshrouded's target, copied right after its only write each frame and handed on frame for frame (stamped and checked on a recording), held the frame
@@ -383,6 +387,7 @@ MotionStep motion_step(bool found, std::uint32_t found_candidate, std::uint32_t 
     if (!g_search) return out;
     std::lock_guard<std::mutex> lock(g_search_mutex);
     g_paused = false;
+    g_motion_found.store(found, std::memory_order_relaxed);
     const bool resized = g_depth_width && g_depth_width != min_width;
     g_depth_width = min_width;
     if (found) {
