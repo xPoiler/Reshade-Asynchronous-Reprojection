@@ -30,7 +30,7 @@ inline constexpr DevKey kDevKeys[] = {
     {"StencilDump", "FW_STENCIL_DUMP", L"FW_STENCIL_DUMP", '1', false},
     {"MotionReference", "FW_MOTION_REF", L"FW_MOTION_REF", '1', false},  // (what moves with the screen by the game's vectors - Renderer::set_motion_reference)
     {"StencilMask", "FW_STENCIL_MASK", L"FW_STENCIL_MASK", '1', false},
-    {"ContinuousWarp", "FW_TETHER", L"FW_TETHER", '1', false},  // (the continuous warp: no gaps, nothing held but the HUD - Renderer::set_tether, dev/plan_continuous_warp.md)  // (the character from the game's stencil - Renderer::stencil_character)  // (the depth's stencil, every 60th frame - see Producer::stencil_dump)
+    {"ContinuousWarp", "FW_TETHER", L"FW_TETHER", '1', true},  // (on by default since 2026-11-07: ContinuousWarp=0 brings back the old holding - Renderer::set_tether)  // (the character from the game's stencil - Renderer::stencil_character)  // (the depth's stencil, every 60th frame - see Producer::stencil_dump)
 };
 
 // The variable's value for a key's first character (0: not set).

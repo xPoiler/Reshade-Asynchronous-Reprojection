@@ -901,7 +901,9 @@ void render_thread() {
         // (CarriedFree, MemoryPositions, AttachedEstimated: dev switches the synthetic scenes rate better since 2026-10-29 - see
         // Renderer::set_carried_free, set_mem_pos, set_attached_estimated)
         const auto env_on = [](const wchar_t* name) { wchar_t v[4]{}; return GetEnvironmentVariableW(name, v, 4) && v[0] == L'1'; };
-        if (env_on(L"FW_TETHER")) { renderer.set_tether(true); logf("continuous warp: nothing held but the HUD, no gaps (development: ContinuousWarp)"); }
+        // (the continuous warp, on by default: ContinuousWarp=0 - FW_TETHER=0 - holds the character/weapon the old way)
+        { wchar_t v[4]{}; const bool off = GetEnvironmentVariableW(L"FW_TETHER", v, 4) && v[0] == L'0'; renderer.set_tether(!off);
+          logf(off ? "continuous warp off: the character/weapon held the old way (ContinuousWarp=0)" : "continuous warp: nothing held but the HUD, no gaps"); }
         if (env_on(L"FW_CARRIED_FREE")) { renderer.set_carried_free(true); logf("carried pixels not held by the warp (development: CarriedFree)"); }
         if (env_on(L"FW_MEM_POS")) { renderer.set_mem_pos(true); logf("the background memory carried with its own positions (development: MemoryPositions)"); }
         if (env_on(L"FW_ATT_ABS")) { renderer.set_att_absolute(true); logf("the attached rule by the share a spot takes (development: AttachedAbsolute)"); }

@@ -643,7 +643,7 @@ private:
     std::array<std::pair<PrivateId, bool>, 21> warp_srv_ = {};  // (the warp table's SRVs as last set - set_x_srv)
     float claims_matrix_[16] = {};
     bool orbit_centre_turn_ = false, orbit_kind_ = true, share_orbit_ = false, projection_changed_ = false, zoom_freeze_ = true, ui8_force_ = false, flow_stamps_ = false, share_stamps_ = false;
-    bool behind_own_share_ = false, tether_ = false;
+    bool behind_own_share_ = false, tether_ = true;
     int tether_iters_ = 1, tether_iters_fine_ = 4, tether_fine_ = 1, tether_block_ = 0;
     bool share_resid_built_ = false, shown_share_resid_ = false;
     struct RecSlot {
