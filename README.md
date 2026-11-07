@@ -100,6 +100,8 @@ To check the version, right-click the file and open Properties > Details.
 2. Optional: put `nvngx_latewarp.dll` next to `install.bat` to have NVIDIA Latewarp available.
 3. Close the game and double-click `install.bat`. It lists your Steam games that have ReShade; type
    the number of the game and press Enter. For a non-Steam game, choose **P** and type its folder.
+   To update every FrameWarp it finds to the installer's version at once, choose **A** (shown when an
+   older one is found: in your Steam libraries and in every folder the installer has installed to).
    The installer copies FrameWarp next to the game's ReShade, and `XPAR.fx` (for games without DLSS
    or FSR) into the game's ReShade shader folder. For Unreal Engine games, it also
    enables Streamline resource tagging in the game's `Engine.ini`, keeping a backup of the file.
@@ -119,8 +121,8 @@ To uninstall, double-click `uninstall.bat` and choose the game. It reverts every
 changed.
 
 Advanced: both files also accept a game name or folder directly (`install.bat "Expedition 33"`), and
-`install.ps1` accepts `-Game`, `-GameDir`, `-Latewarp <dll>`, `-EngineIni <path>`, `-NoCvar` and
-`-Uninstall`.
+`install.ps1` accepts `-Game`, `-GameDir`, `-Latewarp <dll>`, `-EngineIni <path>`, `-NoCvar`,
+`-Uninstall`, `-UpdateAll` (every older FrameWarp found, as **A** does) and `-SteamPath <folder>`.
 
 ## Use
 

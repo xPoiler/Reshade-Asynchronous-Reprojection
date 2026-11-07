@@ -1005,6 +1005,9 @@ void render_thread() {
     CameraSearchWorker camera_worker;
     // (on by default since 2.2: off only when CameraUse=0 passes "0")
     const bool camera_use = [] { wchar_t v[4] = {}; return !(GetEnvironmentVariableW(L"FW_CAMERA_USE", v, 4) && v[0] == L'0'); }();
+    // (the intake between the warps, on unless IntakeBetweenWarps=0 passes "0" - see Renderer::set_intake_gate)
+    renderer.set_intake_gate([] { wchar_t v[4] = {}; return !(GetEnvironmentVariableW(L"FW_INTAKE_GATE", v, 4) && v[0] == L'0'); }());
+    logf("intake between the warps: %s", renderer.intake_gate() ? "on" : "off (IntakeBetweenWarps=0)");
     const bool camera_dump = GetEnvironmentVariableW(L"FW_CAMERA_DUMP", nullptr, 0) != 0;
     bool camera_dumped = false;
     std::vector<std::uint8_t> camera_bytes;
@@ -1669,6 +1672,7 @@ void render_thread() {
                     }
                 }
                 renderer.pass_stamp(Renderer::kPassObjects);
+                renderer.intake_break(2);  // (HUD, mask and memory a piece of their own - see set_intake_gate)
                 if (mask) {
                     // HUD from the upscaler's output only when chosen (opt-in: its colour model cannot be
                     // proven for every game); otherwise the learned HUD map, which works everywhere.
@@ -1840,6 +1844,7 @@ void render_thread() {
             // arrives too close to the refresh waits until just after it.
             const std::int64_t tick = v + compose - lead;
             frame_tick = tick; frame_vblank = v;
+            renderer.set_intake_window(tick, static_cast<std::int64_t>(vblank.period));  // (the intake between the warps - see set_intake_gate)
             const std::int64_t budget = static_cast<std::int64_t>((intake_ms + 1.0) * 1e-3 * f);
             const bool can_take_in = g_app.visible && !generation_aside() && renderer.session_open(sh.session) &&
                                      sh.backbuffer_width == renderer.width() && sh.backbuffer_height == renderer.height();
@@ -1857,6 +1862,7 @@ void render_thread() {
                         const double w1 = now_seconds();
                         intake_wait_ms += (w1 - w0) * 1000.0;
                         renderer.begin_intake();
+                        renderer.set_intake_piece(1);
                         const bool valid = take_in_finish();
                         renderer.submit_work(true);
                         if (valid) renderer.mark_intake_complete();
@@ -1880,6 +1886,7 @@ void render_thread() {
                 const std::int64_t room = renderer.split() ? static_cast<std::int64_t>(2e-3 * f) : budget;
                 if (newest >= 0 && (t + room < tick || overdue)) {
                     renderer.begin_intake();
+                    renderer.set_intake_piece(0);
                     const double t0 = now_seconds();
                     const bool taken = take_in_start(newest);
                     if (taken && intake.sampled) {  // the rest once the samples are back (above)
@@ -2587,6 +2594,7 @@ void render_thread() {
                     static int memory_reports = 0;
                     if (memory_reports++ % 6 == 0) logf("presenter memory: %s", renderer.memory_report().c_str());
                     if (const std::string learn = renderer.hud_learn_report(); !learn.empty()) logf("HUD learning: %s", learn.c_str());
+                    if (renderer.intake_gate() && renderer.split()) logf("intake between the warps: %s", renderer.intake_gate_report().c_str());
                 }
             }
             {
@@ -2653,7 +2661,7 @@ void render_thread() {
                         const auto& hk = sh.hooks;
                         if (sh.settings.frame_cap && hk.cap_reflex) logf("prevent GPU queueing: standing aside, the game's NVIDIA Reflex is on");
                         else if (sh.settings.frame_cap && hk.cap_gpu_bound)
-                            logf("prevent GPU queueing: standing aside, the GPU is the limit (frames queued even when held) | game %.1f fps | GPU done %.1f ms after the game's present | queued %.0f%%",
+                            logf("prevent GPU queueing: the GPU is the limit - one frame queued at most (unless QueueLimit=0) | game %.1f fps | GPU done %.1f ms after the game's present | queued %.0f%%",
                                  hk.cap_game_fps, hk.cap_present_to_done_ms, hk.cap_queued_pct);
                         else if (hk.cap_active)
                             logf("prevent GPU queueing: game held to %.1f fps (now %.1f fps) | GPU done %.1f ms after the game's present, %.1f ms after its frame start | held %.1f ms per frame | queued %.0f%%",

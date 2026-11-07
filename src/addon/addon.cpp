@@ -600,11 +600,19 @@ void on_present(command_queue*, swapchain* chain, const rect*, const rect*, uint
         fw::push_event(g_producer->shared(), fw::kEvSwapPresent, reinterpret_cast<std::uintptr_t>(chain), chain->get_current_back_buffer_index());
 }
 
+// (a frame ReShade presented with its effects - set by on_reshade_present, taken by the frame cap in on_finish_present: Metro 2033
+// Redux presents 121-130 times a second on its own window against 47-50 frames, the rest presents that show nothing new to
+// ReShade; the cap took them all for frames)
+std::atomic<bool> g_frame_presented{false};
+
 void on_finish_present(command_queue* queue, swapchain* chain) {
-    if (chain && (!g_producer || !g_producer->shared() || !g_producer->shared()->game_hwnd ||
-                  reinterpret_cast<std::uint64_t>(chain->get_hwnd()) == g_producer->shared()->game_hwnd))
-        fw::present_ceiling(chain->get_hwnd());
-    if (queue && g_producer && g_producer->shared()) {
+    const bool game_chain = chain && (!g_producer || !g_producer->shared() || !g_producer->shared()->game_hwnd ||
+                                      reinterpret_cast<std::uint64_t>(chain->get_hwnd()) == g_producer->shared()->game_hwnd);
+    if (game_chain) fw::present_ceiling(chain->get_hwnd());
+    // (the cap too only on the game's own window: Metro 2033 Redux presents another swap chain through the same device, 121-130
+    // presents a second against its 47-50 frames - the cap took them all for frames, and its one frame queued for half a frame)
+    const bool frame_presented = g_frame_presented.exchange(false, std::memory_order_acq_rel);
+    if (queue && game_chain && frame_presented && g_producer && g_producer->shared()) {
         auto* sh = g_producer->shared();
         fw::frame_cap_after_present(queue, sh->settings.frame_cap != 0 && sh->settings.enabled != 0, g_producer->generation_active());
         const fw::FrameCapStatus cap = fw::frame_cap_status();
@@ -624,6 +632,7 @@ void on_finish_present(command_queue* queue, swapchain* chain) {
 // reshade_present runs after ReShade has drawn its effects and menu, so the captured frame (which
 // the presenter shows on top of the game) still contains the ReShade UI.
 void on_reshade_present(effect_runtime* runtime) {
+    g_frame_presented.store(true, std::memory_order_release);
     command_queue* queue = runtime->get_command_queue();
     if (!g_producer || !g_producer->ready() || !queue) return;
     if (queue->get_device()->get_api() == device_api::vulkan) {
@@ -913,16 +922,16 @@ void draw_overlay(effect_runtime*) {
         if (shown_in_ui(kHiddenFromUi.frame_cap) && ImGui::Checkbox("Prevent GPU queueing", &cap)) s.frame_cap = cap;
         hint("Not a frame rate limit you set: XPAR finds by itself the rate the game's GPU sustains and holds the game just "
              "below it, so no frame waits in the GPU's queue and the game reads input later (what NVIDIA Reflex does). Stands "
-             "aside by itself while the game's Reflex is on, and while the GPU is the limit (holding the game back would only "
-             "cost frames). Remembered per game.");
+             "aside by itself while the game's Reflex is on; while the GPU is the limit it holds the game to one frame queued instead "
+             "(holding it to a rate would only cost frames). Remembered per game.");
         if (cap && shown_in_ui(kHiddenFromUi.frame_cap)) {
             const fw::FrameCapStatus st = fw::frame_cap_status();
             ImGui::SameLine();
             if (st.reflex)
                 ImGui::TextDisabled("(off: the game's Reflex is on)");
             else if (st.gpu_bound)
-                ImGui::TextDisabled("(standing aside: the GPU is the limit - frames queued even when held | game %.1f fps, %.0f%% queued)",
-                                    st.game_fps, st.queued_pct);
+                ImGui::TextDisabled("(the GPU is the limit: one frame queued at most | game %.1f fps, GPU done %.1f ms after present)",
+                                    st.game_fps, st.present_to_done_ms);
             else if (st.active && st.game_fps < 0.97f * st.cap_fps)  // (the cap rises while no queue forms: a game locked lower never reaches it)
                 ImGui::TextDisabled("(cap %.1f fps, not reached: the game runs at %.1f | GPU done %.1f ms after present | held %.1f ms)", st.cap_fps,
                                     st.game_fps, st.present_to_done_ms, st.wait_ms);

@@ -3,6 +3,9 @@
 #   powershell -ExecutionPolicy Bypass -File tools\install.ps1 -GameDir "D:\Games\Foo"       # game folder or its exe
 #   powershell -ExecutionPolicy Bypass -File tools\install.ps1 -Game "Expedition 33" -Latewarp "C:\Downloads\nvngx_latewarp.dll"
 #   powershell -ExecutionPolicy Bypass -File tools\install.ps1 -Game "Expedition 33" -Uninstall
+#   powershell -ExecutionPolicy Bypass -File tools\install.ps1 -UpdateAll                    # every older FrameWarp found
+# Every folder installed to is also listed in %LOCALAPPDATA%\FrameWarp\installs.txt, so -UpdateAll finds
+# non-Steam games too (besides the Steam libraries it scans).
 # The files go next to ReShade (found by searching the folder). For Unreal Engine games the Streamline
 # force-tagging cvar is added to the user Engine.ini; everything the installer changed is recorded in
 # FrameWarp\install.json so -Uninstall reverts exactly that.
@@ -13,7 +16,9 @@ param(
     [switch]$NoCvar,      # do not touch Engine.ini
     [string]$Latewarp,    # path to nvngx_latewarp.dll (or a folder containing it)
     [switch]$Uninstall,
-    [switch]$Force        # replace an existing FrameWarp without asking
+    [switch]$Force,       # replace an existing FrameWarp without asking
+    [switch]$UpdateAll,   # update every FrameWarp found that is older than this package
+    [string]$SteamPath    # Steam's folder, when it is not where the registry says
 )
 $ErrorActionPreference = "Stop"
 # Run from a release package (files next to this script) or from the source tree (build\Release).
@@ -26,7 +31,7 @@ $upscalerNames = @("sl.interposer.dll", "nvngx_dlss.dll", "amd_fidelityfx_dx12.d
                    "amd_fidelityfx_upscaler_dx12.dll", "ffx_fsr3upscaler_x64.dll", "ffx_fsr2_api_x64.dll")
 
 function Get-SteamGameDirs {
-    $steam = (Get-ItemProperty -ErrorAction SilentlyContinue "HKCU:\Software\Valve\Steam").SteamPath
+    $steam = if ($SteamPath) { $SteamPath } else { (Get-ItemProperty -ErrorAction SilentlyContinue "HKCU:\Software\Valve\Steam").SteamPath }
     if (-not $steam) { $steam = "${env:ProgramFiles(x86)}\Steam" }
     $vdf = Join-Path $steam "steamapps\libraryfolders.vdf"
     $libraries = @($steam)
@@ -70,6 +75,90 @@ function Get-VulkanReShadeDirs([object[]]$files) {
              Where-Object { Get-ChildItem -File -Filter "*.exe" $_ -ErrorAction SilentlyContinue })
 }
 
+# Every Steam game folder, with whether it has ReShade and which FrameWarp it has.
+function Get-SteamGames {
+    foreach ($dir in @(Get-SteamGameDirs | Sort-Object FullName -Unique)) {
+        $found = @(Get-ChildItem -Recurse -Depth 8 -File -ErrorAction SilentlyContinue $dir.FullName -Include ($reshadeNames + $upscalerNames + "FrameWarp.addon64" + "ReShade.ini"))
+        $hasReShade = [bool]($found | Where-Object { $reshadeNames -contains $_.Name } | Where-Object { Test-ReShade $_.FullName }) -or
+                      ((Get-VulkanReShadeDirs $found).Count -gt 0)
+        # The installed add-on (not a staged copy): the one closest to the game folder.
+        $installedAddon = $found | Where-Object { $_.Name -eq "FrameWarp.addon64" } | Sort-Object { $_.FullName.Split('\').Count } | Select-Object -First 1
+        [pscustomobject]@{ Name = $dir.Name; Path = $dir.FullName; ReShade = $hasReShade; FrameWarp = [bool]$installedAddon
+                           Version = $(if ($installedAddon) { Get-FrameWarpVersion $installedAddon.FullName } else { $null }) }
+    }
+}
+
+# The folders installed to before (non-Steam games too), one per line.
+$installList = Join-Path $env:LOCALAPPDATA "FrameWarp\installs.txt"
+function Get-RecordedInstalls { if (Test-Path $installList) { @(Get-Content $installList | Where-Object { $_.Trim() }) } else { @() } }
+function Set-RecordedInstall([string]$dir, [bool]$add) {
+    $list = @(Get-RecordedInstalls | Where-Object { $_ -ne $dir })
+    if ($add) { $list += $dir }
+    try {
+        New-Item -ItemType Directory -Force (Split-Path -Parent $installList) | Out-Null
+        Set-Content -Encoding UTF8 $installList $list
+    } catch { Write-Warning "Could not update $installList ($_)" }
+}
+
+# Older than this package (an add-on without a version counts as older).
+function Test-Older([string]$version) {
+    if (-not $packageVersion -or $packageVersion -eq "unknown") { return $false }
+    if (-not $version -or $version -eq "unknown") { return $true }
+    try { return [version]$version -lt [version]$packageVersion } catch { return $true }
+}
+
+# Every FrameWarp found: in the Steam libraries and in the folders installed to before.
+function Get-FrameWarpInstalls([object[]]$steamGames) {
+    $found = [System.Collections.Generic.List[object]]::new()
+    foreach ($g in $steamGames) { if ($g.FrameWarp) { $found.Add([pscustomobject]@{ Name = $g.Name; Path = $g.Path; Version = $g.Version }) } }
+    foreach ($d in Get-RecordedInstalls) {
+        if (-not (Test-Path -PathType Container $d)) { continue }
+        # (one game counted once: a folder recorded inside a Steam game's folder, or the other way round)
+        $same = $found | Where-Object { $a = $_.Path.TrimEnd('\') + '\'; $b = $d.TrimEnd('\') + '\'
+                                        $a.StartsWith($b, [StringComparison]::OrdinalIgnoreCase) -or $b.StartsWith($a, [StringComparison]::OrdinalIgnoreCase) }
+        if ($same) { continue }
+        $addon = Get-ChildItem -Recurse -Depth 8 -File -ErrorAction SilentlyContinue $d -Filter "FrameWarp.addon64" |
+                 Sort-Object { $_.FullName.Split('\').Count } | Select-Object -First 1
+        if ($addon) { $found.Add([pscustomobject]@{ Name = (Split-Path -Leaf $d); Path = $d; Version = (Get-FrameWarpVersion $addon.FullName) }) }
+    }
+    return $found
+}
+
+# Updates every FrameWarp found that is older than this package, one game after the other; a game that
+# can't be updated (running, no write access) is reported and the rest go on.
+function Invoke-UpdateAll([object[]]$installs) {
+    $older = @($installs | Where-Object { Test-Older $_.Version })
+    $rest = @($installs | Where-Object { -not (Test-Older $_.Version) })
+    foreach ($r in $rest) { Write-Host ("  {0}: FrameWarp {1}, left as it is" -f $r.Name, $r.Version) }
+    if ($older.Count -eq 0) { Write-Host "No FrameWarp older than $packageVersion was found. Nothing changed."; return }
+    Write-Host "To update to FrameWarp ${packageVersion}:"
+    foreach ($o in $older) { Write-Host ("  {0}   [FrameWarp {1}]   {2}" -f $o.Name, $o.Version, $o.Path) }
+    if (-not $Force) {
+        $answer = (Read-Host "Update these $($older.Count)? (Y/N)").Trim()
+        if ($answer -notmatch '^[Yy]') { Write-Host "Nothing changed."; return }
+    }
+    $done = 0; $failed = @()
+    foreach ($o in $older) {
+        Write-Host ""
+        Write-Host "== $($o.Name)"
+        try {
+            $passed = @{ GameDir = $o.Path; Force = $true }
+            if ($Latewarp) { $passed.Latewarp = $Latewarp }
+            if ($NoCvar) { $passed.NoCvar = $true }
+            & $PSCommandPath @passed
+            ++$done
+        } catch { Write-Host "Not updated: $($_.Exception.Message)"; $failed += $o.Name }
+    }
+    Write-Host ""
+    Write-Host "Updated $done of $($older.Count) to FrameWarp $packageVersion.$(if ($failed) { ' Not updated: ' + ($failed -join ', ') + '.' })"
+}
+
+if ($UpdateAll) {
+    Write-Host "Looking for FrameWarp in the Steam libraries and the folders installed to before..."
+    Invoke-UpdateAll (Get-FrameWarpInstalls @(Get-SteamGames))
+    return
+}
+
 # Resolve the game folder.
 if ($GameDir) {
     if (Test-Path -PathType Leaf $GameDir) { $GameDir = Split-Path -Parent $GameDir }
@@ -84,19 +173,11 @@ if ($GameDir) {
 } else {
     # No game given (double-clicked install.bat / uninstall.bat): list the Steam games that can be chosen.
     Write-Host "Scanning Steam libraries..."
-    $choices = @()
-    foreach ($dir in @(Get-SteamGameDirs | Sort-Object FullName -Unique)) {
-        $found = @(Get-ChildItem -Recurse -Depth 8 -File -ErrorAction SilentlyContinue $dir.FullName -Include ($reshadeNames + $upscalerNames + "FrameWarp.addon64" + "ReShade.ini"))
-        $hasReShade = [bool]($found | Where-Object { $reshadeNames -contains $_.Name } | Where-Object { Test-ReShade $_.FullName }) -or
-                      ((Get-VulkanReShadeDirs $found).Count -gt 0)
-        # The installed add-on (not a staged copy): the one closest to the game folder.
-        $installedAddon = $found | Where-Object { $_.Name -eq "FrameWarp.addon64" } | Sort-Object { $_.FullName.Split('\').Count } | Select-Object -First 1
-        $hasFrameWarp = [bool]$installedAddon
-        $installedVersion = if ($installedAddon) { Get-FrameWarpVersion $installedAddon.FullName } else { $null }
-        if (($Uninstall -and $hasFrameWarp) -or (-not $Uninstall -and $hasReShade)) {
-            $choices += [pscustomobject]@{ Name = $dir.Name; Path = $dir.FullName; FrameWarp = $hasFrameWarp; Version = $installedVersion }
-        }
-    }
+    $steamGames = @(Get-SteamGames)
+    $choices = @($steamGames | Where-Object { ($Uninstall -and $_.FrameWarp) -or (-not $Uninstall -and $_.ReShade) })
+    # (installing: every FrameWarp found, for "update all" - non-Steam games installed to before too)
+    $installs = if ($Uninstall) { @() } else { @(Get-FrameWarpInstalls $steamGames) }
+    $olderCount = @($installs | Where-Object { Test-Older $_.Version }).Count
     Write-Host ""
     if ($choices.Count -eq 0) {
         Write-Host $(if ($Uninstall) { "No Steam game with FrameWarp installed was found." } else { "No Steam game with ReShade was found. Install ReShade (with full add-on support) for the game first." })
@@ -112,11 +193,13 @@ if ($GameDir) {
             Write-Host ("  {0,2}) {1}{2}" -f ($i + 1), $c.Name, $(if ($notes) { "   [" + ($notes -join ", ") + "]" } else { "" }))
         }
     }
+    if ($olderCount -gt 0) { Write-Host ("   A) Update every older FrameWarp found to {0} ({1} game{2})" -f $packageVersion, $olderCount, $(if ($olderCount -eq 1) { "" } else { "s" })) }
     Write-Host "   P) Enter a game folder by hand (non-Steam games)"
     Write-Host "   Q) Quit"
     while (-not $GameDir) {
         $answer = (Read-Host "Choose").Trim()
         if ($answer -match '^[Qq]$') { Write-Host "Nothing changed."; return }
+        if ($answer -match '^[Aa]$' -and $olderCount -gt 0) { Write-Host ""; Invoke-UpdateAll $installs; return }
         if ($answer -match '^[Pp]$') {
             $typed = (Read-Host "Game folder (or the game's .exe)").Trim().Trim('"')
             if (Test-Path -PathType Leaf $typed) { $typed = Split-Path -Parent $typed }
@@ -125,10 +208,12 @@ if ($GameDir) {
         }
         $n = 0
         if ([int]::TryParse($answer, [ref]$n) -and $n -ge 1 -and $n -le $choices.Count) { $GameDir = $choices[$n - 1].Path }
-        else { Write-Host "Type a number from the list, P or Q." }
+        else { Write-Host "Type a number from the list$(if ($olderCount -gt 0) { ', A' }), P or Q." }
     }
     Write-Host ""
 }
+
+$GameDir = (Resolve-Path -LiteralPath $GameDir).Path.TrimEnd('\')
 
 # ReShade's folder is where the add-on must go (it loads add-ons from its own directory).
 $reshade = @(Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue $GameDir -Include $reshadeNames | Where-Object { Test-ReShade $_.FullName })
@@ -239,6 +324,7 @@ if ($Uninstall) {
     if (Test-Path $old) { Move-Item -Force $old $binDir }
     if ($info -and $info.engine_ini) { Set-Cvar $info.engine_ini $false; Write-Host "Engine.ini: removed $cvar ($($info.engine_ini))" }
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $target
+    Set-RecordedInstall $GameDir $false
     Write-Host "FrameWarp removed from $binDir"
     return
 }
@@ -321,3 +407,4 @@ if (-not $NoCvar) {
     }
 }
 @{ game_dir = $GameDir; bin_dir = $binDir; engine_ini = $ini; installed = (Get-Date -Format s) } | ConvertTo-Json | Set-Content -Encoding UTF8 $record
+Set-RecordedInstall $GameDir $true

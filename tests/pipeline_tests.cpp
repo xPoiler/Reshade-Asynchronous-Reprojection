@@ -1742,6 +1742,8 @@ int main(int argc, char** argv) {
     std::printf("CPU ms per tick incl. waits (p50/max): new-frame tick %.3f/%.3f, other tick %.3f/%.3f\n", p50(cpu_ingest_tick), pmax(cpu_ingest_tick),
                 p50(cpu_plain_tick), pmax(cpu_plain_tick));
     renderer.wait_idle();
+    // (FW_D3D_DEBUG=1: the debug layer's errors over the whole run fail it)
+    if (std::getenv("FW_D3D_DEBUG")) EXPECT(renderer.print_debug_messages() == 0, "no D3D12 debug layer errors");
     latewarp.shutdown();
     if (failures) { std::printf("%d failure(s)\n", failures); return 1; }
     std::printf("pipeline tests passed\n");

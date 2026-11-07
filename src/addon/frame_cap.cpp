@@ -163,6 +163,13 @@ struct Cap {
     std::int64_t last_release = 0;
     int frames = 0;
     double wait_ms_sum = 0;
+    // Standing aside is not doing nothing: one frame queued at most (QueueLimit, on unless [FrameWarp] QueueLimit=0). After a
+    // present the game goes on once its frame before has finished on the GPU - the GPU still has this one to work on while the
+    // game makes the next, so a GPU-bound game keeps its rate, but no more of its work piles up in the GPU's queue: Metro 2033
+    // Redux kept 30-47 ms queued, and the presenter's work waited behind it or cut ahead of all of it (2026-11-07).
+    HANDLE limit_event = nullptr;
+    int limit_frames = 0, limit_held = 0;
+    double limit_ms = 0, limit_after_present_ms = 0;
 
     std::mutex status_mutex;
     FrameCapStatus status;
@@ -176,6 +183,7 @@ void release_queue() {
     g.aside = false; g.bound_windows = 0; g.free_windows = 0;
     g.uncapped_ms = 0; g.next_trial = 0; g.trial_wait_s = 20.0; g.trial_windows = 0;
     g.reflex = false; g.reflex_checked = 0; g.reflex_off_since = 0;
+    g.limit_frames = g.limit_held = 0; g.limit_ms = g.limit_after_present_ms = 0;
     std::lock_guard<std::mutex> lock(g.status_mutex);
     g.status = {};
 }
@@ -392,6 +400,35 @@ void frame_cap_after_present(command_queue* queue, bool enabled, bool generation
         const std::int64_t target = g.last_release + static_cast<std::int64_t>(g.interval * qpc_frequency());
         // (more than a whole interval late: no wait, and no debt carried into the next frames)
         if (target > now) { sleep_until(target); release = qpc(); }
+    }
+    // (GPU-bound, the cap aside: one frame queued at most - see Cap::limit_event)
+    static const bool queue_limit = [] {
+        char value[8] = {};
+        size_t size = sizeof(value);
+        return !(reshade::get_config_value(nullptr, "FrameWarp", "QueueLimit", value, &size) && value[0] == '0');
+    }();
+    if (capping && g.aside && queue_limit && v >= g.waiter->first + 1) {
+        if (!g.limit_event) g.limit_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        const std::uint64_t before = v - 1;
+        const bool done = g.waiter->fence12 ? g.waiter->fence12->GetCompletedValue() >= before : g.waiter->fence11->GetCompletedValue() >= before;
+        if (!done && g.limit_event) {
+            const HRESULT hr = g.waiter->fence12 ? g.waiter->fence12->SetEventOnCompletion(before, g.limit_event)
+                                                 : g.waiter->fence11->SetEventOnCompletion(before, g.limit_event);
+            if (SUCCEEDED(hr)) WaitForSingleObject(g.limit_event, 100);  // (never longer: a lost GPU must not hang the game)
+            release = qpc();
+            ++g.limit_held;
+        }
+        const Entry& prev = g_ring[before % kRing];
+        if (prev.value.load() == before && prev.done.load() > prev.present.load())
+            g.limit_after_present_ms += double(prev.done.load() - prev.present.load()) * 1000.0 / qpc_frequency();
+        g.limit_ms += double(release - now) * 1000.0 / qpc_frequency();
+        if (++g.limit_frames >= 600) {
+            char text[220];
+            std::snprintf(text, sizeof(text), "XPAR frame cap: the GPU is the limit - one frame queued at most: %d of %d frames held, %.2f ms each on average, the GPU done %.1f ms after a present",
+                          g.limit_held, g.limit_frames, g.limit_ms / g.limit_frames, g.limit_after_present_ms / g.limit_frames);
+            reshade::log::message(reshade::log::level::info, text);
+            g.limit_frames = g.limit_held = 0; g.limit_ms = g.limit_after_present_ms = 0;
+        }
     }
     e.release = release;
     g.wait_ms_sum += double(release - now) * 1000.0 / qpc_frequency();

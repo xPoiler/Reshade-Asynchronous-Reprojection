@@ -119,6 +119,17 @@ public:
     // set_split switches the mode (waits for the GPU; call with no frame being taken in): true if changed.
     bool set_split(bool on);
     bool split() const { return split_; }
+    // The intake between the warps (split queues): each piece of a game frame's intake starts on the GPU only after a chosen
+    // refresh's warp, packed by its measured GPU time into the gaps between the warps - run together, the intake's compute queue
+    // and the refresh queue share the GPU, the warp 2.1-2.5x slower (dev/seq_replay FW_WARP_BENCH=2, Metro 2033 Redux, 2026-11-07).
+    // set_intake_window: the next refresh's warp submission (QPC) and the refresh period. intake_break: the piece recorded so far
+    // submitted, the next one begun (piece: 0 the intake's start, 1 its analysis, 2 HUD/mask/memory). The game never waits for it.
+    void set_intake_gate(bool on) { gate_on_ = on; }
+    bool intake_gate() const { return gate_on_; }
+    void set_intake_window(std::int64_t next_tick_qpc, std::int64_t period_qpc) { gate_tick_ = next_tick_qpc; gate_period_ = period_qpc; }
+    void set_intake_piece(int piece) { gate_piece_ = std::clamp(piece, 0, 3); }
+    void intake_break(int next_piece);
+    std::string intake_gate_report();
     // Starts recording the taking in of a game frame (the intake queue when split, else as begin_frame);
     // submit_work submits it. mark_intake_complete: the frame's work is all submitted - show_intake then
     // makes it the shown set once the GPU has finished it (true when it did: switch the source then).
@@ -174,7 +185,9 @@ public:
                       kPassFlowStart, kPassFlowPyramid, kPassFlowSolve, kPassFlowFill, kPassFlowOut,
                       // (the motion analysis and the follow share apart - stamped only with set_share_stamps, dev/seq_replay FW_TIMES:
                       // kPassAnalyzeOnly ends analyze_motion, kPassShareOnly the share before its own-motion part, then kPassAnalyze)
-                      kPassAnalyzeOnly, kPassShareOnly, kPassKinds };
+                      kPassAnalyzeOnly, kPassShareOnly,
+                      // (the start of an intake piece after intake_break: a gap, not counted - as kPassWarpStart)
+                      kPassPiece, kPassKinds };
     struct PassTimes { double ms[kPassKinds] = {}; std::uint32_t frames = 0, warps = 0; };
     void pass_stamp(IntakePass pass);
     PassTimes take_pass_times() { const PassTimes t = pass_times_; pass_times_ = {}; return t; }
@@ -532,6 +545,18 @@ private:
     ComPtr<ID3D12CommandAllocator> allocators_[kRing];
     ComPtr<ID3D12GraphicsCommandList> list_, lists_[2];
     ComPtr<ID3D12Fence> fences_[2];
+    // (the intake between the warps - see set_intake_gate: warp_fence_ counts the refreshes submitted, gate_requested_ the latest
+    // one an intake piece waits for; released by hand when no refresh comes - wait_idle, release_intake_gate)
+    ComPtr<ID3D12Fence> warp_fence_;
+    std::uint64_t warps_signaled_ = 0, gate_requested_ = 0;
+    bool gate_on_ = false;
+    std::int64_t gate_tick_ = 0, gate_period_ = 0, gate_last_end_ = 0, last_refresh_qpc_ = 0;
+    int gate_piece_ = 0;
+    int piece_of_slot_[kRing] = {};
+    double piece_ema_[4] = {}, warp_ema_ = 0.0;
+    std::uint32_t gate_gaps_[5] = {}, gate_released_ = 0;
+    void signal_refresh();
+    void release_intake_gate();
     HANDLE fence_event_ = nullptr;
     std::uint64_t fence_values_[2] = {}, frame_values_[kRing] = {};
     int context_ = 0, ring_pos_[2] = {0, 0};
@@ -570,6 +595,7 @@ private:
     void w_dispatch(ID3D12PipelineState* pso, const void* constants, const float w[kWConstants], UINT table, UINT groups_x, UINT groups_y);
     void w_dispatch_indirect(ID3D12PipelineState* pso, const void* constants, const float w[kWConstants], UINT table, ID3D12Resource* args);
     bool ensure_warp_list(UINT ow, UINT oh);
+    bool ensure_hud_gate();
     ComPtr<ID3D12PipelineState> cs_gen_depth_, cs_gen_unui_, cs_hudless_clear_, cs_hudless_count_, cs_hudless_score_, cs_hudless_fill_, cs_layer_hud_, cs_layer_check_clear_, cs_layer_check_, cs_obj_join_init_, cs_obj_join_, cs_obj_join_final_, cs_still_, cs_hold_fill_, cs_grow_init_, cs_grow_clear_, cs_grow_, cs_grow_final_, cs_copy4_;
     bool warp_splat_ = false;  // set_warp_splat
     bool rig_check_ = false;   // set_rig_check
@@ -631,7 +657,7 @@ private:
     bool learning_stalled_ = true;
     std::uint32_t detection_idle_ = 0;  // game frames since the HUD was last detected (build_no_warp_mask)
     std::uint32_t scene_idle_ = 0;      // game frames since the upscaler's output last came (ingest)
-    ComPtr<ID3D12PipelineState> cs_attached_, cs_ref_pick_, cs_ref_frac_, cs_depth_vec_, cs_mem_mask_, cs_share_weights_, cs_ref_raw_, cs_share_rows_, cs_share_cols_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_own_warp_reset_, cs_own_warp_lean_, cs_own_warp_args_, cs_own_warp_rest_, cs_warp_claims_clear_, cs_warp_claim_, cs_warp_beside_, cs_warp_held_, cs_own_warp_up_, cs_mask_smooth_, cs_memory_, cs_mem_ratio_, cs_mem_relight_, cs_gun_motion_, cs_mem_vis_, cs_hudless_ui_, cs_hudless_keep_, cs_ui_tiles_, cs_layer_unblend_, cs_layer_seam_clear_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_, cs_camera_fill_, cs_probe_tiles_, cs_probe_clear_, cs_probe_score_, cs_share_measure_, cs_share_blur_, cs_share_bins_, cs_share_final_, cs_share_up_, cs_share_seam_, cs_att_hist_, cs_rec_down_, cs_share_resid_, cs_resid_blur_, cs_own_up_;
+    ComPtr<ID3D12PipelineState> cs_attached_, cs_ref_pick_, cs_ref_frac_, cs_depth_vec_, cs_mem_mask_, cs_share_weights_, cs_ref_raw_, cs_share_rows_, cs_share_cols_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_hud_apply_, cs_hud_gate_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_own_warp_reset_, cs_own_warp_lean_, cs_own_warp_args_, cs_own_warp_rest_, cs_warp_claims_clear_, cs_warp_claim_, cs_warp_beside_, cs_warp_held_, cs_own_warp_up_, cs_mask_smooth_, cs_memory_, cs_mem_ratio_, cs_mem_relight_, cs_gun_motion_, cs_mem_vis_, cs_hudless_ui_, cs_hudless_keep_, cs_ui_tiles_, cs_layer_unblend_, cs_layer_seam_clear_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_, cs_camera_fill_, cs_probe_tiles_, cs_probe_clear_, cs_probe_score_, cs_share_measure_, cs_share_blur_, cs_share_bins_, cs_share_final_, cs_share_up_, cs_share_seam_, cs_att_hist_, cs_rec_down_, cs_share_resid_, cs_resid_blur_, cs_own_up_;
     ComPtr<ID3D12PipelineState> cs_sten_clear_, cs_sten_hist_, cs_sten_cells_, cs_sten_flood_, cs_sten_apply_, cs_sten_count_, cs_sten_grow_init_, cs_sten_grow_, cs_sten_age_, cs_sten_close_, cs_sten_comp_clear_, cs_sten_comp_count_, cs_sten_comp_max_, cs_sten_prune_, cs_sten_luma_, cs_sten_elig_, cs_sten_fringe_, cs_sten_fringe_apply_;
     // Sight reticles (option): the passes, which history texture holds the latest layer, and whether the layer was
     // built for the frame taken in last / the shown one (see cs_ret_layer).
@@ -644,7 +670,8 @@ private:
     float last_flush_ms_ = 0;
     float last_present_call_ms_ = 0;
     std::int64_t last_submit_qpc_ = 0;
-    ComPtr<ID3D12Resource> hud_counts_, hud_readback_, scene_fit_, scene_stamps_readback_;
+    ComPtr<ID3D12Resource> hud_counts_, hud_readback_, scene_fit_, scene_stamps_readback_, hud_gate_args_;
+    std::uint32_t hud_count_scale_[kRing] = {};  // (the camera check's counts per pixel counted - see build_no_warp_mask)
     // The game's HUD layer checked (cs_layer_check): 0 not yet, 1 a HUD (trusted: a frame without it shows no HUD), 2 not
     // a HUD (ignored, the HUD is detected). Counts every second pixel: covered, and of them drawn over the picture.
     ComPtr<ID3D12Resource> layer_counts_, layer_readback_, seam_counts_, seam_readback_;

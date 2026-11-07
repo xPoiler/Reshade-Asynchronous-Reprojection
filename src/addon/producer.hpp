@@ -341,6 +341,11 @@ private:
     Tex want_kind_ = kMotion;
     std::uint32_t want_w_ = 0, want_h_ = 0, want_candidate_ = 0, want_channels_ = 0;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> d11_probe_before_, d11_probe_cov_;
+    // (the picture as the comparison reads it: itself, or a copy - a swapchain made for display only can not be read,
+    // Metro 2033 Redux's; see d11_readable)
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> d11_readable_;
+    bool d11_readable_logged_ = false;
+    ID3D11Resource* d11_readable(ID3D11DeviceContext* context, ID3D11Resource* picture);
     Microsoft::WRL::ComPtr<ID3D11Resource> d11_probe_picture_;
     bool d11_probe_taken_ = false, d11_probe_use_ = false, d11_probe_used_ = false;
     void d3d11_learned(ID3D11DeviceContext* context, int slot);

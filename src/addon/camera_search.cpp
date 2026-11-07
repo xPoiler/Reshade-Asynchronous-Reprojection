@@ -101,6 +101,13 @@ std::uint64_t g_copied_bytes = 0;                                  // (Direct3D 
 // (Direct3D 11, between searches: only the buffers bound to the slots of the places held are copied as the game writes them - Dark Souls copied all 2000 a frame, 0.5-1.6
 // ms, to read a few. Any other's copy is dropped at once, never read stale: if the camera moves on to it, the places held miss and the search starts again)
 std::unordered_set<std::uint64_t> g_held_buffers;
+// (Direct3D 11) Each constant buffer: the slot it was last bound to, and whether it was bound since its last write. Most games bind a
+// buffer after filling it, and it is read there; a game that binds its buffers once and refills them in place (Metro 2033 Redux: 14
+// buffers, about 1400 writes a frame, no binds at all) is read at the write instead - a write with no bind since the one before. Its own
+// lock: binds are counted before anything else is decided, and between searches most take nothing more.
+struct D3D11Buffer { std::uint32_t key = 0; bool keyed = false, bound = false, written = false; };
+std::mutex g_d3d11_mutex;
+std::unordered_map<std::uint64_t, D3D11Buffer> g_d3d11;
 std::uint64_t g_bytes = 0, g_ranges = 0;
 std::atomic<bool> g_budget_spent{false};
 std::uint32_t g_rotate = 0;
@@ -763,6 +770,13 @@ void on_push_descriptors(command_list* cmd, shader_stage stage, pipeline_layout 
     // (Direct3D 11: every constant buffer is bound this way, *SetConstantBuffers, by stage; what it holds is the copy kept at its last write)
     const bool d3d11 = dev->get_api() == device_api::d3d11, vulkan = dev->get_api() == device_api::vulkan;
     if (update.type != descriptor_type::constant_buffer && !vulkan) return;
+    if (d3d11) {
+        const auto* bound = static_cast<const buffer_range*>(update.descriptors);
+        const std::uint32_t key_base = mix(mix(mix(6, layout_of(layout)), param), std::uint32_t(stage));
+        std::lock_guard<std::mutex> lock(g_d3d11_mutex);
+        for (uint32_t i = 0; i < update.count; ++i)
+            if (bound[i].buffer.handle) { D3D11Buffer& d = g_d3d11[bound[i].buffer.handle]; d.key = mix(key_base, update.binding + i); d.keyed = true; d.bound = true; }
+    }
     if ((!d3d11 && !vulkan && dev->get_api() != device_api::d3d12) || (g_dump != 2 && g_budget_spent.load(std::memory_order_relaxed) && !g_held_count.load(std::memory_order_relaxed))) return;
     Timed timed(kPush);
     const auto* ranges = static_cast<const buffer_range*>(update.descriptors);
@@ -901,6 +915,18 @@ void on_bind_tables(command_list* cmd, shader_stage, pipeline_layout layout, uin
 // (under the lock) What a constant buffer was filled with, from offset on, kept for its binds.
 void keep(resource res, const std::uint8_t* data, std::uint64_t offset, std::uint64_t size) {
     if (offset >= kRangeBytes) return;
+    // (refilled with no bind since the last write: read here, under the slot it was last bound to - or the buffer's own, never bound)
+    bool read_here = false;
+    std::uint32_t key = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_d3d11_mutex);
+        D3D11Buffer& d = g_d3d11[res.handle];
+        read_here = d.written && !d.bound;
+        d.written = true; d.bound = false;
+        key = d.keyed ? d.key : mix(mix(8, std::uint32_t(res.handle)), std::uint32_t(res.handle >> 32));
+    }
+    read_here = read_here && wanted(key);
+    if (read_here && !g_searching.load(std::memory_order_relaxed)) g_held_buffers.insert(res.handle);
     if (!g_searching.load(std::memory_order_relaxed) && g_held_count.load(std::memory_order_relaxed) && !g_held_buffers.count(res.handle)) {
         const auto it = g_mapped.find(res.handle);
         if (it != g_mapped.end() && it->second.data) { it->second.data = nullptr; ++it->second.version; }
@@ -916,6 +942,7 @@ void keep(resource res, const std::uint8_t* data, std::uint64_t offset, std::uin
     m.size = copy.size();
     m.copy = true;
     ++m.version;
+    if (read_here) read_now(copy.data(), copy.size(), key);
 }
 void on_map(device* dev, resource res, uint64_t, uint64_t size, map_access access, void** data) {
     if (g_paused.load(std::memory_order_relaxed) || dev->get_api() != device_api::d3d11 || !data || !*data || access == map_access::read_only) return;
@@ -950,6 +977,8 @@ void on_destroy(device* dev, resource res) {
     if (it->second.game) vk::g_buffers.erase(res.handle);  // (its memory's list keeps the handle: refresh checks the memory still matches)
     it->second = Mapped{};  // (kept: views to it are still listed)
     g_copies.erase(res.handle);
+    std::lock_guard<std::mutex> d3d11_lock(g_d3d11_mutex);
+    g_d3d11.erase(res.handle);
 }
 }  // namespace
 

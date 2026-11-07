@@ -331,7 +331,7 @@ void Producer::release_textures() {
     if (hudless_vk_.handle) CloseHandle(hudless_vk_.handle);
     hudless_vk_ = Texture{};
     hudless_vk_fresh_ = false;
-    d11_before_.Reset(); d11_cover_.Reset(); d11_picture_.Reset(); d11_cover_cs_.Reset();
+    d11_before_.Reset(); d11_cover_.Reset(); d11_picture_.Reset(); d11_cover_cs_.Reset(); d11_readable_.Reset();
     d11_before_taken_ = d11_cs_failed_ = d11_none_ = d11_confirmed_ = false;
     for (auto& r : retired_) {
         if (vk_) vk_->destroy(r.vk);
@@ -1196,6 +1196,35 @@ bool Producer::ensure_d11_cover_cs(ID3D11Device* device) {
     return d11_cover_cs_ != nullptr;
 }
 
+// The picture as a comparison reads it: itself when it can be read in a shader, else a copy (a back buffer made only for
+// display - DXGI_USAGE_RENDER_TARGET_OUTPUT alone, Metro 2033 Redux: no view of it to read; the comparison failed every
+// frame, without a word, and the HUD was never learned).
+ID3D11Resource* Producer::d11_readable(ID3D11DeviceContext* context, ID3D11Resource* picture) {
+    ComPtr<ID3D11Texture2D> texture;
+    D3D11_TEXTURE2D_DESC pd{};
+    if (!picture || FAILED(picture->QueryInterface(IID_PPV_ARGS(&texture)))) return nullptr;
+    texture->GetDesc(&pd);
+    if (pd.BindFlags & D3D11_BIND_SHADER_RESOURCE) return picture;
+    if (pd.SampleDesc.Count != 1) return nullptr;
+    D3D11_TEXTURE2D_DESC rd{};
+    if (d11_readable_) d11_readable_->GetDesc(&rd);
+    if (!d11_readable_ || rd.Width != pd.Width || rd.Height != pd.Height || rd.Format != pd.Format) {
+        ComPtr<ID3D11Device> device;
+        context->GetDevice(&device);
+        D3D11_TEXTURE2D_DESC d = pd;
+        d.MipLevels = 1; d.ArraySize = 1; d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE; d.CPUAccessFlags = 0; d.MiscFlags = 0;
+        d11_readable_.Reset();
+        if (!device || FAILED(device->CreateTexture2D(&d, nullptr, &d11_readable_))) return nullptr;
+    }
+    if (pd.MipLevels == 1 && pd.ArraySize == 1) context->CopyResource(d11_readable_.Get(), picture);
+    else context->CopySubresourceRegion(d11_readable_.Get(), 0, 0, 0, 0, picture, 0, nullptr);
+    if (!d11_readable_logged_) {
+        d11_readable_logged_ = true;
+        set_message("HUD (Direct3D 11): the picture can not be read in a shader (made for display only) - compared through a copy");
+    }
+    return d11_readable_.Get();
+}
+
 // HUD learning, Direct3D 11: the copy at the candidate point (see hud_learn.hpp).
 void Producer::on_hud_probe_d3d11(ID3D11Resource* picture, ID3D11DeviceContext* context, std::uint32_t candidate, bool use) {
     std::lock_guard lock(mutex_);
@@ -1246,7 +1275,8 @@ void Producer::d3d11_probe(ID3D11DeviceContext* context, int slot) {
     ComPtr<ID3D11UnorderedAccessView> cover_view;
     D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
     sv.Format = d11_srv_format(bd.Format); sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels = 1;
-    if (FAILED(device->CreateShaderResourceView(picture.Get(), &sv, &now_view)) ||
+    ID3D11Resource* now = d11_readable(context, picture.Get());
+    if (!now || FAILED(device->CreateShaderResourceView(now, &sv, &now_view)) ||
         FAILED(device->CreateShaderResourceView(d11_probe_before_.Get(), &sv, &before_view)) ||
         FAILED(device->CreateUnorderedAccessView(d11_probe_cov_.Get(), nullptr, &cover_view)))
         return;
@@ -1388,7 +1418,8 @@ void Producer::d3d11_cover(ID3D11DeviceContext* context, int slot) {
     ComPtr<ID3D11UnorderedAccessView> cover_view;
     D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
     sv.Format = d11_srv_format(bd.Format); sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels = 1;
-    if (FAILED(device->CreateShaderResourceView(d11_picture_.Get(), &sv, &now_view)) ||
+    ID3D11Resource* now = d11_readable(context, d11_picture_.Get());
+    if (!now || FAILED(device->CreateShaderResourceView(now, &sv, &now_view)) ||
         FAILED(device->CreateShaderResourceView(d11_before_.Get(), &sv, &before_view)) ||
         FAILED(device->CreateUnorderedAccessView(d11_cover_.Get(), nullptr, &cover_view))) {
         d11_picture_.Reset();
