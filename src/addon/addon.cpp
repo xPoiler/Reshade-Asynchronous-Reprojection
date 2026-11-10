@@ -32,6 +32,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include "addon/diag.hpp"
 
 using namespace reshade::api;
 
@@ -126,6 +127,8 @@ void launch_presenter() {
         const wchar_t text[2] = {static_cast<wchar_t>(c), 0};
         SetEnvironmentVariableW(key.wenv, c ? text : nullptr);
     }
+    // (detailed diagnostics on at launch: the presenter's log from its first line - see its set_diagnostics)
+    SetEnvironmentVariableW(L"FW_DIAG", g_producer && g_producer->shared() && g_producer->shared()->settings.record_diagnostics ? L"1" : nullptr);
     fw::register_stencil_dump_events();  // (StencilDump/StencilMask: hooked only when one is on - see reshade_feed.cpp)
     DWORD error = ERROR_FILE_NOT_FOUND;
     for (const auto& path : candidates) {
@@ -251,7 +254,7 @@ void reset_all_settings(fw::Settings& s) {
         std::snprintf(value, sizeof(value), "%d", k.default_value);
         reshade::set_config_value(nullptr, "FrameWarp", k.key, static_cast<const char*>(value));
     }
-    reshade::log::message(reshade::log::level::info, "XPAR: all settings reset to the defaults (panel)");
+    fw::diag_log(reshade::log::level::info, "XPAR: all settings reset to the defaults (panel)");
 }
 // Every panel frame: what changed since the last write is written.
 void save_persisted(const fw::Settings& s) {
@@ -392,7 +395,7 @@ void log_refusal() {
     if (n == 1 || n % 100 == 0) {
         char text[160];
         std::snprintf(text, sizeof(text), "XPAR: exclusive fullscreen refused (%d so far): the game stays in a window and is told it is fullscreen", n);
-        reshade::log::message(reshade::log::level::info, text);
+        fw::diag_log(reshade::log::level::info, text);
     }
 }
 bool on_create_swapchain(reshade::api::device_api, reshade::api::swapchain_desc& desc, void*) {
@@ -472,7 +475,7 @@ void on_init_swapchain(swapchain* sc, bool) {
         if (saved_version[0]) {
             char text[160];
             std::snprintf(text, sizeof(text), "XPAR updated from %s to %s: settings reset to the defaults", saved_version, build);
-            reshade::log::message(reshade::log::level::info, text);
+            fw::diag_log(reshade::log::level::info, text);
         }
     }
     auto saved = [&](const char* key) {
@@ -487,7 +490,12 @@ void on_init_swapchain(swapchain* sc, bool) {
         shared->settings.hud_fill = saved("FillBehindHud") != 0;
         shared->settings.turn_rule = saved("HoldOrbitedCharacter") != 0;
         shared->settings.near_camera_rule = saved("NearCameraRule") != 0;
-        shared->settings.record_diagnostics = saved("RecordDiagnostics") != 0;
+        // ([FrameWarp] DiagnosticsOn=1, development: detailed diagnostics on in every run - the test games; never in a shipped ini)
+        char dev_diag[4] = {};
+        size_t dev_diag_size = sizeof(dev_diag);
+        const bool diag_forced = reshade::get_config_value(nullptr, "FrameWarp", "DiagnosticsOn", dev_diag, &dev_diag_size) && dev_diag[0] == '1';
+        shared->settings.record_diagnostics = saved("RecordDiagnostics") != 0 || diag_forced;
+        fw::g_diag = shared->settings.record_diagnostics != 0;  // (see diag.hpp)
         shared->settings.background_memory = saved("BackgroundMemory") != 0;
         shared->settings.stretch_width = static_cast<std::uint32_t>(std::clamp(saved("StretchWidth"), 0, 32));
         shared->settings.gpu_priority = static_cast<std::uint32_t>(std::clamp(saved("GpuPriority"), 0, 2));
@@ -579,6 +587,7 @@ void on_present(command_queue*, swapchain* chain, const rect*, const rect*, uint
         reinterpret_cast<std::uint64_t>(chain->get_hwnd()) == g_producer->shared()->game_hwnd) {
         // (diagnostics: the draws of one game frame, on Ctrl+Shift+D - see ui_probe.hpp)
         fw::ui_probe::on_present(chain, g_producer->shared()->settings.record_diagnostics != 0);
+        fw::g_diag = g_producer->shared()->settings.record_diagnostics != 0;  // (the add-on's log lines - see diag.hpp)
         fw::ui_layer::on_present(chain);
         {
             const auto& sh = *g_producer->shared();
@@ -594,7 +603,7 @@ void on_present(command_queue*, swapchain* chain, const rect*, const rect*, uint
             g_producer->shared()->color_space = cs;
             char text[96];
             std::snprintf(text, sizeof(text), "XPAR: the game's colour space is now %u", cs);
-            reshade::log::message(reshade::log::level::info, text);
+            fw::diag_log(reshade::log::level::info, text);
         }
     }
     if (g_producer && g_producer->ready() && chain)
@@ -1446,7 +1455,7 @@ __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE reshade_modul
     fw::hud_learn::set_profile(dir + L"\\FrameWarp\\profiles\\hud_point.txt", addon_build());
     if (!g_producer) {
         g_producer = std::make_unique<fw::Producer>();
-        g_producer->log_line = [](const char* text) { reshade::log::message(reshade::log::level::info, text); };
+        g_producer->log_line = [](const char* text) { fw::diag_log(reshade::log::level::info, text); };
     }
     fw::install_streamline_hooks(g_producer.get());
     fw::install_ngx_hooks(g_producer.get());

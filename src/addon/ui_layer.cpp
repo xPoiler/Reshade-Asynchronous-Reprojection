@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include "addon/diag.hpp"
 
 namespace fw::ui_layer {
 namespace {
@@ -238,7 +239,7 @@ void on_barrier(command_list* cmd, uint32_t count, const resource* resources, co
             char text[192];
             std::snprintf(text, sizeof(text), "XPAR: the game draws its HUD onto the back buffer after finishing it with compute shaders (%ux%u, format %u) - "
                           "a HUD-less copy taken before", d.texture.width, d.texture.height, static_cast<unsigned>(d.texture.format));
-            reshade::log::message(reshade::log::level::info, text);
+            fw::diag_log(reshade::log::level::info, text);
         }
         // (VkImageLayout: COLOR_ATTACHMENT_OPTIMAL)
         g_take_hudless_vk(vk_hudless, static_cast<std::uint32_t>(d.texture.format), d.texture.width, d.texture.height, 2, cmd->get_native());
@@ -307,7 +308,7 @@ bool pick(device* dev, command_list* cmd, const char* at, std::uint64_t& layer, 
         std::snprintf(text, sizeof(text), "XPAR: the game's HUD layer found (%ux%u, format %u, state 0x%x%s%s, at %s) - taken as the frame's UI layer",
                       g_width, g_height, static_cast<unsigned>(dev->get_resource_desc(resource{layer}).texture.format), state,
                       with_depth ? ", drawn with depth" : "", g_inverted.count(layer) ? ", cleared to opaque black: alpha inverted" : "", at);
-        reshade::log::message(reshade::log::level::info, text);
+        fw::diag_log(reshade::log::level::info, text);
     }
     return true;
 }
@@ -384,7 +385,7 @@ void target(command_list* cmd, resource_view first, bool depth) {
                         char text[160];
                         std::snprintf(text, sizeof(text), "XPAR: the game draws its HUD onto its final picture (%ux%u, format %u, state 0x%x) - a HUD-less copy taken before",
                                       g_width, g_height, static_cast<unsigned>(dev->get_resource_desc(r).texture.format), hstate);
-                        reshade::log::message(reshade::log::level::info, text);
+                        fw::diag_log(reshade::log::level::info, text);
                     }
                 }
             }
@@ -566,7 +567,7 @@ void drawn_back_buffer(command_list* cmd) {
             take = true;
             if (!g_bb_seen) {
                 g_bb_seen = true;
-                reshade::log::message(reshade::log::level::info,
+                fw::diag_log(reshade::log::level::info,
                                       "XPAR: the game draws its HUD straight onto the back buffer after the picture - a HUD-less copy taken before it");
             }
         }
@@ -608,7 +609,7 @@ void drawn(command_list* cmd) {
                 g_hud_picture = picture;
                 if (picture != g_logged_before) {
                     g_logged_before = picture;
-                    reshade::log::message(reshade::log::level::info,
+                    fw::diag_log(reshade::log::level::info,
                                           "XPAR: the game draws its HUD into its picture after the post-processing (Direct3D 11) - a copy taken before it");
                 }
             } else {
@@ -744,7 +745,7 @@ void on_present(swapchain* chain) {
                       "(not a layer) %zu",
                       g_frames, g_same_list, g_elsewhere, g_not_read, g_skipped, g_at_copy, g_with_depth_n, g_waited, g_inverted_seen.size(),
                       g_inv_turned_down, g_inv_alpha, g_inv_draws, g_multi.size());
-        reshade::log::message(reshade::log::level::info, text);
+        fw::diag_log(reshade::log::level::info, text);
         g_frames = g_same_list = g_elsewhere = g_not_read = g_skipped = g_at_copy = g_with_depth_n = g_waited = g_inv_turned_down = 0;
     }
     // (final pictures not copied onto a back buffer for 300 presents are forgotten)
@@ -759,7 +760,7 @@ void on_present(swapchain* chain) {
             std::snprintf(text, sizeof(text), "XPAR: final pictures over %u presents: %zu known, copied onto the back buffer %u, pictures copied into them %u, "
                           "drawn into %u times (%u without a picture copied in first), HUD-less copies taken %u, skipped for an unknown state %u",
                           g_presents, g_finals.size(), g_copies_out, g_copies_in, g_final_binds, g_unarmed, g_hudless_taken_n, g_hudless_unknown);
-            reshade::log::message(reshade::log::level::info, text);
+            fw::diag_log(reshade::log::level::info, text);
         }
         g_presents = g_copies_out = g_copies_in = g_final_binds = g_unarmed = g_hudless_taken_n = g_hudless_unknown = 0;
     }

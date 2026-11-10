@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include "addon/diag.hpp"
 
 using namespace reshade::api;
 
@@ -54,14 +55,14 @@ void on_init_pipeline(device*, pipeline_layout, uint32_t count, const pipeline_s
         std::snprintf(text, sizeof(text), "XPAR shader scan: compute pipeline %llx (%zu bytes, parts: %s, entry %s) uses %s",
                       static_cast<unsigned long long>(p.handle), shader->code_size, parts(data, shader->code_size).c_str(),
                       shader->entry_point ? shader->entry_point : "-", found.c_str());
-        reshade::log::message(reshade::log::level::info, text);
+        fw::diag_log(reshade::log::level::info, text);
     }
 }
 void on_destroy_device(device*) {
     if (g_compute.load()) {
         char text[160];
         std::snprintf(text, sizeof(text), "XPAR shader scan: %d compute shaders searched, %d with FSR 2 resource names", g_compute.load(), g_logged.load());
-        reshade::log::message(reshade::log::level::info, text);
+        fw::diag_log(reshade::log::level::info, text);
     }
 }
 }  // namespace

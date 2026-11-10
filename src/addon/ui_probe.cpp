@@ -7,6 +7,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "addon/diag.hpp"
 
 namespace fw::ui_probe {
 namespace {
@@ -255,7 +256,7 @@ void write_file() {
     for (const std::uint64_t key : recorded)
         if (!done[key]) dump(key, "recorded, not submitted in the frame", ++index, 2);
     std::fclose(f);
-    reshade::log::message(reshade::log::level::info, "XPAR: UI probe written (FrameWarp\\logs\\ui_probe_N.txt)");
+    fw::diag_log(reshade::log::level::info, "XPAR: UI probe written (FrameWarp\\logs\\ui_probe_N.txt)");
 }
 }  // namespace
 

@@ -11,6 +11,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <vector>
+#include "addon/diag.hpp"
 
 namespace fw::mv_probe {
 namespace {
@@ -219,7 +220,7 @@ void write_files(device* dev) {
         }
         dev->destroy_resource(g.staging);
     }
-    reshade::log::message(reshade::log::level::info, "XPAR: motion buffer probe written (FrameWarp\\captures\\mv_N_*)");
+    fw::diag_log(reshade::log::level::info, "XPAR: motion buffer probe written (FrameWarp\\captures\\mv_N_*)");
 }
 void on_present(command_queue* queue, swapchain* chain, const rect*, const rect*, uint32_t, const rect*) {
     const bool key = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000) && (GetAsyncKeyState('V') & 0x8000);
@@ -439,7 +440,7 @@ MotionStep motion_step(bool found, std::uint32_t found_candidate, std::uint32_t 
             std::snprintf(item, sizeof(item), " %u %ux%u: %u %u %u %u;", std::get<0>(k), std::get<1>(k), std::get<2>(k), c.passes, c.written, c.read_after, c.copyable);
             text += item;
         }
-        reshade::log::message(reshade::log::level::info, text.c_str());
+        fw::diag_log(reshade::log::level::info, text.c_str());
         // (which candidate is which, for the presenter's "motion search:" lines)
         text = "XPAR: motion search candidates (id format WxH, frames since drawn):";
         for (std::size_t i = 0; i < g_candidates.size() && text.size() < 1800; ++i) {
@@ -448,7 +449,7 @@ MotionStep motion_step(bool found, std::uint32_t found_candidate, std::uint32_t 
             std::snprintf(item, sizeof(item), " %zu %u %ux%u %d;", i + 1, unsigned(c.format), c.w, c.h, int(c.age));
             text += item;
         }
-        reshade::log::message(reshade::log::level::info, text.c_str());
+        fw::diag_log(reshade::log::level::info, text.c_str());
         g_census.clear();
         g_census_frames = 0;
     }

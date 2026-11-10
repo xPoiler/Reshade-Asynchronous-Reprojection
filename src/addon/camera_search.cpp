@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include "addon/diag.hpp"
 
 using namespace reshade::api;
 
@@ -212,7 +213,7 @@ struct Timed {
     bool timing, searching;
     int part;
     LARGE_INTEGER start{};
-    explicit Timed(int p) : timing(t_pending.calls % 8 == 0), searching(g_searching.load(std::memory_order_relaxed)), part(p) {
+    explicit Timed(int p) : timing(fw::diag() && t_pending.calls % 8 == 0), searching(g_searching.load(std::memory_order_relaxed)), part(p) {
         tally(g_part_calls[p], 1);
         if (timing) { t_timing = true; QueryPerformanceCounter(&start); }
     }
@@ -360,7 +361,7 @@ bool place_of(device* dev, descriptor_table table, uint32_t binding, uint32_t ar
                 std::snprintf(text, sizeof(text), "XPAR: camera search: Direct3D 12 heap %llx, a base left to ReShade: table %llx binding %u + %u at %u by ReShade, %u by us; base %llx, %llu descriptors of %llu bytes",
                               static_cast<unsigned long long>(k.handle), static_cast<unsigned long long>(table.handle), binding, array_offset, offset, mine, static_cast<unsigned long long>(base.value),
                               static_cast<unsigned long long>(k.count), static_cast<unsigned long long>(k.step));
-                reshade::log::message(reshade::log::level::warning, text);
+                fw::diag_log(reshade::log::level::warning, text);
             }
         } else if (base.matched.fetch_add(1, std::memory_order_relaxed) + 1 >= 64) { int checking = 0; base.state.compare_exchange_strong(checking, 1); }
     }
@@ -1007,7 +1008,7 @@ std::uint32_t take(MatrixCandidate* out, std::uint32_t capacity, const volatile 
                 std::snprintf(one, sizeof(one), " %ls (%s)", file.c_str(), g_values_file ? "opened" : std::strerror(error));
                 said += one;
             }
-            reshade::log::message(reshade::log::level::info, (std::string("XPAR: camera search: CameraDump=2, every value found to") + said).c_str());
+            fw::diag_log(reshade::log::level::info, (std::string("XPAR: camera search: CameraDump=2, every value found to") + said).c_str());
         }
         if (g_values_file) {
             const std::uint32_t head[2] = {0x56415058u, std::uint32_t(g_dump_found.size())};
@@ -1018,7 +1019,7 @@ std::uint32_t take(MatrixCandidate* out, std::uint32_t capacity, const volatile 
             if (g_values_bytes > kDumpFileBytes) {
                 std::fclose(g_values_file);
                 g_values_file = nullptr;
-                reshade::log::message(reshade::log::level::info, "XPAR: camera search: logs/camera_values.bin written (3 GB)");
+                fw::diag_log(reshade::log::level::info, "XPAR: camera search: logs/camera_values.bin written (3 GB)");
             }
         }
         static std::uint32_t dump_frames = 0;
@@ -1029,7 +1030,7 @@ std::uint32_t take(MatrixCandidate* out, std::uint32_t capacity, const volatile 
             std::snprintf(text, sizeof(text), "XPAR: camera search, CameraDump=2: this frame %llu KB in %llu ranges, %zu values, %zu of them object matrices; buffer views so far: %llu in tables, %llu root (%llu read)",
                           static_cast<unsigned long long>(g_dump_bytes / 1024), static_cast<unsigned long long>(g_dump_ranges), g_dump_found.size(), objects,
                           static_cast<unsigned long long>(g_dump_srv_views), static_cast<unsigned long long>(g_dump_root_views), static_cast<unsigned long long>(g_dump_root_read));
-            reshade::log::message(reshade::log::level::info, text);
+            fw::diag_log(reshade::log::level::info, text);
         }
     }
     // (CameraDump=2: the objects' after the camera's values, in at most half the room left)
@@ -1039,14 +1040,14 @@ std::uint32_t take(MatrixCandidate* out, std::uint32_t capacity, const volatile 
     const std::uint32_t objects = std::uint32_t(std::min(g_raw_objects.size(), std::size_t(capacity - n)));
     std::copy(g_raw_objects.begin(), g_raw_objects.begin() + objects, out + n);
     if (g_budget_spent) { g_spent_frames.fetch_add(1, std::memory_order_relaxed); for (std::uint32_t i = 0; i < n + objects; ++i) out[i].flags |= 8; }  // (for the dump: this frame was cut short)
-    if (g_said < 60 && ++g_rotate % 300 == 150) {
+    if (fw::diag() && g_said < 60 && ++g_rotate % 300 == 150) {  // (the hooks' times are taken only while it is written - Timed)
         ++g_said;
         char text[1400];
         const double ms = 1000.0 * double(g_ticks.load()) / double(g_frequency.QuadPart) / 300.0;
         std::snprintf(text, sizeof(text), "XPAR: camera search: this frame %llu KB in %llu ranges, %zu matrices, %zu under their slots, %zu from %u places held; a frame: %.2f ms in the hooks (all threads), %llu descriptors written, %llu copied, %llu tables bound, %llu skipped",
                       static_cast<unsigned long long>(g_bytes / 1024), static_cast<unsigned long long>(g_ranges), g_found.size(), g_raw.size(), g_held_found.size(), g_held_count.load(), ms, static_cast<unsigned long long>(g_written.load() / 300),
                       static_cast<unsigned long long>(g_copied.load() / 300), static_cast<unsigned long long>(g_bound.load() / 300), static_cast<unsigned long long>(g_skipped.load() / 300));
-        reshade::log::message(reshade::log::level::info, text);
+        fw::diag_log(reshade::log::level::info, text);
         {
             const double all = double(g_ticks.load()), searching = double(g_ticks_searching.exchange(0)), tick_ms = 1000.0 / double(g_frequency.QuadPart);
             const std::uint64_t searched = g_search_frames.exchange(0);
@@ -1054,7 +1055,7 @@ std::uint32_t take(MatrixCandidate* out, std::uint32_t capacity, const volatile 
                           static_cast<unsigned long long>(searched), searched ? searching * tick_ms / double(searched) : 0.0, searched < 300 ? (all - searching) * tick_ms / double(300 - searched) : 0.0, g_window, g_reads_last,
                           static_cast<unsigned long long>(g_copied_bytes / 300 / 1024));
             g_copied_bytes = 0;
-            reshade::log::message(reshade::log::level::info, text);
+            fw::diag_log(reshade::log::level::info, text);
         }
         const auto list = [](std::atomic<std::uint64_t>* values, int count) {
             std::string out;
@@ -1067,7 +1068,7 @@ std::uint32_t take(MatrixCandidate* out, std::uint32_t capacity, const volatile 
         std::snprintf(text, sizeof(text), "XPAR: camera search: a frame: bound directly, by kind%s; written, by kind%s; constant buffers bound directly, by memory%s; in tables bound, %llu views, %llu places without one; buffers known %zu, readable %zu; bound without a size %llu, of 64 KB or more %llu; budget spent on %llu of 300 frames",
                       pushed.c_str(), written.c_str(), heaps.c_str(), static_cast<unsigned long long>(g_table_views.exchange(0) / 300), static_cast<unsigned long long>(g_table_empty.exchange(0) / 300), g_mapped.size(), readable,
                       static_cast<unsigned long long>(g_unsized.exchange(0) / 300), static_cast<unsigned long long>(g_large.exchange(0) / 300), static_cast<unsigned long long>(g_spent_frames.exchange(0)));
-        reshade::log::message(reshade::log::level::info, text);
+        fw::diag_log(reshade::log::level::info, text);
         if (vk::g_device) {
             std::size_t mapped_now = 0, buffers_readable = 0;
             for (const auto& [handle, m] : vk::g_memory) mapped_now += m.data ? 1 : 0;
@@ -1076,7 +1077,7 @@ std::uint32_t take(MatrixCandidate* out, std::uint32_t capacity, const volatile 
                           vk::g_hooked.c_str(), mapped_now, vk::g_memory.size(), vk::g_buffers.size(), buffers_readable, static_cast<unsigned long long>(vk::g_maps.exchange(0)),
                           static_cast<unsigned long long>(vk::g_unmaps.exchange(0)), static_cast<unsigned long long>(vk::g_frees.exchange(0)), static_cast<unsigned long long>(vk::g_binds.exchange(0)),
                           static_cast<unsigned long long>(vk::g_dynamic.exchange(0)));
-            reshade::log::message(reshade::log::level::info, text);
+            fw::diag_log(reshade::log::level::info, text);
         }
         {
             std::string parts;
@@ -1095,7 +1096,7 @@ std::uint32_t take(MatrixCandidate* out, std::uint32_t capacity, const volatile 
             for (int i = 0; i < g_known_count.load(); ++i)
                 for (int k = 0; k < g_known[i].based.load(); ++k) { const int st = g_known[i].bases[k].state.load(); ++bases; trusted += st == 1; refused += st == -1; }
             std::snprintf(text, sizeof(text), "XPAR: camera search: where the hooks' time goes, a frame (all threads):%s; Direct3D 12 table bases placed by us %d, left to ReShade %d (of %d, in %d heaps)", parts.c_str(), trusted, refused, bases, g_known_count.load());
-            reshade::log::message(reshade::log::level::info, text);
+            fw::diag_log(reshade::log::level::info, text);
         }
         g_ticks = 0; g_written = 0; g_copied = 0; g_bound = 0; g_skipped = 0;
     }

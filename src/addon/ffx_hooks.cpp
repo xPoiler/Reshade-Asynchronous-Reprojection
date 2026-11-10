@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstring>
 #include <string>
+#include "addon/diag.hpp"
 
 namespace fw {
 namespace {
@@ -357,7 +358,7 @@ void log_frame_generation_setup(const ffxApiHeader* desc) {
                               fg->HUDLessColor.description.width, fg->HUDLessColor.description.height, fg->HUDLessColor.description.format, fg->HUDLessColor.state);
             else
                 std::snprintf(text, sizeof(text), "XPAR: FSR frame generation setup: no HUD-less picture (frame generation %s)", fg->frameGenerationEnabled ? "on" : "off");
-            reshade::log::message(reshade::log::level::info, text);
+            fw::diag_log(reshade::log::level::info, text);
         }
     }
     if (const auto* ui = find_desc<ffxConfigureDescFrameGenerationSwapChainRegisterUiResourceDX12>(desc, kConfigureRegisterUi)) {
@@ -368,7 +369,7 @@ void log_frame_generation_setup(const ffxApiHeader* desc) {
                               ui->uiResource.description.width, ui->uiResource.description.height, ui->uiResource.description.format, ui->flags);
             else
                 std::snprintf(text, sizeof(text), "XPAR: FSR frame generation setup: UI layer registered empty");
-            reshade::log::message(reshade::log::level::info, text);
+            fw::diag_log(reshade::log::level::info, text);
         }
     }
 }

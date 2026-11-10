@@ -316,6 +316,36 @@ void wr(FILE* f, const char* format, ...) {
     va_end(args);
 }
 
+// Detailed diagnostics (Settings::record_diagnostics, opt-in - 2026-11-10, user: a shipped build debugs nothing and writes no
+// file unless the option is on; [FrameWarp] DiagnosticsOn=1 turns it on in the test games): presenter.log and every log line,
+// and the work done only for them, only while on. The log is opened the first time they are switched on (the add-on hands the
+// option over at launch, FW_DIAG, so a run started with it on logs from its first line); the previous run's logs moved aside then.
+std::atomic<bool> g_diag{false};
+bool diag() { return g_diag.load(std::memory_order_relaxed); }
+void logf(const char* format, ...);
+void set_diagnostics(bool on) {
+    static bool opened = false;
+    if (on && !opened) {
+        opened = true;
+        // Keep the previous run's logs: after a crash the user restarts the presenter, and that run is the one we need.
+        std::error_code ec;
+        std::filesystem::create_directories(g_app.data_dir / L"logs", ec);
+        const auto previous = g_app.data_dir / L"logs" / L"previous";
+        std::filesystem::remove_all(previous, ec);
+        std::filesystem::create_directories(previous, ec);
+        for (const auto& entry : std::filesystem::directory_iterator(g_app.data_dir / L"logs", ec))
+            if (entry.is_regular_file(ec)) std::filesystem::rename(entry.path(), previous / entry.path().filename(), ec);
+        g_app.log = _wfsopen((g_app.data_dir / L"logs" / L"presenter.log").c_str(), L"w", _SH_DENYNO);
+        g_diag.store(true);
+        LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+        logf("FrameWarp presenter " FW_VERSION ", qpc frequency %lld", fq.QuadPart);
+        if (g_app.data_dir != g_app.base_dir) logf("the FrameWarp folder is read-only: logs and calibration are kept in %ls", g_app.data_dir.c_str());
+        if (g_app.in_process) logf("running inside the game's process, on its D3D12 device");
+        return;
+    }
+    g_diag.store(on);
+}
+
 // Detailed CSV recordings (opt-in): opened the first time they are switched on, written only while on,
 // closed at exit (the window thread writes mouse input too).
 std::atomic<bool> g_recording{false};
@@ -360,7 +390,7 @@ void open_recordings() {
 }
 
 void logf(const char* format, ...) {
-    if (!g_app.log) return;
+    if (!g_diag.load(std::memory_order_relaxed) || !g_app.log) return;
     char line[1100];
     int n = std::snprintf(line, 32, "[%.3f] ", now_seconds());
     va_list args; va_start(args, format);
@@ -450,8 +480,8 @@ void record_hooks(const Shared& sh, double now) {
 // FrameWarp steps aside for the game's frame generation).
 void record_timeline(Shared& sh, const Settings& settings) {
     if ((settings.record_diagnostics != 0) != g_recording.load()) {
-        if (settings.record_diagnostics) { open_recordings(); logf("detailed diagnostics: recording to the logs folder"); }
-        else { g_recording = false; logf("detailed diagnostics: off"); }
+        if (settings.record_diagnostics) { set_diagnostics(true); open_recordings(); logf("detailed diagnostics: recording to the logs folder"); }
+        else { g_recording = false; logf("detailed diagnostics: off"); set_diagnostics(false); }
     }
     if (rec(g_app.csv_events)) {
         const std::int64_t count = sh.timeline_count;
@@ -1695,7 +1725,7 @@ void render_thread() {
                         memory_frame = m.frame_id;
                         renderer.pass_stamp(Renderer::kPassMemory);
                     }
-                    if (++mask_builds >= 300) {
+                    if (++mask_builds >= 300 && diag()) {
                         mask_builds = 0;
                         const HudStats hs = renderer.take_hud_stats();
                         if (hs.scene_frames) {
@@ -2398,6 +2428,7 @@ void render_thread() {
                          g_app.model.consistent_orbit(), g_app.model.orbit_side(), g_app.model.orbit_lift());
         }
         record_timeline(sh, settings);
+        renderer.set_log_stamps(diag());  // (timestamps read back for the log alone: none without diagnostics)
         // (a refresh: a present, or with pacing a refresh that keeps the same picture - not the 1 ms polls of the
         // unpaced loop while nothing changes)
         if (!same_picture || paced_last) ++stat_frames;
@@ -2560,7 +2591,7 @@ void render_thread() {
             st.mv_fit_quality = float(mv_scale.quality);
             st.moving_fraction = float(mv_scale.moving_fraction);
             // What the presenter costs the GPU (shared with the game), every 10 s.
-            if (now - last_usage_log >= 10.0) {
+            if (diag() && now - last_usage_log >= 10.0) {
                 const Renderer::GpuUsage u = renderer.take_gpu_usage();
                 {
                     const auto hs = renderer.take_held_stats();
@@ -2910,35 +2941,21 @@ static int presenter_main(HINSTANCE instance, DWORD pid, const std::filesystem::
     }
     g_app.data_dir = g_app.base_dir;
     {
+        // (the folder itself tested - the shader cache and the camera profiles need it; the logs folder is made only with
+        // detailed diagnostics on, see set_diagnostics)
         std::error_code ec;
-        std::filesystem::create_directories(g_app.base_dir / L"logs", ec);
-        const auto probe = g_app.base_dir / L"logs" / L".write-test";
+        const auto probe = g_app.base_dir / L".write-test";
         FILE* written = _wfsopen(probe.c_str(), L"w", _SH_DENYNO);
         if (written) { std::fclose(written); std::filesystem::remove(probe, ec); }
         else {
             wchar_t local[MAX_PATH]{};
             if (GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH))
                 g_app.data_dir = std::filesystem::path(local) / L"FrameWarp" / g_app.base_dir.parent_path().filename();
-            std::filesystem::create_directories(g_app.data_dir / L"logs", ec);
+            std::filesystem::create_directories(g_app.data_dir, ec);
         }
     }
-    // Keep the previous run's logs: after a crash the user restarts the presenter, and that run is the one we need.
-    {
-        std::error_code ec;
-        const auto previous = g_app.data_dir / L"logs" / L"previous";
-        std::filesystem::remove_all(previous, ec);
-        std::filesystem::create_directories(previous, ec);
-        for (const auto& entry : std::filesystem::directory_iterator(g_app.data_dir / L"logs", ec))
-            if (entry.is_regular_file(ec)) std::filesystem::rename(entry.path(), previous / entry.path().filename(), ec);
-    }
-    g_app.log = _wfsopen((g_app.data_dir / L"logs" / L"presenter.log").c_str(), L"w", _SH_DENYNO);
     g_files.start();
-    {
-        LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
-        logf("FrameWarp presenter " FW_VERSION ", qpc frequency %lld", fq.QuadPart);
-        if (g_app.data_dir != g_app.base_dir) logf("the FrameWarp folder is read-only: logs and calibration are kept in %ls", g_app.data_dir.c_str());
-        if (g_app.in_process) logf("running inside the game's process, on its D3D12 device");
-    }
+    { wchar_t v[4]{}; if (GetEnvironmentVariableW(L"FW_DIAG", v, 4) && v[0] == L'1') set_diagnostics(true); }  // (see set_diagnostics)
     if (!g_app.pid) { logf("usage: FrameWarpPresenter --pid <game pid>"); return 1; }
 
     // One presenter per game.

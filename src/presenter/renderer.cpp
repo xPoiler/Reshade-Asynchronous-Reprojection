@@ -7563,7 +7563,7 @@ bool Renderer::detect_hud_from_scene(const XConstants& base, bool fill, PrivateI
         list_->ResourceBarrier(1, &fit);
     };
     UINT stamp = 0;
-    auto mark = [&]() { if (scene_stamps_) list_->EndQuery(scene_stamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * kSceneStamps + stamp++); };
+    auto mark = [&]() { if (scene_stamps_ && log_stamps_) list_->EndQuery(scene_stamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * kSceneStamps + stamp++); };
     auto run = [&](ID3D12PipelineState* pso, UINT read, UINT write, UINT rule, UINT gx, UINT gy) {
         run_pass(pso, read, write, rule, gx, gy);
         mark();
@@ -7605,16 +7605,18 @@ bool Renderer::detect_hud_from_scene(const XConstants& base, bool fill, PrivateI
         transition(private_[kPFill], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         fill_ready_ = true;
     }
-    // The HUD pixel count goes to the log.
-    auto to_copy = transition_barrier(scene_fit_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    list_->ResourceBarrier(1, &to_copy);
-    list_->CopyBufferRegion(hud_readback_.Get(), UINT64(frame_index_) * 16 + 8, scene_fit_.Get(), kSceneHudCount, 4);
-    std::swap(to_copy.Transition.StateBefore, to_copy.Transition.StateAfter);
-    list_->ResourceBarrier(1, &to_copy);
-    if (scene_stamps_)
-        list_->ResolveQueryData(scene_stamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * kSceneStamps, kSceneStamps,
-                                scene_stamps_readback_.Get(), UINT64(frame_index_) * kSceneStamps * 8);
-    hud_scene_pending_[frame_index_] = true;
+    // The HUD pixel count and the passes' times go to the log - only while it is written (set_log_stamps).
+    if (log_stamps_) {
+        auto to_copy = transition_barrier(scene_fit_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list_->ResourceBarrier(1, &to_copy);
+        list_->CopyBufferRegion(hud_readback_.Get(), UINT64(frame_index_) * 16 + 8, scene_fit_.Get(), kSceneHudCount, 4);
+        std::swap(to_copy.Transition.StateBefore, to_copy.Transition.StateAfter);
+        list_->ResourceBarrier(1, &to_copy);
+        if (scene_stamps_)
+            list_->ResolveQueryData(scene_stamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * kSceneStamps, kSceneStamps,
+                                    scene_stamps_readback_.Get(), UINT64(frame_index_) * kSceneStamps * 8);
+        hud_scene_pending_[frame_index_] = true;
+    }
     hud_scene_pixels_ = double(ow) * double(oh);
     return true;
 }
@@ -8037,7 +8039,7 @@ void Renderer::tint_mask() {
 
 void Renderer::pass_stamp(IntakePass pass) {
     int& n = pass_count_[frame_index_];
-    if (!pass_stamps_ || !pass_readback_ || n >= kPassStamps) return;
+    if (!log_stamps_ || !pass_stamps_ || !pass_readback_ || n >= kPassStamps) return;
     list_->EndQuery(pass_stamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * kPassStamps + n);
     pass_ids_[frame_index_][n++] = static_cast<std::uint8_t>(pass);
 }

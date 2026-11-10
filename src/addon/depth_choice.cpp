@@ -11,6 +11,7 @@
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
+#include "addon/diag.hpp"
 
 namespace fw {
 namespace {
@@ -164,7 +165,7 @@ struct Chooser {
     bool restart_needed = false;
 } c;
 
-void say(const char* text) { reshade::log::message(reshade::log::level::info, text); }
+void say(const char* text) { fw::diag_log(reshade::log::level::info, text); }
 
 // Of the picture's shape, whatever its size (a scene can be rendered at any fraction of the picture and
 // scaled up, by an upscaler or by the game itself, or above it); what tells the scene's apart is the probe.

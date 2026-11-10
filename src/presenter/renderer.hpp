@@ -125,6 +125,9 @@ public:
     // set_intake_window: the next refresh's warp submission (QPC) and the refresh period. intake_break: the piece recorded so far
     // submitted, the next one begun (piece: 0 the intake's start, 1 its analysis, 2 HUD/mask/memory). The game never waits for it.
     void set_intake_gate(bool on) { gate_on_ = on; }
+    // GPU timestamps and counts read back for the log alone - the passes' times (pass_stamp, take_pass_times) and the HUD
+    // detection's (take_hud_stats): the presenter keeps them on only while diagnostics are recorded; on by default (dev/seq_replay)
+    void set_log_stamps(bool on) { log_stamps_ = on; }
     bool intake_gate() const { return gate_on_; }
     void set_intake_window(std::int64_t next_tick_qpc, std::int64_t period_qpc) { gate_tick_ = next_tick_qpc; gate_period_ = period_qpc; }
     void set_intake_piece(int piece) { gate_piece_ = std::clamp(piece, 0, 3); }
@@ -556,6 +559,7 @@ private:
     ComPtr<ID3D12Fence> warp_fence_;
     std::uint64_t warps_signaled_ = 0, gate_requested_ = 0;
     bool gate_on_ = false;
+    bool log_stamps_ = true;
     std::int64_t gate_tick_ = 0, gate_period_ = 0, gate_last_end_ = 0, last_refresh_qpc_ = 0;
     int gate_piece_ = 0;
     int piece_of_slot_[kRing] = {};

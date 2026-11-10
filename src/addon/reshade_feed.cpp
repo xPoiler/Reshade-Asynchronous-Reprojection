@@ -13,6 +13,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include "addon/diag.hpp"
 
 namespace fw {
 namespace {
@@ -162,7 +163,7 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
             if (g.depth.handle) runtime->get_texture_binding(g.depth, &view, &unused_view);
             const std::string text = "XPAR: StencilDump: api " + std::to_string(int(dev->get_api())) + ", XPAR_Depth " + std::to_string(g.depth.handle != 0) +
                                      ", bound " + std::to_string(view.handle != 0) + ", " + p->stencil_status();
-            reshade::log::message(reshade::log::level::info, text.c_str());
+            fw::diag_log(reshade::log::level::info, text.c_str());
         }
     }
     // The camera search also while an upscaler gives depth and motion but not the game's camera (NGX or FSR without Streamline): the camera is
@@ -189,7 +190,7 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
         char text[200];
         std::snprintf(text, sizeof(text), "XPAR: ReShade feed waiting: on %d, the game's depth seen %d, frame generation %d, depth buffers bound a frame %.0f, frames of a 3D scene %u of 600, XPAR.fx %d",
                       int(p->shared()->settings.enabled), int(p->game_depth_seen()), int(p->generation_active()), depth_binds_per_frame(), g.waited, int(g.feed.handle != 0));
-        reshade::log::message(reshade::log::level::info, text);
+        fw::diag_log(reshade::log::level::info, text);
     }
     if (!wanted) {
         g.status[0] = 0;
@@ -258,7 +259,7 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
             runtime->set_preprocessor_definition_for_effect("XPAR.fx", "XPAR_FEED_H", v);
             char text[200];
             std::snprintf(text, sizeof(text), "XPAR: ReShade feed: depth handed over at the game's depth buffer's size, %ux%u (was %ux%u, the picture %ux%u)", fw_, fh_, w, h, sw, shh);
-            reshade::log::message(reshade::log::level::info, text);
+            fw::diag_log(reshade::log::level::info, text);
         }
     }
     const bool oriented = usable && depth_orientation_ready(runtime, cmd_list, probe_view, g.flip);
@@ -277,7 +278,7 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
             char text[200];
             std::snprintf(text, sizeof(text), "XPAR: no DLSS or FSR data, a 3D scene drawn (%.0f depth buffers bound a frame, its depth %s): the ReShade feed starts",
                           depth_binds_per_frame(), oriented ? "read" : "not told apart - handed over as far away");
-            reshade::log::message(reshade::log::level::info, text);
+            fw::diag_log(reshade::log::level::info, text);
         } else {
             set_status(choosing ? "No DLSS or FSR data from this game: waiting for a 3D scene - finding the game's depth buffer..."
                                 : "No DLSS or FSR data from this game: waiting for a 3D scene.");

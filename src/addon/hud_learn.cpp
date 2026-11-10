@@ -9,6 +9,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "addon/diag.hpp"
 
 using namespace reshade::api;
 
@@ -408,7 +409,7 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
     if (g_presents % 600 == 0 && g_final) {
         const std::string text = "XPAR HUD learning: " + describe(g_final, "final picture") + " | " + describe(g_bb_frame, "back buffer") +
                                  " | candidates " + std::to_string(g_cands.size());
-        reshade::log::message(reshade::log::level::info, text.c_str());
+        fw::diag_log(reshade::log::level::info, text.c_str());
     }
     // The saved point (FrameWarp\profiles\hud_point.txt), once: locked from the start - no learning on every launch.
     if (!g_profile_read && !g_profile.empty()) {
@@ -426,7 +427,7 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
                 char text[160];
                 std::snprintf(text, sizeof(text), "XPAR HUD learning: the saved point is from another build (%s) - deleted, learned again",
                               saved_build[0] ? saved_build : "before 2.1");
-                reshade::log::message(reshade::log::level::info, text);
+                fw::diag_log(reshade::log::level::info, text);
             }
             if (ours && fscanf_s(f, "%x %u", &fp, &role) == 2 && fp && learning) {
                 g_locked = fp;
@@ -436,7 +437,7 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
                 g_cands[fp].last = g_presents;
                 char text[128];
                 std::snprintf(text, sizeof(text), "XPAR HUD learning: %08x from the profile (in the %s)", fp, g_locked_role ? "back buffer" : "final picture");
-                reshade::log::message(reshade::log::level::info, text);
+                fw::diag_log(reshade::log::level::info, text);
             }
             if (f) std::fclose(f);
         }
@@ -458,7 +459,7 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
                 char text[128];
                 std::snprintf(text, sizeof(text), "XPAR HUD learning: %08x dropped (%s) - learning again", g_locked,
                               relearn != g_relearn_seen ? "Relearn" : fail == g_locked ? "it no longer behaves like a HUD" : "it has not drawn lately");
-                reshade::log::message(reshade::log::level::info, text);
+                fw::diag_log(reshade::log::level::info, text);
             }
             if (forget && learning && !g_profile.empty()) _wremove(g_profile.c_str());
             if (forget) g_saved = false;
@@ -479,7 +480,7 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
             char text[128];
             std::snprintf(text, sizeof(text), "XPAR HUD learning: %08x learned (in the %s) - the HUD taken from there", pick,
                           g_locked_role ? "back buffer" : "final picture");
-            reshade::log::message(reshade::log::level::info, text);
+            fw::diag_log(reshade::log::level::info, text);
         }
         if (g_locked) {
             // A frame the game drew where the learned point did not: no HUD (the game hides it - for as long as it does).
@@ -494,7 +495,7 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
                         std::fclose(f);
                         char text[128];
                         std::snprintf(text, sizeof(text), "XPAR HUD learning: %08x saved to the profile", g_locked);
-                        reshade::log::message(reshade::log::level::info, text);
+                        fw::diag_log(reshade::log::level::info, text);
                     }
                 }
             } else if (drew) {

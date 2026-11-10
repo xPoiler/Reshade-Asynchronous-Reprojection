@@ -12,6 +12,7 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include "addon/diag.hpp"
 
 namespace fw {
 namespace {
@@ -59,7 +60,7 @@ void log_reflex(int result, bool on) {
     g_reflex_logged = key;
     char text[160];
     std::snprintf(text, sizeof(text), "XPAR frame cap: the game's NVIDIA Reflex is %s (NVAPI sleep status: %d)", on ? "on - the cap stands aside" : "off", result);
-    reshade::log::message(reshade::log::level::info, text);
+    fw::diag_log(reshade::log::level::info, text);
 }
 
 bool reflex_on_logged(IUnknown* device) {
@@ -81,7 +82,7 @@ bool reflex_on_logged(IUnknown* device) {
         if (size) {
             char text[96];
             std::snprintf(text, sizeof(text), "XPAR frame cap: NVAPI sleep status takes %u bytes", size);
-            reshade::log::message(reshade::log::level::info, text);
+            fw::diag_log(reshade::log::level::info, text);
         }
     }
     const bool on = result == 0 && p.low_latency_mode != 0;
@@ -250,7 +251,7 @@ void log_trial(const char* what, double capped_ms, double uncapped_ms, double ne
         std::snprintf(text, sizeof(text), "XPAR frame cap: %s (capped %.1f fps, uncapped %.1f fps) - next try in %.0f s", what, capped, uncapped, next_s);
     else
         std::snprintf(text, sizeof(text), "XPAR frame cap: %s (capped %.1f fps, uncapped %.1f fps)", what, capped, uncapped);
-    reshade::log::message(reshade::log::level::info, text);
+    fw::diag_log(reshade::log::level::info, text);
 }
 
 // Stands aside (the GPU is the limit); the next trial after the current wait.
@@ -426,7 +427,7 @@ void frame_cap_after_present(command_queue* queue, bool enabled, bool generation
             char text[220];
             std::snprintf(text, sizeof(text), "XPAR frame cap: the GPU is the limit - one frame queued at most: %d of %d frames held, %.2f ms each on average, the GPU done %.1f ms after a present",
                           g.limit_held, g.limit_frames, g.limit_ms / g.limit_frames, g.limit_after_present_ms / g.limit_frames);
-            reshade::log::message(reshade::log::level::info, text);
+            fw::diag_log(reshade::log::level::info, text);
             g.limit_frames = g.limit_held = 0; g.limit_ms = g.limit_after_present_ms = 0;
         }
     }
@@ -475,7 +476,7 @@ void present_ceiling(void* hwnd) {
             char text[192];
             std::snprintf(text, sizeof(text), "XPAR: the game presents faster than twice the display's refresh (%u Hz) - held to %u presents a second "
                           "(a menu, splash or loading screen without a frame cap)", hz, 2 * hz);
-            reshade::log::message(reshade::log::level::info, text);
+            fw::diag_log(reshade::log::level::info, text);
         }
         if (!g.timer) g.timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
         const std::int64_t target = last_release + static_cast<std::int64_t>(interval * f);
