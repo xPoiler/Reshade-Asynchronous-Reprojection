@@ -133,7 +133,7 @@ struct Settings {
     std::uint32_t frame_cap;           // default on: prevent GPU queueing (hold the game just below its GPU rate) while its NVIDIA Reflex is off (add-on; saved per game)
     std::uint32_t game_hud_layers;     // default on: the HUD from the game's own HUD layer / a HUD-less copy of its final picture where the add-on
                                        // finds one (Direct3D 12; ui_layer.hpp); off: HUD detection only (add-on; saved per game)
-    std::uint32_t warp_splat;          // default on: the XPAR warp by forward splat (every rendered pixel claims where it lands, the nearest
+    std::uint32_t warp_splat;          // default off: the XPAR warp by forward splat (every rendered pixel claims where it lands, the nearest
                                        // winning) instead of the search from each displayed pixel alone (saved per game)
     std::uint32_t hold_characters;     // default on: what stays in place on screen over several frames while the camera moves is
                                        // held, and the character's limbs with it (Renderer::hold_characters; saved per game)
@@ -143,7 +143,7 @@ struct Settings {
                                        // (Renderer::follow_share) instead of held whole (hold_characters, the stretch; saved per game)
     std::uint32_t share_from_input;    // default on: ...measured against the turn the input explains (what the warp applies), not
                                        // the game camera's whole turn (a car's steering, a gun's own animation; saved per game)
-    std::uint32_t memory_resolution;   // background memory: 0 the picture's own resolution, 1 half (default), 2 a quarter - less
+    std::uint32_t memory_resolution;   // background memory: 0 the picture's own resolution, 1 half, 2 a quarter (default) - less
                                        // video memory and GPU time, softer where it fills (saved per game)
 };
 

@@ -45,7 +45,7 @@ void default_settings(Settings& s) {
     s.floor_release = 1;  // the ground around the character moves with a measured orbit (acts only while one is in use)
     s.hold_reticles = 1;  // sight reticles drawn without depth move with the gun (acts only inside a sight's window)
     s.game_hud_layers = 1;  // the HUD from the game's own HUD layer / final picture where found
-    s.warp_splat = 1;  // the XPAR warp by forward splat
+    s.warp_splat = 0;  // the XPAR warp by the search; 1: by forward splat (off by default since 2026-11-10: +28-38% of the warp's GPU time for scores within 0.5% on recordings)
     s.hold_characters = 1;  // whole characters held
     s.hud_learn = 1;  // learn where the game draws its HUD
     s.follow_share = 1;  // the character/weapon by the share of the turn it follows
@@ -59,7 +59,8 @@ void default_settings(Settings& s) {
     s.turn_rule = 1;
     s.stretch_width = 1;
     s.background_memory = 1;  // what the warp uncovers comes from the scenery last seen there (XPAR engine)  // hold what stays nearly still on screen while the camera turns (orbit cameras)
-    s.memory_resolution = 1;  // (the background memory at half the picture's resolution: full fills seamlessly, ~4x the video memory)
+    s.memory_resolution = 2;  // (the background memory at a quarter of the picture's resolution: with the continuous warp it fills only
+                              // the screen edges and behind the HUD - no difference seen against 1/2 or full, Requiem; full ~16x the video memory)
     s.hud_from_scene = 2;  // HUD from the upscaler's output + camera-motion check (learned HUD without an upscaler output)
     s.auto_prediction = 6;     // default: the lowest latency without edge fill (now .. one game frame back); 3: Auto - 1/2 game frame, 1/4 in games
                                // without HUD layers (shorter warps hide mask misses), 1 without DLSS/FSR (XPAR's own motion); 1: full, 2: half, 4: quarter

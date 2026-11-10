@@ -3297,6 +3297,22 @@ Texture2D<uint2> tt_pick_t : register(t20);
     tt_half_u[id.xy] = float4(d, bn, 0);
     tt_tb_u[id.xy] = d;
 }
+// One pair of blocks, dp and its neighbour dq in direction k, step blocks apart: the pull on dp if they part by more than the
+// limit, added to corr (true then)
+bool tether_pull(float3 dp, float3 dq, int k, int step, inout float2 corr) {
+    const float len = length(float2(kRetDirs[k]));
+    const float2 n = float2(kRetDirs[k]) / len;
+    // (pulling apart along the pair, and sliding past each other across it: both bounded - a slide unbounded tore the
+    // scenery above a held gun from the rows beside it, held back by the stretch; pushing together stays free)
+    const float2 dd = dq.xy - dp.xy;
+    const float2 t = float2(-n.y, n.x);
+    const float lim = kTetherL * float(tether_b()) * len * float(step);  // (a block is B rendered px)
+    const float a = dot(dd, n) - lim, b = abs(dot(dd, t)) - lim;
+    if (!(a > 0 || b > 0)) return false;
+    const float2 v = n * max(a, 0.0) + t * (sign(dot(dd, t)) * max(b, 0.0));
+    corr += v / (1.0 + exp2(clamp((dp.z - dq.z) / 16.0, -60.0, 60.0)));
+    return true;
+}
 [numthreads(8, 8, 1)] void cs_tether_step(uint3 id : SV_DispatchThreadID) {
     const uint2 hs = tether_blocks();
     if (any(id.xy >= hs)) return;
@@ -3312,23 +3328,60 @@ Texture2D<uint2> tt_pick_t : register(t20);
     [unroll] for (int k = 0; k < 8; ++k) {
         const int2 q = p + kRetDirs[k] * step;
         if (any(q < 0) || any(q >= int2(hs))) continue;
-        const float len = length(float2(kRetDirs[k]));
-        const float2 n = float2(kRetDirs[k]) / len;
-        // (pulling apart along the pair, and sliding past each other across it: both bounded - a slide unbounded tore the
-        // scenery above a held gun from the rows beside it, held back by the stretch; pushing together stays free)
-        const float4 dq = tt_half_t.Load(int3(q, 0));
-        const float2 dd = dq.xy - dp.xy;
-        const float2 t = float2(-n.y, n.x);
-        const float lim = kTetherL * float(tether_b()) * len * float(step);  // (a block is B rendered px)
-        const float a = dot(dd, n) - lim, b = abs(dot(dd, t)) - lim;
-        if (a > 0 || b > 0) {
-            const float2 v = n * max(a, 0.0) + t * (sign(dot(dd, t)) * max(b, 0.0));
-            corr += v / (1.0 + exp2(clamp((dp.z - dq.z) / 16.0, -60.0, 60.0)));
-            count += 1.0;
-        }
+        if (tether_pull(dp.xyz, tt_half_t.Load(int3(q, 0)).xyz, k, step, corr)) count += 1.0;
     }
     const float2 solved = dp.xy + (count > 0 ? corr / count : float2(0, 0));
     tt_half_u[p] = float4(alpha < 0 ? solved - tt_tb_t.Load(int3(p, 0)) : solved, dp.z, 0);
+}
+// The solver's fine end - step 2 once, then step 1 four times, the default (set_tether_iterations) - in one dispatch: a 16 x 16
+// group's blocks and 6 around them (2 + 4 x 1, as far as five passes reach) in groupshared, the five passes between barriers.
+// The same pairs, the same arithmetic, the same order: the same result as five cs_tether_step passes, without four dispatches
+// and the round trips through memory between them. Blocks by the tile's edge go wrong pass by pass - their neighbours outside
+// it are missing - but none of them reaches the 16 x 16 the group writes.
+static const int kTfOut = 16, kTfHalo = 6, kTfSide = kTfOut + 2 * kTfHalo;
+groupshared float2 tf_a[kTfSide * kTfSide];
+groupshared float2 tf_b[kTfSide * kTfSide];
+groupshared float tf_z[kTfSide * kTfSide];  // (the nearness: no pass changes it)
+[numthreads(16, 16, 1)] void cs_tether_fine(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID, uint gi : SV_GroupIndex) {
+    const int2 hs = int2(tether_blocks());
+    const int2 o = int2(gid.xy) * kTfOut - kTfHalo;
+    for (uint i = gi; i < uint(kTfSide * kTfSide); i += 256u) {
+        const int2 q = o + int2(i % uint(kTfSide), i / uint(kTfSide));
+        const float4 d = all(q >= 0) && all(q < hs) ? tt_half_t.Load(int3(q, 0)) : float4(0, 0, 0, 0);
+        tf_a[i] = d.xy;
+        tf_z[i] = d.z;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (int it = 0; it < 5; ++it) {
+        // (2, then 1: from the constants, alpha = 2, not literals - folded at compile time, the limits came out rounded unlike
+        // cs_tether_step's and the result differed)
+        const int step = max(1, int(abs(alpha) + 0.5)) >> (it == 0 ? 0 : 1);
+        // (only what a later pass still reads: the tile less 2 at the first pass, then 1 more each - their neighbours were all
+        // worked out by the pass before)
+        const int lo = it == 0 ? 2 : 2 + it, side = kTfSide - 2 * lo;
+        for (uint i = gi; i < uint(side * side); i += 256u) {
+            const int2 l = lo + int2(i % uint(side), i / uint(side));
+            const int2 p = o + l;
+            const uint c = uint(l.x + l.y * kTfSide);
+            const float3 dp = float3((it & 1) ? tf_b[c] : tf_a[c], tf_z[c]);
+            float2 corr = 0;
+            float count = 0;
+            [unroll] for (int k = 0; k < 8; ++k) {
+                const int2 q = p + kRetDirs[k] * step;
+                if (any(q < 0) || any(q >= hs)) continue;
+                const int2 lq = l + kRetDirs[k] * step;
+                const uint j = uint(lq.x + lq.y * kTfSide);
+                if (tether_pull(dp, float3((it & 1) ? tf_b[j] : tf_a[j], tf_z[j]), k, step, corr)) count += 1.0;
+            }
+            const float2 r = dp.xy + (count > 0 ? corr / count : float2(0, 0));
+            if (it & 1) tf_a[c] = r; else tf_b[c] = r;
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    const int2 p = int2(gid.xy) * kTfOut + int2(gt.xy);
+    if (any(p >= hs)) return;
+    const uint c = uint(int(gt.x) + kTfHalo + (int(gt.y) + kTfHalo) * kTfSide);  // (five passes: a > b > a > b > a > b)
+    tt_half_u[p] = float4(tf_b[c] - tt_tb_t.Load(int3(p, 0)), tf_z[c], 0);  // (the last pass's correction - see cs_tether_step)
 }
 // Each rendered pixel: its own displacement plus the correction of the four blocks around it, bilinear, each weighted by how
 // close its nearness is to the pixel's (halved every 2 steps, ~4%): a gun's edge pixel takes the gun's blocks' correction -
@@ -3770,6 +3823,9 @@ bool ow_find(float2 uv, out float2 src) {
         if (ow_tether() && all(src >= 0) && all(src <= 1) && !((flags & 2) && ow_held(int3(min(uint2(src * float2(out_size)), out_size - 1), 0)))) return true;
         // (landed on held pixels - the hand that covered the spot: the memory at the scenery's own spot first; asked at
         // the hand's instead - see ow_scene_from - it gave a thin line of other street along the hand's edge, Cyberpunk)
+        // (HLSL evaluates both sides of &&: ow_mem_fill is asked here whatever the rest says, and what it finds stays in
+        // ow_hidden - so past the frame's edge too the memory at the scenery's own spot is shown first. Kept as it is - the
+        // text of this path unchanged keeps its output bit for bit - and done outright with the splat off: see below)
         if ((flags & 2) && all(src >= 0) && all(src <= 1) && ow_held(int3(min(uint2(src * float2(out_size)), out_size - 1), 0)) && ow_mem_fill(uv, ow_near(ow_depth(src)))) {
             ow_path = 4;
             return true;
@@ -3794,7 +3850,16 @@ bool ow_find(float2 uv, out float2 src) {
         else ow_path = 9;
         return true;
     }
-    return ow_search(uv, src);
+    // The forward splat off - no claims made: every spot by the search, and where it ends past the frame's edge or on held
+    // pixels the same rules as above where no claim is around - the memory at the scenery's own spot first. (It was the bare
+    // search: the frame's edge filled otherwise than with the splat on, Metro seq_1 112, measured 2026-11-10. The splat
+    // decides whether claims are looked up, nothing else)
+    if (!ow_search(uv, src)) return false;
+    const bool in_frame = all(src >= 0) && all(src <= 1);
+    const bool on_held = (flags & 2) && ow_held(int3(min(uint2(src * float2(out_size)), out_size - 1), 0));
+    if (in_frame && !on_held) return true;
+    if (ow_mem_fill(uv, ow_near(ow_depth(src))) && in_frame) ow_path = 4;
+    return true;
 }
 // What the warp shows at an output pixel that is not held (src: where its search landed).
 float4 ow_scene_from(uint2 id, float2 uv, float2 src, bool valid);
@@ -4026,27 +4091,18 @@ RWByteAddressBuffer ow_list_u : register(u1);  // [0] how many, [16..] per block
 RWByteAddressBuffer ow_args_u : register(u0);  // cs_own_warp_args: the full warp's dispatch (groups x, y, z)
 [numthreads(1, 1, 1)] void cs_own_warp_reset(uint3 id : SV_DispatchThreadID) { ow_list_u.Store(0, 0); }
 // The nearest claim around uv, if its surface reaches uv (ow_claimed's first try: the same claim, the same steps).
-// (the nearest claim of a cell's 3x3, kept for the thread's next pixel: the 2x2 output pixels of a thread mostly share their cell -
-// at a 2x upscale always - and looked at the same nine claims each)
-static int2 ow_lc_cell = int2(-100000, -100000);
-static uint ow_lc_best = 0;
-static int2 ow_lc_pb = int2(0, 0);
 bool ow_lean_claim(float2 uv, out float2 src) {
     src = uv;
     const int2 c0 = int2(ow_claims_uv(uv) * float2(rect.zw));
-    if (any(c0 != ow_lc_cell)) {
-        uint best = 0;
-        int bi = 0;
-        [unroll] for (int k = 0; k < 9; ++k) {
-            const uint key = ow_claims_t.Load(int3(clamp(c0 + int2(k % 3 - 1, k / 3 - 1), int2(0, 0), int2(rect.zw) - 1), 0));
-            if (key > best) { best = key; bi = k; }
-        }
-        ow_lc_cell = c0;
-        ow_lc_best = best;
-        ow_lc_pb = best ? ow_claimant(clamp(c0 + int2(bi % 3 - 1, bi / 3 - 1), int2(0, 0), int2(rect.zw) - 1), best) : int2(0, 0);
+    uint best = 0;
+    int bi = 0;
+    [unroll] for (int k = 0; k < 9; ++k) {
+        const uint key = ow_claims_t.Load(int3(clamp(c0 + int2(k % 3 - 1, k / 3 - 1), int2(0, 0), int2(rect.zw) - 1), 0));
+        if (key > best) { best = key; bi = k; }
     }
-    if (ow_lc_best == 0) return false;
-    return ow_refine(uv, ow_lc_pb, float(ow_lc_best >> 22), src);
+    if (best == 0) return false;
+    const int2 pb = ow_claimant(clamp(c0 + int2(bi % 3 - 1, bi / 3 - 1), int2(0, 0), int2(rect.zw) - 1), best);
+    return ow_refine(uv, pb, float(best >> 22), src);
 }
 // Output pixel p the plain way: true if written (what ow_scene + ow_finish give it), false: left for the full warp.
 bool ow_lean(uint2 p) {
@@ -4091,19 +4147,21 @@ bool ow_lean(uint2 p) {
     ow_store(p, c.rgb);
     return true;
 }
-[numthreads(8, 8, 1)] void cs_own_warp_lean(uint3 id : SV_DispatchThreadID) {
-    const uint2 p0 = id.xy * 2;
-    if (any(p0 >= out_size)) return;
-    uint rest = 0;
-    const uint n = ow_low() ? 1u : 4u;  // (at the game's resolution: the block's first pixel alone)
-    [loop] for (uint k = 0; k < n; ++k) {
-        const uint2 p = p0 + uint2(k & 1, k >> 1);
-        if (all(p < out_size) && !ow_lean(p)) rest |= 1u << k;
-    }
-    if (rest) {
+// (a thread per output pixel, the 2x2 block's bits gathered in the group: a thread walking its block's four pixels in turn
+// waited on each one's chain of reads - the claims, the depth, the field's steps, the colour - four times over)
+groupshared uint ol_rest[8 * 8];
+[numthreads(16, 16, 1)] void cs_own_warp_lean(uint3 id : SV_DispatchThreadID, uint3 gt : SV_GroupThreadID) {
+    const uint bi = (gt.y >> 1) * 8 + (gt.x >> 1), k = (gt.x & 1) | ((gt.y & 1) << 1);
+    if (k == 0) ol_rest[bi] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    const uint2 p = id.xy;
+    // (at the game's resolution, ow_low: the block's first pixel alone)
+    if (all(p < out_size) && (k == 0 || !ow_low()) && !ow_lean(p)) InterlockedOr(ol_rest[bi], 1u << k);
+    GroupMemoryBarrierWithGroupSync();
+    if (k == 0 && all(p < out_size) && ol_rest[bi]) {
         uint i;
         ow_list_u.InterlockedAdd(0, 1, i);
-        ow_list_u.Store(16 + 4 * i, id.x | (id.y << 12) | (rest << 24));
+        ow_list_u.Store(16 + 4 * i, (p.x >> 1) | ((p.y >> 1) << 12) | (ol_rest[bi] << 24));
     }
 }
 [numthreads(1, 1, 1)] void cs_own_warp_args(uint3 id : SV_DispatchThreadID) {
@@ -5898,7 +5956,7 @@ bool Renderer::create_pipelines(std::string& error) {
         error = "warp root signature"; return false;
     }
     struct { const char* entry; ComPtr<ID3D12PipelineState>* pso; } ws[] = {
-        {"cs_own_warp", &cs_own_warp_}, {"cs_own_warp_reset", &cs_own_warp_reset_}, {"cs_own_warp_lean", &cs_own_warp_lean_}, {"cs_own_warp_args", &cs_own_warp_args_}, {"cs_own_warp_rest", &cs_own_warp_rest_}, {"cs_warp_claims_clear", &cs_warp_claims_clear_}, {"cs_warp_claim", &cs_warp_claim_}, {"cs_warp_beside", &cs_warp_beside_}, {"cs_warp_held", &cs_warp_held_}, {"cs_own_warp_up", &cs_own_warp_up_}, {"cs_gen_depth", &cs_gen_depth_}, {"cs_gen_unui", &cs_gen_unui_}, {"cs_obj_join_init", &cs_obj_join_init_}, {"cs_obj_join", &cs_obj_join_}, {"cs_obj_join_final", &cs_obj_join_final_}, {"cs_still", &cs_still_}, {"cs_hold_fill", &cs_hold_fill_}, {"cs_grow_init", &cs_grow_init_}, {"cs_grow_clear", &cs_grow_clear_}, {"cs_grow", &cs_grow_}, {"cs_grow_final", &cs_grow_final_}, {"cs_share_measure", &cs_share_measure_}, {"cs_share_blur", &cs_share_blur_}, {"cs_share_bins", &cs_share_bins_}, {"cs_share_final", &cs_share_final_}, {"cs_share_up", &cs_share_up_}, {"cs_share_seam", &cs_share_seam_}, {"cs_att_hist", &cs_att_hist_}, {"cs_share_resid", &cs_share_resid_}, {"cs_resid_blur", &cs_resid_blur_}, {"cs_own_up", &cs_own_up_}, {"cs_tether_init", &cs_tether_init_}, {"cs_tether_step", &cs_tether_step_}, {"cs_tether_final", &cs_tether_final_}, {"cs_tether_pick", &cs_tether_pick_},
+        {"cs_own_warp", &cs_own_warp_}, {"cs_own_warp_reset", &cs_own_warp_reset_}, {"cs_own_warp_lean", &cs_own_warp_lean_}, {"cs_own_warp_args", &cs_own_warp_args_}, {"cs_own_warp_rest", &cs_own_warp_rest_}, {"cs_warp_claims_clear", &cs_warp_claims_clear_}, {"cs_warp_claim", &cs_warp_claim_}, {"cs_warp_beside", &cs_warp_beside_}, {"cs_warp_held", &cs_warp_held_}, {"cs_own_warp_up", &cs_own_warp_up_}, {"cs_gen_depth", &cs_gen_depth_}, {"cs_gen_unui", &cs_gen_unui_}, {"cs_obj_join_init", &cs_obj_join_init_}, {"cs_obj_join", &cs_obj_join_}, {"cs_obj_join_final", &cs_obj_join_final_}, {"cs_still", &cs_still_}, {"cs_hold_fill", &cs_hold_fill_}, {"cs_grow_init", &cs_grow_init_}, {"cs_grow_clear", &cs_grow_clear_}, {"cs_grow", &cs_grow_}, {"cs_grow_final", &cs_grow_final_}, {"cs_share_measure", &cs_share_measure_}, {"cs_share_blur", &cs_share_blur_}, {"cs_share_bins", &cs_share_bins_}, {"cs_share_final", &cs_share_final_}, {"cs_share_up", &cs_share_up_}, {"cs_share_seam", &cs_share_seam_}, {"cs_att_hist", &cs_att_hist_}, {"cs_share_resid", &cs_share_resid_}, {"cs_resid_blur", &cs_resid_blur_}, {"cs_own_up", &cs_own_up_}, {"cs_tether_init", &cs_tether_init_}, {"cs_tether_step", &cs_tether_step_}, {"cs_tether_fine", &cs_tether_fine_}, {"cs_tether_final", &cs_tether_final_}, {"cs_tether_pick", &cs_tether_pick_},
         {"cs_copy4", &cs_copy4_},
         {"cs_sten_clear", &cs_sten_clear_}, {"cs_sten_hist", &cs_sten_hist_}, {"cs_sten_cells", &cs_sten_cells_}, {"cs_sten_flood", &cs_sten_flood_},
         {"cs_sten_apply", &cs_sten_apply_}, {"cs_sten_count", &cs_sten_count_}, {"cs_sten_grow_init", &cs_sten_grow_init_}, {"cs_sten_grow", &cs_sten_grow_}, {"cs_sten_age", &cs_sten_age_}, {"cs_sten_close", &cs_sten_close_}, {"cs_sten_comp_clear", &cs_sten_comp_clear_}, {"cs_sten_comp_count", &cs_sten_comp_count_}, {"cs_sten_comp_max", &cs_sten_comp_max_}, {"cs_sten_prune", &cs_sten_prune_}, {"cs_sten_luma", &cs_sten_luma_}, {"cs_sten_elig", &cs_sten_elig_}, {"cs_sten_fringe", &cs_sten_fringe_}, {"cs_sten_fringe_apply", &cs_sten_fringe_apply_}};
@@ -6896,7 +6954,12 @@ void Renderer::follow_share(const IngestedSource& src, const float clip_to_prev_
     if (share_stamps_) pass_stamp(kPassShareOnly);
     // What the characters do on their own, per cell (cs_share_resid): with the measuring pass's constants (this frame's
     // camera motion, its flags) against the shares just made.
-    if (ensure_private(kPShareResid, cw, ch, DXGI_FORMAT_R16G16B16A16_FLOAT)) {
+    // (only for a warp that carries characters on along it - set_warp_ahead, development: the presenter keeps it at 0, so these
+    // four passes and their textures fed nothing)
+    if (warp_ahead_ <= 0) {
+        if (private_[kPShareResid].texture) retire(kPShareResid);
+        if (private_[kPOwnMove].texture) retire(kPOwnMove);
+    } else if (ensure_private(kPShareResid, cw, ch, DXGI_FORMAT_R16G16B16A16_FLOAT)) {
         for (UINT i = 0; i < kWSrvCount; ++i) set_x_srv(kWSrv(kWShareResid) + i, kPDepth);
         set_x_srv(kWSrv(kWShareResid) + 0, kPObject);
         set_x_srv(kWSrv(kWShareResid) + 2, kPShare);
@@ -7289,6 +7352,11 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
     // game frame's picture to compare this one with (the HUD-less pictures when the previous one is HUD-less).
     bool reticle = false;
     UINT sight_cell = 0;  // (the sight windows found this frame: their cells' size - 0, none looked for)
+    // (the layer only while a sight's window was seen in the last 8 game frames - cs_ret_args' count, read back every frame. Used
+    // whenever it existed, it kept what it last held after the window had gone: a patch of an old one at the screen's centre,
+    // Requiem captures 2-3 (2026-11-09), drawn into every refresh with no sight anywhere - a dark streak on a wall. Seen again
+    // after a gap: made again from nothing - both textures, no history - so nothing older than the gap comes back)
+    const bool window_lately = (ret_seen_bits_ & 0xFFull) != 0;
     if (reticles && keep_att && previous_valid_ && private_[kPPrevious].texture && private_[kPPrevious].width == ow &&
         private_[kPPrevious].height == oh) {
         const PrivateId current = previous_from_hudless_ ? kPHudless : kPBackbuffer;
@@ -7336,12 +7404,12 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
             XConstants a = k;
             // (flag 4 - run the full-screen passes anyway - clears what old layers hold; without layers there is nothing to
             // clear, and it would read back as a window seen: the layers made in every game)
-            a.flags = (ret_ran_ || !layers) ? 0u : 4u;
+            a.flags = ((ret_ran_ && !(ret_restart_ && window_lately)) || !layers) ? 0u : 4u;  // (4 too when made again after a gap)
             x_dispatch(cs_ret_args_.Get(), &a, kXRetEnclSrv, kXRetArgsUav, 1, 1);
             ret_ran_ = true;
             list_->ResourceBarrier(1, &buf);
-            // (no layers yet: whether a sight's window shows, read back - the layers are made once it does, see ret_layers_ready)
-            if (!layers) {
+            // (whether a sight's window shows, read back: the layers are made once it does - see ret_layers_ready - and used while it does)
+            {
                 auto to_copy = transition_barrier(ret_args_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
                 list_->ResourceBarrier(1, &to_copy);
                 list_->CopyBufferRegion(ret_args_readback_.Get(), UINT64(frame_index_) * 32, ret_args_.Get(), 0, 32);
@@ -7351,8 +7419,10 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
             }
         }
         reticle = reticle && layers;
-        if (reticle) {
-            const bool fresh = private_[kPRetA].texture.Get() != history_before;
+        if (reticle && !window_lately) ret_restart_ = true;
+        if (reticle && window_lately) {
+            const bool fresh = private_[kPRetA].texture.Get() != history_before || ret_restart_;
+            if (ret_restart_) { ret_written_[0] = ret_written_[1] = 0; ret_restart_ = false; }  // (every group rewrites both, in turn)
             const PrivateId from = ret_flip_ ? kPRetB : kPRetA, to = ret_flip_ ? kPRetA : kPRetB;
             XConstants k = c;
             k.mv_size[0] = cw; k.mv_size[1] = ch;
@@ -7404,7 +7474,7 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
         }
     }
     if (!reticle) ret_ran_ = false;
-    layer_built_ = reticle;
+    layer_built_ = reticle && window_lately;
     // The stretch around them (option): the distance share, in two passes.
     // (set_motion_reference: the follow texture is every pixel's share of the camera's motion, written with the analysis - cs_ref_frac)
     const bool ref_follow = motion_ref_ && ref_frac_built_ && keep_att && !shared && private_[kPRamp].width == w && private_[kPRamp].height == h;
@@ -7599,8 +7669,11 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
     // character none of it, the scenery all - and the search lost what is carried while the scenery swept past it: a gun in
     // a character's hand broke into pieces whenever the camera turned, RE2 - only in the refreshes between game frames, so
     // no capture ever showed it as bad as it looked. Pure turns are most of RE2's: the forward splat, with depth)
+    // (whatever the forward splat is set to: tied to it, the splat off dropped the depth on every pure turn - and with the depth
+    // the continuous warp, which needs it: the old holding by the search instead, every frame of AC6 seq_1, measured 2026-11-10.
+    // splat_turns_ off - development, FW_SEARCH_TURNS - is the depthless search on pure turns, as before 2026-10-16)
     const bool no_depth = std::fabs(m[8]) <= 1e-6f * scale && std::fabs(m[9]) <= 1e-6f * scale && std::fabs(m[11]) <= 1e-6f * scale &&
-                          !(warp_splat_ && splat_turns_);
+                          !splat_turns_;
     const bool fill_ready = split_ ? shown_fill_ : fill_ready_;
     const bool fill = mask && !split && fill_ready && shown(kPFill).width == ow && shown(kPFill).height == oh;
     const bool remembered = memory && mask && mem_shown_ >= 0 && private_[kPMem0 + mem_shown_].texture;
@@ -7768,17 +7841,26 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
         XConstants tc = c;
         bool in_a = true;
         int passes = 0;
-        for (int step = 64; step >= 1; step /= 2) passes += step <= tether_fine_ ? tether_iters_fine_ : tether_iters_;
+        // (the default passes - one a step, four at step 1: steps 2 and 1 in one dispatch, cs_tether_fine - the same result)
+        const bool fused = tether_iters_ == 1 && tether_iters_fine_ == 4 && tether_fine_ == 1;
+        const int last_step = fused ? 4 : 1;
+        for (int step = 64; step >= last_step; step /= 2) passes += step <= tether_fine_ ? tether_iters_fine_ : tether_iters_;
         const int passes_all = passes;
-        for (int step = 64; step >= 1; step /= 2)
+        for (int step = 64; step >= last_step; step /= 2)
             for (int it = 0; it < (step <= tether_fine_ ? tether_iters_fine_ : tether_iters_); ++it) {
-                tc.alpha = --passes == 0 ? -float(step) : float(step);
+                tc.alpha = --passes == 0 && !fused ? -float(step) : float(step);  // (fused: cs_tether_fine is the last)
                 transition(private_[in_a ? kPTetherA : kPTetherB], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 transition(private_[in_a ? kPTetherB : kPTetherA], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 w_dispatch(cs_tether_step_.Get(), &tc, wc, in_a ? kWTetherAB : kWTetherBA, gx, gy);
                 in_a = !in_a;
             }
-        if (passes_all == 0) {  // (development, FW_TETHER_IT with no passes at all: one at step 1, for the corrections the claims read)
+        if (fused) {
+            transition(private_[in_a ? kPTetherA : kPTetherB], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            transition(private_[in_a ? kPTetherB : kPTetherA], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            tc.alpha = 2.0f;
+            w_dispatch(cs_tether_fine_.Get(), &tc, wc, in_a ? kWTetherAB : kWTetherBA, (hw + 15) / 16, (hh + 15) / 16);
+            in_a = !in_a;
+        } else if (passes_all == 0) {  // (development, FW_TETHER_IT with no passes at all: one at step 1, for the corrections the claims read)
             tc.alpha = -1.0f;
             transition(private_[in_a ? kPTetherA : kPTetherB], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             transition(private_[in_a ? kPTetherB : kPTetherA], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
