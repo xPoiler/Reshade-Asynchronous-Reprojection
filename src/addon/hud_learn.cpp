@@ -79,6 +79,13 @@ std::unordered_map<std::uint64_t, std::uint32_t> g_fstate;
 // buffer's draw: one the game draws into now, not a remembered handle the game may have destroyed since).
 std::uint64_t g_taken_res = 0, g_taken_res_last = 0;
 std::atomic<std::uint32_t> g_status_cands{0}, g_status_active{0};
+// Idle - learning paused while the game gives its HUD, or off: the hooks below return at once (they bound every bind and draw
+// of the game's render thread for nothing - nothing is copied or learned then). Only the pipelines' fingerprints (made when the
+// game creates them) and destroyed textures are still followed. When it resumes: what was followed per list and the pictures'
+// states forgotten, and no candidate tried for the first frames (binds recorded while idle are not known).
+std::atomic<bool> g_idle{false};
+std::uint32_t g_settle = 0;
+bool idle() { return g_idle.load(std::memory_order_relaxed); }
 constexpr std::uint32_t kRun = 12;  // frames per candidate
 
 bool is_bb(std::uint64_t r) { return std::find(g_bbs.begin(), g_bbs.end(), r) != g_bbs.end(); }
@@ -136,7 +143,7 @@ void on_destroy_pipeline(device* dev, pipeline p) {
     g_pipes.erase(p.handle);
 }
 void on_bind_pipeline(command_list* cmd, pipeline_stage stages, pipeline p) {
-    if (!cmd) return;
+    if (!cmd || idle()) return;
     const auto st = static_cast<uint32_t>(stages);
     const bool ps = st & static_cast<uint32_t>(pipeline_stage::pixel_shader), om = st & static_cast<uint32_t>(pipeline_stage::output_merger);
     if (!ps && !om) return;
@@ -167,16 +174,17 @@ void target(command_list* cmd, resource_view first) {
 }
 void on_bind(command_list* cmd, uint32_t n, const resource_view* rtvs, resource_view) {
     if (cmd && tl_pass_list == cmd->get_native()) tl_pass_list = 0;
+    if (idle()) return;
     target(cmd, n && rtvs ? rtvs[0] : resource_view{0});
 }
 bool on_begin_pass(command_list* cmd, uint32_t n, const render_pass_render_target_desc* rts, const render_pass_depth_stencil_desc*, render_pass_flags) {
-    target(cmd, n && rts ? rts[0].view : resource_view{0});
+    if (!idle()) target(cmd, n && rts ? rts[0].view : resource_view{0});
     if (cmd) tl_pass_list = cmd->get_native();
     return false;
 }
 bool on_end_pass(command_list* cmd) { if (cmd && tl_pass_list == cmd->get_native()) tl_pass_list = 0; return false; }
 void drawn(command_list* cmd) {
-    if (!cmd || !g_probe) return;
+    if (!cmd || !g_probe || idle()) return;
     const std::uint64_t list = cmd->get_native();
     if (tl_list != list || !tl_target) return;
     if (!tl_watched) {
@@ -250,7 +258,7 @@ bool on_draw_indirect(command_list* cmd, indirect_command type, resource, uint64
     return false;
 }
 void copied(command_list* cmd, resource src, resource dst) {
-    if (!cmd || !src.handle || !dst.handle) return;
+    if (!cmd || !src.handle || !dst.handle || idle()) return;
     device* dev = cmd->get_device();
     if (!api_ok(dev)) return;
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -262,7 +270,7 @@ void copied(command_list* cmd, resource src, resource dst) {
 }
 bool on_copy_resource(command_list* cmd, resource src, resource dst) { copied(cmd, src, dst); return false; }
 void on_barrier(command_list* cmd, uint32_t count, const resource* resources, const resource_usage*, const resource_usage* new_states) {
-    if (!cmd || g_api != device_api::d3d12) return;
+    if (!cmd || g_api != device_api::d3d12 || idle()) return;
     for (uint32_t i = 0; i < count; ++i) {
         if (!watched(resources[i].handle)) continue;
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -284,12 +292,12 @@ void on_destroy_resource(device*, resource r) {
     if (g_finals.size() != before) rebuild_watch();
 }
 void on_execute(command_queue*, command_list* cmd) {
-    if (!cmd || g_api != device_api::d3d12) return;
+    if (!cmd || g_api != device_api::d3d12 || idle()) return;
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_exec.size() < 1024) g_exec.push_back(cmd->get_native());
 }
 void on_reset(command_list* cmd) {
-    if (!cmd) return;
+    if (!cmd || idle()) return;
     std::lock_guard<std::mutex> lock(g_mutex);
     g_lists.erase(cmd->get_native());
 }
@@ -364,6 +372,19 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
         g_w = d.texture.width; g_h = d.texture.height;
         g_api = dev->get_api();
     }
+    const bool now_idle = paused || !learning;
+    if (now_idle != idle()) {
+        if (!now_idle) {  // (resumed: see g_idle)
+            g_lists.clear();
+            g_exec.clear();
+            g_fstate.clear();
+            g_finals.clear();
+            g_log.clear();
+            g_final = 0;
+            g_settle = 2;
+        }
+        g_idle.store(now_idle, std::memory_order_relaxed);
+    }
     // (final pictures not seen for 300 presents are forgotten)
     const auto before = g_finals.size();
     g_finals.erase(std::remove_if(g_finals.begin(), g_finals.end(), [](const Final& f) { return g_presents - f.seen > 300; }), g_finals.end());
@@ -386,7 +407,7 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
     // has hundreds before it)
     std::vector<std::pair<std::uint32_t, std::uint8_t>> found;
     std::uint32_t seen_bb = 0;
-    for (const auto& e : g_log) {
+    if (!g_settle) for (const auto& e : g_log) {
         if (!e.fp) continue;
         const bool bb = is_bb(e.res);
         if (!bb && e.res != g_final) continue;
@@ -502,8 +523,10 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
                 ++g_since_drawn;
                 if (g_none) g_none();
             }
-            g_active = g_locked;
+            g_active = g_settle ? 0 : g_locked;
         } else if (!learning) {
+            g_active = 0;
+        } else if (g_settle) {
             g_active = 0;
         } else if (g_run == 0 || !g_cands.count(g_active)) {
             // The next candidate after a run (in fingerprint order, round and round).
@@ -516,6 +539,7 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
             --g_run;
         }
     }
+    if (g_settle) --g_settle;
     g_status_cands = static_cast<std::uint32_t>(g_cands.size());
     g_status_active = g_active;
     g_status_locked = g_locked;

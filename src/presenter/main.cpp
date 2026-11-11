@@ -2276,7 +2276,11 @@ void render_thread() {
         // The same picture as the one presented last - this frame shown as it is again (the camera has not
         // moved, or nothing is warped), nothing drawn on it that changes: nothing to draw or present. With a still
         // camera the GPU does nothing at all between game frames.
-        const bool as_is = !(warped && !unmoved) && !settings.overlay_debug && !settings.show_mask && g_app.has_frames && !g_rec.busy;
+        // (the frame counter - Settings::fps_counter: its numbers as of the last half second; a picture is presented when they
+        // change, twice a second at most, even when nothing else has)
+        renderer.set_fps_counter(settings.fps_counter, std::uint32_t(sh.presenter.source_fps + 0.5f), std::uint32_t(sh.presenter.output_fps + 0.5f));
+        const bool as_is = !(warped && !unmoved) && !settings.overlay_debug && !settings.show_mask && g_app.has_frames && !g_rec.busy &&
+                           !renderer.fps_counter_dirty();
         const bool same_picture = as_is && shown_frame && as_is_frame == shown_frame && as_is_w == renderer.width() && as_is_h == renderer.height();
         if (same_picture) renderer.skip_frame();
         // (the recording's dot: red while it records, amber while it is written out - see the blit shader)
@@ -2803,6 +2807,28 @@ struct MouseRing {
 std::wstring mouse_ring_name(DWORD pid) { return L"Local\\FrameWarpMouse_" + std::to_wstring(pid); }
 std::wstring mouse_event_name(DWORD pid) { return L"Local\\FrameWarpMouseEvent_" + std::to_wstring(pid); }
 
+// The presenter's own process blocked for good (not inside the game - there the game's process would go with it): logged,
+// and the process ends, so its window no longer covers the game with a frozen picture. The add-on starts the presenter once a
+// game session (g_presenter_launched): the game runs on as it is. Seen twice in AC6, 2026-11-11: the Steam overlay, injected
+// into the presenter, waited inside its hook on the presenter's Present forever - the refresh stopped a few seconds in, and
+// after the game closed the presenter waited for its render thread for ever too.
+[[noreturn]] void give_up(const char* why) {
+    logf("the presenter gave up: %s (the Steam overlay %s in this process) - it ends here; the game shows as it is", why,
+         GetModuleHandleW(L"gameoverlayrenderer64.dll") ? "is" : "is not");
+    if (g_app.shared) g_app.shared->presenter.pid = 0;
+    g_files.stop();
+    if (g_app.log) std::fflush(g_app.log);
+    TerminateProcess(GetCurrentProcess(), 3);
+    for (;;) Sleep(INFINITE);
+}
+bool present_hung() {
+    const std::int64_t since = g_present_entered.load(std::memory_order_relaxed);
+    if (!since || g_app.in_process) return false;
+    LARGE_INTEGER now, f;
+    QueryPerformanceCounter(&now); QueryPerformanceFrequency(&f);
+    return now.QuadPart - since > 2 * f.QuadPart;  // (2 s: a Present at 120 Hz takes under 10 ms; a mode change well under that)
+}
+
 LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_INPUT: {
@@ -2815,6 +2841,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;  // DefWindowProc must still run for WM_INPUT cleanup
         }
         case WM_TIMER:
+            if (present_hung()) give_up("a refresh has been inside the swap chain's Present for over 2 s");
             if (!g_app.running || (g_app.game_process && WaitForSingleObject(g_app.game_process, 0) == WAIT_OBJECT_0) ||
                 g_app.shared->magic != kMagic) {
                 g_app.running = false;
@@ -2980,6 +3007,9 @@ static int presenter_main(HINSTANCE instance, DWORD pid, const std::filesystem::
     load_profile();
     logf("attached to pid %lu, backbuffer %ux%u fmt %u cs %u", g_app.pid, g_app.shared->backbuffer_width,
          g_app.shared->backbuffer_height, g_app.shared->backbuffer_format, g_app.shared->color_space);
+    // (the add-on starts the presenter without Steam's variables, so the overlay should not take it for the game - see give_up)
+    if (!g_app.in_process)
+        logf("Steam overlay in the presenter's process: %s", GetModuleHandleW(L"gameoverlayrenderer64.dll") ? "YES (injected - see give_up)" : "no");
 
     // Render thread priority matters as much as GPU priority for hitting every vblank.
     if (!g_app.in_process) SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
@@ -3020,6 +3050,9 @@ static int presenter_main(HINSTANCE instance, DWORD pid, const std::filesystem::
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
     g_app.running = false;
+    // (a render thread blocked for good - see give_up - would keep the process alive after the game has gone)
+    if (!g_app.in_process && WaitForSingleObject(renderer.native_handle(), 5000) == WAIT_TIMEOUT)
+        give_up("the render thread did not end within 5 s of the presenter stopping");
     renderer.join();
     controller.join();
     if (mouse_reader.joinable()) mouse_reader.join();
@@ -3049,6 +3082,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::wstring(argv[i]) == L"--pid") pid = static_cast<DWORD>(std::wcstoul(argv[i + 1], nullptr, 10));
         if (std::wstring(argv[i]) == L"--mouse-for") return fw::mouse_helper(instance, static_cast<DWORD>(std::wcstoul(argv[i + 1], nullptr, 10)));
+        // (--env NAME=VALUE: the add-on's switches - development keys, FW_DIAG - when it starts the presenter through Explorer,
+        // whose environment is not the game's: see the add-on's launch_presenter)
+        if (std::wstring(argv[i]) == L"--env") {
+            const std::wstring kv = argv[i + 1];
+            const auto eq = kv.find(L'=');
+            if (eq != std::wstring::npos && eq > 0) SetEnvironmentVariableW(kv.substr(0, eq).c_str(), kv.substr(eq + 1).c_str());
+        }
     }
     wchar_t exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);

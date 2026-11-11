@@ -157,6 +157,13 @@ public:
     // the presenter itself presents once per refresh; a frame that misses its refresh is replaced by the next
     // one instead of holding every frame after it a refresh back). Otherwise each frame waits for a refresh.
     void finish_frame(bool warped, int marker, bool newest = false);
+    // The frame counter drawn by the final pass (Settings::fps_counter: 0 off, 1-4 the corner) with the game's frames and the
+    // refreshes a second (at most 999 each); dirty: what it shows changed since the last picture presented - one is
+    // presented for it even when the picture is the same (main.cpp, as_is).
+    void set_fps_counter(std::uint32_t corner, std::uint32_t game, std::uint32_t out) {
+        fps_word_ = corner ? (std::min(corner, 4u) << 4) | (std::min(game, 999u) << 9) | (std::min(out, 999u) << 19) : 0u;
+    }
+    bool fps_counter_dirty() const { return fps_word_ != fps_word_drawn_; }
     // Nothing new to show this refresh (the picture presented last is still the right one): what the refresh
     // recorded so far (a frame taken in on the same queue, for one) is submitted, with no warp, no blit and no
     // present - the composition keeps showing the last picture.
@@ -671,7 +678,7 @@ private:
     bool learning_stalled_ = true;
     std::uint32_t detection_idle_ = 0;  // game frames since the HUD was last detected (build_no_warp_mask)
     std::uint32_t scene_idle_ = 0;      // game frames since the upscaler's output last came (ingest)
-    ComPtr<ID3D12PipelineState> cs_attached_, cs_ref_pick_, cs_ref_frac_, cs_depth_vec_, cs_mem_mask_, cs_share_weights_, cs_ref_raw_, cs_share_rows_, cs_share_cols_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_hud_apply_, cs_hud_gate_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_own_warp_reset_, cs_own_warp_lean_, cs_own_warp_args_, cs_own_warp_rest_, cs_warp_claims_clear_, cs_warp_claim_, cs_warp_beside_, cs_warp_held_, cs_own_warp_up_, cs_mask_smooth_, cs_memory_, cs_mem_ratio_, cs_mem_relight_, cs_gun_motion_, cs_mem_vis_, cs_hudless_ui_, cs_hudless_keep_, cs_ui_tiles_, cs_layer_unblend_, cs_layer_seam_clear_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_, cs_camera_fill_, cs_probe_tiles_, cs_probe_clear_, cs_probe_score_, cs_share_measure_, cs_share_blur_, cs_share_bins_, cs_share_final_, cs_share_up_, cs_share_seam_, cs_att_hist_, cs_rec_down_, cs_share_resid_, cs_resid_blur_, cs_own_up_, cs_tether_init_, cs_tether_step_, cs_tether_fine_, cs_tether_final_, cs_tether_pick_;
+    ComPtr<ID3D12PipelineState> cs_attached_, cs_ref_pick_, cs_ref_frac_, cs_depth_vec_, cs_mem_mask_, cs_share_weights_, cs_ref_raw_, cs_share_rows_, cs_share_cols_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_hud_apply_, cs_hud_gate_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_own_warp_reset_, cs_own_warp_lean_, cs_own_warp_seek_, cs_own_warp_args_, cs_own_warp_rest_, cs_warp_claims_clear_, cs_warp_claim_, cs_warp_beside_, cs_warp_held_, cs_own_warp_up_, cs_mask_smooth_, cs_memory_, cs_mem_ratio_, cs_mem_relight_, cs_gun_motion_, cs_mem_vis_, cs_hudless_ui_, cs_hudless_keep_, cs_ui_tiles_, cs_layer_unblend_, cs_layer_seam_clear_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_, cs_camera_fill_, cs_probe_tiles_, cs_probe_clear_, cs_probe_score_, cs_share_measure_, cs_share_blur_, cs_share_bins_, cs_share_final_, cs_share_up_, cs_share_seam_, cs_att_hist_, cs_rec_down_, cs_share_resid_, cs_resid_blur_, cs_own_up_, cs_tether_init_, cs_tether_step_, cs_tether_fine_, cs_tether_final_, cs_tether_pick_;
     ComPtr<ID3D12PipelineState> cs_sten_clear_, cs_sten_hist_, cs_sten_cells_, cs_sten_flood_, cs_sten_apply_, cs_sten_count_, cs_sten_grow_init_, cs_sten_grow_, cs_sten_age_, cs_sten_close_, cs_sten_comp_clear_, cs_sten_comp_count_, cs_sten_comp_max_, cs_sten_prune_, cs_sten_luma_, cs_sten_elig_, cs_sten_fringe_, cs_sten_fringe_apply_;
     // Sight reticles (option): the passes, which history texture holds the latest layer, and whether the layer was
     // built for the frame taken in last / the shown one (see cs_ret_layer).
@@ -779,6 +786,7 @@ private:
     ComPtr<ID3D12PipelineState> cs_color_, cs_depth_, blit_;
     ComPtr<ID3DBlob> blit_vs_, blit_ps_;  // (the final pass, rebuilt for another output format)
     std::uint32_t color_space_ = 0;
+    std::uint32_t fps_word_ = 0, fps_word_drawn_ = 0;  // (see set_fps_counter)
     void apply_color_space(std::uint32_t color_space);
     ComPtr<ID3D12DescriptorHeap> heap_, rtv_heap_;
     UINT descriptor_size_ = 0, rtv_size_ = 0;
@@ -824,5 +832,9 @@ private:
     std::vector<ID3D12Resource*> reading_;  // shared textures transitioned for this frame
     ID3D12Resource* srv_resource_[kSlots * kTexCount] = {};  // resource currently described at each source SRV index
 };
+
+// The QPC time the refresh entered the swap chain's Present, 0 outside it: the presenter's watchdog (main.cpp, WM_TIMER) -
+// another process's hook there (the Steam overlay's, injected into the presenter) blocked for good, 2026-11-11 AC6 twice.
+extern std::atomic<std::int64_t> g_present_entered;
 
 }  // namespace fw

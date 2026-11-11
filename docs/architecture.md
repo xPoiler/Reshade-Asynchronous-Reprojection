@@ -1,268 +1,93 @@
 # Architecture
 
-```
- GAME PROCESS                                               PRESENTER PROCESS (FrameWarpPresenter.exe)
- ReShade + FrameWarp.addon64                                 own D3D12 device on the same GPU
- ─────────────────────────────────                           ───────────────────────────────────────────
- inline hooks in sl.interposer.dll                           main thread: overlay window, raw mouse
-   slSetConstants ─► camera (+ integrated position)            (RIDEV_INPUTSINK), window tracking
-   slSetTag/ForFrame ─► GPU copy of depth / MV /             render thread (TIME_CRITICAL), per vblank:
-                        HUD-less / UI into slot textures        1. newest slot whose game fence completed
- PCL marker hook ─► sim-start time, present frame id            2. convert shared → private textures
- reshade_present ─► GPU copy of backbuffer (incl. ReShade UI)   3. PoseModel.predict(now)
-                    signal shared fence, publish slot           4. own warp engine, or NVIDIA Latewarp
- NGX / FSR hooks ─► depth / MV / upscaler output               5. blit → DirectComposition swapchain
-          ═══ shared memory "Local\FrameWarp_<pid>" ═══        GPU priority: realtime process class
-          ═══ shared D3D12 textures + fence (NT handles) ═══     + HIGH queue
+Reviewed against the working tree on 2026-11-11. This describes the current source, including development changes; it is not a claim that every path has been validated in game. Settings and implementation details are defined by the linked source files. Release snapshots describe their own versions.
+
+## Processes and frame transport
+
+FrameWarp runs a ReShade add-on in the game and normally renders through a separate presenter process. The presenter uses D3D12 on the game's adapter and draws into a DirectComposition overlay. The tree also contains an in-process presenter DLL and development paths; their existence does not make them the default deployment.
+
+```text
+Game / ReShade add-on
+  camera, depth, motion, HUD and frame capture
+                 |
+       shared textures + fence
+       shared frame metadata
+                 |
+Presenter intake queue
+  ingest, motion/camera analysis, HUD, mask, memory
+                 |
+       completed shown-frame state
+                 |
+Presenter refresh queue
+  predicted camera -> warp -> composition overlay
 ```
 
-## Source layout
+The shared contract is [protocol.hpp](../src/shared/protocol.hpp). Four slots move through `Free -> Writing -> Ready -> Reading -> Free`. Texture generations distinguish recreated resources; frame metadata and fences associate captures with GPU completion. The presenter promotes completed intake work as a coherent shown-frame state, including its camera and textures.
 
-| Path | Role |
+D3D12 resources use shared handles. The D3D11 transport opens compatible D3D12 textures and shared fences on the game's adapter. Vulkan uses the interop implementation in [vk_transport.cpp](../src/addon/vk_transport.cpp). The overlay can appear on a display driven by another adapter through Windows composition, with potentially substantial extra cost.
+
+## Data acquisition
+
+| Source | Current role |
 |---|---|
-| `src/shared/protocol.hpp` | Shared-memory contract (slots, settings, status, diagnostics, event timeline). Version-checked. |
-| `src/shared/camera_motion.hpp` | Recovers frame-to-frame camera rotation + translation from `viewToClip` and `clipToPrevClip`. |
-| `src/addon/addon.cpp` | ReShade registration, `reshade_present` capture, presenter launch, ImGui panel. |
-| `src/addon/streamline_hooks.cpp` | Hooks for Streamline; runtime layout detection (BaseStructure size, ResourceTag stride); buffer classification. |
-| `src/addon/producer.cpp` | Slot management, GPU copies into shared textures, shared fence, camera position integration, event log. |
-| `src/addon/ngx_hooks.cpp` | Hooks on the driver's NGX exports (`CreateFeature`/`EvaluateFeature`): DLSS parameters, and for games without Streamline, depth, motion vectors and the DLSS output per evaluation. |
-| `src/addon/ffx_hooks.cpp` | Hooks on AMD FSR: the FFX API (`amd_fidelityfx_*_dx12.dll`, FSR 3.1/4), the FidelityFX SDK 1.0 upscaler (`ffx_fsr3upscaler_x64.dll`, FSR 3.0) and FSR 2 (`ffx_fsr2_api_x64.dll`). Depth, motion vectors and the upscaled output per dispatch. |
-| `src/addon/game_probe.cpp` | Byte-verified probes into Expedition 33's Unreal Streamline plugin (forces `ForceTagStreamlineBuffers()` true, counts calls). |
-| `src/common/inline_hook.cpp` | Minimal x64 inline hook (prologue relocation incl. RIP-relative, near relay, atomic patch). |
-| `src/presenter/main.cpp` | Presenter process: overlay window, raw input, render loop, logging, profile persistence. |
-| `src/presenter/renderer.cpp` | D3D12 device/queue, composition swapchain, shared-texture ingest + format conversion, blit, timing. |
-| `src/presenter/latewarp12.cpp` | NGX Latewarp on D3D12 (parameter names from `nvngx_latewarp.dll`); optional. |
-| `src/presenter/pose.hpp` | Camera model: fitting, prediction/interpolation, handoff blending, cursor gate. |
-| `src/presenter/camera_estimator.hpp` | Games without camera data: rotation, translation and field of view fitted to the motion vectors. |
-| `src/presenter/frame_clock.hpp` | Frame times at the game's steady pace for frames that come without a simulation time. |
-| `src/addon/reshade_feed.cpp` | Games without DLSS or FSR: ReShade's depth (through `shaders/XPAR.fx`) published as the frame's depth. |
-| `src/addon/depth_choice.cpp` | Which of the game's depth buffers is the scene's, which way round its depth is stored, and whether ReShade has to copy it before the game clears it. |
-| `src/addon/depth_probe_score.hpp` | Does a depth buffer belong to the picture: brightness changes across its depth edges. |
-| `src/addon/ui_layer.cpp` | The game's own HUD step: a HUD layer it blends onto the picture, or a HUD-less copy of the picture taken right before the HUD's draws (DirectX 12, DirectX 11, Vulkan). |
-| `src/addon/hud_learn.cpp` | HUD learning: where the game draws its HUD, for games no pattern of `ui_layer.cpp` catches - candidate steps copied, scored by the presenter, the best one kept per game. |
-| `src/addon/frame_cap.cpp` | *Prevent GPU queueing*: holds the game's frame starts just below the rate its GPU sustains; stands aside for Reflex, frame generation and a GPU-bound game, with trials to come back. |
-| `shaders/XPAR.fx` | ReShade effect the add-on enables itself: ReShade's depth, oriented near = 1, and a small probe of depth and brightness. |
+| [streamline_hooks.cpp](../src/addon/streamline_hooks.cpp) | Camera constants, tagged depth/motion/HUD resources and frame markers where the game supplies them. |
+| [ngx_hooks.cpp](../src/addon/ngx_hooks.cpp) | DLSS inputs/output and supported generated images, including games without Streamline camera data. |
+| [ffx_hooks.cpp](../src/addon/ffx_hooks.cpp) | Supported FSR upscaler and frame-generation interfaces. FSR 3.0 upscaling support does not imply support for its older frame-generation interface. |
+| [reshade_feed.cpp](../src/addon/reshade_feed.cpp), [depth_choice.cpp](../src/addon/depth_choice.cpp), [XPAR.fx](../shaders/XPAR.fx) | Depth selection, orientation and frame feed when no hooked upscaler supplies the needed data. |
+| [mv_probe.cpp](../src/addon/mv_probe.cpp), [motion_search.hpp](../src/presenter/motion_search.hpp) | Find and validate game motion-vector targets on D3D11/D3D12. Vulkan target searching is disabled (`kVulkanSearch = false`); Vulkan upscaler-provided vectors are a separate path. |
+| [camera_search.cpp](../src/addon/camera_search.cpp), [camera_search.hpp](../src/presenter/camera_search.hpp) | Collect candidate matrices and check their predicted motion against observed motion on D3D11, D3D12 and Vulkan. |
+| [ui_layer.cpp](../src/addon/ui_layer.cpp), [hud_learn.cpp](../src/addon/hud_learn.cpp) | Capture a HUD layer or a picture before HUD drawing, and learn suitable drawing points when direct patterns do not suffice. |
 
-## Game side (add-on)
+Game camera data and found camera matrices are checked against motion evidence. A valid found camera is followed directly; otherwise [camera_estimator.hpp](../src/presenter/camera_estimator.hpp) estimates camera motion from usable vectors or picture-derived flow. Camera search can account for constants supplied a frame ahead. Do not assume every game's callbacks arrive in the E33 ordering observed in early experiments.
 
-* **Hooks.** `slSetConstants`, `slSetTag`, `slSetTagForFrame` (exports of `sl.interposer.dll`) and the
-  PCL marker function (via `slGetFeatureFunction`) are inline-hooked. The add-on module pins itself
-  because ReShade unloads/reloads add-ons during startup while hooks stay installed.
-* **Frame association.** Everything is keyed by Streamline frame token. In Expedition 33 the constants, tags, the
-  PCL present marker and the present call arrive in order on one thread per frame.
-* **Slots.** 4 slots, state machine `Free → Writing (game) → Ready (fence signalled) → Reading
-  (presenter) → Free`, with CAS transitions. The game never touches a slot being read.
-* **Copies only.** Tagged resources are copied with `CopyTextureRegion` in the game's own command
-  list at tag time (transition from the state Streamline reports → COPY_SOURCE and back). Depth is
-  copied in its planar typeless format. The backbuffer is copied at `reshade_present` (after ReShade's
-  effects and menu) and the shared fence is signalled on the game's queue.
-* **Camera position.** Streamline's `cameraPos` is camera-relative (always 0), so the add-on integrates
-  an absolute position every frame from `clipToPrevClip` (`camera_motion.hpp`); discontinuities bump
-  `position_epoch`.
-* **Games without Streamline, and FSR.** After 60 upscaler calls with no Streamline camera, each DLSS
-  evaluation or FSR dispatch publishes its depth and motion vectors as a frame marked `estimated`; the
-  presenter works out the camera (`camera_estimator.hpp`: a robust fit of rotation and translation to
-  an 80x45 grid of motion vectors; the field of view learned by votes, or the one the game gives FSR
-  once checked against the picture). A game that keeps sending its Streamline camera but no Streamline
-  depth (Cyberpunk 2077 with FSR) gets FSR's depth and motion vectors attached to its own frames.
-* **Games without DLSS or FSR (ReShade path).** When no upscaler has given depth for 600 frames, the
-  add-on enables `XPAR.fx` in ReShade's effect chain and publishes its depth (ReShade's depth buffer,
-  un-linearised to near / distance) as the frame's depth, with no motion vectors and a camera to
-  estimate. It drives ReShade's Generic Depth by itself: each picture-shaped depth buffer the game
-  binds is selected in turn (Generic Depth's own override) and scored on a 256x144 probe (brightness
-  changes across depth edges against elsewhere, times coverage); the best one is kept, re-checked when
-  another buffer comes into use. The probe also tells which way round the depth is stored (XPAR.fx
-  turns it), and an empty depth in a running 3D scene switches Generic Depth's copy before clears on.
-  The first upscaler frame ends the feed; it comes back 600 frames after the last one.
-* **DirectX 11.** A D3D12 device of the add-on's own on the game's adapter creates the shared textures
-  (as render-target-capable, which D3D11 needs to open them) and the fence; the game's D3D11.4 device
-  opens both. Copies go through its immediate context, and the fence is signalled from it after the
-  backbuffer copy.
-* **Upscaler output.** Unless *Find the HUD* is set to *Learned from camera motion*: copied right after the
-  upscaler writes it (after `slEvaluateFeature` for Streamline games, after the NGX evaluation or the
-  FSR dispatch otherwise).
-* **The game's HUD step** (`ui_layer.cpp`, option *Use the game's own HUD layer when found*). Found by what the
-  game does, not per game: a screen-sized texture cleared to transparent, drawn into and read at the end of the
-  frame (a draw onto the back buffer, or a compute pass that composes the final picture) is a HUD layer, handed
-  over as the frame's UI layer (its coverage, 8 bits); a HUD drawn straight onto the final picture after the
-  picture is copied there, or onto the back buffer itself, is caught by a copy taken right before the HUD's
-  draws (the frame's HUD-less picture). Nothing is copied inside an open Direct3D 12 render pass. Where no
-  pattern applies, *HUD learning* (`hud_learn.cpp`) records candidate steps, copies one at a time and lets the
-  presenter score it against the picture; the best is kept per game and paused while the game hands its HUD
-  over another way.
-* **Counters.** Presented images and rendered frames are counted for frame-generation detection.
-* **Frame generation (the game's own).** ReShade sits below frame generation's swapchain, so it sees every
-  presented image, from frame generation's own thread and order. The images are therefore taken where they
-  are generated instead: each DLSS-G evaluation (NGX feature 11: `DLSSG.OutputInterpolated`, `DLSSG.Backbuffer`,
-  `DLSSG.MultiFrameCount`) and each FSR 3.1 frame-generation dispatch (`ffxDispatch` of
-  `ffxDispatchDescFrameGeneration`: `outputs`, `presentColor`, `numGeneratedFrames`) gets the generated images
-  and the frame's own picture copied into the frame's slot (`kGen0..2`, `SlotMeta::generated`), on the
-  command list that generated them. The frame is the one whose present the game started last, or the next
-  one when that one has its images already (FSR may generate just before the present marker). At the end of
-  the copies a `WriteBufferImmediate` marker goes into a small readback buffer; a thread publishes the frame
-  (the shared fence signalled from the CPU) once the GPU has written it, whichever queue frame generation
-  submits on. Meanwhile presents publish nothing. With more than three images per frame (6x multi frame
-  generation), three are taken, spread evenly (`SlotMeta::gen_index`: the game's numbers of the ones taken).
+Partial targets containing full motion only on drawn objects are supported. The remaining pixels initially use estimated flow; a validated camera can supply camera-plus-depth motion through `Renderer::fill_from_camera`. Targets containing only object motion relative to camera motion are detected but not used yet. The camera must be judged against independent motion evidence before using it to fill missing vectors.
 
-## Presenter
+With no usable scene depth, only camera rotation can be reprojected. Data source changes reset relevant learned state; depth selection and search can take time after loading or changing settings.
 
-* **Device and priority.** Own D3D12 device on the game's adapter (by LUID), direct queue at HIGH
-  priority, process GPU scheduling class REALTIME (falls back to HIGH), process CPU class HIGH, render
-  thread TIME_CRITICAL.
-* **Never waits on the game GPU.** A slot is taken only when the game's shared fence has already
-  completed (CPU check). Waiting on the GPU made every new frame cost 3 refreshes.
-* **Ingest.** Shared textures (opened by name per generation) are converted by a compute shader into
-  typed private textures (colour in the game's own 4-byte format when it holds the values exactly,
-  RGBA16F otherwise; R32F depth; RG16F motion). A new
-  game frame is taken in between refreshes, as its own GPU submission, so a refresh only warps and
-  presents; one arriving too close to a refresh waits until just after it.
-* **Split queues** (XPAR engine, paced): a game frame is taken in on a second, compute queue at normal
-  priority, into one of two sets of the textures the warp reads (colour, HUD-less and UI layers, depth,
-  no-warp mask, fill); the warp keeps reading the other, shown set. Once the intake queue's fence shows
-  the frame complete, the sets are exchanged on the CPU together with the frame's camera, before a
-  refresh is recorded, and the next intake waits on the GPU for the warps that still read the old set.
-  The shown set stays in the shader-read state on both queues (an unwarped refresh copies it with the
-  warp shader instead of transitioning it); state kept across frames (learned HUD score, world evidence,
-  motion analysis) stays on the intake side, and the previous frame the HUD checks compare against is
-  the shown set itself. The several ms of HUD/mask work of a new frame at 4K therefore never delay a
-  refresh. Latewarp and the unpaced path keep a single queue.
-* **Follow share** (default; option *Character/weapon by how much it follows the turn*). Instead of a held /
-  not-held mask for the character/weapon, every spot learns how much of the camera's turn it follows on screen:
-  a per-spot least-squares fit of its motion against the turn over its recent frames, carried along the spot's
-  own motion from the same surface only and capped by information (a spot keeps its share while the camera
-  rests). Frames that disagree with what a spot has followed so far count less (a weapon's own animation, head
-  bob). Two parts of the turn (*...measured against the turn from your input*): a frame's turn counts as the
-  input's if the mouse or stick moved shortly before it, otherwise as the rest's (a car's steering). The
-  camera's movement has a share of its own, learned only from movement across the frame's turn (an orbiting
-  camera moves along its turn, and those frames teach it nothing) and never above the turn's share. The
-  scenery's shares come from 24 depth bands fed by the spots the motion analysis finds the camera explains
-  (not what it carries); a spot that follows well under half of its band's share is carried (little in
-  between: from 0.35 to 0.5 of it). Spots are spread over their surroundings at the same distance and of the
-  same kind - what the motion analysis finds attached to the camera or moving on its own is not mixed with
-  the scenery beside it - and then carried by region: where at least half of the surroundings are carried,
-  so a gun or a body is carried as one. All of it runs on one spot per 2x2 block of render pixels
-  (`cs_share_measure`, `cs_share_bins`, `cs_share_blur`, `cs_share_final`, `cs_share_vote_h`/`_v`), put
-  back at render resolution by distance (`cs_share_up`, RGBA16: x the input turn's share, y the rest's, z
-  the movement's), which the warp reads directly next to the R8 no-warp mask (HUD; 0.95 for what is held
-  with the share - an outline next to what it carries, a reticle inside a sight's window).
-* **No-warp mask** (R8, used by the warp), built once per game frame:
-  * *character/weapon* (every game): pixels whose motion vectors the camera motion does not explain,
-    close to the camera, or stuck to the screen while the camera moves further out;
-  * *HUD* (games without HUD layers): learned from pixels that stay the same at the same place while
-    the camera moves the scene under them; or, with the option on, predicted per frame from the DLSS
-    output (tone curve per channel, highlight wash-out, smooth per-tile correction) - what the
-    prediction misses is HUD.
-* **Camera check.** The game's frame-to-frame reprojection (with depth) and its motion vectors describe
-  the same motion of the static scene. Per game frame with real camera motion, the presenter measures
-  how much of the first the second explains at its best scale (`shared/camera_check.hpp`). Games whose
-  camera data is right lock the motion vector scale within a few such frames, which ends the check;
-  150 frames with fewer than one in ten consistent, without ever locking, mark the game's camera
-  unusable (`Shared::game_camera_check`). The add-on then ignores the Streamline camera and tags and
-  publishes frames from the upscaler's call with a camera the presenter estimates, remembers the
-  verdict per game until the next update, and takes it back if the estimate explains the motion
-  vectors no better. A game that sends its Streamline camera but no depth gets depth and motion
-  vectors from the DLSS call, for the frame being rendered.
-* **Own motion estimation** (frames with depth but no motion vectors): brightness pyramid of the new and
-  the previous picture, a whole-pixel search at the coarsest level, then inverse-compositional
-  Lucas-Kanade per level with a 3x3 median; a pixel is trusted where its window has texture in both
-  directions and little is left after matching. Untrusted pixels take the motion around them
-  (push-pull fill) and never count as moving on their own. The estimator samples trusted pixels only;
-  with such noisy vectors it falls back to a consensus turn when a plain fit fails, keeps the move
-  close to the previous frame's where a turn and a move look alike, keeps the camera level and eases
-  its up-down angle back towards level, and carries the last frame's motion over up to two frames it
-  cannot explain. These frames are timed by `FrameClock`, and *Auto* latency shows them a whole game
-  frame back.
-* **Frame generation.** When the game presents 1.6 or more images per rendered frame, or calls its frame
-  generation (DLSS-G evaluations, FSR frame-generation dispatches, `Shared::generation_calls`) at least every
-  other frame, for a second, and no
-  generated images come with its frames (a kind XPAR does not take, or NVIDIA Latewarp as the engine), the
-  presenter steps aside (overlay hidden, no GPU work) until the ratio is back near 1. With them, each image
-  gets its depth once per game frame (this frame's, moved back along the motion vectors to the image's
-  moment) and, with HUD layers, the UI taken back out (the warp puts the frame's UI back); over each frame
-  interval the warp shows image i of n at (i + 1) / (n + 1) of it, then the frame, each from the camera of
-  its moment: the game's clipToPrevClip C blended, (1 - b) I + b C for an image b of the way back (exact at
-  both ends, whatever the engine's units and projection), then warped to the displayed camera.
-* **Warp engines.** The own engine (default, any D3D12 GPU). Forward splat (default): every rendered pixel
-  claims the output spot it lands on (its share of each part of the predicted motion, see *Follow share*), the
-  nearest claim winning; each output pixel then refines the nearest claimant's surface onto itself, and what
-  no surface reaches is the scenery behind, continued up to the edge of what is in front (or background
-  memory). The plain pixels go through a small shader first; the rest is packed for the full warp. Without
-  forward splat, for each output pixel a short fixed-point
-  search finds the rendered pixel that lands there at its own depth; masked pixels stay put and are
-  never used as a source for others; revealed screen edges are filled with a short inward blend; no
-  work while the camera has not moved. Around the character/weapon the scenery follows the warp less
-  and less towards it (the stretch: a distance ramp from the camera-attached pixels at render
-  resolution, in two separable passes, stored with the held pixels in a second, XPAR-only mask), so the
-  gap the warp uncovers beside it is covered by stretched scenery and the outline its motion vectors
-  miss stays with it. Uncovered areas elsewhere come from the background memory when it holds them: a
-  half-resolution colour + depth picture of the scenery last seen behind held pixels and just beyond the
-  frame, updated once per game frame on the intake side and carried along with the camera at its
-  remembered depth, forgotten after 60 game frames. Moving objects (option): once per game frame,
-  each pixel the motion analysis finds moving on its own gets its straight-line 3D motion back to the
-  previous frame, as an offset in clip space (`cs_obj_move`, from both frames' depth, the game's
-  clipToPrevClip and projection; per 8x8 block a flag whether anything moves); every frame taken in keeps
-  the previous one's picture and depth (compute copies from the shown set). Per refresh the moving pixels
-  claim the output pixels they cover at the displayed moment, nearest first (`cs_obj_splat`, atomics on a
-  key texture; they also mark where they would land standing still), the warp runs as before, and
-  `cs_obj_fix` revisits only the marked blocks: a claim shows the object at its exact sub-pixel spot (a few
-  steps across the object's surface from the claiming pixel), and a
-  pixel the warp found on an object that has moved on shows the previous frame, warped with its own
-  depth (or, where that frame has the object there too, the nearest still scenery along its motion).
-  What "Keep still" holds as attached to the camera (character/weapon) gets its on-screen motion instead
-  (no camera warp; marked w = kHeld in the offset texture) and claims along it the same way; where it has
-  moved away, the fix-up shows the warp's scene there. Where the warp copies a moving object's pixel
-  without the fix-up looking again (beside held pixels), it takes it from where the object is at the
-  displayed moment. Objects run on their own clock, one game frame behind (frame generation): when a frame is first shown
-  they are where the previous one had them and reach this one's positions one frame interval later; the
-  camera is the warp's, at the displayed moment.
-  NVIDIA Latewarp (optional, `nvngx_latewarp.dll`, NVIDIA GPUs):
-  on a new game frame a throwaway `IsRenderedFrame=1` evaluation registers it, followed by the real
-  evaluation with the predicted camera. View matrices are built relative to the source camera
-  position for precision.
-* **Frame cap** (*Prevent GPU queueing*, add-on side, `frame_cap.cpp`). A fence per present tells when the
-  game's GPU work for each frame is done; once a window of 60 frames, the cap moves towards just under the
-  rate the GPU sustains (no frame waiting in the GPU's queue). It stands aside while the game's Reflex is on,
-  during frame generation, and when frames keep queueing although it holds the game back (GPU-bound); from
-  there it tries again after 20 s (doubling up to 5 minutes while tries fail) and keeps the cap if the game's
-  frame interval grows by 8% or less.
-* **Pacing.** A vblank clock: its period is the refresh rate of the display the game is on, from the display's
-  current mode (`QueryDisplayConfig`, read by the window thread once a second and when the game moves to
-  another display); its phase comes from our swapchain's DXGI frame statistics (measured from them alone when
-  the mode cannot be read). A refresh that would show the same picture as the one presented last (the frame
-  as it is again: camera unmoved, nothing drawn over it that changes) is submitted without drawing or
-  presenting; the composition keeps showing the picture. With present lead
-  > 0 (default 6 ms) the swapchain allows one queued frame and the render thread wakes `lead` ms
-  before each DWM composition deadline (vblank + 2.5 ms), rendering one frame per refresh; the
-  schedule resets whenever the overlay becomes visible again. Lead 0: frame latency 1, render when
-  the swapchain frees a buffer.
-* **Output.** A layered, transparent, no-activate, topmost window follows the game's client area; a
-  DirectComposition visual holds a flip-model composition swapchain (3 buffers, max latency 1,
-  waitable). The window is hidden when the game is not in front or no frames are available. The
-  monitor may be driven by another GPU: rendering stays on the game's GPU and Windows composes the
-  overlay onto whichever display shows it.
+## Intake and refresh scheduling
 
-## Camera model (`pose.hpp`)
+[main.cpp](../src/presenter/main.cpp) coordinates the shown frame, camera model and display clock. [renderer.cpp](../src/presenter/renderer.cpp) implements GPU processing and presentation.
 
-Per axis (yaw about world up, pitch):
+With paced XPAR rendering, intake runs on a separate compute queue while refresh work reads the completed shown set. Separate queues do **not** provide GPU execution isolation: intake, refreshes and the game compete for GPU time.
 
-```
-theta(t) = theta_N + tau*w_N*(1 - exp(-h/tau)) + g * sum_i dc_i * (1 - exp(-(t - s_i)/tau))
-```
+The intake gate (`Renderer::set_intake_gate`, enabled unless `IntakeBetweenWarps=0`) splits intake into pieces and schedules them after chosen refresh fences, using measured piece durations to fit gaps. It has release paths when refreshes stop. This reduces overlap; it does not guarantee an uninterrupted refresh or zero added source latency.
 
-* `theta_N`, `w_N`: angle and angular velocity of the newest game frame; `dc_i`: raw mouse counts at
-  `s_i` (shifted by input delay `d`); `tau`: the game's camera smoothing; `g`: radians per count.
-* `tau` and `d` by grid search, `g` by least squares, refitted every 30 frames on the game's own camera
-  history (frames with a visible cursor excluded).
-* Displayed camera time = `now − latency + setting`, where `latency` is the measured sim-to-ingest time.
-  Negative `h` interpolates between the last two real frames (angles and position exactly).
-* Translation: residual camera velocity (orbit + walking) extrapolated; manual orbit pivot optional.
-* Handoff: when a new frame arrives, the angular difference to the previous prediction is blended out
-  over 50 ms (positions are not blended — tested worse).
+The display clock uses the active display mode and DXGI statistics. Automatic present lead adjusts when rendering starts to meet refreshes. A refresh that would show an unchanged picture can reuse the displayed result without a new draw/present. Neither queue priority nor a fixed amount of GPU work guarantees a particular refresh rate under all game loads.
 
-## Shared memory protocol
+The D3D11/D3D12 frame cap in [frame_cap.cpp](../src/addon/frame_cap.cpp) normally paces the game to reduce queueing. It stands aside for Reflex and frame generation. When GPU-bound, it instead limits queue depth by waiting for the preceding game frame's fence, with a bounded wait; `QueueLimit=0` disables that fallback. The add-on filters present callbacks to those associated with a ReShade game frame.
 
-`Shared` (see `protocol.hpp`) contains: producer identity/session/adapter, backbuffer format and
-colour space, 4 `SlotMeta` (state, frame id, fence value, timestamps, `Camera` incl. matrices and
-position, per-texture info), `Settings` (written by the UI), `PresenterStatus` (written by the
-presenter), `HookStats` (diagnostics) and a 4096-entry event timeline ring. `kVersion` must match on
-both sides; object names embed the game PID and a per-device session id.
+## Warp and image handling
+
+Defaults come from `default_settings` in [producer.cpp](../src/addon/producer.cpp) and runtime setup in [main.cpp](../src/presenter/main.cpp). Saved per-game settings and developer overrides can change them.
+
+| Setting/path | Current default |
+|---|---|
+| Engine | XPAR; NVIDIA Latewarp is optional. |
+| Continuous displacement field | On (`ContinuousWarp` / `FW_TETHER` controls the development override). |
+| Forward splat | Off (`Settings::warp_splat = 0`). |
+| Follow share | On; input-driven and other camera motion are distinguished. |
+| Background memory | On, at 1/4 of the picture's width and height. |
+| Uncovered screen edges | Dithered. |
+| Camera latency | Lowest latency without edge fill (`auto_prediction = 6`). |
+| Present lead | Automatic; 6 ms is the manual setting's initial value. |
+| Detailed diagnostics | Off unless enabled or forced by a developer override. |
+
+Motion analysis and follow-share history identify how regions move relative to the camera. The continuous warp builds a displacement field that limits separation between neighboring regions, reducing tears while stretching nearby scenery. It does not reconstruct unseen geometry; large turns and thin strands can still show artifacts.
+
+With splat off, each output pixel searches the field for its source. With splat on, rendered pixels claim output locations and nearer surfaces win. Both use the continuous field when enabled; splat off is not equivalent to disabling continuous warp. The current search path can separate ordinary pixels from the more expensive remainder (`cs_own_warp_seek` / `cs_own_warp_rest`), with fallback paths for reticle layers, debug paths and other conditions. This optimization's in-game validation is tracked separately from its implementation.
+
+The HUD is composited from game-provided layers, captured/learned drawing points or detection, depending on available data. Layer validation currently depends on upscaler output in relevant paths. The D3D11 direct-back-buffer fourth capture pattern remains a support gap.
+
+Reticles without their own depth use a learned sight layer. The layer is only applied while a sight window has been seen recently, and its history is restarted after a gap. Character and weapon pixels under continuous warp generally follow the field rather than forming the old hard held mask. The near-camera and turn rules still contribute to their classification when follow share is enabled.
+
+Background memory retains eligible scenery and is updated with each game frame. Under the default continuous warp it mainly supplies screen-edge and HUD fills. Memory validity, visibility and guard state affect reuse; there is no universal promise that every remembered pixel expires after exactly one second or 60 frames.
+
+The old XPAR moving-objects/frame-generation implementation was removed. The presenter keeps `set_warp_ahead(0)`; do not infer that the development residual-motion path is active. Supported DLSS and FSR 3.1 generated images from the game are still consumed and reprojected. Unsupported generation modes make FrameWarp pause.
+
+NVIDIA Latewarp remains an optional engine requiring its DLL and suitable hardware. Its path registers a new rendered frame with a throwaway evaluation before the target-camera evaluation. Performance measurements from that path do not describe XPAR's current warp.
+
+## Camera prediction and diagnostics
+
+[pose.hpp](../src/presenter/pose.hpp) learns the camera response to mouse/controller input and predicts the display camera. [camera_motion.hpp](../src/shared/camera_motion.hpp) handles matrix-derived motion, and [frame_clock.hpp](../src/presenter/frame_clock.hpp) regularizes frame timing when simulation timestamps are unavailable. Use the model tests and recordings to validate changes; E33's early gain, delay and orbit measurements are not universal constants. The current presenter disables the measured-orbit warp rather than exposing the old manual orbit controls as an active default.
+
+Routine diagnostics and log-only measurements are opt-in. Log rotation occurs when diagnostics first open in a run; crash and add-on initialization-failure reports are exceptions. See [testing and diagnostics](../dev/docs/testing-and-diagnostics.md) for tests, recording controls and verification limits.

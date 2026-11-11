@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 88;
+constexpr std::uint32_t kVersion = 89;
 // (four: the presenter taking one in, one ready, and the add-on writing two - a game that starts its next frame before
 // the last one is presented (its tags and constants come first: Cyberpunk, Enshrouded) has two being written. Three
 // slots, 2026-10-28, dropped 43-55% of their frames before the presenter saw them - the reprojection fed at half the
@@ -145,6 +145,9 @@ struct Settings {
                                        // the game camera's whole turn (a car's steering, a gun's own animation; saved per game)
     std::uint32_t memory_resolution;   // background memory: 0 the picture's own resolution, 1 half, 2 a quarter (default) - less
                                        // video memory and GPU time, softer where it fills (saved per game)
+    std::uint32_t fps_counter;         // the presenter's frame counter in a corner of its picture - the game's frames and the
+                                       // refreshes shown a second: 0 off, 1 top left, 2 top right (default), 3 bottom left, 4 bottom
+                                       // right (saved per game; the Steam overlay's own counter is not drawn on the presenter)
 };
 
 // Presenter status, displayed by the add-on UI.

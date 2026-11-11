@@ -21,6 +21,11 @@
 #include "shared/dev_keys.hpp"
 #include <d3d12.h>
 #include <dxgi1_2.h>
+#include <shlobj.h>
+#include <exdisp.h>
+#include <shldisp.h>
+#include <servprov.h>
+#include <wrl/client.h>
 #include <algorithm>
 #include <cmath>
 #include <atomic>
@@ -28,6 +33,7 @@
 #include <cstdio>
 #include <initializer_list>
 #include <string>
+#include <vector>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -107,8 +113,107 @@ bool launch_in_process(const std::wstring& dir) {
     return true;
 }
 
+// The game's environment for the presenter without Steam's variables (Steam*, the Vulkan overlay layer's switch): the Steam
+// overlay follows a game's child processes and, taking the presenter for the game, hooked its Present - and blocked there
+// for good, AC6 twice on 2026-11-11 (see the presenter's give_up). Its log says whether the overlay is still in it.
+std::vector<wchar_t> presenter_environment() {
+    std::vector<wchar_t> out;
+    wchar_t* const block = GetEnvironmentStringsW();
+    if (!block) return out;
+    for (const wchar_t* e = block; *e; e += wcslen(e) + 1) {
+        if (_wcsnicmp(e, L"Steam", 5) == 0 || _wcsnicmp(e, L"ENABLE_VK_LAYER_VALVE", 21) == 0) continue;
+        out.insert(out.end(), e, e + wcslen(e) + 1);
+    }
+    FreeEnvironmentStringsW(block);
+    out.push_back(0);
+    if (out.size() == 1) out.push_back(0);  // (an empty block: two zeros)
+    return out;
+}
+
+// (the game runs elevated: a presenter Explorer starts - not elevated - could not open the game's shared memory or process)
+bool game_elevated() {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    TOKEN_ELEVATION e{};
+    DWORD n = 0;
+    const bool ok = GetTokenInformation(token, TokenElevation, &e, sizeof(e), &n) != 0;
+    CloseHandle(token);
+    return ok && e.TokenIsElevated;
+}
+// The presenter started by Explorer - the desktop's shell view, IShellDispatch2::ShellExecute - not by the game: no child of
+// the game's, so the Steam overlay, which follows the game's child processes, is not injected into it. (Without Steam's
+// variables it still was - AC6 2026-11-11 - and twice it blocked the presenter's Present for good: see the presenter's
+// give_up.) Asked on a thread of its own and not waited for: a call into Explorer has no time limit, and a hung Explorer
+// must not hold the game's present. The thread keeps the add-on loaded until it ends (FreeLibraryAndExitThread).
+// g_explorer_state: 0 asked, 1 Explorer took it, 2 it did not.
+std::atomic<int> g_explorer_state{0};
+struct ExplorerLaunch { std::wstring path, args, dir; HMODULE module; };
+DWORD WINAPI explorer_launch_thread(void* p) {
+    std::unique_ptr<ExplorerLaunch> job(static_cast<ExplorerLaunch*>(p));
+    bool done = false;
+    if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
+        {
+            using Microsoft::WRL::ComPtr;
+            ComPtr<IShellWindows> windows;
+            ComPtr<IDispatch> desktop, background, application;
+            ComPtr<IServiceProvider> provider;
+            ComPtr<IShellBrowser> browser;
+            ComPtr<IShellView> view;
+            ComPtr<IShellFolderViewDual> folder_view;
+            ComPtr<IShellDispatch2> shell;
+            VARIANT location{}, empty{};
+            location.vt = VT_I4; location.lVal = CSIDL_DESKTOP;
+            long hwnd = 0;
+            if (SUCCEEDED(CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(&windows))) &&
+                windows->FindWindowSW(&location, &empty, SWC_DESKTOP, &hwnd, SWFO_NEEDDISPATCH, &desktop) == S_OK && desktop &&
+                SUCCEEDED(desktop.As(&provider)) && SUCCEEDED(provider->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(&browser))) &&
+                SUCCEEDED(browser->QueryActiveShellView(&view)) && SUCCEEDED(view->GetItemObject(SVGIO_BACKGROUND, IID_PPV_ARGS(&background))) &&
+                SUCCEEDED(background.As(&folder_view)) && SUCCEEDED(folder_view->get_Application(&application)) && application &&
+                SUCCEEDED(application.As(&shell))) {
+                BSTR file = SysAllocString(job->path.c_str());
+                VARIANT a{}, d{}, op{}, show{};
+                a.vt = VT_BSTR; a.bstrVal = SysAllocString(job->args.c_str());
+                d.vt = VT_BSTR; d.bstrVal = SysAllocString(job->dir.c_str());
+                op.vt = VT_BSTR; op.bstrVal = SysAllocString(L"open");
+                show.vt = VT_I4; show.lVal = SW_SHOWNOACTIVATE;  // (never the game's focus)
+                done = SUCCEEDED(shell->ShellExecute(file, a, d, op, show));
+                SysFreeString(file); VariantClear(&a); VariantClear(&d); VariantClear(&op);
+            }
+        }
+        CoUninitialize();
+    }
+    g_explorer_state = done ? 1 : 2;
+    const HMODULE module = job->module;
+    job.reset();
+    if (module) FreeLibraryAndExitThread(module, 0);
+    return 0;
+}
+// (true: asked - see g_explorer_state for what came of it)
+bool launch_through_explorer(const std::wstring& path, const std::wstring& args, const std::wstring& dir) {
+    HMODULE module = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(&explorer_launch_thread), &module);
+    auto* job = new ExplorerLaunch{path, args, dir, module};
+    g_explorer_state = 0;
+    const HANDLE thread = CreateThread(nullptr, 0, explorer_launch_thread, job, 0, nullptr);
+    if (!thread) { delete job; if (module) FreeLibrary(module); return false; }
+    CloseHandle(thread);
+    return true;
+}
+// (started through Explorer, when: Explorer refused it, or not registered in the shared memory 10 s later - it is started
+// the usual way instead)
+std::uint64_t g_explorer_tick = 0;
+bool g_explorer_failed = false;
+
 void launch_presenter() {
-    if (g_presenter_launched) return;
+    if (g_presenter_launched) {
+        if (!g_explorer_tick) return;
+        const bool refused = g_explorer_state == 2;
+        if (!refused && GetTickCount64() - g_explorer_tick < 10000) return;
+        g_explorer_tick = 0;
+        g_explorer_failed = true;
+        if (g_producer) g_producer->log_line(refused ? "FrameWarp: Explorer did not start the presenter - started by the game instead"
+                                                     : "FrameWarp: the presenter started through Explorer did not come up - started by the game instead");
+    }
     g_presenter_launched = true;
     // Next to the add-on first. Some games (e.g. RE9's launcher) copy the DLLs from the game folder into a
     // staging folder and load them from there without subfolders, so also look next to the game's exe.
@@ -129,6 +234,13 @@ void launch_presenter() {
     }
     // (detailed diagnostics on at launch: the presenter's log from its first line - see its set_diagnostics)
     SetEnvironmentVariableW(L"FW_DIAG", g_producer && g_producer->shared() && g_producer->shared()->settings.record_diagnostics ? L"1" : nullptr);
+    // (the same switches on the command line for a presenter Explorer starts - its environment is Explorer's)
+    std::wstring env_args;
+    for (const fw::DevKey& key : fw::kDevKeys) {
+        wchar_t v[2] = {};
+        if (GetEnvironmentVariableW(key.wenv, v, 2) == 1) env_args += L" --env " + std::wstring(key.wenv) + L"=" + v;
+    }
+    if (g_producer && g_producer->shared() && g_producer->shared()->settings.record_diagnostics) env_args += L" --env FW_DIAG=1";
     fw::register_stencil_dump_events();  // (StencilDump/StencilMask: hooked only when one is on - see reshade_feed.cpp)
     DWORD error = ERROR_FILE_NOT_FOUND;
     for (const auto& path : candidates) {
@@ -136,9 +248,15 @@ void launch_presenter() {
         std::wstring cmd = L"\"" + path + L"\"" + args;
         const std::wstring dir = path.substr(0, path.find_last_of(L"\\/"));
         if (launch_in_process(dir)) return;
+        if (!g_explorer_failed && !game_elevated() && launch_through_explorer(path, args + env_args, dir)) {
+            g_explorer_tick = GetTickCount64();
+            return;
+        }
         STARTUPINFOW si{sizeof(si)};
         PROCESS_INFORMATION pi{};
-        if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, dir.c_str(), &si, &pi)) {
+        std::vector<wchar_t> env = presenter_environment();
+        if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                           env.empty() ? nullptr : env.data(), dir.c_str(), &si, &pi)) {
             CloseHandle(pi.hThread);
             g_presenter_process = pi.hProcess;
             return;
@@ -161,6 +279,7 @@ bool presenter_running() {
         if (WaitForSingleObject(h, 0) == WAIT_TIMEOUT) {
             if (g_presenter_process) CloseHandle(g_presenter_process);
             g_presenter_process = h;
+            g_explorer_tick = 0;  // (came up - see launch_presenter)
             return true;
         }
         CloseHandle(h);
@@ -192,6 +311,7 @@ constexpr Persisted kPersisted[] = {
     {"FrameCap", &fw::Settings::frame_cap, nullptr},
     {"EdgeFill", &fw::Settings::edge_fill, nullptr},
     {"MemoryResolution", &fw::Settings::memory_resolution, nullptr},
+    {"FpsCounter", &fw::Settings::fps_counter, nullptr},
     {"EdgeLimit", nullptr, &fw::Settings::edge_limit_pct},
     {"EdgeUnlimited", &fw::Settings::edge_unlimited, nullptr},
     {"WarpEngine", &fw::Settings::warp_engine, nullptr},
@@ -787,6 +907,15 @@ void draw_overlay(effect_runtime*) {
     ImGui::SameLine();
     bool original = s.show_original != 0;
     if (ImGui::Checkbox("Show original (A/B)", &original)) s.show_original = original;
+    {
+        static const char* const kCorners[] = {"Off", "Top left", "Top right", "Bottom left", "Bottom right"};
+        int corner = static_cast<int>(std::min<std::uint32_t>(s.fps_counter, 4u));
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9.0f);
+        if (ImGui::Combo("Frame counter", &corner, kCorners, 5)) s.fps_counter = static_cast<std::uint32_t>(corner);
+        hint("The presenter's own counter in a corner of the picture: GAME - the game's frames a second XPAR takes in; OUT - the "
+             "refreshes a second it shows. Drawn by XPAR on its own picture, which covers the game's window - counters drawn into "
+             "the game (the Steam overlay's, for one) stay under it. Remembered per game.");
+    }
 
     const bool alive = presenter_running();
     ImGui::Text("Presenter: %s", alive ? "running" : "not running");
@@ -1172,7 +1301,9 @@ void draw_overlay(effect_runtime*) {
             if (shown_in_ui(kHiddenFromUi.hud_learn) && ImGui::Checkbox("Learn where the game draws its HUD (where nothing above gives it)", &learn)) s.hud_learn = learn;
             if (s.hud_learn && g_producer && g_producer->shared()) {
                 const auto& lh = g_producer->shared()->hooks;
-                if (lh.learn_locked)
+                if (g_producer->game_gives_hud())  // (see hud_learn::on_present: nothing tried or copied meanwhile)
+                    ImGui::TextDisabled("HUD learning: paused - the game gives its HUD itself%s", lh.learn_locked ? " (a learned point kept)" : "");
+                else if (lh.learn_locked)
                     ImGui::TextDisabled("HUD learning: learned (%08x), the HUD taken from there on %u frames", lh.learn_locked, lh.learn_used);
                 else
                     ImGui::TextDisabled("HUD learning: learning - %u candidates, trying %08x, %u copies taken", lh.learn_candidates, lh.learn_active,

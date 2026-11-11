@@ -3,6 +3,8 @@ DISABLE GLOBAL FRAME LIMITERS, INCLUDING BACKGROUND FRAME LIMITERS (CHECK NVIDIA
  
 # FrameWarp
 
+This README describes the current source checkout. Documentation bundled with a release describes that release.
+
 **Asynchronous camera reprojection for PC games.** FrameWarp shows camera motion at your display's
 refresh rate, whatever frame rate the game renders at. For example, a game locked to 30 fps turns and
 moves at 120 Hz on a 120 Hz display. In ReShade it appears as **XPAR** (xPoiler's Asynchronous
@@ -142,15 +144,18 @@ to defaults** at the top of the panel does the same at any time.
 |---|---|
 | **Enable reprojection (N Hz)** | Turns reprojection on or off. N is the refresh rate of the display the game is on, from its current display mode. |
 | **Show original (A/B)** | Shows the game's own frames, for comparison. |
+| **Frame counter** | On by default, remembered per game. A small grey counter in a corner of FrameWarp's picture: **GAME**, the game's frames per second that FrameWarp takes in, and **OUT**, the refreshes per second it shows. Pick the corner (top right by default) or turn it off. Counters drawn into the game, such as the Steam overlay's, are hidden under FrameWarp's picture. |
 | **Auto latency** | How far behind the newest game frame the displayed camera sits. **Lowest latency without edge fill** (default): every refresh, the camera as late as it can be without revealing anything the game hasn't rendered - the camera as of now (your mouse up to this moment) while you aim or turn slowly, falling back as far as one game frame during fast turns, where what the warp reveals comes from the game's last two frames (keep *Background memory* on). **Camera as of now (edge-limited)**: always as close to now as the uncovered screen edge allows (*Extra uncovered edge*: how much more of the edge than *Auto* may be uncovered; *No edge limit*: always now). **Auto**: 1/2 game frame behind, 1/4 in games without HUD layers, a whole frame in games without DLSS or FSR. **1 frame**, **1/2**, **1/4**, or **Off** to set the latency by hand. |
-| **Prevent GPU queueing** | On by default, remembered per game. Not a frame rate limit you set: FrameWarp finds the rate the game's GPU sustains and holds the game just below it, so no frame waits in the GPU's queue and the game reads your input later (what NVIDIA Reflex does). It stands aside by itself while the game's own Reflex is on, during frame generation, and while the GPU is the limit (holding the game back would only cost frames); then it tries again now and then (after 20 s, twice as long after each try that fails, up to 5 minutes) and comes back if it costs the game 8% of its frame rate or less (ReShade.log says how each try went). DirectX 12 and 11. |
+| **Prevent GPU queueing** | On by default, remembered per game. FrameWarp measures the rate the game can sustain and paces its frames to reduce GPU queueing. It stands aside for the game's Reflex and frame generation. When the GPU is the limit, it instead limits the game to one queued frame, then periodically retries pacing. DirectX 12 and 11. Performance still depends on the GPU load shared by the game and presenter. |
 | **Uncovered screen edges** | XPAR engine, remembered per game. What a fast turn uncovers past the edge of the game's frame, where background memory has nothing. **Dithered** (default): the game's frame as it is there, mixed into the warped picture in a fine pattern near the edge - noisy, not smeared. **Soft**: a blur of the scenery along the edge, wider further out. **Extended edge pixels**: the edge repeated (sharper close to it, streaks further out). |
 | **Controller right stick drives rotation** | On by default, remembered per game. The right stick of a controller (XInput: Xbox pads, or others through Steam Input) moves the reprojected camera between the game's frames, as the mouse does; how fast the stick turns the camera and the game's response curve are learned from the game's own camera (shown under the camera model). |
 | **Force a borderless window** | Off by default, remembered per game, applies when the game is restarted. For games that only run in exclusive fullscreen, where nothing can be shown over the game: the game stays in a window that covers the screen and is told it is fullscreen. |
-| **Show the mask** | Tints what is held (magenta): the HUD, and what follows almost none of the camera's turn, to check the options above. With *Learned from camera motion* and NVIDIA Latewarp (or *Present lead* 0), the HUD still being learned shows green too. |
-| **Record detailed diagnostics** | Off by default, remembered per game. Writes frame-by-frame recordings to the logs folder, for troubleshooting, and turns on the **Ctrl+Shift+M** (mark a moment in the log) and **Ctrl+Shift+D** (capture the current frames; the game pauses for about a second) keys. |
+| **Show the mask** | Shows the pixels the active warp holds still. With the default continuous warp, characters and weapons follow the displacement field, so the held-pixel view mainly shows the HUD. The view differs with other warp paths. |
+| **Record detailed diagnostics** | Off by default, remembered per game. Enables routine presenter/add-on diagnostics, performance measurements for the logs, and frame-by-frame CSV recordings. Also enables **Ctrl+Shift+M** (mark a moment), **Ctrl+Shift+D** (capture frames), and **Ctrl+Shift+F8** (record a sequence). Capturing frames can briefly pause the output. Crash reports and add-on initialization-failure reports are separate. |
 | **Reset camera model** | Re-learns how the game's camera responds to your mouse. This also happens automatically within seconds of play. |
 | **Start presenter** | Restarts the presenter if it was closed. |
+
+Settings that the current path does not use are greyed out; their tooltips explain why.
 
 The panel shows only the settings above; the others keep working at their defaults, or at what
 `ReShade.ini` remembers. To see and change them, add `ShowAllSettings=1` under `[FrameWarp]` in the
@@ -158,24 +163,24 @@ game's `ReShade.ini`:
 
 | Setting | What it does |
 |---|---|
-| **Automatic present lead** | On by default. FrameWarp renders each refresh as late as its warp still makes it (measured), for the freshest camera, and backs off when a frame misses. Untick it to set **Present lead (ms)** by hand: how early each frame is rendered before the display refresh. With the XPAR engine and a lead above 0, new game frames are taken in on their own GPU queue, so their processing never delays a refresh (about 50–100 MB more video memory at 4K). |
+| **Automatic present lead** | On by default. FrameWarp measures how early it must render to reach each refresh and adjusts the lead. Untick it to set **Present lead (ms)** manually. With the XPAR engine and a lead above zero, new frames are processed on a separate GPU queue; intake work is scheduled between refresh warps where possible. Both queues still share the GPU, so heavy work can delay a refresh. |
 | **Keep HUD still** | Warps the scene but not the HUD, using the HUD layers the game provides (Expedition 33). |
-| **Keep still** | What is not warped. **HUD + character/weapon** (default), **HUD only**, **Character/weapon only** or **Off**. *HUD*: in games without HUD layers, FrameWarp finds the HUD itself (see *Find the HUD*). *Character/weapon*: what moves with the camera, such as a first-person weapon, a third-person character or a car's interior, from the game's motion vectors in every game (see *Character/weapon by how much it follows the turn*); it starts after a few seconds of turning the camera. |
-| **Character/weapon by how much it follows the turn** | On by default, remembered per game. Every spot of the picture learns, frame after frame, how much of the camera's turn it follows on screen, and the warp moves it by exactly that: a third-person character the camera circles not at all, the scenery all of it, the ground around the character part of it; the camera's movement (walking, driving) is learned on its own, so a weapon or a car's interior that follows the turn but not the movement isn't pushed by it. There is no edge between held and not held for a character to split along. *Keep still what the camera turns around*, *Hold the whole character* and the stretch aren't used with it. |
+| **Keep still** | Selects the HUD and character/weapon handling: **HUD + character/weapon** (default), **HUD only**, **Character/weapon only** or **Off**. HUD layers are used where available; otherwise the HUD is detected. Character/weapon motion comes from game vectors or picture-derived estimates. With the default continuous warp, these regions guide the displacement field rather than all being held at a fixed screen position. |
+| **Character/weapon by how much it follows the turn** | On by default, remembered per game. Learns how much each part of the picture follows the camera's turn and movement, so scenery, a character and a vehicle interior can move differently. The default continuous warp smooths the displacement around them to reduce tears, at the cost of stretching nearby scenery. *Hold the whole character* and *Stretch around character/weapon* apply when this option is off. The near-camera and turn rules still contribute to character classification. |
 | **...measured against the turn from your input** | On by default, remembered per game. A turn from your mouse or stick and a turn the camera makes by itself (a car's steering) are learned separately, and the warp applies each to its own part of the predicted turn: a car's interior stays put while you steer and follows when you look around. |
-| **Keep near-camera motion still** | On by default, remembered per game. Part of *Character/weapon*: things close to the camera that move against it (a weapon mid-animation, hands) are kept still. Turn it off if the floor near the camera is kept still while strafing; a weapon that stays put on screen is still kept still. |
-| **Keep still what the camera turns around (third-person)** | On by default, remembered per game; not used with *Character/weapon by how much it follows the turn*. Part of *Character/weapon*: while the camera turns, anything that moves less than a fifth of what the turn alone would move it on screen is kept still. Over-the-shoulder cameras circle the character, so it barely moves on screen while the room swings around it; the warp turns the view around the camera and would otherwise swing the character away until the next game frame snaps it back. |
+| **Keep near-camera motion still** | On by default, remembered per game. Helps classify nearby things moving against the camera, such as an animated weapon or hands. The active warp uses that classification for character/weapon handling. Try disabling it if nearby scenery is incorrectly treated as attached to the camera. |
+| **Keep still what the camera turns around (third-person)** | On by default, remembered per game. Part of character/weapon classification: identifies things that move much less on screen than the camera turn would move scenery. With follow share on, this still helps identify attached regions; it does not enable the separate measured-orbit camera model. |
 | **Hold the whole character** | On by default, remembered per game; only used with *Character/weapon by how much it follows the turn* off. A character the camera follows (running, its limbs swinging, the camera lagging a little) is held as one piece: what stays in place on screen over several frames while the camera moves, and its moving parts touching it. |
 | **Hold sight reticles** | On by default, remembered per game, XPAR engine. Part of *Character/weapon*: red dot and holographic sights whose reticle the game draws without depth of its own (it would skip with the scenery behind the glass while turning). Inside the window the held weapon encloses, what is on the glass (reticle, glow) is learned as a layer that follows the reticle within a few frames of turning, and only the scenery under it is warped. Sights drawn with depth are held anyway. |
 | **Stretch around character/weapon** | 0-32 render pixels, 1 by default (0 turns it off), remembered per game, XPAR engine; only used with *Character/weapon by how much it follows the turn* off. Where the scenery slides away from a kept-still character or weapon, the warp uncovers a gap and fills it from the nearest scenery pixel, which draws streaks and smears the outline its motion vectors miss (anti-aliasing, the upscaler's softening). With a width set, the scenery that close follows the warp less and less towards the character or weapon: the gap is covered by slightly stretched scenery, and the outline stays with it. |
-| **Background memory for uncovered areas** | On by default, remembered per game, XPAR engine. The scenery last seen around the kept-still character or weapon, just beyond the screen's edges and behind things that pass in front of it (a person walking by, a pole the camera moves past) is remembered (at *Background memory resolution*, up to a second) and shown where the warp uncovers it while turning or strafing, instead of stretched scenery. About 0.2 ms of GPU time per game frame at 1/2, on the intake queue. |
-| **Background memory resolution** | **1/2** (default), **Full** or **1/4**, remembered per game, against the game's picture. Full fills behind the HUD, the character and the screen edges as sharp as the scenery around them, for about 4x the video memory and more GPU time (about 415, 105 and 26 MB at 4K for Full, 1/2 and 1/4); 1/2 and 1/4 are softer where they fill. |
+| **Background memory for uncovered areas** | On by default, remembered per game, XPAR engine. Remembers visible scenery and uses it where the warp reveals areas it has seen before. With the default continuous warp, it mainly helps at screen edges and behind the HUD; the field handles stretching beside characters. GPU and memory costs depend on resolution and scene content. |
+| **Background memory resolution** | **1/4** (default), **1/2** or **Full**, remembered per game, relative to the game's picture dimensions. Full preserves finer detail in remembered fills; lower resolutions reduce GPU work and video memory. Doubling each dimension uses roughly four times the memory for these textures. |
 | **Find the HUD** | Remembered per game. **Upscaler output + camera motion check** (default): compares the final picture with the upscaler's (DLSS or FSR) own output, which has no HUD, and leaves out what is seen moving with the world when the camera turns (bright lights, neon or effects drawn after upscaling). **From the upscaler output**: the comparison alone. **Learned from camera motion**: finds the HUD from what stays put on screen while the camera moves; it needs a few seconds of camera movement, and is used whenever there is no upscaler output. |
 | **Use the game's own HUD layer when found** | On by default, remembered per game; DirectX 12, DirectX 11 and Vulkan games. Where the game draws its whole HUD into a layer of its own and blends it on at the end, or draws it straight onto its final picture (XPAR then takes a copy of the picture from just before), XPAR takes the HUD from that step instead of finding it: exact from the first frame, and bright lights or neon next to the HUD are never mistaken for it. Games that hand their HUD layers over themselves (through their frame generation integration) use those anyway. In games with DLSS or FSR, a HUD layer is first checked against the upscaler's output (everything of a HUD, markers anchored in the world too, is drawn over the finished picture; full-screen menus do not count): once it passes, a frame without it is one where the game hides its HUD, and nothing is detected there; a layer that fails is ignored and the HUD is detected. Without DLSS or FSR the layer can't be checked, and it isn't used in frames where it covers 90% of the screen or more (that is no HUD). The panel says where the HUD comes from and how the check went. Turn it off if a game's HUD warps or parts of the scenery are held still with it: the HUD is then found as chosen in **Find the HUD**. |
 | **Learn where the game draws its HUD** | On by default, remembered per game. For a game where none of the steps above is found, XPAR tries the places the game could be drawing its HUD, scores them against the picture and keeps the one that holds the HUD: learned once and saved per game (**Relearn** starts over). It rests while the game hands its HUD over another way. |
 | **Fill behind the HUD from the upscaler output** | On by default, remembered per game; XPAR engine, with the HUD found from the upscaler output. When the camera turns, the scenery the HUD covered is taken from the upscaler's output (colour-matched to the game's picture) instead of being smeared from the surroundings, so the HUD leaves no trail. Effects the game adds after upscaling, such as bloom or film grain, may be missing in those spots. |
 | **Warp engine** | **XPAR** (default): FrameWarp's own engine, any GPU. **NVIDIA Latewarp**: selectable when `nvngx_latewarp.dll` is installed and the GPU is NVIDIA's. |
-| **Forward-splat warp** | On by default, remembered per game, XPAR engine. Every point of the game's frame is placed where the camera now sees it, the nearest one winning, and each screen pixel shows the nearest surface that reaches it; what nothing reaches is filled from the scenery behind (background memory when it has seen it, otherwise stretched). Near objects keep their shape and are not doubled when strafing. Off: the earlier warp, which searches from each screen pixel. |
+| **Forward-splat warp** | Off by default, remembered per game, XPAR engine. Off: searches from each output pixel for its source using the active warp field. On: rendered pixels claim output locations, with the nearer surface winning. Both paths support the continuous warp; switching splat off does not switch back to the old character-holding method. |
 | **Presenter GPU priority** | Keep **Realtime**. Lower priorities cannot hold the refresh rate while the game loads the GPU. |
 
 The remaining options (extrapolation, manual mouse gain, debug strip, Streamline diagnostics) are for
@@ -191,7 +196,9 @@ fine-tuning and troubleshooting.
   frame are shown, spread evenly. Frame generation and FrameWarp together need GPU headroom: at 3x and 4x
   the output may not reach the refresh rate on mid-range GPUs.
 * During very fast turns, the screen edges can briefly show fill for areas the game never rendered (with the
-  default latency only at the start of a flick, as a soft blur).
+  default settings, as a dithered transition to the unwarped frame).
+* Overlays drawn into the game, such as the Steam overlay (Shift+Tab) and its FPS counter, are covered by
+  FrameWarp's picture while it shows its frames. Use the **Frame counter** instead.
 * VRR (G-SYNC, FreeSync): while FrameWarp shows its frames, the screen runs at its maximum refresh rate.
   FrameWarp's window is always composited by Windows, so VRR can't follow it, also with G-SYNC for windowed
   mode. FrameWarp paces itself to the screen's refreshes instead, so no frames queue at the maximum.
@@ -212,8 +219,9 @@ fine-tuning and troubleshooting.
   Enshrouded).
 * Very fast motion goes beyond what re-projecting a single frame can hide. In Expedition 33's
   overworld, very fast camera turns can make the picture shake slightly.
-* The Expedition 33 support targets the current Steam build. It switches itself off safely if a game
-  update changes the relevant code.
+* Expedition 33's optional executable probes use addresses and expected bytes from a previously tested
+  Steam executable. Probes whose bytes no longer match are skipped; this is not a compatibility guarantee
+  for the latest game build.
 
 ## Troubleshooting
 
@@ -233,15 +241,24 @@ it; the game it covers can be capped too. Turn the setting off, for all programs
 `FrameWarpPresenter.exe` and the game. The XPAR panel warns when its output is held back by a frame
 rate cap like this.
 
+FrameWarp asks Windows Explorer to start its presenter, so that the Steam overlay is not loaded into it (it
+could freeze the presenter). If security software blocks that, or the game runs as administrator, the
+presenter is started by the game instead, up to 10 seconds later. If the presenter's picture ever stops
+updating for 2 seconds, it closes itself and the game carries on without reprojection; `ReShade.log` and,
+with diagnostics on, `presenter.log` say what happened.
+
 If the game crashes when you open the ReShade menu (Red Dead Redemption 2 does, also without FrameWarp),
 turn off ReShade's **Generic Depth** add-on: add `DisabledAddons=Generic Depth` under `[ADDON]` in the game's
 `ReShade.ini` (it then shows unticked in ReShade's Add-ons tab). Games with DLSS or FSR don't need it: FrameWarp takes the depth from the upscaler.
 
-Logs are written to `FrameWarp\logs\`, next to the game's ReShade. The previous run is kept in
-`logs\previous\`. For a problem report, tick **Record detailed diagnostics** in the XPAR panel,
-reproduce the problem (pressing **Ctrl+Shift+M** marks the moment it looks wrong in the logs), and
-include both log folders. Without DLSS or FSR, `ReShade.log` also shows which depth buffer FrameWarp
-picked and why.
+For a problem report, turn on **Record detailed diagnostics** in the XPAR panel before reproducing
+it. Routine logs are written to `FrameWarp\logs\`, next to the presenter; when diagnostics first open
+in a run, the preceding logs are moved to `logs\previous\`. A read-only installation falls back to
+`%LOCALAPPDATA%\FrameWarp\<game-folder>\`. Press **Ctrl+Shift+M** to mark a bad moment, then include the
+current and previous logs and the game's `ReShade.log`. With diagnostics enabled, the latter includes
+FrameWarp's depth-choice messages. Routine FrameWarp diagnostics are disabled when the option is off;
+crash and add-on initialization-failure reports remain available. Developer test installations may
+force diagnostics on with `DiagnosticsOn=1` under `[FrameWarp]` in `ReShade.ini`.
 
 ## Building from source
 

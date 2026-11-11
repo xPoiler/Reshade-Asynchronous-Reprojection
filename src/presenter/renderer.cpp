@@ -14,6 +14,7 @@
 #include <vector>
 
 namespace fw {
+std::atomic<std::int64_t> g_present_entered{0};  // (see renderer.hpp)
 namespace {
 
 const char kShaders[] = R"(
@@ -38,6 +39,64 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
     float2 uv = float2((id << 1) & 2, id & 2);
     return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
 }
+static const uint kFpsGlyph[18 * 7] = {  // 5x7, a row a value, the leftmost pixel the highest of 5 bits: 0-9, G A M E O U T, space
+    14, 17, 19, 21, 25, 17, 14,  // '0'
+    4, 12, 4, 4, 4, 4, 14,  // '1'
+    14, 17, 1, 2, 4, 8, 31,  // '2'
+    30, 1, 1, 14, 1, 1, 30,  // '3'
+    2, 6, 10, 18, 31, 2, 2,  // '4'
+    31, 16, 30, 1, 1, 17, 14,  // '5'
+    6, 8, 16, 30, 17, 17, 14,  // '6'
+    31, 1, 2, 4, 8, 8, 8,  // '7'
+    14, 17, 17, 14, 17, 17, 14,  // '8'
+    14, 17, 17, 15, 1, 2, 12,  // '9'
+    14, 17, 16, 23, 17, 17, 15,  // 'G'
+    14, 17, 17, 31, 17, 17, 17,  // 'A'
+    17, 27, 21, 21, 17, 17, 17,  // 'M'
+    31, 16, 16, 30, 16, 16, 31,  // 'E'
+    14, 17, 17, 17, 17, 17, 14,  // 'O'
+    17, 17, 17, 17, 17, 17, 14,  // 'U'
+    31, 4, 4, 4, 4, 4, 4,  // 'T'
+    0, 0, 0, 0, 0, 0, 0  // ' '
+};
+// The frame counter (marker bits 4-6 the corner, 1-4; 7-8 the text's brightness; 9-18 the game's frames a second, 19-28 the
+// refreshes shown - see Renderer::set_fps_counter): "GAME nnn" over "OUT  nnn", light grey with a one-pixel shadow and no
+// box - out of sight unless looked at (user 2026-11-11: the first, boxed at 3x, was too big and too noticeable). 47 x 16
+// units of size.y / 2160 px (1 up to 4K: 5 x 7 px characters), 6 units from the corner.
+bool fps_lit(int2 u, uint game, uint shown) {  // (u: units from the text's top-left)
+    if (any(u < 0)) return false;
+    const uint row = uint(u.y) / 9u, col = uint(u.x) / 6u, gx = uint(u.x) % 6u, gy = uint(u.y) % 9u;
+    if (row > 1u || col > 7u || gx > 4u || gy > 6u) return false;
+    const uint value = row == 0u ? game : shown;
+    uint glyph = 17u;
+    if (col < 4u) glyph = row == 0u ? 10u + col : (col < 3u ? 14u + col : 17u);
+    else if (col >= 5u) {
+        const uint place = col - 5u;  // (0 hundreds, 1 tens, 2 ones; no leading zeros)
+        const uint digit = place == 0u ? value / 100u : place == 1u ? (value / 10u) % 10u : value % 10u;
+        glyph = (place == 0u && value < 100u) || (place == 1u && value < 10u) ? 17u : digit;
+    }
+    return ((kFpsGlyph[glyph * 7u + gy] >> (4u - gx)) & 1u) != 0u;
+}
+float4 fps_counter(int2 p, float4 c) {
+    const uint corner = (marker >> 4) & 7u;
+    if (corner == 0) return c;
+    const int s = int(max(1u, size.y / 2160u));
+    const int2 box = int2(48, 17) * s;  // (the text, 47 x 16, and its shadow one unit right and down)
+    const int m = 6 * s;
+    const int2 o = int2((corner == 2u || corner == 4u) ? int(size.x) - m - box.x : m, corner >= 3u ? int(size.y) - m - box.y : m);
+    const int2 q = p - o;
+    if (any(q < 0) || any(q >= box)) return c;
+    const uint game = (marker >> 9) & 1023u, shown = (marker >> 19) & 1023u;
+    const int2 u = int2(uint2(q) / uint(s));  // (q is not negative here)
+    if (fps_lit(u, game, shown)) {
+        const uint kind = (marker >> 7) & 3u;
+        // (light grey, about 100-120 nits in HDR: PQ 0.5, scRGB 1.5 - 1.0 there is 80 nits)
+        c.rgb = kind == 1u ? 0.5 : kind == 2u ? 1.5 : 0.8;
+    } else if (fps_lit(u - 1, game, shown)) {
+        c.rgb *= 0.25;  // (the shadow: legible on a bright sky)
+    }
+    return c;
+}
 float4 ps(float4 pos : SV_Position) : SV_Target {
     int2 p = int2(pos.xy);
     // Scale to fit when the frame and the window differ in size (1:1 when they match, as usual).
@@ -60,6 +119,7 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
         const bool lit = (marker & 4u) || ((counter / 30u) & 1u) == 0;
         if (d < r * 1.25 && lit) c = d < r ? ((marker & 4u) ? float4(1, 0.05, 0.05, 1) : float4(1, 0.65, 0, 1)) : float4(0, 0, 0, 1);
     }
+    c = fps_counter(p, c);
     return float4(c.rgb, 1);
 }
 )";
@@ -4164,6 +4224,48 @@ groupshared uint ol_rest[8 * 8];
         ow_list_u.Store(16 + 4 * i, (p.x >> 1) | ((p.y >> 1) << 12) | (ol_rest[bi] << 24));
     }
 }
+// The same two passes with the forward splat off and the continuous warp (ow_tether), no sight-reticle layer (flag 2048), no
+// warp paths (flag 32768): output pixel p the plain way - true if written, with what ow_find + ow_finish give it; false: left
+// for cs_own_warp_rest. Plain: held (the HUD alone under the continuous warp - ow_weapon_held is never true, so whether the
+// weapon moved changes nothing: not looked for), or the search lands inside the frame on a spot not held, outside the
+// dithered edges' band (where ow_dither_warped could pick the frame as it is). The HUD layer, then the faint panels' ratio,
+// in ow_finish's order. (The full shader searched under the HUD too, and looked up the weapon's shift at every pixel)
+bool ow_seek(uint2 p) {
+    const int3 pi = int3(p, 0);
+    float4 c;
+    float2 src = 0;
+    const bool held_here = (flags & 2) && ow_held(pi);
+    if (held_here) {
+        c = ow_held_colour(pi);
+    } else {
+        const float2 uv = (float2(p) + 0.5) / float2(out_size);
+        if (!ow_search(uv, src)) return false;
+        if (!(all(src >= 0) && all(src <= 1))) return false;  // (ow_find's test: outside, the memory's way)
+        const float2 half_px = 0.5 / float2(out_size);
+        if (!all(clamp(src, half_px, 1.0 - half_px) == src)) return false;  // (ow_scene_from's: the frame's edge)
+        if ((flags & 2) && ow_held(int3(clamp(int2(src * float2(out_size)), int2(0, 0), int2(out_size) - 1), 0))) return false;
+        c = ow_bilinear(src);
+        if ((flags & 16777216) && !ow_dither_warped(p, uv, src)) c = ow_color_t.Load(pi);  // (dithered edges: see ow_scene_from)
+    }
+    if ((flags & 1) && !ow_low() && !((flags & 1073741824) && held_here)) c.rgb = ow_over(c.rgb, ow_ui_at(pi));
+    if ((flags & 8388608) && !held_here) c.rgb = ow_faint(c.rgb, pi.xy, src);
+    ow_store(p, c.rgb);
+    return true;
+}
+groupshared uint os_rest[8 * 8];
+[numthreads(16, 16, 1)] void cs_own_warp_seek(uint3 id : SV_DispatchThreadID, uint3 gt : SV_GroupThreadID) {
+    const uint bi = (gt.y >> 1) * 8 + (gt.x >> 1), k = (gt.x & 1) | ((gt.y & 1) << 1);
+    if (k == 0) os_rest[bi] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    const uint2 p = id.xy;
+    if (all(p < out_size) && !ow_seek(p)) InterlockedOr(os_rest[bi], 1u << k);
+    GroupMemoryBarrierWithGroupSync();
+    if (k == 0 && all(p < out_size) && os_rest[bi]) {
+        uint i;
+        ow_list_u.InterlockedAdd(0, 1, i);
+        ow_list_u.Store(16 + 4 * i, (p.x >> 1) | ((p.y >> 1) << 12) | (os_rest[bi] << 24));
+    }
+}
 [numthreads(1, 1, 1)] void cs_own_warp_args(uint3 id : SV_DispatchThreadID) {
     // (a thread per pixel of each block - at the game's resolution, ow_low, one: the block's first pixel alone)
     ow_args_u.Store3(0, uint3((ow_list_u.Load(0) * (ow_low() ? 1 : 4) + 63) / 64, 1, 1));
@@ -5956,7 +6058,7 @@ bool Renderer::create_pipelines(std::string& error) {
         error = "warp root signature"; return false;
     }
     struct { const char* entry; ComPtr<ID3D12PipelineState>* pso; } ws[] = {
-        {"cs_own_warp", &cs_own_warp_}, {"cs_own_warp_reset", &cs_own_warp_reset_}, {"cs_own_warp_lean", &cs_own_warp_lean_}, {"cs_own_warp_args", &cs_own_warp_args_}, {"cs_own_warp_rest", &cs_own_warp_rest_}, {"cs_warp_claims_clear", &cs_warp_claims_clear_}, {"cs_warp_claim", &cs_warp_claim_}, {"cs_warp_beside", &cs_warp_beside_}, {"cs_warp_held", &cs_warp_held_}, {"cs_own_warp_up", &cs_own_warp_up_}, {"cs_gen_depth", &cs_gen_depth_}, {"cs_gen_unui", &cs_gen_unui_}, {"cs_obj_join_init", &cs_obj_join_init_}, {"cs_obj_join", &cs_obj_join_}, {"cs_obj_join_final", &cs_obj_join_final_}, {"cs_still", &cs_still_}, {"cs_hold_fill", &cs_hold_fill_}, {"cs_grow_init", &cs_grow_init_}, {"cs_grow_clear", &cs_grow_clear_}, {"cs_grow", &cs_grow_}, {"cs_grow_final", &cs_grow_final_}, {"cs_share_measure", &cs_share_measure_}, {"cs_share_blur", &cs_share_blur_}, {"cs_share_bins", &cs_share_bins_}, {"cs_share_final", &cs_share_final_}, {"cs_share_up", &cs_share_up_}, {"cs_share_seam", &cs_share_seam_}, {"cs_att_hist", &cs_att_hist_}, {"cs_share_resid", &cs_share_resid_}, {"cs_resid_blur", &cs_resid_blur_}, {"cs_own_up", &cs_own_up_}, {"cs_tether_init", &cs_tether_init_}, {"cs_tether_step", &cs_tether_step_}, {"cs_tether_fine", &cs_tether_fine_}, {"cs_tether_final", &cs_tether_final_}, {"cs_tether_pick", &cs_tether_pick_},
+        {"cs_own_warp", &cs_own_warp_}, {"cs_own_warp_reset", &cs_own_warp_reset_}, {"cs_own_warp_lean", &cs_own_warp_lean_}, {"cs_own_warp_seek", &cs_own_warp_seek_}, {"cs_own_warp_args", &cs_own_warp_args_}, {"cs_own_warp_rest", &cs_own_warp_rest_}, {"cs_warp_claims_clear", &cs_warp_claims_clear_}, {"cs_warp_claim", &cs_warp_claim_}, {"cs_warp_beside", &cs_warp_beside_}, {"cs_warp_held", &cs_warp_held_}, {"cs_own_warp_up", &cs_own_warp_up_}, {"cs_gen_depth", &cs_gen_depth_}, {"cs_gen_unui", &cs_gen_unui_}, {"cs_obj_join_init", &cs_obj_join_init_}, {"cs_obj_join", &cs_obj_join_}, {"cs_obj_join_final", &cs_obj_join_final_}, {"cs_still", &cs_still_}, {"cs_hold_fill", &cs_hold_fill_}, {"cs_grow_init", &cs_grow_init_}, {"cs_grow_clear", &cs_grow_clear_}, {"cs_grow", &cs_grow_}, {"cs_grow_final", &cs_grow_final_}, {"cs_share_measure", &cs_share_measure_}, {"cs_share_blur", &cs_share_blur_}, {"cs_share_bins", &cs_share_bins_}, {"cs_share_final", &cs_share_final_}, {"cs_share_up", &cs_share_up_}, {"cs_share_seam", &cs_share_seam_}, {"cs_att_hist", &cs_att_hist_}, {"cs_share_resid", &cs_share_resid_}, {"cs_resid_blur", &cs_resid_blur_}, {"cs_own_up", &cs_own_up_}, {"cs_tether_init", &cs_tether_init_}, {"cs_tether_step", &cs_tether_step_}, {"cs_tether_fine", &cs_tether_fine_}, {"cs_tether_final", &cs_tether_final_}, {"cs_tether_pick", &cs_tether_pick_},
         {"cs_copy4", &cs_copy4_},
         {"cs_sten_clear", &cs_sten_clear_}, {"cs_sten_hist", &cs_sten_hist_}, {"cs_sten_cells", &cs_sten_cells_}, {"cs_sten_flood", &cs_sten_flood_},
         {"cs_sten_apply", &cs_sten_apply_}, {"cs_sten_count", &cs_sten_count_}, {"cs_sten_grow_init", &cs_sten_grow_init_}, {"cs_sten_grow", &cs_sten_grow_}, {"cs_sten_age", &cs_sten_age_}, {"cs_sten_close", &cs_sten_close_}, {"cs_sten_comp_clear", &cs_sten_comp_clear_}, {"cs_sten_comp_count", &cs_sten_comp_count_}, {"cs_sten_comp_max", &cs_sten_comp_max_}, {"cs_sten_prune", &cs_sten_prune_}, {"cs_sten_luma", &cs_sten_luma_}, {"cs_sten_elig", &cs_sten_elig_}, {"cs_sten_fringe", &cs_sten_fringe_}, {"cs_sten_fringe_apply", &cs_sten_fringe_apply_}};
@@ -7978,8 +8080,10 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
     const PrivateId target = low ? kPLowScene : kPOutput;
     set_x_uav(kWUav(kWWarp) + 0, target); set_x_uav(kWUav(kWWarp) + 1, target);
     transition(private_[target], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    // (forward splat: the plain pixels first, the rest packed for the full warp - see cs_own_warp_lean)
-    if ((c.flags & 4096) && warp_blocks_ && ensure_warp_list(ow, oh)) {
+    // (forward splat: the plain pixels first, the rest packed for the full warp - see cs_own_warp_lean; the splat off, the
+    // continuous warp's search the same way - see cs_own_warp_seek. With a sight-reticle layer or the warp paths the full warp)
+    const bool seek = !(c.flags & 4096) && tether_field != kPCount && !layer && !warp_paths_;
+    if (((c.flags & 4096) || seek) && warp_blocks_ && ensure_warp_list(ow, oh)) {
         D3D12_UNORDERED_ACCESS_VIEW_DESC raw{};
         raw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; raw.Format = DXGI_FORMAT_R32_TYPELESS; raw.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
         raw.Buffer.NumElements = UINT(warp_list_->GetDesc().Width / 4);
@@ -7991,7 +8095,7 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
         D3D12_RESOURCE_BARRIER lb{}; lb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; lb.UAV.pResource = warp_list_.Get();
         w_dispatch(cs_own_warp_reset_.Get(), &c, wc, kWWarp, 1, 1);
         list_->ResourceBarrier(1, &lb);
-        w_dispatch(cs_own_warp_lean_.Get(), &c, wc, kWWarp, ((ow + 1) / 2 + 7) / 8, ((oh + 1) / 2 + 7) / 8);
+        w_dispatch((seek ? cs_own_warp_seek_ : cs_own_warp_lean_).Get(), &c, wc, kWWarp, ((ow + 1) / 2 + 7) / 8, ((oh + 1) / 2 + 7) / 8);
         stamp(kPassWarpLean);
         if (warp_stop_ <= 2) return true;
         list_->ResourceBarrier(1, &lb);
@@ -9549,7 +9653,7 @@ void Renderer::finish_frame(bool warped, int marker, bool newest) {
         list_->SetDescriptorHeaps(1, heaps);  // NGX may have bound its own heap
         list_->SetPipelineState(blit_.Get());
         list_->SetGraphicsRootSignature(root_.Get());
-        const std::uint32_t constants[4] = {width_, height_, static_cast<std::uint32_t>(marker), static_cast<std::uint32_t>(present_counter_++)};
+        std::uint32_t constants[4] = {width_, height_, static_cast<std::uint32_t>(marker), static_cast<std::uint32_t>(present_counter_++)};
         list_->SetGraphicsRoot32BitConstants(0, 4, constants, 0);
         list_->SetGraphicsRootDescriptorTable(1, gpu(kPrivSrv + source));
         const D3D12_VIEWPORT vp{0, 0, float(width_), float(height_), 0, 1};
@@ -9559,6 +9663,23 @@ void Renderer::finish_frame(bool warped, int marker, bool newest) {
         list_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
         list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         list_->DrawInstanced(3, 1, 0, 0);
+        // The frame counter (see set_fps_counter): the same pass again, its counter bits on, only over the counter's own
+        // rectangle (the scissor) - the full-screen draw above never draws it (its bits off: one bit test a pixel), the
+        // counter's ~800 pixels are drawn twice. Its place as the shader works it out (fps_counter): 48 x 17 units of
+        // height / 2160 px, 6 units from the corner. Bits 7-8 how bright its text is: 1 HDR10 PQ, 2 scRGB, 0 SDR.
+        fps_word_drawn_ = fps_word_;
+        if (fps_word_) {
+            const LONG unit = LONG(std::max(1u, height_ / 2160u)), bw = 48 * unit, bh = 17 * unit, m = 6 * unit;
+            const std::uint32_t corner = (fps_word_ >> 4) & 7u;
+            const LONG x = (corner == 2 || corner == 4) ? LONG(width_) - m - bw : m, y = corner >= 3 ? LONG(height_) - m - bh : m;
+            const D3D12_RECT box{std::max(0L, x), std::max(0L, y), std::min(LONG(width_), x + bw), std::min(LONG(height_), y + bh)};
+            if (box.right > box.left && box.bottom > box.top) {
+                constants[2] |= fps_word_ | ((color_space_ == 12 ? 1u : color_space_ == 1 ? 2u : 0u) << 7);
+                list_->SetGraphicsRoot32BitConstants(0, 4, constants, 0);
+                list_->RSSetScissorRects(1, &box);
+                list_->DrawInstanced(3, 1, 0, 0);
+            }
+        }
         transition(private_[source], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     } else {
         const float black[4] = {0, 0, 0, 1};
@@ -9580,7 +9701,9 @@ void Renderer::finish_frame(bool warped, int marker, bool newest) {
     {
         LARGE_INTEGER a, b, f;
         QueryPerformanceCounter(&a);
+        g_present_entered.store(a.QuadPart ? a.QuadPart : 1, std::memory_order_relaxed);
         swapchain_->Present(newest ? 0 : 1, 0);
+        g_present_entered.store(0, std::memory_order_relaxed);
         QueryPerformanceCounter(&b); QueryPerformanceFrequency(&f);
         last_present_call_ms_ = float(double(b.QuadPart - a.QuadPart) * 1000.0 / double(f.QuadPart));
     }

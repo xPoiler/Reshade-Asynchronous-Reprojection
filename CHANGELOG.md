@@ -1,5 +1,97 @@
 # Changelog
 
+## 2.3.0
+
+The character and the weapon are no longer cut out and held still: a continuous warp moves every pixel and leaves no
+gaps to fill. Games with standard (not reversed) depth now work, the warp costs less on every refresh, a hang caused
+by the Steam overlay is gone, and FrameWarp shows its own small frame counter.
+As with every update, the settings remembered per game go back to the defaults (*Record detailed diagnostics*
+stays).
+
+### The continuous warp replaces the holding mask
+
+* **Nothing is held but the HUD.** Until now the character and the weapon were cut out of the picture, held where the
+  game drew them, and the scenery that the turn uncovered beside them was filled in from memory or from the pixels
+  around. Their outlines left copies and seams behind. Now every pixel gets its own displacement, and no two
+  neighbouring pixels may pull apart by more than half a pixel per pixel: the nearer one keeps its motion, the scenery
+  beside it stretches a little instead of tearing. There are no gaps by construction, so nothing is filled in and no
+  outline is copied. Cyberpunk 2077 and Resident Evil Requiem looked much cleaner around the character.
+* A sight's glass now moves with the camera through the warp instead of being held.
+* The field is solved on blocks sized to about 480x270 of them at any render resolution, so the result is the same at
+  every resolution. Cost in game: 0.22-0.50 ms of GPU time per refresh at 4K.
+* Known: in very fast turns (200-250 px between frames, Armored Core VI) the scenery right beside a large character
+  can be dragged along with it.
+* `ContinuousWarp=0` under `[FrameWarp]` in the game's `ReShade.ini` holds the character and weapon the old way.
+
+### Games with standard depth
+
+* **Games whose depth is not reversed now work properly** (checked on Metro 2033 Redux). The motion analysis and the
+  follow share read the depth as if it were always reversed, so in these games nothing was ever found attached to the
+  camera: the first-person gun was warped as scenery a metre away and thrown up to ~450 px across a 4K screen as the
+  camera moved between frames. Games with reversed depth are unchanged.
+* A held weapon that swayed between game frames sent all its pixels through the warp's slowest path (Metro 2033
+  Redux: 4.2-4.5 ms a refresh, refreshes fell to 100-110 a second at 120 Hz). It now takes the cheap path.
+
+### HUD
+
+* **HUD learning works on DirectX 11 games whose back buffer can only be displayed** (Metro 2033 Redux): the picture
+  is compared through a copy. Before, no candidate was ever scored. Metro's HUD is now learned and kept, at 0.05 ms a
+  game frame.
+* While the game hands its HUD over itself, HUD learning is paused and its hooks no longer run on every draw of the
+  game's render thread. The panel says "paused - the game gives its HUD itself" instead of "trying 00000000".
+* The check of the upscaler-output HUD against the camera's motion costs about half as much (Metro 2033 Redux at 4K:
+  5.6-6.3 ms a game frame down to 2.95-3.31 ms).
+* Sight reticle layers are used only while a sight's window is actually seen, and made again from nothing after a gap
+  (a stale patch could stay at the screen's centre).
+
+### Steam overlay hang and frame counter
+
+* **Fixed: the presenter could freeze a few seconds into a session and stay frozen after the game closed.** The Steam
+  overlay followed the game into the presenter's process, hooked its present, and in some sessions waited there for
+  good (Armored Core VI, twice in a row). The presenter is now started by Windows Explorer instead of by the game, so
+  the overlay is not loaded into it. If Explorer does not start it within 10 seconds, or the game runs as
+  administrator, it is started the old way.
+* A watchdog ends the presenter if a present ever blocks for over 2 seconds, or if it does not shut down within 5
+  seconds of the game closing: the game then goes on without reprojection instead of under a frozen picture.
+* **New: a small frame counter**, on by default in the top-right corner: GAME, the game's frames a second, and OUT,
+  the refreshes shown a second, in small grey text with no background. FrameWarp's picture covers the game's window,
+  so counters drawn into the game, the Steam overlay's among them, stay under it. *Frame counter* in the panel picks
+  the corner or turns it off (remembered per game). It is drawn only over its own few pixels: nothing is added to the
+  rest of the picture.
+
+### Performance
+
+* **The default warp costs less per refresh**: the plain pixels go through a small, fast pass and only the rare ones
+  through the full warp. Armored Core VI at 4K: 1.00-1.11 ms down to 0.59-0.82 ms a refresh.
+* The game frame's work is scheduled between the refreshes instead of competing with them (Metro 2033 Redux: a refresh
+  went from about 6 ms to 3.5-4.5 ms while turning). `IntakeBetweenWarps=0` turns it off.
+* When the GPU is the limit, the game is held to one frame queued: fresher frames, less latency. `QueueLimit=0`
+  turns it off.
+* Lossless passes over the default path: about 0.2 ms less GPU time per game frame and per refresh, and the add-on's
+  motion search stops its per-bind bookkeeping once the game's vectors are found.
+* The upscaler-output HUD detection's final pass works on 2x2 pixels per thread.
+
+### Defaults and panel
+
+* **Forward splat is off by default**: every pixel is found by the search through the continuous warp.
+  `ForwardSplatWarp=1` turns it back on.
+* The background memory is kept at a quarter of the picture's resolution by default (no difference seen, less video
+  memory).
+* Settings the current warp path does not use are greyed, with the reason in their tooltip.
+* Nothing is logged, written or measured for logs unless *Record detailed diagnostics* is on. Crashes are still
+  logged.
+
+### Camera search
+
+* DirectX 11 games that fill their constant buffers in place without binding them again (Metro 2033 Redux) are now
+  searched too.
+
+### Installer
+
+* "Update all" (menu option A, `-UpdateAll`): updates every older FrameWarp install it finds in the Steam libraries
+  and in its own list, leaves same or newer versions alone, and skips a game that is running. `-SteamPath` points it
+  at a Steam folder.
+
 ## 2.2.0
 
 FrameWarp now finds the game's own camera and motion vectors by itself: in games without DLSS or FSR, and in games
