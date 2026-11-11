@@ -712,7 +712,7 @@ void on_present(command_queue*, swapchain* chain, const rect*, const rect*, uint
         {
             const auto& sh = *g_producer->shared();
             fw::hud_learn::on_present(chain, sh.settings.hud_learn != 0, g_producer->game_gives_hud(), sh.presenter.hud_learn_pick,
-                                      sh.presenter.hud_learn_fail, sh.settings.hud_relearn);
+                                      sh.presenter.hud_learn_fail, sh.settings.hud_relearn, sh.presents_without_frame < 3);  // (3: as the presenter's "has frames")
         }
         const auto learn = fw::hud_learn::status();
         g_producer->shared()->hooks.learn_candidates = learn.candidates;

@@ -458,15 +458,26 @@ void Producer::time_report(ID3D12CommandQueue* queue) {
     static const char* const kNames[kTCount] = {"picture", "depth", "motion vectors", "other tags", "HUD layer taken", "HUD layer pass",
                                                 "HUD layer to slot", "HUD-less taken", "HUD-less to slot", "HUD learning"};
     char text[512];
-    int n = std::snprintf(text, sizeof(text), "XPAR: the add-on's GPU work in the game's frames, ms per present (%u):", ts_presents_);
+    // (per present of the game, not per frame handed over: the copies' ticks add up on presents that hand no frame too - menus,
+    // loading, a launch - and divided by the 600 frames alone a launch read as "HUD learning 4.0 ms per present", AC6: ~2.4 s
+    // of GPU time over ~7000 presents. And what HUD learning copied meanwhile, against what reached the presenter with a frame)
+    const std::uint32_t presents_now = static_cast<std::uint32_t>(shared_->presents_total);
+    const std::uint32_t presents = std::max<std::uint32_t>(presents_now - ts_presents_seen_, ts_presents_);
+    ts_presents_seen_ = presents_now;
+    int n = std::snprintf(text, sizeof(text), "XPAR: the add-on's GPU work in the game's frames, ms per present (%u presents, %u with a frame):", presents, ts_presents_);
     double total = 0;
     for (int k = 0; k < kTCount; ++k) {
-        const double ms = double(ts_ticks_[k]) * 1000.0 / double(frequency) / double(ts_presents_);
+        const double ms = double(ts_ticks_[k]) * 1000.0 / double(frequency) / double(presents);
         total += ms;
         if (ms > 0.0005 && n < int(sizeof(text)) - 40) n += std::snprintf(text + n, sizeof(text) - n, " %s %.3f,", kNames[k], ms);
         ts_ticks_[k] = 0;
     }
-    if (n < int(sizeof(text)) - 20) std::snprintf(text + n, sizeof(text) - n, " total %.3f", total);
+    if (n < int(sizeof(text)) - 20) n += std::snprintf(text + n, sizeof(text) - n, " total %.3f", total);
+    const std::uint32_t probes_now = shared_->hooks.learn_probes;
+    if (probes_now != ts_probes_seen_ && n < int(sizeof(text)) - 80)
+        std::snprintf(text + n, sizeof(text) - n, " | HUD learning copies: %u taken, %u reached the presenter with a frame", probes_now - ts_probes_seen_, probe_handed_);
+    ts_probes_seen_ = probes_now;
+    probe_handed_ = 0;
     if (log_line) log_line(text);
     ts_presents_ = 0;
 }
@@ -953,6 +964,7 @@ void Producer::d3d12_motion(ID3D12GraphicsCommandList* list, int slot) {
 void Producer::d3d12_probe(ID3D12GraphicsCommandList* list, int slot) {
     if (!probe_pending_ || probe_age_ > 1 || !probe_candidate_) return;
     probe_age_ = 2;  // (handed over once)
+    ++probe_handed_;  // (time_report)
     auto& bbt = textures_[slot][kBackbuffer];
     const auto pd = probe_pending_->GetDesc();
     // (the final picture as the back buffer's draw read it when there is one - a candidate in the final picture - else

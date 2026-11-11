@@ -85,6 +85,7 @@ std::atomic<std::uint32_t> g_status_cands{0}, g_status_active{0};
 // states forgotten, and no candidate tried for the first frames (binds recorded while idle are not known).
 std::atomic<bool> g_idle{false};
 std::uint32_t g_settle = 0;
+std::uint32_t g_held = 0;  // (the candidate being tried when the game stopped handing frames over - see on_present's scorable)
 bool idle() { return g_idle.load(std::memory_order_relaxed); }
 constexpr std::uint32_t kRun = 12;  // frames per candidate
 
@@ -360,7 +361,7 @@ void shutdown() {
     g_none = nullptr;
 }
 
-void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick, std::uint32_t fail, std::uint32_t relearn) {
+void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick, std::uint32_t fail, std::uint32_t relearn, bool scorable) {
     if (!chain) return;
     device* dev = chain->get_device();
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -524,19 +525,31 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
                 if (g_none) g_none();
             }
             g_active = g_settle ? 0 : g_locked;
+            g_held = 0;
         } else if (!learning) {
             g_active = 0;
+            g_held = 0;
         } else if (g_settle) {
             g_active = 0;
-        } else if (g_run == 0 || !g_cands.count(g_active)) {
-            // The next candidate after a run (in fingerprint order, round and round).
-            auto it = g_cands.upper_bound(g_active);
-            if (it == g_cands.end()) it = g_cands.begin();
-            g_active = it == g_cands.end() ? 0 : it->first;
-            g_run = kRun;
-            if (g_active && std::find(g_tried.begin(), g_tried.end(), g_active) == g_tried.end()) g_tried.push_back(g_active);
+        } else if (!scorable) {
+            // No candidate while the game hands no frames over (a title screen, loading, a menu): a copy is scored only with a
+            // frame's depth and camera, against the copy of the frame before - none here. Measured 2026-11-11: AC6's launch
+            // took 7363 copies of which 61 reached the presenter with a frame, none scored (~2.8 s of GPU time); Requiem's 471
+            // and 27. Its run goes on where it stopped once frames come again.
+            if (g_active) { g_held = g_active; g_active = 0; }
         } else {
-            --g_run;
+            const bool resumed = g_held != 0;
+            if (resumed) { g_active = g_held; g_held = 0; }
+            if (g_run == 0 || !g_cands.count(g_active)) {
+                // The next candidate after a run (in fingerprint order, round and round).
+                auto it = g_cands.upper_bound(g_active);
+                if (it == g_cands.end()) it = g_cands.begin();
+                g_active = it == g_cands.end() ? 0 : it->first;
+                g_run = kRun;
+                if (g_active && std::find(g_tried.begin(), g_tried.end(), g_active) == g_tried.end()) g_tried.push_back(g_active);
+            } else if (!resumed) {
+                --g_run;
+            }
         }
     }
     if (g_settle) --g_settle;

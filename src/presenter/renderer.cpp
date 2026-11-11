@@ -1280,16 +1280,26 @@ uint hud_classify(uint2 id, out float weight) {
     const int2 p = int2(id);
     const float3 delta = abs(seen(hud_current_t.Load(int3(p, 0)).rgb) - seen(hud_previous_t.Load(int3(p, 0)).rgb));
     const float change = max(delta.r, max(delta.g, delta.b));
-    const float2 ec = edge(hud_current_t, p), ep = edge(hud_previous_t, p);
-    const float lc = length(ec), lp = length(ep);
-    const bool same_edge = lc > 0.05 && lp > 0.05 && dot(ec, ep) > 0.9 * lc * lp && lc < 2.0 * lp && lp < 2.0 * lc;
     const bool same_colour = change < 0.03;
     const float4 pv = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, depth, 1), clip_to_prev);
     const float2 cam_px = pv.w > 0 ? (float2(pv.x / pv.w * 0.5 + 0.5, 0.5 - pv.y / pv.w * 0.5) - uv) * float2(out_size) : float2(0, 0);
     const float moved = length(cam_px);
+    // (the edges - 8 loads each - only where the answer needs them: the camera moving under 3 px here nothing is telling, and
+    // short of a clear change - not over 0.06 - the answer is 0 whatever the edges are; the colour the same, the previous
+    // frame's edge is never asked for. The same answers as with both read first - FW_HUD_EDGES_FIRST, development: so)
+    const bool far_enough = moved >= 3.0;
+    [branch] if (!far_enough && !(change > 0.06) && !(flags & 4194304)) return 0;
+    const float2 ec = edge(hud_current_t, p);
+    const float lc = length(ec);
+    bool same_edge = false;
+    [branch] if (!same_colour || (flags & 4194304)) {
+        const float2 ep = edge(hud_previous_t, p);
+        const float lp = length(ep);
+        same_edge = lc > 0.05 && lp > 0.05 && dot(ec, ep) > 0.9 * lc * lp && lc < 2.0 * lp && lp < 2.0 * lc;
+    }
     // Only detail ALONG the camera motion (>= 3 px here) can show whether a pixel moved: flat areas and
     // edges parallel to the motion (a rooftop during a horizontal pan) look the same either way.
-    const bool telling = moved >= 3.0 && abs(dot(ec, cam_px / max(moved, 1e-6))) >= 0.05;
+    const bool telling = far_enough && abs(dot(ec, cam_px / max(moved, 1e-6))) >= 0.05;
     if (!same_colour && !same_edge) return change > 0.06 ? (telling ? 2u : 4u) : 0u;
     if (!telling) return 0;
     // If moving scenery explains the pixel just as well (it matches where the scene came from), it is no
@@ -2060,6 +2070,43 @@ RWTexture2D<float4> rc_cells_u : register(u0);
             sum += (o.xy / float2(rect.zw) + cam) * float2(out_size);  // its own motion plus the camera's (see cs_analyze)
             n += 1;
         }
+    rc_cells_u[id.xy] = float4(n > 0 ? sum / n : float2(0, 0), n, nearest);
+}
+// The same for cells of up to 8 px (render heights up to ~1545) without a loop: first whether the cell holds anything attached
+// at all - 64 loads with nothing between them; most cells hold nothing - then its pixels in the loop's order, each taken or
+// not: the same values, bit for bit (the cells hashed over AC6, Metro and the synthetic clips, 2026-11-11). The loop above was
+// what cost: 36-49 loads one after the other a thread took 2-5x as long as these 64-192 (it did with nothing attached too,
+// and nothing without the loads). Pixels past the cell's own (cells under 8 px) and past the frame are read and not counted.
+[numthreads(8, 8, 1)] void cs_ret_cells_flat(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= mv_size)) return;
+    bool any_on = false;
+    [unroll] for (uint yy = 0; yy < 8; ++yy)
+        [unroll] for (uint xx = 0; xx < 8; ++xx) {
+            const uint2 q = id.xy * groups_x + uint2(xx, yy);
+            const bool inside = xx < groups_x && yy < groups_x && all(q < rect.zw);
+            const float w = rc_object_t.Load(int3(rect.xy + min(q, rect.zw - 1), 0)).w;
+            any_on = any_on || (inside && !(w < 1.5));
+        }
+    float2 sum = 0;
+    float n = 0, nearest = 0;
+    [branch] if (any_on) {
+        [unroll] for (uint y = 0; y < 8; ++y)
+            [unroll] for (uint x = 0; x < 8; ++x) {
+                const uint2 p = id.xy * groups_x + uint2(x, y);
+                const bool inside = x < groups_x && y < groups_x && all(p < rect.zw);
+                const int2 pr = int2(rect.xy + min(p, rect.zw - 1));
+                const float4 o = rc_object_t.Load(int3(pr, 0));
+                const float2 uv = (float2(p) + 0.5) / float2(rect.zw);
+                const float d = rc_depth_t.Load(int3(pr, 0));
+                const float4 pv = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, d, 1), clip_to_prev);
+                const float2 cam = pv.w > 0 ? float2(pv.x / pv.w * 0.5 + 0.5, 0.5 - pv.y / pv.w * 0.5) - uv : float2(0, 0);
+                [flatten] if (inside && !(o.w < 1.5)) {
+                    nearest = max(nearest, saturate((log2(max((flags & 16) ? d : 1.0 - d, 1e-12)) + 30.0) / 32.0));
+                    sum += (o.xy / float2(rect.zw) + cam) * float2(out_size);
+                    n += 1;
+                }
+            }
+    }
     rc_cells_u[id.xy] = float4(n > 0 ? sum / n : float2(0, 0), n, nearest);
 }
 // Per cell: enclosed by held cells (z 1), the gun's motion there (xy: the mean of the 8 held cells met) and how near the
@@ -4224,6 +4271,21 @@ groupshared uint ol_rest[8 * 8];
         ow_list_u.Store(16 + 4 * i, (p.x >> 1) | ((p.y >> 1) << 12) | (ol_rest[bi] << 24));
     }
 }
+// (ow_search for this pass - the continuous warp only, where a step lands by the field and uses of ow_forward nothing but
+// whether the spot is behind the shown camera: with ow_dev 262144 - own_warp found that no spot within a frame's size around
+// the frame can be, at any depth - the step takes no depth there. A text of its own: ow_search is shared with the full pass)
+bool ow_seek_search(float2 uv, out float2 src) {
+    src = uv;
+    const bool safe = (ow_dev() & 262144u) != 0;
+    const int steps = (flags & 128) ? 12 : 6;
+    [loop] for (int it = 0; it < steps; ++it) {
+        if (!(safe && all(src >= -1.0) && all(src <= 2.0))) { const float3 f = ow_forward(src); if (f.z <= 1e-6) return false; }
+        const float2 miss = uv - (src + ow_tether_t.SampleLevel(ow_linear, src, 0) / float2(rect.zw));
+        src += miss;
+        if (all(abs(miss * float2(out_size)) < 0.25)) break;
+    }
+    return true;
+}
 // The same two passes with the forward splat off and the continuous warp (ow_tether), no sight-reticle layer (flag 2048), no
 // warp paths (flag 32768): output pixel p the plain way - true if written, with what ow_find + ow_finish give it; false: left
 // for cs_own_warp_rest. Plain: held (the HUD alone under the continuous warp - ow_weapon_held is never true, so whether the
@@ -4239,7 +4301,7 @@ bool ow_seek(uint2 p) {
         c = ow_held_colour(pi);
     } else {
         const float2 uv = (float2(p) + 0.5) / float2(out_size);
-        if (!ow_search(uv, src)) return false;
+        if (!ow_seek_search(uv, src)) return false;
         if (!(all(src >= 0) && all(src <= 1))) return false;  // (ow_find's test: outside, the memory's way)
         const float2 half_px = 0.5 / float2(out_size);
         if (!all(clamp(src, half_px, 1.0 - half_px) == src)) return false;  // (ow_scene_from's: the frame's edge)
@@ -6033,7 +6095,7 @@ bool Renderer::create_pipelines(std::string& error) {
         {"cs_attached", &cs_attached_}, {"cs_probe_tiles", &cs_probe_tiles_}, {"cs_probe_clear", &cs_probe_clear_}, {"cs_probe_score", &cs_probe_score_}, {"cs_memory", &cs_memory_}, {"cs_mem_ratio", &cs_mem_ratio_}, {"cs_mem_relight", &cs_mem_relight_}, {"cs_gun_motion", &cs_gun_motion_}, {"cs_ref_pick", &cs_ref_pick_}, {"cs_ref_frac", &cs_ref_frac_}, {"cs_depth_vec", &cs_depth_vec_}, {"cs_mem_mask", &cs_mem_mask_}, {"cs_share_weights", &cs_share_weights_}, {"cs_ref_raw", &cs_ref_raw_}, {"cs_share_rows", &cs_share_rows_}, {"cs_share_cols", &cs_share_cols_}, {"cs_hudless_ui", &cs_hudless_ui_}, {"cs_hudless_keep", &cs_hudless_keep_}, {"cs_ui_tiles", &cs_ui_tiles_}, {"cs_layer_unblend", &cs_layer_unblend_}, {"cs_layer_seam_clear", &cs_layer_seam_clear_}, {"cs_mem_vis", &cs_mem_vis_}, {"cs_ramp_rows", &cs_ramp_rows_}, {"cs_ramp", &cs_ramp_},
         {"cs_flow_luma", &cs_flow_luma_}, {"cs_flow_feat", &cs_flow_feat_}, {"cs_flow_search", &cs_flow_search_}, {"cs_flow_lk", &cs_flow_lk_},
         {"cs_flow_median", &cs_flow_median_}, {"cs_flow_motion", &cs_flow_motion_}, {"cs_flow_fill", &cs_flow_fill_},
-        {"cs_ret_cells", &cs_ret_cells_}, {"cs_ret_enclose", &cs_ret_enclose_}, {"cs_ret_layer", &cs_ret_layer_},
+        {"cs_ret_cells", &cs_ret_cells_}, {"cs_ret_cells_flat", &cs_ret_cells_flat_}, {"cs_ret_enclose", &cs_ret_enclose_}, {"cs_ret_layer", &cs_ret_layer_},
         {"cs_ret_align", &cs_ret_align_}, {"cs_ret_pick", &cs_ret_pick_}, {"cs_ret_args", &cs_ret_args_}, {"cs_ret_shift", &cs_ret_shift_}};
     for (auto& x : xs) {
         auto code = compile(x.entry, "cs_5_0", error, kShadersX);
@@ -7104,6 +7166,8 @@ void Renderer::follow_share(const IngestedSource& src, const float clip_to_prev_
 // (with split queues from the shown set, read in place; the copies go to the set this frame fills). Only
 // when this frame has the same sizes: otherwise the previous frame is of no use, and this frame's intake
 // replaces the textures the copies would read before the GPU gets to them.
+// (development, FW_HUD_EDGES_FIRST: hud_classify with both edges read before anything is decided, as before 2026-11-11)
+static bool hud_edges_first() { static const bool on = std::getenv("FW_HUD_EDGES_FIRST") != nullptr; return on; }
 ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const float clip_to_prev_clip[16], bool hud, bool attached,
                                              bool keep_attached, bool depth_inverted, bool combined, bool fill, int stretch, bool reticles,
                                              bool share) {
@@ -7337,7 +7401,7 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
                 D3D12_RESOURCE_BARRIER lu{}; lu.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; lu.UAV.pResource = private_[kPHudLearned].texture.Get();
                 list_->ResourceBarrier(1, &lu);
             }
-            c.flags = 2u | (depth_inverted ? 16u : 0u) | (attached ? 32u : 0u) | (check_step == 2 ? 256u : 0u);
+            c.flags = 2u | (depth_inverted ? 16u : 0u) | (attached ? 32u : 0u) | (check_step == 2 ? 256u : 0u) | (hud_edges_first() ? 4194304u : 0u);
             // The gate: the two dispatches below with their groups, or none.
             static const bool no_gate = GetEnvironmentVariableW(L"FW_HUD_CHECK_EVERY", nullptr, 0) != 0;  // (every frame, as before)
             XConstants g = c; g.mv_size[0] = (cw + 7) / 8; g.mv_size[1] = (ch + 7) / 8;
@@ -7415,7 +7479,7 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
         raw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; raw.Format = DXGI_FORMAT_R32_TYPELESS;
         raw.Buffer.NumElements = 4; raw.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
         device_->CreateUnorderedAccessView(hud_counts_.Get(), nullptr, &raw, cpu(kXHudUav + 1));
-        c.flags = 2u | (depth_inverted ? 16u : 0u) | (attached ? 32u : 0u);
+        c.flags = 2u | (depth_inverted ? 16u : 0u) | (attached ? 32u : 0u) | (hud_edges_first() ? 4194304u : 0u);
         transition(private_[kPHudScore], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         D3D12_RESOURCE_BARRIER counts{}; counts.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; counts.UAV.pResource = hud_counts_.Get();
         x_dispatch(cs_clear_counts_.Get(), &c, kXHudSrv, kXHudUav, 1, 1);
@@ -7486,7 +7550,9 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
             for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXRetCellsSrv + i, i == 1 ? kPDepth : kPObject);
             set_x_uav(kXRetCellsUav + 0, kPRetCells); set_x_uav(kXRetCellsUav + 1, kPRetCells);
             transition(private_[kPRetCells], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            x_dispatch(cs_ret_cells_.Get(), &k, kXRetCellsSrv, kXRetCellsUav, (cw + 7) / 8, (ch + 7) / 8);
+            // (cells of up to 8 px without the loop - see cs_ret_cells_flat; FW_RET_CELLS_OLD / set_ret_cells_old, development: the loop)
+            static const bool cells_old_env = std::getenv("FW_RET_CELLS_OLD") != nullptr;
+            x_dispatch((cell <= 8 && !cells_old_env && !ret_cells_old_ ? cs_ret_cells_flat_ : cs_ret_cells_).Get(), &k, kXRetCellsSrv, kXRetCellsUav, (cw + 7) / 8, (ch + 7) / 8);
             transition(private_[kPRetCells], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             D3D12_UNORDERED_ACCESS_VIEW_DESC raw{};
             raw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; raw.Format = DXGI_FORMAT_R32_TYPELESS;
@@ -8083,6 +8149,17 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
     // (forward splat: the plain pixels first, the rest packed for the full warp - see cs_own_warp_lean; the splat off, the
     // continuous warp's search the same way - see cs_own_warp_seek. With a sight-reticle layer or the warp paths the full warp)
     const bool seek = !(c.flags & 4096) && tether_field != kPCount && !layer && !warp_paths_;
+    // (the search's steps without the depth - see ow_seek_search: w = x m3 + y m7 + d m11 + m15 is linear, so over the box the
+    // search may wander in - uv in [-1, 2]: x, y in [-3, 3] - and any depth in [0, 1] its least value is at a corner. Clearly
+    // positive there - a thousandth of the terms' sizes, far above the shader's rounding: nothing in the box is behind the shown
+    // camera. FW_SEEK_DEPTH, development: never - the depth read at every step, as before)
+    static const bool seek_depth_env = std::getenv("FW_SEEK_DEPTH") != nullptr;
+    if (seek && !seek_depth_env) {
+        const float s3 = 3.0f * std::fabs(m[3]), s7 = 3.0f * std::fabs(m[7]);
+        const float w_min = m[15] - s3 - s7 + std::min(0.0f, m[11]);
+        const bool safe = w_min > 1e-6f + 1e-3f * (s3 + s7 + std::fabs(m[11]) + std::fabs(m[15]));
+        if (safe) c.threshold = float(static_cast<std::uint32_t>(c.threshold + 0.5f) | 262144u);
+    }
     if (((c.flags & 4096) || seek) && warp_blocks_ && ensure_warp_list(ow, oh)) {
         D3D12_UNORDERED_ACCESS_VIEW_DESC raw{};
         raw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; raw.Format = DXGI_FORMAT_R32_TYPELESS; raw.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
@@ -9823,7 +9900,7 @@ std::uint32_t Renderer::warp_rest_blocks() {
 bool Renderer::read_back(int which, std::vector<std::uint16_t>& pixels, std::uint32_t& w, std::uint32_t& h) {
     static const PrivateId kWhich[] = {kPBackbuffer, kPOutput, kPScene, kPDepth, kPMotion, kPObject, kPMask, kPHudScore, kPWorld, kPFill,
                                        kPStashColor, kPStashDepth, kPStashMotion, kPFlowB, kPStashHudless, kPStash2Color, kPStash2Hudless,
-                                       kPStash2Depth, kPStash2Motion, kPHudless, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPUi, kPWarpMask, kPRetLayer, kPDepth, kPDepth, kPDepth, kPHudLearned, kPHudTiles, kPHudKind, kPShare, kPRetEncl, kPAttached, kPMem0, kPPaths, kPStenCellsA, kPStenMask, kPShareSm, kPRamp, kPGunMove, kPTetherF, kPTetherA};
+                                       kPStash2Depth, kPStash2Motion, kPHudless, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPUi, kPWarpMask, kPRetLayer, kPDepth, kPDepth, kPDepth, kPHudLearned, kPHudTiles, kPHudKind, kPShare, kPRetEncl, kPAttached, kPMem0, kPPaths, kPStenCellsA, kPStenMask, kPShareSm, kPRamp, kPGunMove, kPTetherF, kPTetherA, kPRetCells};
     if (which < 0 || which >= int(std::size(kWhich))) return false;
     // (the sight reticles' layer: the history texture written last)
     // (the background memory: the one written last)
@@ -9938,7 +10015,7 @@ bool Renderer::read_back(int which, std::vector<std::uint16_t>& pixels, std::uin
 bool Renderer::write_back(int which, const std::vector<std::uint16_t>& pixels, std::uint32_t w, std::uint32_t h) {
     static const PrivateId kWhich[] = {kPBackbuffer, kPOutput, kPScene, kPDepth, kPMotion, kPObject, kPMask, kPHudScore, kPWorld, kPFill,
                                        kPStashColor, kPStashDepth, kPStashMotion, kPFlowB, kPStashHudless, kPStash2Color, kPStash2Hudless,
-                                       kPStash2Depth, kPStash2Motion, kPHudless, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPUi, kPWarpMask, kPRetLayer, kPDepth, kPDepth, kPDepth, kPHudLearned, kPHudTiles, kPHudKind, kPShare, kPRetEncl, kPAttached, kPMem0, kPPaths, kPStenCellsA, kPStenMask, kPShareSm, kPRamp, kPGunMove, kPTetherF, kPTetherA};
+                                       kPStash2Depth, kPStash2Motion, kPHudless, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPUi, kPWarpMask, kPRetLayer, kPDepth, kPDepth, kPDepth, kPHudLearned, kPHudTiles, kPHudKind, kPShare, kPRetEncl, kPAttached, kPMem0, kPPaths, kPStenCellsA, kPStenMask, kPShareSm, kPRamp, kPGunMove, kPTetherF, kPTetherA, kPRetCells};
     if (which < 0 || which >= int(std::size(kWhich)) || pixels.size() < std::size_t(w) * h * 4) return false;
     auto& p = kWhich[which] == kPMem0 ? private_[kPMem0 + std::max(mem_shown_, 0)]
             : split_ && shown_id(kWhich[which]) ? front_[kWhich[which]] : private_[kWhich[which]];

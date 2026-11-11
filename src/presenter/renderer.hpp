@@ -357,6 +357,7 @@ public:
     void set_orbit_centre_turn(bool on) { orbit_centre_turn_ = on; }  // (the orbit's centre measured against the turn: see share_measure_at, flag 512)
     // (development: the claims of an earlier refresh of the same frame used again - see own_warp's reuse_claims)
     void set_claims_reuse(bool on) { claims_reuse_ = on; }
+    void set_ret_cells_old(bool on) { ret_cells_old_ = on; }  // (development: the sight cells by the loop - see cs_ret_cells_flat)
     // (development: the reused claims looked up by the camera's turn alone, as before the lookup by depth - see ow_claims_uv)
     void set_claims_turn_only(bool on) { claims_turn_only_ = on; }
     // Development (dev/warp_replay's bench): the claim rules kept between warps without split queues too - the caller does
@@ -641,7 +642,7 @@ private:
     // (the claim rules of the shown frame's rendered pixels - cs_warp_beside, kPWarpBeside - and what they were made with;
     // kept only with split queues, where the shown set does not change until the next swap - see own_warp)
     std::array<std::uint64_t, 7> beside_key_ = {};
-    bool beside_valid_ = false, beside_kept_ = false;
+    bool beside_valid_ = false, beside_kept_ = false, ret_cells_old_ = false;
     bool lowres_between_ = false, mask_smooth_ = false, claims_beside_held_ = false;
     int beside_moved_ = 0;
     bool edge_dither_band_ = true, att_absolute_ = false, held_between_ = false, gun_built_ = false, motion_ref_ = false, ref_built_ = false, ref_frac_built_ = false;
@@ -682,7 +683,7 @@ private:
     ComPtr<ID3D12PipelineState> cs_sten_clear_, cs_sten_hist_, cs_sten_cells_, cs_sten_flood_, cs_sten_apply_, cs_sten_count_, cs_sten_grow_init_, cs_sten_grow_, cs_sten_age_, cs_sten_close_, cs_sten_comp_clear_, cs_sten_comp_count_, cs_sten_comp_max_, cs_sten_prune_, cs_sten_luma_, cs_sten_elig_, cs_sten_fringe_, cs_sten_fringe_apply_;
     // Sight reticles (option): the passes, which history texture holds the latest layer, and whether the layer was
     // built for the frame taken in last / the shown one (see cs_ret_layer).
-    ComPtr<ID3D12PipelineState> cs_ret_cells_, cs_ret_enclose_, cs_ret_layer_, cs_ret_align_, cs_ret_pick_, cs_ret_args_, cs_ret_shift_;
+    ComPtr<ID3D12PipelineState> cs_ret_cells_, cs_ret_cells_flat_, cs_ret_enclose_, cs_ret_layer_, cs_ret_align_, cs_ret_pick_, cs_ret_args_, cs_ret_shift_;
     ComPtr<ID3D12Resource> ret_buf_;  // the reticle's tracking sums and the shift chosen (cs_ret_align)
     bool ret_flip_ = false, layer_built_ = false, shown_layer_ = false;
     PrivateId ret_latest_ = kPRetA, ret_shown_ = kPRetA;  // the sight reticles' layer the intake wrote last / the shown frame's

@@ -288,7 +288,7 @@ private:
     unsigned ts_next_ = 0;
     int ts_tag_[kTsPairs] = {};
     std::uint64_t ts_ticks_[kTCount] = {};
-    std::uint32_t ts_presents_ = 0;
+    std::uint32_t ts_presents_ = 0, ts_presents_seen_ = 0, ts_probes_seen_ = 0, probe_handed_ = 0;  // (time_report: the frames handed over; the presents and HUD-learning copies at the last report; copies handed on since)
     bool ts_failed_ = false;
     void collect_retired();
 
