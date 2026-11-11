@@ -104,6 +104,9 @@ To check the version, right-click the file and open Properties > Details.
    the number of the game and press Enter. For a non-Steam game, choose **P** and type its folder.
    To update every FrameWarp it finds to the installer's version at once, choose **A** (shown when an
    older one is found: in your Steam libraries and in every folder the installer has installed to).
+   The installer keeps that list of folders since version 2.3, so a game outside your Steam libraries
+   (Epic, GOG, a folder of your own) that was installed with an earlier version isn't found by **A**:
+   choose it once with **P**, and **A** finds it from then on.
    The installer copies FrameWarp next to the game's ReShade, and `XPAR.fx` (for games without DLSS
    or FSR) into the game's ReShade shader folder. For Unreal Engine games, it also
    enables Streamline resource tagging in the game's `Engine.ini`, keeping a backup of the file.
