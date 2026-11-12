@@ -1222,6 +1222,80 @@ RWTexture2D<float4> oj_object_u : register(u0);
 Texture2D<float4> gs_object_t : register(t0);
 Texture2D<float2> gs_motion_t : register(t1);
 RWTexture2D<float2> gs_motion_u : register(u0);
+// The vectors checked (flag 8192; cs_gun_check first, its verdicts at t4): a game's vector can point where the pixel never
+// was. Cyberpunk's ejected casing, every frame of its flight, points back to the ejection port - 180 to 530 rendered px
+// where it moves 30-45 - and, attached and carried as the gun is, was shifted by that much between frames: the continuous
+// warp bent the scenery around it over 400x its size (seq_1 104-107, 153-155). A pixel whose vector is refused is not
+// shifted: it steps with the game's frames, as everything attached did before set_held_between.
+// The check, per pixel, against the frame before - t3, the follow share's sums of that frame, each cell with the nearness it
+// had (share_pack; a cell per 2x2 rendered pixels):
+// - nothing as near as the pixel (within ~40%, as sm_prev_at) was where the vector says it was - any of the 3x3 cells
+//   around, so a rim pixel finds its own surface: refused;
+// - or another attached pixel, elsewhere, came from that same spot - found one step back along the vector of what is there
+//   now - and fits the nearness that was there better (by 5%: the cells' own error): refused. The casing while the
+//   pistol's slide is open - the port's inside is as near as the casing, within 5-30%.
+// - it was outside the frame, and nothing of it inside (see below): refused. It was not in the picture a frame ago, so there is no earlier place to show it at -
+//   shifted back by its whole way in, a hand coming back up from below the edge at the end of a reload dragged the scenery
+//   around the gun with it for a frame (Cyberpunk, reload clip of 2026-11-11, frame 192: 215,000 px of the picture off -
+//   the user saw the gun "explode"). It appears where the game drew it and is shifted again from the next frame on.
+// Then the vote (cs_gun_motion): a pixel is refused when a sixth of the pixels around it moving as it does - 8 directions,
+// 3 distances, vectors within a quarter - are: a thing is refused whole or not at all. Per pixel a third of the casing
+// still passed in some frames, and any part of it shifted bends as much as all of it. In those frames the gun's own
+// refused pixels, 0.02% of it, are at the port and have vectors of 1-13 px.
+Texture2D<uint4> gs_prev_t : register(t3);
+Texture2D<float> gs_flag_t : register(t4);  // (cs_gun_check: 0 no vector, 1/3 believed, 2/3 refused - it was outside the frame, 1 refused)
+RWTexture2D<float> gc_flag_u : register(u0);
+bool gun_attached(float4 o) { return o.w > 1.5 && o.z > 1.0 / 64.0; }
+float2 gun_px(int2 q) { return gs_motion_t.Load(int3(min(uint2(q), mv_size - 1), 0)) * mv_scale * float2(rect.zw); }
+// (0: believed; 1: refused; 2: refused, it was outside the frame)
+int gun_vector_false(uint2 id, float2 v, float n) {
+    const float2 size = float2(rect.zw);
+    const float2 p0 = float2(id) - float2(rect.xy);
+    const float2 p = p0 + 0.5 + v * size;  // (where it was, rendered px of the rect)
+    if (any(p < 0) || any(p >= size)) {
+        // (...unless the thing was already partly in the picture: the pixel one vector further in is the same thing, moving
+        // the same way - and that one was where this pixel is now, inside. An arm that always crosses the bottom edge, a hand
+        // on its second frame in: shifted whole, as before. Refused there, its newly entered rim stayed while the rest was
+        // shifted - a cut across the hand, frames 193-194 of the same clip)
+        const float2 q = p0 + 0.5 - v * size;
+        if (any(q < 0) || any(q >= size)) return 2;
+        const int2 qi = int2(rect.xy) + int2(floor(q));
+        if (!gun_attached(gs_object_t.Load(int3(qi, 0)))) return 2;
+        const float2 vp = v * size, vq = gun_px(qi);
+        return length(vq - vp) > 0.25 * max(length(vp), length(vq)) + 1.0 ? 2 : 0;
+    }
+    const int2 cells = int2(share_cells());
+    const int2 c = int2(round((p - 0.5) * 0.5));
+    const float l = log2(max(n, 1e-9));
+    float best = 1e9, there = 0;
+    [unroll] for (int k = 0; k < 9; ++k) {
+        float dz;
+        share_unpack(gs_prev_t.Load(int3(clamp(c + int2(k % 3 - 1, k / 3 - 1), int2(0, 0), cells - 1), 0)), dz);
+        const float lz = log2(max(dz, 1e-9));
+        best = min(best, abs(lz - l));
+        if (k == 4) there = lz;
+    }
+    if (best >= 0.5) return 1;
+    const float2 q2 = p - gun_px(int2(rect.xy) + int2(floor(p)));
+    if (any(q2 < 0) || any(q2 >= size)) return 0;
+    const int2 i2 = int2(floor(q2));
+    const float4 o2 = gs_object_t.Load(int3(int2(rect.xy) + i2, 0));
+    if (!gun_attached(o2)) return 0;
+    if (length(float2(i2) + 0.5 + gun_px(int2(rect.xy) + i2) - p) > 2.0 || length(float2(i2) - p0) <= 4.0) return 0;
+    return best > abs(there - log2(max(o2.z, 1e-9))) + 0.07 ? 1 : 0;
+}
+[numthreads(8, 8, 1)] void cs_gun_check(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= grid)) return;
+    const float4 o = gs_object_t.Load(int3(id.xy, 0));
+    float f = 0;
+    if (all(id.xy >= rect.xy) && all(id.xy < rect.xy + rect.zw) && gun_attached(o)) {
+        const float2 v = gs_motion_t.Load(int3(min(id.xy, mv_size - 1), 0)) * mv_scale;
+        if (any(v != 0)) { const int c = gun_vector_false(id.xy, v, o.z); f = c == 0 ? 1.0 / 3.0 : c == 2 ? 2.0 / 3.0 : 1.0; }
+    }
+    gc_flag_u[id.xy] = f;
+}
+static const float2 kGunDirs[8] = {float2(1, 0), float2(0.70710678, 0.70710678), float2(0, 1), float2(-0.70710678, 0.70710678),
+                                   float2(-1, 0), float2(-0.70710678, -0.70710678), float2(0, -1), float2(0.70710678, -0.70710678)};
 [numthreads(8, 8, 1)] void cs_gun_motion(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= grid)) return;
     // (only the first-person weapon and hands - attached and near the camera, the analysis' own range for them, 64x the near
@@ -1229,10 +1303,52 @@ RWTexture2D<float2> gs_motion_u : register(u0);
     // fill could not keep up with - Leon beside a wall tore it into steps, RE Requiem seq_1 false edges +27%. It stays at the
     // game's rate, as before)
     const float4 o = gs_object_t.Load(int3(id.xy, 0));
-    const bool attached = all(id.xy >= rect.xy) && all(id.xy < rect.xy + rect.zw) && o.w > 1.5 && o.z > 1.0 / 64.0;
-    gs_motion_u[id.xy] = attached ? gs_motion_t.Load(int3(min(id.xy, mv_size - 1), 0)) * mv_scale : float2(0, 0);
+    const bool attached = all(id.xy >= rect.xy) && all(id.xy < rect.xy + rect.zw) && gun_attached(o);
+    float2 v = attached ? gs_motion_t.Load(int3(min(id.xy, mv_size - 1), 0)) * mv_scale : float2(0, 0);
+    if ((flags & 8192) && any(v != 0)) {
+        // (the verdicts around first: none refused - nearly every pixel - and nothing more is read)
+        const int2 lo = int2(rect.xy), hi = int2(rect.xy + rect.zw) - 1;
+        const float s = max(1.0, round(float(rect.z) / 640.0));
+        float f[24];
+        const float2 vp = v * float2(rect.zw);
+        const float lp = length(vp);
+        bool self_refused = gs_flag_t.Load(int3(id.xy, 0)) > 0.5, with_origin = false;
+        // (what is now where this pixel was is the same thing and refused for having been outside the frame: this one with
+        // it. A hand a little longer than its way in a frame - most of it was outside, the fingertips inside: the tips
+        // alone were shifted, by 131 px, and the hand came out cut in two, the same clip, frame 193. A thing still on its
+        // way in steps with the game's frames whole)
+        if (!self_refused) {
+            const int2 was = int2(rect.xy) + int2(floor(float2(id.xy) - float2(rect.xy) + 0.5 + vp));
+            if (all(was >= lo) && all(was <= hi)) {
+                const float fw = gs_flag_t.Load(int3(was, 0));
+                if (fw > 0.5 && fw < 0.83) {
+                    const float2 vw = gun_px(was);
+                    // (within half, not a quarter: a hand turning as it comes in moves 174 px at the wrist and 101 at the fingertips)
+                    with_origin = self_refused = length(vw - vp) <= 0.5 * max(lp, length(vw)) + 1.0;
+                }
+            }
+        }
+        bool any_refused = self_refused;
+        [unroll] for (int k = 0; k < 24; ++k) {
+            const float rad = (k < 8 ? 1.0 : k < 16 ? 2.5 : 4.5) * s;
+            f[k] = gs_flag_t.Load(int3(clamp(int2(id.xy) + int2(round(kGunDirs[k & 7] * rad)), lo, hi), 0));
+            any_refused = any_refused || f[k] > 0.5;
+        }
+        if (any_refused) {
+            float n = 1.0, r = self_refused ? 1.0 : 0.0;
+            [unroll] for (int k2 = 0; k2 < 24; ++k2) {
+                if (f[k2] <= 0.16) continue;
+                const float rad = (k2 < 8 ? 1.0 : k2 < 16 ? 2.5 : 4.5) * s;
+                const float2 vq = gun_px(clamp(int2(id.xy) + int2(round(kGunDirs[k2 & 7] * rad)), lo, hi));
+                if (length(vq - vp) > 0.25 * max(lp, length(vq)) + 1.0) continue;
+                n += 1.0;
+                if (f[k2] > 0.5) r += 1.0;
+            }
+            if (with_origin || r * 6.0 >= n) v = float2(0, 0);
+        }
+    }
+    gs_motion_u[id.xy] = v;
 }
-
 // A copy, read in place (the shown textures stay readable for both queues - see copy_shown_to_output).
 Texture2D<float4> cp_in4_t : register(t0);
 RWTexture2D<float4> cp_out4_u : register(u0);
@@ -5491,7 +5607,9 @@ constexpr UINT kXMemMaskSrv = kXDepthVec + 5 * 8, kXMemMaskUav = kXMemMaskSrv + 
 constexpr UINT kXShareSm = kXMemMaskUav + 2;
 // The camera check (cs_hud_apply: 6 + 2; cs_hud_gate: its args at u0, 2).
 constexpr UINT kXHudApplySrv = kXShareSm + 6 * 8, kXHudApplyUav = kXHudApplySrv + 6, kXHudGateUav = kXHudApplyUav + 2;
-constexpr UINT kW = kXHudGateUav + 2;
+// The gun's vectors checked against the frame before (cs_gun_check; 6 + 2).
+constexpr UINT kXGunCheckSrv = kXHudGateUav + 2, kXGunCheckUav = kXGunCheckSrv + 6;
+constexpr UINT kW = kXGunCheckUav + 2;
 enum WTable : UINT { kWWarp, kWShown, kWJoinInit, kWJoinAB, kWJoinBA, kWJoinFinal,
                      kWGenDepth0, kWGenDepth1, kWGenDepth2, kWGenUi0, kWGenUi1, kWGenUi2, kWClaim,
                      kWStill, kWHoldInit, kWHoldAB, kWHoldBA, kWHoldFinal, kWHoldFill, kWHoldFillFinal, kWGrowInit, kWGrowAB, kWGrowBA,
@@ -6092,7 +6210,7 @@ bool Renderer::create_pipelines(std::string& error) {
         {"cs_scene_clear", &cs_scene_clear_}, {"cs_scene_accum", &cs_scene_accum_}, {"cs_scene_finish", &cs_scene_finish_},
         {"cs_scene_tiles", &cs_scene_tiles_}, {"cs_scene_hud", &cs_scene_hud_}, {"cs_scene_fill", &cs_scene_fill_}, {"cs_scene_grey", &cs_scene_grey_},
         {"cs_scene_grey_finish", &cs_scene_grey_finish_}, {"cs_scene_wash", &cs_scene_wash_}, {"cs_scene_wash_finish", &cs_scene_wash_finish_},
-        {"cs_attached", &cs_attached_}, {"cs_probe_tiles", &cs_probe_tiles_}, {"cs_probe_clear", &cs_probe_clear_}, {"cs_probe_score", &cs_probe_score_}, {"cs_memory", &cs_memory_}, {"cs_mem_ratio", &cs_mem_ratio_}, {"cs_mem_relight", &cs_mem_relight_}, {"cs_gun_motion", &cs_gun_motion_}, {"cs_ref_pick", &cs_ref_pick_}, {"cs_ref_frac", &cs_ref_frac_}, {"cs_depth_vec", &cs_depth_vec_}, {"cs_mem_mask", &cs_mem_mask_}, {"cs_share_weights", &cs_share_weights_}, {"cs_ref_raw", &cs_ref_raw_}, {"cs_share_rows", &cs_share_rows_}, {"cs_share_cols", &cs_share_cols_}, {"cs_hudless_ui", &cs_hudless_ui_}, {"cs_hudless_keep", &cs_hudless_keep_}, {"cs_ui_tiles", &cs_ui_tiles_}, {"cs_layer_unblend", &cs_layer_unblend_}, {"cs_layer_seam_clear", &cs_layer_seam_clear_}, {"cs_mem_vis", &cs_mem_vis_}, {"cs_ramp_rows", &cs_ramp_rows_}, {"cs_ramp", &cs_ramp_},
+        {"cs_attached", &cs_attached_}, {"cs_probe_tiles", &cs_probe_tiles_}, {"cs_probe_clear", &cs_probe_clear_}, {"cs_probe_score", &cs_probe_score_}, {"cs_memory", &cs_memory_}, {"cs_mem_ratio", &cs_mem_ratio_}, {"cs_mem_relight", &cs_mem_relight_}, {"cs_gun_motion", &cs_gun_motion_}, {"cs_gun_check", &cs_gun_check_}, {"cs_ref_pick", &cs_ref_pick_}, {"cs_ref_frac", &cs_ref_frac_}, {"cs_depth_vec", &cs_depth_vec_}, {"cs_mem_mask", &cs_mem_mask_}, {"cs_share_weights", &cs_share_weights_}, {"cs_ref_raw", &cs_ref_raw_}, {"cs_share_rows", &cs_share_rows_}, {"cs_share_cols", &cs_share_cols_}, {"cs_hudless_ui", &cs_hudless_ui_}, {"cs_hudless_keep", &cs_hudless_keep_}, {"cs_ui_tiles", &cs_ui_tiles_}, {"cs_layer_unblend", &cs_layer_unblend_}, {"cs_layer_seam_clear", &cs_layer_seam_clear_}, {"cs_mem_vis", &cs_mem_vis_}, {"cs_ramp_rows", &cs_ramp_rows_}, {"cs_ramp", &cs_ramp_},
         {"cs_flow_luma", &cs_flow_luma_}, {"cs_flow_feat", &cs_flow_feat_}, {"cs_flow_search", &cs_flow_search_}, {"cs_flow_lk", &cs_flow_lk_},
         {"cs_flow_median", &cs_flow_median_}, {"cs_flow_motion", &cs_flow_motion_}, {"cs_flow_fill", &cs_flow_fill_},
         {"cs_ret_cells", &cs_ret_cells_}, {"cs_ret_cells_flat", &cs_ret_cells_flat_}, {"cs_ret_enclose", &cs_ret_enclose_}, {"cs_ret_layer", &cs_ret_layer_},
@@ -6365,6 +6483,9 @@ void Renderer::fill_from_camera(const float clip_to_prev_clip[16], float scale_x
 void Renderer::analyze_motion(const IngestedSource& src, const float clip_to_prev_clip[16], float scale_x, float scale_y, bool scale_valid,
                               bool depth_inverted, bool near_rule, bool turn_rule, std::uint64_t frame, float floor_pivot_depth) {
     game_vectors_ = src.has_motion && !src.motion_estimated && scale_valid;  // (the game's own motion vectors this frame - see infill_memory_)
+    // (whether the follow share measured the frame taken in before this one - set again by this frame's: see cs_gun_motion's check)
+    const bool share_before = share_measured_;
+    share_measured_ = false;
     if (!src.has_depth || !src.has_motion) return;
     const auto& depth = private_[kPDepth];
     const UINT w = depth.width, h = depth.height, gx = (w + 7) / 8, gy = (h + 7) / 8;
@@ -6512,7 +6633,26 @@ void Renderer::analyze_motion(const IngestedSource& src, const float clip_to_pre
         set_x_srv(kXGunSrv + 1, kPMotion);
         set_x_uav(kXGunUav + 0, kPGunMove); set_x_uav(kXGunUav + 1, kPGunMove);
         transition(private_[kPGunMove], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        x_dispatch(cs_gun_motion_.Get(), &c, kXGunSrv, kXGunUav, gx, gy);
+        // (each vector checked against the frame before - cs_gun_check: the follow share's sums of that frame, the ones its
+        // next measure reads. Only when it measured the frame taken in before this one, at this size: otherwise unchecked)
+        XConstants g = c;
+        const PrivateId before = share_flip_ ? kPShareB : kPShareA;
+        static const bool gun_check_off = std::getenv("FW_GUN_CHECK_OFF") != nullptr;  // (development: the vectors as they are)
+        if (!gun_check_off && share_before && private_[before].texture && private_[before].width == (c.rect[2] + 1) / 2 &&
+            private_[before].height == (c.rect[3] + 1) / 2 && ensure_private(kPGunFlag, w, h, DXGI_FORMAT_R8_UNORM)) {
+            for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(kXGunCheckSrv + i, kPDepth);
+            set_x_srv(kXGunCheckSrv + 0, kPObject);
+            set_x_srv(kXGunCheckSrv + 1, kPMotion);
+            set_x_srv(kXGunCheckSrv + 3, before);
+            set_x_uav(kXGunCheckUav + 0, kPGunFlag); set_x_uav(kXGunCheckUav + 1, kPGunFlag);
+            transition(private_[before], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            transition(private_[kPGunFlag], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            x_dispatch(cs_gun_check_.Get(), &g, kXGunCheckSrv, kXGunCheckUav, gx, gy);
+            transition(private_[kPGunFlag], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            set_x_srv(kXGunSrv + 4, kPGunFlag);
+            g.flags |= 8192u;
+        }
+        x_dispatch(cs_gun_motion_.Get(), &g, kXGunSrv, kXGunUav, gx, gy);
         transition(private_[kPGunMove], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         gun_built_ = true;
         ++held_stats_.sums;
@@ -7021,6 +7161,7 @@ void Renderer::follow_share(const IngestedSource& src, const float clip_to_prev_
     transition(private_[to], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     w_dispatch(cs_share_measure_.Get(), &c, wc, kWShareMeasure, (cw + 7) / 8, (ch + 7) / 8);
     transition(private_[to], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    share_measured_ = true;  // (this frame's nearness per cell is in `to`: analyze_motion's check of the next frame's gun vectors)
     // The bands (cs_share_bins).
     D3D12_RESOURCE_BARRIER bins{}; bins.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; bins.UAV.pResource = share_bins_.Get();
     list_->ResourceBarrier(1, &bins);
@@ -9834,7 +9975,7 @@ void Renderer::release_stash() {
 }
 
 std::string Renderer::memory_report() {
-    static const char* const kNames[] = {"Backbuffer", "Hudless", "Ui", "Depth", "Motion", "ZeroUi", "Output", "Object", "ObjKindA", "ObjKindB", "Gen0", "Gen1", "Gen2", "GenZ0", "GenZ1", "GenZ2", "Previous", "HudScore", "Mask", "Scene", "Attached", "World", "Fill", "Mem0", "Mem1", "MemZ0", "MemZ1", "RampRows", "Ramp", "WarpMask", "HudKind", "StashColor", "StashDepth", "StashMotion", "StashHudless", "Stash2Color", "Stash2Hudless", "Stash2Depth", "Stash2Motion", "LumaA", "LumaB", "Feat", "FlowA", "FlowB", "RetCells", "RetEncl", "RetA", "RetB", "RetLayer", "HudLearned", "HudTiles", "WarpClaims", "Still", "GrowA", "GrowB", "Probe", "ProbeTilesA", "ProbeTilesB", "ShareA", "ShareB", "ShareT", "Share", "RetDirtyA", "RetDirtyB", "ShareT2", "ShareHalf", "RecColour", "RecUi", "ShareResid", "OwnMove", "Paths", "ShareSeam", "AttHist", "MemVis", "UiTiles", "WarpBeside", "WarpHeld", "LowScene", "MaskRaw", "MemF0", "MemF1", "MemFZ0", "MemFZ1", "GunMove", "MemRatio", "MotionProbe", "MotionGame", "Stencil", "StenCellsA", "StenCellsB", "StenMask", "StenGrowA", "StenGrowB", "StenAge", "StenLumaA", "StenLumaB", "StenElig", "StenFringeA", "StenFringeB", "DepthVA", "DepthVB", "MemMask", "ShareSm", "ShareSmA", "RecOut", "TetherA", "TetherB", "TetherT", "TetherF", "TetherP"};
+    static const char* const kNames[] = {"Backbuffer", "Hudless", "Ui", "Depth", "Motion", "ZeroUi", "Output", "Object", "ObjKindA", "ObjKindB", "Gen0", "Gen1", "Gen2", "GenZ0", "GenZ1", "GenZ2", "Previous", "HudScore", "Mask", "Scene", "Attached", "World", "Fill", "Mem0", "Mem1", "MemZ0", "MemZ1", "RampRows", "Ramp", "WarpMask", "HudKind", "StashColor", "StashDepth", "StashMotion", "StashHudless", "Stash2Color", "Stash2Hudless", "Stash2Depth", "Stash2Motion", "LumaA", "LumaB", "Feat", "FlowA", "FlowB", "RetCells", "RetEncl", "RetA", "RetB", "RetLayer", "HudLearned", "HudTiles", "WarpClaims", "Still", "GrowA", "GrowB", "Probe", "ProbeTilesA", "ProbeTilesB", "ShareA", "ShareB", "ShareT", "Share", "RetDirtyA", "RetDirtyB", "ShareT2", "ShareHalf", "RecColour", "RecUi", "ShareResid", "OwnMove", "Paths", "ShareSeam", "AttHist", "MemVis", "UiTiles", "WarpBeside", "WarpHeld", "LowScene", "MaskRaw", "MemF0", "MemF1", "MemFZ0", "MemFZ1", "GunMove", "MemRatio", "MotionProbe", "MotionGame", "Stencil", "StenCellsA", "StenCellsB", "StenMask", "StenGrowA", "StenGrowB", "StenAge", "StenLumaA", "StenLumaB", "StenElig", "StenFringeA", "StenFringeB", "DepthVA", "DepthVB", "MemMask", "ShareSm", "ShareSmA", "RecOut", "TetherA", "TetherB", "TetherT", "TetherF", "TetherP", "GunFlag"};
     static_assert(sizeof(kNames) / sizeof(kNames[0]) == kPCount, "a name for every private texture");
     struct Item { std::string name; double mb; };
     std::vector<Item> items;

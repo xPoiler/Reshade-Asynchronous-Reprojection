@@ -626,6 +626,73 @@ void on_init_swapchain(swapchain* sc, bool) {
     }
 }
 
+// The panel starts as a tab in ReShade's bar, next to Home. ReShade opens an add-on's panel as a loose window and
+// writes where the windows are only when one of its own settings changes or the game takes its device down in an
+// orderly way - Dark Souls Remastered never does, so a panel docked by hand was loose again on every launch. So
+// before ReShade reads its window layout: the panel's saved entry gets Home's dock node, unless it has one of its
+// own; where the user pulled the panel out of the bar ([FrameWarp] PanelDocked=0, see draw_overlay) it loses it.
+// The layout is the list ReShade keeps under [OVERLAY] Window: "[Window][name]" followed by that window's lines.
+void dock_panel_by_default() {
+    char choice[8] = "";
+    size_t choice_size = sizeof(choice);
+    const bool loose = reshade::get_config_value(nullptr, "FrameWarp", "PanelDocked", choice, &choice_size) && choice[0] == '0';
+    std::vector<std::string> lines;
+    size_t size = 0;
+    if (reshade::get_config_value(nullptr, "OVERLAY", "Window", nullptr, &size) && size > 1) {
+        std::string raw(size, '\0');
+        size_t got = size;
+        reshade::get_config_value(nullptr, "OVERLAY", "Window", raw.data(), &got);
+        for (size_t at = 0; at < got;) {
+            const size_t end = std::min(raw.find('\0', at), got);
+            lines.emplace_back(raw, at, end - at);
+            at = end + 1;
+        }
+    }
+    const auto save = [&lines] {
+        std::string raw;
+        for (const std::string& line : lines) raw.append(line).push_back('\0');
+        reshade::set_config_value(nullptr, "OVERLAY", "Window", raw.data(), raw.size());
+    };
+    if (loose) {
+        // Pulled out of the bar: the saved entry may still say docked (written here, or by ReShade before the
+        // panel was pulled out and never since) - without its dock node the panel comes up as a loose window.
+        bool in_panel = false, changed = false;
+        for (size_t i = 0; i < lines.size();) {
+            if (!lines[i].empty() && lines[i][0] == '[') in_panel = lines[i] == "[Window][XPAR]";
+            if (in_panel && lines[i].rfind("DockId=", 0) == 0) {
+                lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(i));
+                changed = true;
+            } else {
+                ++i;
+            }
+        }
+        if (changed) save();
+        return;
+    }
+    // (no layout saved yet: ReShade's first node, the one it docks its own tabs into, is 1)
+    std::string dock = lines.empty() ? "DockId=0x00000001" : "";
+    size_t panel_end = 0;  // one past the panel's last line; 0: no entry
+    bool in_home = false, in_panel = false;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        const std::string& line = lines[i];
+        if (!line.empty() && line[0] == '[') {
+            in_home = line == "[Window][###home]";
+            in_panel = line == "[Window][XPAR]";
+        } else if (line.rfind("DockId=", 0) == 0) {
+            if (in_panel) return;  // docked where the user put it
+            if (in_home) dock = line.substr(0, line.find(','));  // (without Home's place in the tab order)
+        }
+        if (in_panel) panel_end = i + 1;
+    }
+    if (dock.empty()) return;  // Home itself is a loose window: no bar to go into
+    if (panel_end) {
+        lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(panel_end), dock);
+    } else {
+        lines.insert(lines.end(), {"[Window][XPAR]", "Collapsed=0", dock});
+    }
+    save();
+}
+
 // The ReShade menu takes the mouse and is drawn on the final frame only (not in a game's HUD layers): while
 // it is open the presenter shows the game's frame as it is and ignores the mouse.
 bool on_open_overlay(effect_runtime*, bool open, reshade::api::input_source) {
@@ -896,6 +963,25 @@ void draw_overlay(effect_runtime*) {
     auto& s = sh.settings;
     auto& h = sh.hooks;
     auto& p = sh.presenter;
+    {
+        // Pulled out of ReShade's bar, the panel stays a loose window in the next sessions; docked again, a tab
+        // (dock_panel_by_default). What is remembered is how the panel is, once it has been that way for a few
+        // draws in a row - not a change seen happening: a tab that is not the open one is not drawn at all, so a
+        // tab pulled straight out of the bar is first seen here when it is already loose.
+        static int saved = -1, seen = -1, streak = 0;
+        if (saved < 0) {
+            char choice[8] = "";
+            size_t choice_size = sizeof(choice);
+            saved = reshade::get_config_value(nullptr, "FrameWarp", "PanelDocked", choice, &choice_size) && choice[0] == '0' ? 0 : 1;
+        }
+        const int docked = ImGui::IsWindowDocked() ? 1 : 0;
+        streak = docked == seen ? streak + 1 : 0;
+        seen = docked;
+        if (streak >= 10 && docked != saved) {
+            reshade::set_config_value(nullptr, "FrameWarp", "PanelDocked", docked ? "1" : "0");
+            saved = docked;
+        }
+    }
     ImGui::TextDisabled("XPAR (xPoiler's Asynchronous Reprojection) " FW_VERSION);
 
     bool enabled = s.enabled != 0;
@@ -1592,6 +1678,7 @@ __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE reshade_modul
     fw::install_ngx_hooks(g_producer.get());
     fw::install_ffx_hooks(g_producer.get());
     fw::install_game_probes(g_producer->shared() ? &g_producer->shared()->hooks : nullptr);
+    dock_panel_by_default();
     register_callbacks();
     return true;
 }
