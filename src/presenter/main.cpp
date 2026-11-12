@@ -6,6 +6,7 @@
 #include "presenter/frame_clock.hpp"
 #include "presenter/camera_search.hpp"
 #include "presenter/renderer.hpp"
+#include "presenter/output_effects.hpp"
 #include "shared/camera_check.hpp"
 #include <shellapi.h>
 #include <compressapi.h>
@@ -894,6 +895,7 @@ std::uint32_t hardware_scheduling(const LUID& adapter) {
 
 void render_thread() {
     auto& sh = *g_app.shared;
+    OutputEffects fx;  // (before the renderer: it outlives it - see Renderer::set_output_effects)
     Renderer renderer;
     std::string error;
     const std::uint32_t w = sh.backbuffer_width, h = sh.backbuffer_height;
@@ -905,6 +907,22 @@ void render_thread() {
         g_app.running = false; PostMessageW(g_app.overlay, WM_CLOSE, 0, 0); return;
     }
     logf("renderer ready %ux%u, queue priority %s; %s", w, h, renderer.queue_priority(), renderer.shader_report().c_str());
+    // The game's ReShade effects on the picture (Settings::reshade_on_output, output_effects.hpp) - as the setting is at the start; not
+    // inside the game (its own ReShade is there).
+    std::uint32_t fx_state = 0;
+    LONG fx_serial = sh.reshade_preset_serial;
+    if (sh.settings.reshade_on_output && !g_app.in_process && !g_app.shadow) {
+        if (fx.load(g_app.base_dir.wstring()) && renderer.set_output_effects(&fx)) {
+            fx_state = 2;
+            logf("ReShade effects on the picture: the game's ReShade started on the presenter's swap chain (drawn while the game has effects on)");
+        } else {
+            fx_state = 1;
+            logf("ReShade effects on the picture: not available - %s", fx.note().c_str());
+        }
+        std::snprintf(sh.presenter.reshade_note, sizeof(sh.presenter.reshade_note), "%s", fx.note().c_str());
+    }
+    sh.presenter.reshade_state = fx_state;
+    bool fx_drawing = false;
     {
         // (development: the claims reused across the refreshes of one game frame - FW_CLAIMS_REUSE, from the add-on's
         // ClaimsReuse; see Renderer::set_claims_reuse)
@@ -2046,6 +2064,19 @@ void render_thread() {
         if (renderer.has_generated() && !source.generated && !incoming.s.generated && now_seconds() - last_generated > 3.0) {
             renderer.release_generated();
             logf("frame generation: its textures released (no generated images for 3 s)");
+        }
+        // The game's ReShade effects on the picture (output_effects.hpp): drawn while the game has any on, its ReShade menu is closed (the
+        // game draws them then) and this picture is the one on screen - the add-on switches the game's own off while they are drawn.
+        if (fx_state >= 2) {
+            fx.want(settings.reshade_on_output && sh.reshade_fx_active && !sh.overlay_open && g_app.visible && g_app.has_frames && !aside && !memory_aside);
+            if (sh.reshade_preset_serial != fx_serial) { fx_serial = sh.reshade_preset_serial; fx.reload_preset(); }
+            sh.presenter.reshade_drawn_qpc = fx.drawn_qpc();
+            sh.presenter.reshade_gpu_ms = fx.gpu_ms();
+            sh.presenter.reshade_state = fx.drawing() ? 3u : 2u;
+            if (fx.drawing() != fx_drawing) {
+                fx_drawing = fx.drawing();
+                logf(fx_drawing ? "ReShade effects on the picture: drawn" : "ReShade effects on the picture: not drawn (no effect on in the game, its menu open, or the picture not shown)");
+            }
         }
         // (game not in front / disabled / frame generation / video memory short: don't compete with it for the GPU)
         if (!g_app.visible || aside || memory_aside) {

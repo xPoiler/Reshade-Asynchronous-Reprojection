@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 89;
+constexpr std::uint32_t kVersion = 91;  // (90: a test build installed 2026-11-12, never committed)
 // (four: the presenter taking one in, one ready, and the add-on writing two - a game that starts its next frame before
 // the last one is presented (its tags and constants come first: Cyberpunk, Enshrouded) has two being written. Three
 // slots, 2026-10-28, dropped 43-55% of their frames before the presenter saw them - the reprojection fed at half the
@@ -148,6 +148,9 @@ struct Settings {
     std::uint32_t fps_counter;         // the presenter's frame counter in a corner of its picture - the game's frames and the
                                        // refreshes shown a second: 0 off, 1 top left, 2 top right (default), 3 bottom left, 4 bottom
                                        // right (saved per game; the Steam overlay's own counter is not drawn on the presenter)
+    std::uint32_t reshade_on_output;   // default on: the game's ReShade effects drawn on XPAR's own picture, every refresh, instead of on the
+                                       // game's (output_effects.hpp) - the picture shown then has them whichever way the frame was taken in
+                                       // (back buffer, HUD-less picture, frame generation). Read when the presenter starts (saved per game)
 };
 
 // Presenter status, displayed by the add-on UI.
@@ -211,6 +214,14 @@ struct PresenterStatus {
     // Where the character mask comes from (the panel says it): 0 estimated from the motion, 1 the game's depth-stencil marks the character
     // (StencilMask=1, development - Renderer::stencil_character)
     std::uint32_t character_source;
+    // The game's ReShade effects on the presenter's picture (Settings::reshade_on_output, output_effects.hpp): 0 off (the setting off when
+    // the presenter started), 1 not available (reshade_note says why), 2 ready - not drawing (no effects on in the game, its ReShade menu
+    // open, the picture not shown, effects still loading), 3 drawing. The last time they were drawn (qpc; the add-on switches the game's
+    // own effects off while it is recent) and their GPU time a refresh (ms, median of the last second; 0 not measured).
+    std::uint32_t reshade_state;
+    float reshade_gpu_ms;
+    volatile LONG64 reshade_drawn_qpc;
+    char reshade_note[160];
 };
 
 struct HookStats {
@@ -352,6 +363,10 @@ struct Shared {
     volatile LONG camera_share;  // (percent of the last frames the camera found was used on: the status line)
     volatile LONG camera_held[8];  // (the camera search's places that win, by key: the add-on reads them every frame, whatever its budget; 0: none)
     volatile LONG camera_held_state;  // (on the last frame that moved and was judged, the places held: 1 predicted it, 2 did not - the add-on searches whole frames again; 0 not known)
+    // The game's ReShade, for the presenter's own (output_effects.hpp), written by the add-on: 1 its effects are on and at least one of the
+    // user's techniques is enabled; the preset as the game has it now, written to FrameWarp\ReShadePreset.ini - +1 each time it is written.
+    volatile LONG reshade_fx_active;
+    volatile LONG reshade_preset_serial;
     volatile LONG64 timeline_count;
     TimelineEvent timeline[kTimeline];
 };

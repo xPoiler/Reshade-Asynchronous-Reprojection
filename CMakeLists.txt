@@ -30,7 +30,7 @@ target_include_directories(fw_options INTERFACE src)
 
 # In-game ReShade add-on (static CRT so it has no runtime dependency inside the game).
 add_library(FrameWarpAddon SHARED src/addon/addon.cpp src/addon/producer.cpp src/addon/vk_transport.cpp src/addon/streamline_hooks.cpp
-            src/addon/ngx_hooks.cpp src/addon/ffx_hooks.cpp src/addon/reshade_feed.cpp src/addon/depth_choice.cpp src/addon/ui_probe.cpp src/addon/mv_probe.cpp src/addon/camera_search.cpp src/addon/ui_layer.cpp src/addon/shader_scan.cpp src/addon/hud_learn.cpp src/addon/game_probe.cpp src/addon/frame_cap.cpp src/addon/fault_log.cpp src/common/inline_hook.cpp)
+            src/addon/ngx_hooks.cpp src/addon/ffx_hooks.cpp src/addon/reshade_feed.cpp src/addon/output_effects.cpp src/addon/depth_choice.cpp src/addon/ui_probe.cpp src/addon/mv_probe.cpp src/addon/camera_search.cpp src/addon/ui_layer.cpp src/addon/shader_scan.cpp src/addon/hud_learn.cpp src/addon/game_probe.cpp src/addon/frame_cap.cpp src/addon/fault_log.cpp src/common/inline_hook.cpp)
 target_link_libraries(FrameWarpAddon PRIVATE fw_options d3d12 dxgi d3dcompiler ole32 oleaut32 advapi32)
 # Symbols (FrameWarp.pdb, kept in the build folder): the fault log's offsets resolve to functions and lines (fault_log.cpp)
 target_compile_options(FrameWarpAddon PRIVATE /Zi)
@@ -41,10 +41,11 @@ set_target_properties(FrameWarpAddon PROPERTIES OUTPUT_NAME "FrameWarp" PREFIX "
                       MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # Out-of-process presenter (dynamic CRT to match NVIDIA's nvsdk_ngx_d.lib).
-add_library(fw_presenter_core STATIC src/presenter/renderer.cpp src/presenter/latewarp12.cpp)
+add_library(fw_presenter_core STATIC src/presenter/renderer.cpp src/presenter/latewarp12.cpp src/presenter/output_effects.cpp)
 target_link_libraries(fw_presenter_core PUBLIC fw_options d3d12 dxgi dcomp d3dcompiler
                       "${FW_NGX_LIB}" advapi32 shlwapi shell32 ole32)
 target_include_directories(fw_presenter_core SYSTEM PUBLIC "${FW_NGX_INCLUDE}")
+target_include_directories(fw_presenter_core SYSTEM PRIVATE third_party/reshade/include)  # (output_effects.cpp: ReShade loaded as a library)
 set_target_properties(fw_presenter_core PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
 
 # The presenter's shaders compiled at build time and built into it (FW_SHADERS - see Renderer::bake_shaders): a game's

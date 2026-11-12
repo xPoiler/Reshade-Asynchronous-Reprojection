@@ -38,15 +38,21 @@ bool named(const char* reported, const char* declared) {
     return n == m || !std::isalnum(static_cast<unsigned char>(reported[n - m - 1]));
 }
 
-// XPAR.fx's technique and its output.
+// XPAR's effect file: XPAR.addonfx since 2.4 - an add-on effect, drawn even while ReShade's effects are switched off (as the add-on
+// does while the presenter draws them on its own picture: output_effects.hpp); XPAR.fx before it (still found: an install not updated).
+const char* g_effect = "XPAR.fx";
+
+// XPAR's technique and its output.
 void scan(effect_runtime* runtime) {
     g.scanned = true;
-    g.feed = runtime->find_technique("XPAR.fx", "XPAR_Feed");
+    g_effect = "XPAR.addonfx";
+    g.feed = runtime->find_technique(g_effect, "XPAR_Feed");
+    if (!g.feed.handle) { g_effect = "XPAR.fx"; g.feed = runtime->find_technique(g_effect, "XPAR_Feed"); }
     g.depth = {0}; g.probe = {0}; g.bound = {0};
-    g.flip = runtime->find_uniform_variable("XPAR.fx", "XPAR_Flip");
-    g.far_switch = runtime->find_uniform_variable("XPAR.fx", "XPAR_Far");
+    g.flip = runtime->find_uniform_variable(g_effect, "XPAR_Flip");
+    g.far_switch = runtime->find_uniform_variable(g_effect, "XPAR_Far");
     g.far_on = false;  // (a reloaded effect starts with its default)
-    runtime->enumerate_texture_variables("XPAR.fx", [&](effect_runtime* r, effect_texture_variable v) {
+    runtime->enumerate_texture_variables(g_effect, [&](effect_runtime* r, effect_texture_variable v) {
         char name[160] = "";
         r->get_texture_variable_name(v, name);
         if (named(name, "XPAR_Depth")) g.depth = v;
@@ -60,6 +66,13 @@ void set_status(const char* text) { std::snprintf(g.status, sizeof(g.status), "%
 }  // namespace
 
 void install_reshade_feed(Producer* producer) { g_producer = producer; mv_probe::set_producer(producer); }
+
+const char* xpar_effect_name() { return g_effect; }
+
+bool feed_needs_user_effects(effect_runtime* runtime) {
+    if (!runtime || !g.scanned || !g.feed.handle || std::strcmp(g_effect, "XPAR.fx") != 0) return false;
+    return runtime->get_technique_state(g.feed);
+}
 
 // StencilDump=1 (development, plan_character_coordinates.md option 2): whether the game marks its characters in its depth's stencil. The
 // depth an upscaler is handed and the one ReShade gives effects are copies without it (Requiem: format 41 both): the stencil is only in the
@@ -254,9 +267,9 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
             asked_w = fw_; asked_h = fh_;
             char v[16];
             std::snprintf(v, sizeof(v), "%u", fw_);
-            runtime->set_preprocessor_definition_for_effect("XPAR.fx", "XPAR_FEED_W", v);
+            runtime->set_preprocessor_definition_for_effect(g_effect, "XPAR_FEED_W", v);
             std::snprintf(v, sizeof(v), "%u", fh_);
-            runtime->set_preprocessor_definition_for_effect("XPAR.fx", "XPAR_FEED_H", v);
+            runtime->set_preprocessor_definition_for_effect(g_effect, "XPAR_FEED_H", v);
             char text[200];
             std::snprintf(text, sizeof(text), "XPAR: ReShade feed: depth handed over at the game's depth buffer's size, %ux%u (was %ux%u, the picture %ux%u)", fw_, fh_, w, h, sw, shh);
             fw::diag_log(reshade::log::level::info, text);

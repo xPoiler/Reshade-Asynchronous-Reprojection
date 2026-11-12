@@ -1,4 +1,5 @@
 #include "presenter/renderer.hpp"
+#include "presenter/output_effects.hpp"
 #include "presenter/pose.hpp"
 #include <cctype>
 #include <cmath>
@@ -5911,6 +5912,7 @@ DispatchProfile g_profile;
 
 Renderer::~Renderer() {
     if (queue_ && fences_[0]) wait_idle();
+    if (fx_) fx_->detach();
     if (fence_event_) CloseHandle(fence_event_);
     if (waitable_) CloseHandle(waitable_);
 }
@@ -6097,6 +6099,13 @@ bool Renderer::set_output(DXGI_FORMAT game_format, std::uint32_t color_space) {
     const DXGI_FORMAT format = swapchain_format(game_format);
     if (format == swap_format_ && color_space == color_space_) return true;
     wait_idle();
+    // (ReShade's effect runtime holds the back buffers and knows the colour space: made again after - see set_output_effects)
+    const bool fx_attached = fx_ && fx_->attached();
+    if (fx_attached) fx_->detach();
+    struct Reattach {
+        Renderer* r; bool on;
+        ~Reattach() { if (on) r->fx_->attach(r->device_.Get(), r->queue_.Get(), r->swapchain_.Get(), r->color_space_); }
+    } reattach{this, fx_attached};
     if (format != swap_format_) {
         if (FAILED(swapchain_->ResizeBuffers(3, width_, height_, format, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))) {
             notes_.push_back("output: could not switch the swap chain to format " + std::to_string(unsigned(format)));
@@ -6133,10 +6142,19 @@ void Renderer::create_swapchain_views() {
 bool Renderer::resize(std::uint32_t width, std::uint32_t height) {
     if (width == width_ && height == height_) return true;
     wait_idle();
-    if (FAILED(swapchain_->ResizeBuffers(3, width, height, swap_format_, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))) return false;
-    width_ = width; height_ = height;
-    create_swapchain_views();
-    return true;
+    const bool fx_attached = fx_ && fx_->attached();
+    if (fx_attached) fx_->detach();  // (it holds the back buffers: made again at the new size)
+    const bool resized = SUCCEEDED(swapchain_->ResizeBuffers(3, width, height, swap_format_, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT));
+    if (resized) { width_ = width; height_ = height; create_swapchain_views(); }
+    if (fx_attached) fx_->attach(device_.Get(), queue_.Get(), swapchain_.Get(), color_space_);
+    return resized;
+}
+
+bool Renderer::set_output_effects(OutputEffects* fx) {
+    if (fx_ == fx) return !fx || fx->attached();
+    if (fx_) { wait_idle(); fx_->detach(); }
+    fx_ = fx;
+    return !fx_ || fx_->attach(device_.Get(), queue_.Get(), swapchain_.Get(), color_space_);
 }
 
 bool Renderer::create_pipelines(std::string& error) {
@@ -9909,7 +9927,11 @@ void Renderer::finish_frame(bool warped, int marker, bool newest) {
         list_->EndQuery(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * 2 + 1);
         list_->ResolveQueryData(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * 2, 2, readback_.Get(), frame_index_ * 16);
     }
+    // The game's ReShade effects (output_effects.hpp): its own work for the picture first - on the queue before this list, so what it
+    // draws on the back buffer (its splash) is covered by the final pass - then the effects on the finished picture.
+    if (fx_) fx_->before_final_pass();
     execute();
+    if (fx_) fx_->after_final_pass(back.Get(), index, swap_format_);
     signal_refresh();  // (the intake pieces waiting for this refresh go once its warp is done)
     {
         LARGE_INTEGER q; QueryPerformanceCounter(&q);

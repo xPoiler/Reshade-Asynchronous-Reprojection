@@ -1,5 +1,6 @@
 #include "addon/depth_choice.hpp"
 #include "addon/frame_cap.hpp"
+#include "addon/reshade_feed.hpp"
 #include <reshade.hpp>
 #include <d3d11.h>
 #include <d3d12.h>
@@ -440,7 +441,7 @@ void drop_twin(effect_runtime* runtime) {
     g_twin_gone = false;
     g_twin_of = 0;
     if (runtime) {
-        if (const auto v = runtime->find_uniform_variable("XPAR.fx", "XPAR_Twin"); v.handle) runtime->set_uniform_value_bool(v, false);
+        if (const auto v = runtime->find_uniform_variable(xpar_effect_name(), "XPAR_Twin"); v.handle) runtime->set_uniform_value_bool(v, false);
         if (g_twin_view.handle) runtime->update_texture_bindings("XPAR_TWIN_DEPTH", resource_view{0}, resource_view{0});
         if (g_twin_view.handle) runtime->get_device()->destroy_resource_view(g_twin_view);
         if (g_twin_copy.handle) runtime->get_device()->destroy_resource(g_twin_copy);
@@ -466,7 +467,7 @@ bool bind_twin(effect_runtime* runtime, resource res) {
     }
     g_twin = res;
     runtime->update_texture_bindings("XPAR_TWIN_DEPTH", g_twin_view, g_twin_view);
-    if (const auto v = runtime->find_uniform_variable("XPAR.fx", "XPAR_Twin"); v.handle) runtime->set_uniform_value_bool(v, true);
+    if (const auto v = runtime->find_uniform_variable(xpar_effect_name(), "XPAR_Twin"); v.handle) runtime->set_uniform_value_bool(v, true);
     else why(5, "XPAR: this XPAR.fx cannot read a second depth buffer (an older one?)");
     return true;
 }

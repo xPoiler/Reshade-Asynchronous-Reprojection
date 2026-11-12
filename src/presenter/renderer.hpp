@@ -19,6 +19,7 @@
 
 namespace fw {
 using Microsoft::WRL::ComPtr;
+class OutputEffects;
 
 // The warp passes' second block of root constants (cbuffer W): wmat 16, wproj 4, the claims homography 10.
 constexpr unsigned kWConstants = 30;
@@ -164,6 +165,10 @@ public:
         fps_word_ = corner ? (std::min(corner, 4u) << 4) | (std::min(game, 999u) << 9) | (std::min(out, 999u) << 19) : 0u;
     }
     bool fps_counter_dirty() const { return fps_word_ != fps_word_drawn_; }
+    // The game's ReShade effects on the presented pictures (output_effects.hpp; Settings::reshade_on_output): attached to the swap chain
+    // here (false: it could not start - fx->note() says why), driven around the final pass, made again when the swap chain's buffers or
+    // colour space change. Set after init; outlives the renderer or is set back to null before it goes.
+    bool set_output_effects(OutputEffects* fx);
     // Nothing new to show this refresh (the picture presented last is still the right one): what the refresh
     // recorded so far (a frame taken in on the same queue, for one) is submitted, with no warp, no blit and no
     // present - the composition keeps showing the last picture.
@@ -788,6 +793,7 @@ private:
     ComPtr<ID3DBlob> blit_vs_, blit_ps_;  // (the final pass, rebuilt for another output format)
     std::uint32_t color_space_ = 0;
     std::uint32_t fps_word_ = 0, fps_word_drawn_ = 0;  // (see set_fps_counter)
+    OutputEffects* fx_ = nullptr;  // (see set_output_effects)
     void apply_color_space(std::uint32_t color_space);
     ComPtr<ID3D12DescriptorHeap> heap_, rtv_heap_;
     UINT descriptor_size_ = 0, rtv_size_ = 0;

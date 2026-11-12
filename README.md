@@ -107,8 +107,8 @@ To check the version, right-click the file and open Properties > Details.
    The installer keeps that list of folders since version 2.3, so a game outside your Steam libraries
    (Epic, GOG, a folder of your own) that was installed with an earlier version isn't found by **A**:
    choose it once with **P**, and **A** finds it from then on.
-   The installer copies FrameWarp next to the game's ReShade, and `XPAR.fx` (for games without DLSS
-   or FSR) into the game's ReShade shader folder. For Unreal Engine games, it also
+   The installer copies FrameWarp next to the game's ReShade, and `XPAR.addonfx` (for games without DLSS
+   or FSR; it replaces the `XPAR.fx` of versions before 2.4) into the game's ReShade shader folder. For Unreal Engine games, it also
    enables Streamline resource tagging in the game's `Engine.ini`, keeping a backup of the file.
    **Vulkan games** (DOOM Eternal): install ReShade for the game choosing **Vulkan** as the rendering
    API. ReShade then runs as a system-wide Vulkan layer and puts only a `ReShade.ini` in the game's

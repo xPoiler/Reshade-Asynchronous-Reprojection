@@ -17,6 +17,7 @@
 #include "addon/shader_scan.hpp"
 #include "addon/hud_learn.hpp"
 #include "addon/reshade_feed.hpp"
+#include "addon/output_effects.hpp"
 #include "addon/frame_cap.hpp"
 #include "shared/dev_keys.hpp"
 #include <d3d12.h>
@@ -248,6 +249,7 @@ void launch_presenter() {
         std::wstring cmd = L"\"" + path + L"\"" + args;
         const std::wstring dir = path.substr(0, path.find_last_of(L"\\/"));
         if (launch_in_process(dir)) return;
+        fw::output_effects::prepare(g_producer ? g_producer->shared() : nullptr, dir);  // (ReShade for the presenter's own picture)
         if (!g_explorer_failed && !game_elevated() && launch_through_explorer(path, args + env_args, dir)) {
             g_explorer_tick = GetTickCount64();
             return;
@@ -312,6 +314,7 @@ constexpr Persisted kPersisted[] = {
     {"EdgeFill", &fw::Settings::edge_fill, nullptr},
     {"MemoryResolution", &fw::Settings::memory_resolution, nullptr},
     {"FpsCounter", &fw::Settings::fps_counter, nullptr},
+    {"ReShadeOnOutput", &fw::Settings::reshade_on_output, nullptr},
     {"EdgeLimit", nullptr, &fw::Settings::edge_limit_pct},
     {"EdgeUnlimited", &fw::Settings::edge_unlimited, nullptr},
     {"WarpEngine", &fw::Settings::warp_engine, nullptr},
@@ -832,6 +835,8 @@ void on_reshade_present(effect_runtime* runtime) {
     g_frame_presented.store(true, std::memory_order_release);
     command_queue* queue = runtime->get_command_queue();
     if (!g_producer || !g_producer->ready() || !queue) return;
+    // (the game's ReShade effects on the presenter's picture: its preset handed over, its own effects off while the presenter draws them)
+    fw::output_effects::after_present(runtime, g_producer->shared(), presenter_running(), g_in_process_running);
     if (queue->get_device()->get_api() == device_api::vulkan) {
         if (!g_producer->shared()->game_vulkan) InterlockedExchange(&g_producer->shared()->game_vulkan, 1);
         if (g_producer->vulkan()) present_vulkan(runtime, queue);
@@ -1001,6 +1006,31 @@ void draw_overlay(effect_runtime*) {
         hint("The presenter's own counter in a corner of the picture: GAME - the game's frames a second XPAR takes in; OUT - the "
              "refreshes a second it shows. Drawn by XPAR on its own picture, which covers the game's window - counters drawn into "
              "the game (the Steam overlay's, for one) stay under it. Remembered per game.");
+    }
+    {
+        bool on = s.reshade_on_output != 0;
+        if (ImGui::Checkbox("ReShade effects on XPAR's picture", &on)) s.reshade_on_output = on;
+        hint("The game's ReShade effects drawn on the picture XPAR shows, every refresh, and switched off in the game meanwhile. Without "
+             "it they are missing whenever XPAR takes the game's picture before ReShade draws them: the game's picture without its HUD, "
+             "and frame generation's images. Costs the effects' GPU time once a refresh instead of once a game frame. While the ReShade "
+             "menu is open the game draws them as usual. Depth-based effects get no depth on XPAR's picture. Takes effect when the "
+             "presenter starts. Remembered per game.");
+        if (on && presenter_running()) {
+            const char* note = p.reshade_note[0] ? p.reshade_note : "";
+            switch (p.reshade_state) {
+                case 0: ImGui::TextDisabled("  Applies from the presenter's next start."); break;
+                case 1: ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "  Not available: %s", note); break;
+                case 2:
+                    if (fw::output_effects::old_feed_effect())
+                        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "  Not drawing: XPAR.fx is the old XPAR effect - install XPAR again (it brings XPAR.addonfx).");
+                    else ImGui::TextDisabled("  Not drawing: %s", sh.reshade_fx_active ? "loading effects, or the picture not shown" : "no effect is on in the game");
+                    break;
+                default:
+                    if (p.reshade_gpu_ms > 0.0f) ImGui::TextDisabled("  Drawn each refresh: %.2f ms of GPU time%s", p.reshade_gpu_ms,
+                                                                   fw::output_effects::game_effects_off() ? "" : " (the game draws its own too: menu open)");
+                    else ImGui::TextDisabled("  Drawn each refresh.");
+            }
+        }
     }
 
     const bool alive = presenter_running();
@@ -1539,6 +1569,7 @@ void register_callbacks() {
     reshade::register_event<reshade::addon_event::reshade_present>(on_reshade_present);
     reshade::register_event<reshade::addon_event::reshade_finish_effects>(fw::on_reshade_finish_effects);
     reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(fw::on_reshade_reloaded_effects);
+    fw::output_effects::register_events();
     fw::register_depth_choice_events();
     fw::register_stencil_dump_events();
     fw::ui_probe::init();
@@ -1620,6 +1651,7 @@ void unregister_callbacks() {
     fw::ui_layer::shutdown();
     fw::shader_scan::shutdown();
     fw::hud_learn::shutdown();
+    fw::output_effects::unregister_events();
     reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(fw::on_reshade_reloaded_effects);
     reshade::unregister_event<reshade::addon_event::reshade_finish_effects>(fw::on_reshade_finish_effects);
     reshade::unregister_event<reshade::addon_event::reshade_present>(on_reshade_present);

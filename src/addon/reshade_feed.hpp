@@ -19,4 +19,9 @@ void on_reshade_finish_effects(reshade::api::effect_runtime* runtime, reshade::a
 void on_reshade_reloaded_effects(reshade::api::effect_runtime* runtime);
 // For the panel: what the feed is doing, or what it is missing ("" while the game's own data is used).
 const char* reshade_feed_status();
+// XPAR's effect file as ReShade loaded it: "XPAR.addonfx" (2.4 on), or "XPAR.fx" (an older install).
+const char* xpar_effect_name();
+// The feed is running from an XPAR.fx - an ordinary effect, drawn only while ReShade's effects are on: they cannot be switched off for
+// the presenter's own then (output_effects.hpp) without stopping it.
+bool feed_needs_user_effects(reshade::api::effect_runtime* runtime);
 }
