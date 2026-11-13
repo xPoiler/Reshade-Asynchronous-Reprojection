@@ -565,6 +565,21 @@ void Producer::set_present_matrices(const MatrixCandidate* matrices, std::uint32
     std::lock_guard lock(mutex_);
     present_matrix_count_ = std::min(count, kMatrixCandidates);
     std::copy(matrices, matrices + present_matrix_count_, present_matrices_);
+    // The game's frame generation: the presents are its own and publish nothing (on_present). The game renders a frame, then
+    // presents it - frame generation makes its images there (on_generated) and presents them: the first present after that
+    // carries what was found while the frame was rendered. Its values go with that frame, while it is still being written.
+    if (matrices_frame_) {
+        const int slot = slot_for_frame(matrices_frame_, false);
+        if (slot >= 0) {
+            auto& m = shared_->slots[slot];
+            if (m.state == kWriting && m.camera.estimated && !m.matrices) {
+                std::copy(present_matrices_, present_matrices_ + present_matrix_count_, m.matrix);
+                m.matrices = present_matrix_count_;
+            }
+        }
+        matrices_frame_ = 0;
+        present_matrix_count_ = 0;
+    }
 }
 
 void Producer::set_motion_meta(std::uint64_t frame, std::uint32_t candidate, std::uint32_t channels) {
@@ -1788,8 +1803,21 @@ void Producer::on_generated(std::uint64_t frame, std::uint32_t index, std::uint3
         // also run just before the game's present marker for it (FSR), so when the frame the marker names has
         // all its images already (or is published), these are the next frame's.
         frame = pending_present_frame_;
-        const int named = slot_for_frame(frame, false);
-        if (named < 0 || (shared_->slots[named].gen_last && shared_->slots[named].gen_last >= shared_->slots[named].per_frame)) ++frame;
+        if (frame) {
+            const int named = slot_for_frame(frame, false);
+            if (named < 0 || (shared_->slots[named].gen_last && shared_->slots[named].gen_last >= shared_->slots[named].per_frame)) ++frame;
+        } else {
+            // A game that sends no present markers (Streamline 1.x - Returnal): the newest frame the GPU was given, from the
+            // last second, as the presents pick theirs without markers (on_present). The frame stayed 0 and no image was ever
+            // taken: once frame generation ran, no frame was published again.
+            int newest = -1;
+            for (int i = 0; i < kSlots; ++i)
+                if (shared_->slots[i].state == kWriting && shared_->slots[i].camera.valid && slot_submitted_[i] &&
+                    qpc_now() - shared_->slots[i].qpc_constants < shared_->qpc_frequency &&
+                    !(shared_->slots[i].gen_last && shared_->slots[i].gen_last >= shared_->slots[i].per_frame) &&  // (its images all in)
+                    (newest < 0 || shared_->slots[i].frame_id > shared_->slots[newest].frame_id)) newest = i;
+            if (newest >= 0) frame = shared_->slots[newest].frame_id;
+        }
     }
     const int slot = slot_for_frame(frame, false);
     if (slot < 0) return skip(kGenSkipNoSlot);
@@ -1800,6 +1828,8 @@ void Producer::on_generated(std::uint64_t frame, std::uint32_t index, std::uint3
     if (index > per_frame || index <= m.gen_last) return skip(kGenSkipOrder);
     m.per_frame = per_frame;
     m.gen_last = index;
+    // (the camera search's values for it come with the next present - see set_present_matrices)
+    if (m.camera.estimated && !m.matrices) matrices_frame_ = m.frame_id;
     const bool last = index == per_frame;
     // More than kMaxGenerated per frame (6x: 5): the first, the last and evenly in between (1, 3, 5).
     bool wanted = per_frame <= static_cast<std::uint32_t>(kMaxGenerated);
@@ -1851,6 +1881,9 @@ void Producer::on_generated(std::uint64_t frame, std::uint32_t index, std::uint3
                 set_info(kHudless);
             }
         }
+        // (HUD learning's comparison and the learned point's HUD are not handed over here: tried 2026-11-13 on frame
+        // generation's own command list - Returnal froze twice within minutes, its GPU queue waiting for good, then crashed.
+        // With frame generation on, HUD learning has nothing to score and the learned point gives nothing - see hud_learn)
     }
     if (take) m.gen_index[m.generated++] = index;
     generated_qpc_ = qpc_now();

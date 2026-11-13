@@ -42,14 +42,36 @@ std::atomic<std::uint64_t> g_last_full{0};  // the last back-buffer-sized textur
 // draw), with the present count then. Watched (lock-free check at a bind): those and the back buffers.
 struct Final { std::uint64_t res; std::uint32_t seen; };
 std::vector<Final> g_finals;
-constexpr int kWatch = 8;
+// Feeders: full-size textures copied into a final picture, or into such a texture (a step further back), lately - with what
+// they were copied into, their size and format, and the copies (the log). Watched too. A feeder is the frame's picture
+// (source_seen) when the final picture it was copied into is not drawn into after that copy: the picture reaching the screen
+// through the copy, its drawings the frame's candidates and the learned point's (see on_present's pic). Returnal with its
+// frame generation: its final picture filled by a copy every frame and never drawn into, from a ring of three textures the
+// picture and its HUD are drawn into - the same drawings, its learned point among them, as without frame generation.
+// Any other feeder: logged only, never a candidate (see drawn).
+// A feeder the game draws into (drawn_seen: when last seen drawn into, at its copy or in the frame's drawings) is kept before
+// any other: with the game's frame generation its own textures are copied into the generated images many times a frame
+// (Returnal: 900 copies every 600 presents), and those pushed the game's ring out before its drawings were ever seen.
+struct Feeder { std::uint64_t res, into; std::uint32_t seen, w, h, format, copies, source_seen, drawn_seen; };
+std::vector<Feeder> g_feeders;
+std::uint32_t g_feed_copies = 0, g_idle_presents = 0;
+// Full-size textures (not a back buffer) drawn into over the last presents, with the present then (see note_full).
+std::vector<std::pair<std::uint64_t, std::uint32_t>> g_drawn_full;
+std::atomic<std::uint32_t> g_present_now{0};
+thread_local std::uint32_t tl_full_present = 0;
+// This present: the copies into a final picture or feeder (from, into, that picture drawn into after it).
+struct Copy { std::uint64_t src, dst; bool dst_drawn; };
+std::vector<Copy> g_frame_copies;
+// (back buffers, up to 8 final pictures - with frame generation the generated images reach the back buffer too: Returnal 9,
+// its real final picture pushed out of 4 - and up to 6 feeders)
+constexpr int kWatch = 20;
 std::atomic<std::uint64_t> g_watch[kWatch];
 // This frame: draws into watched textures (texture, fingerprint, blend, draws), merged while the same; the final
 // picture found; the back buffer drawn into yet; the candidate's copy taken.
 struct Entry { std::uint64_t res; std::uint32_t fp; std::uint8_t blend; std::uint32_t draws; };
 std::vector<Entry> g_log;
 std::uint64_t g_final = 0, g_bb_frame = 0;  // (the back buffer drawn into this frame)
-bool g_bb_drawn = false, g_taken = false;
+bool g_bb_drawn = false, g_taken = false, g_end_taken = false;  // (g_end_taken: the end copy taken this frame - at a copy onto the back buffer or its first draw)
 // Direct3D 12: per command list, the last back-buffer-sized texture drawn into, and - if it draws into a back buffer - the
 // last one before that; the lists in the order the game hands them to the GPU this frame. The final picture is the one
 // drawn into last before the back buffer's draw in that order (Elden Ring records its lists on several threads at once:
@@ -71,6 +93,17 @@ std::wstring g_profile;
 std::string g_profile_build;  // (the add-on build the saved point must come from - see set_profile)
 bool g_profile_read = false, g_from_profile = false, g_saved = false;
 std::uint8_t g_locked_role = 0;
+// The final pictures the learned point drew into lately (a point in the final picture: a frame where it did not draw is a
+// hidden HUD only if the frame's final picture is one of these - see on_present).
+std::uint64_t g_locked_drew[4]{};
+void forget_drew() { for (auto& r : g_locked_drew) r = 0; }
+void note_drew(std::uint64_t r) {
+    if (!r) return;
+    for (const auto x : g_locked_drew) if (x == r) return;
+    std::rotate(std::begin(g_locked_drew), std::end(g_locked_drew) - 1, std::end(g_locked_drew));
+    g_locked_drew[0] = r;
+}
+bool drew_into(std::uint64_t r) { return r && std::find(std::begin(g_locked_drew), std::end(g_locked_drew), r) != std::end(g_locked_drew); }
 std::vector<std::uint32_t> g_tried;
 std::atomic<std::uint32_t> g_status_locked{0};
 // Direct3D 12: the final pictures' states as changed last (for the copy as the back buffer's draw reads it).
@@ -94,7 +127,43 @@ void rebuild_watch() {
     int n = 0;
     for (const auto b : g_bbs) if (n < kWatch) g_watch[n++] = b;
     for (const auto& f : g_finals) if (n < kWatch) g_watch[n++] = f.res;
+    for (const auto& f : g_feeders) if (n < kWatch) g_watch[n++] = f.res;
     while (n < kWatch) g_watch[n++] = 0;
+}
+bool is_final(std::uint64_t r) { return std::any_of(g_finals.begin(), g_finals.end(), [&](const Final& f) { return f.res == r; }); }
+bool is_feeder(std::uint64_t r) { return std::any_of(g_feeders.begin(), g_feeders.end(), [&](const Feeder& f) { return f.res == r; }); }
+// (the frame's picture lately - see Feeder)
+bool is_source(std::uint64_t r) {
+    return std::any_of(g_feeders.begin(), g_feeders.end(), [&](const Feeder& f) { return f.res == r && f.source_seen && g_presents - f.source_seen <= 300; });
+}
+void note_full(std::uint64_t r) {  // (under g_mutex: a full-size texture drawn into this present)
+    for (auto& e : g_drawn_full) if (e.first == r) { e.second = g_presents; return; }
+    if (g_drawn_full.size() >= 32)
+        g_drawn_full.erase(std::min_element(g_drawn_full.begin(), g_drawn_full.end(), [](const auto& a, const auto& b) { return a.second < b.second; }));
+    g_drawn_full.push_back({r, g_presents});
+}
+bool drawn_lately(std::uint64_t r) {  // (this present or the last two)
+    for (const auto& e : g_drawn_full) if (e.first == r) return g_presents - e.second <= 2;
+    return false;
+}
+bool feeder_drawn(const Feeder& f) { return f.drawn_seen && g_presents - f.drawn_seen <= 300; }
+void add_feeder(std::uint64_t r, std::uint64_t into, const resource_desc& d) {  // (under g_mutex)
+    ++g_feed_copies;
+    const bool drawn = drawn_lately(r);
+    for (auto& f : g_feeders)
+        if (f.res == r) { f.seen = g_presents; f.into = into; ++f.copies; if (drawn) f.drawn_seen = g_presents; return; }
+    if (g_feeders.size() >= 6) {
+        // (one not drawn into goes first, the least recently copied of them - see drawn_seen)
+        const auto out = std::min_element(g_feeders.begin(), g_feeders.end(), [](const Feeder& a, const Feeder& b) {
+            const bool da = feeder_drawn(a), db = feeder_drawn(b);
+            return da != db ? !da : a.seen < b.seen;
+        });
+        if (feeder_drawn(*out) && !drawn) return;  // (all drawn into, this one not: not kept)
+        g_feeders.erase(out);
+    }
+    g_feeders.push_back({r, into, g_presents, d.texture.width, d.texture.height, static_cast<std::uint32_t>(d.texture.format), 1, 0,
+                         drawn ? g_presents : 0u});
+    rebuild_watch();
 }
 bool watched(std::uint64_t r) {
     for (auto& w : g_watch) if (w.load(std::memory_order_relaxed) == r) return true;
@@ -102,8 +171,8 @@ bool watched(std::uint64_t r) {
 }
 void add_final(std::uint64_t r) {  // (under g_mutex)
     for (auto& f : g_finals) if (f.res == r) { f.seen = g_presents; return; }
-    if (g_finals.size() >= 4) g_fstate.erase(std::min_element(g_finals.begin(), g_finals.end(), [](const Final& a, const Final& b) { return a.seen < b.seen; })->res);
-    if (g_finals.size() >= 4) g_finals.erase(std::min_element(g_finals.begin(), g_finals.end(), [](const Final& a, const Final& b) { return a.seen < b.seen; }));
+    if (g_finals.size() >= 8) g_fstate.erase(std::min_element(g_finals.begin(), g_finals.end(), [](const Final& a, const Final& b) { return a.seen < b.seen; })->res);
+    if (g_finals.size() >= 8) g_finals.erase(std::min_element(g_finals.begin(), g_finals.end(), [](const Final& a, const Final& b) { return a.seen < b.seen; }));
     g_finals.push_back({r, g_presents});
     rebuild_watch();
 }
@@ -191,10 +260,13 @@ void drawn(command_list* cmd) {
     if (!tl_watched) {
         if (tl_full) {
             g_last_full.store(tl_target, std::memory_order_relaxed);
-            if (g_api == device_api::d3d12 && (tl_full_list != list || tl_full_res != tl_target)) {  // (the lock only when it changes)
-                tl_full_list = list; tl_full_res = tl_target;
+            // (the lock only when it changes - list, texture, or a present since)
+            const std::uint32_t now = g_present_now.load(std::memory_order_relaxed);
+            if (tl_full_list != list || tl_full_res != tl_target || tl_full_present != now) {
+                tl_full_list = list; tl_full_res = tl_target; tl_full_present = now;
                 std::lock_guard<std::mutex> lock(g_mutex);
-                g_lists[list].last_full = tl_target;
+                if (g_api == device_api::d3d12) g_lists[list].last_full = tl_target;
+                note_full(tl_target);
             }
         }
         return;
@@ -212,6 +284,7 @@ void drawn(command_list* cmd) {
         if (!bb && tl_full) {  // (a watched final picture is still the last full-size texture drawn into)
             g_last_full.store(res, std::memory_order_relaxed);
             if (g_api == device_api::d3d12) { g_lists[list].last_full = res; tl_full_list = list; tl_full_res = res; }
+            note_full(res);
         }
         if (bb) {
             g_bb_frame = res;
@@ -220,7 +293,7 @@ void drawn(command_list* cmd) {
                 if (!li.bb) { li.bb = true; li.before_bb = li.last_full; }
             }
         }
-        if (bb && !g_bb_drawn && g_api == device_api::d3d12 && g_active) {
+        if (bb && !g_bb_drawn && g_api == device_api::d3d12 && g_active && !g_end_taken) {
             // (a candidate in the final picture: the final picture as the back buffer's draw reads it - the latest one)
             const auto c = g_cands.find(g_active);
             const std::uint64_t from = g_taken_res ? g_taken_res : g_taken_res_last;
@@ -240,8 +313,9 @@ void drawn(command_list* cmd) {
             if (g_api == device_api::d3d11 && last && !g_final) { g_final = last; add_final(last); }
         }
         if (!g_log.empty() && g_log.back().res == res && g_log.back().fp == fp && g_log.back().blend == blend) ++g_log.back().draws;
-        else if (g_log.size() < 512) g_log.push_back({res, fp, blend, 1});
-        if (g_active && fp == g_active && !g_taken) {
+        else if (g_log.size() < 2048) g_log.push_back({res, fp, blend, 1});
+        for (auto& cp : g_frame_copies) if (cp.dst == res) cp.dst_drawn = true;  // (drawn into after the copy: not filled by it alone)
+        if (g_active && fp == g_active && !g_taken && (bb || !is_feeder(res))) {  // (a feeder: logged only - see Feeder)
             const auto c = g_cands.find(fp);
             if (c != g_cands.end() && (c->second.role == 1) == bb) { g_taken = true; take = true; if (!bb) g_taken_res = res; in_final = !bb; }
         }
@@ -262,12 +336,36 @@ void copied(command_list* cmd, resource src, resource dst) {
     if (!cmd || !src.handle || !dst.handle || idle()) return;
     device* dev = cmd->get_device();
     if (!api_ok(dev)) return;
-    std::lock_guard<std::mutex> lock(g_mutex);
-    if (!is_bb(dst.handle) || is_bb(src.handle)) return;
-    const resource_desc d = dev->get_resource_desc(src);
-    if (d.texture.width != g_w || d.texture.height != g_h) return;
-    g_final = src.handle;
-    add_final(src.handle);
+    std::uint64_t end_res = 0;
+    std::uint32_t end_state = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (is_bb(src.handle)) return;
+        const bool into_bb = is_bb(dst.handle);
+        if (!into_bb && !is_final(dst.handle) && !is_feeder(dst.handle)) return;
+        const resource_desc d = dev->get_resource_desc(src);
+        if (d.texture.width != g_w || d.texture.height != g_h) return;
+        if (!into_bb) {  // (into a final picture or a feeder: see Feeder)
+            if (src.handle == dst.handle) return;
+            add_feeder(src.handle, dst.handle, d);
+            if (g_frame_copies.size() < 64) g_frame_copies.push_back({src.handle, dst.handle, false});
+        } else {
+            g_final = src.handle;
+            add_final(src.handle);
+        }
+        // (a candidate in the final picture, Direct3D 12, when the game copies that picture onto the back buffer and never
+        // draws into it: the end copy here, the picture as the copy reads it - else none was ever taken, and no candidate in
+        // the final picture could be scored. Returnal: its 3-10 candidates tried round and round, none ever picked)
+        if (into_bb && g_api == device_api::d3d12 && g_active && !g_end_taken) {
+            const auto c = g_cands.find(g_active);
+            const std::uint64_t from = g_taken_res ? g_taken_res : g_taken_res_last;
+            if (c != g_cands.end() && c->second.role == 0 && from == src.handle) {
+                const auto st = g_fstate.find(from);  // (only with its state known - see drawn)
+                if (st != g_fstate.end()) { end_res = from; end_state = st->second; g_end_taken = true; }
+            }
+        }
+    }
+    if (end_res && tl_pass_list != cmd->get_native()) g_probe(end_res, false, end_state, cmd->get_native(), g_active, true, false);
 }
 bool on_copy_resource(command_list* cmd, resource src, resource dst) { copied(cmd, src, dst); return false; }
 void on_barrier(command_list* cmd, uint32_t count, const resource* resources, const resource_usage*, const resource_usage* new_states) {
@@ -286,6 +384,9 @@ void on_destroy_resource(device*, resource r) {
     std::lock_guard<std::mutex> lock(g_mutex);
     const auto before = g_finals.size();
     g_finals.erase(std::remove_if(g_finals.begin(), g_finals.end(), [&](const Final& f) { return f.res == r.handle; }), g_finals.end());
+    const auto feeders = g_feeders.size();
+    g_feeders.erase(std::remove_if(g_feeders.begin(), g_feeders.end(), [&](const Feeder& f) { return f.res == r.handle; }), g_feeders.end());
+    if (g_feeders.size() != feeders) rebuild_watch();
     g_fstate.erase(r.handle);
     if (g_taken_res == r.handle) g_taken_res = 0;
     if (g_taken_res_last == r.handle) g_taken_res_last = 0;
@@ -307,15 +408,23 @@ bool on_copy_region(command_list* cmd, resource src, uint32_t, const subresource
     return false;
 }
 // The frame's groups into a texture: consecutive draws by one pixel shader.
-std::string describe(std::uint64_t res, const char* name) {
+std::string describe(std::uint64_t res, const char* name, bool last = false) {
     std::string out = std::string(name) + ":";
     char item[48];
     int n = 0;
+    // (last: the last 24 groups and how many came before - a feeder the scene is drawn into has hundreds before the HUD)
+    std::size_t skip = 0;
+    if (last) {
+        std::size_t total = 0;
+        for (const auto& e : g_log) if (e.res == res) ++total;
+        if (total > 24) { skip = total - 24; out += " (" + std::to_string(skip) + " groups before) ..."; }
+    }
     for (const auto& e : g_log) {
         if (e.res != res) continue;
+        if (skip) { --skip; continue; }
         std::snprintf(item, sizeof(item), " %08x/%c%u", e.fp, "oa+-"[std::min<int>(e.blend, 3)], e.draws);
         out += item;
-        if (++n >= 24) { out += " ..."; break; }
+        if (++n >= 24) { if (!last) out += " ..."; break; }
     }
     return out;
 }
@@ -366,6 +475,7 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
     device* dev = chain->get_device();
     std::lock_guard<std::mutex> lock(g_mutex);
     ++g_presents;
+    g_present_now.store(g_presents, std::memory_order_relaxed);
     g_bbs.clear();
     for (uint32_t i = 0; i < chain->get_back_buffer_count(); ++i) g_bbs.push_back(chain->get_back_buffer(i).handle);
     if (dev && !g_bbs.empty()) {
@@ -403,7 +513,22 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
     }
     g_exec.clear();
     if (g_lists.size() > 4096) g_lists.clear();
-    // The frame's candidates: the groups into its final picture, and into the back buffer after its first draw.
+    // The textures the game draws into and copies on with nothing drawn over the copy (sources - see Feeder): found and
+    // logged, not learned from. Learning there with frame generation also needs its comparison handed over with frame
+    // generation's frames, and that, recorded on frame generation's own command list, froze Returnal (2026-11-13) - so with
+    // frame generation the frame's picture stays the final picture, which it never draws into: nothing to learn.
+    for (auto& f : g_feeders)
+        if (std::any_of(g_log.begin(), g_log.end(), [&](const Entry& e) { return e.res == f.res; })) f.drawn_seen = g_presents;
+    // (a source stays one for 300 presents - see is_source: with frame generation the game's drawings and its copy out of
+    // them often fall on either side of a present - a real and a generated one per game frame - and a source taken only
+    // within one present was never found: Returnal, its ring's drawings seen, 0 candidates)
+    for (const auto& cp : g_frame_copies) {
+        if (cp.dst_drawn || !drawn_lately(cp.src)) continue;
+        for (auto& f : g_feeders) if (f.res == cp.src) f.source_seen = g_presents;
+    }
+    g_frame_copies.clear();
+    const std::uint64_t pic = g_final;
+    // The frame's candidates: the groups into its picture, and into the back buffer after its first draw.
     // (the last 16 groups of each: the HUD comes at the end - a final picture the scene is drawn into as well, Elden Ring,
     // has hundreds before it)
     std::vector<std::pair<std::uint32_t, std::uint8_t>> found;
@@ -411,7 +536,7 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
     if (!g_settle) for (const auto& e : g_log) {
         if (!e.fp) continue;
         const bool bb = is_bb(e.res);
-        if (!bb && e.res != g_final) continue;
+        if (!bb && e.res != pic) continue;
         if (bb && seen_bb++ == 0) continue;  // (the back buffer's first group: the picture drawn onto it)
         found.push_back({e.fp, bb ? std::uint8_t(1) : std::uint8_t(0)});
     }
@@ -429,9 +554,46 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
         it = g_presents - it->second.last > 600 ? g_cands.erase(it) : std::next(it);
     // (every 600 presents, what the frame drawn last looked like)
     if (g_presents % 600 == 0 && g_final) {
-        const std::string text = "XPAR HUD learning: " + describe(g_final, "final picture") + " | " + describe(g_bb_frame, "back buffer") +
+        const std::string text = "XPAR HUD learning: " + describe(pic, pic == g_final ? "final picture" : "final picture (copied in from)") + " | " + describe(g_bb_frame, "back buffer") +
                                  " | candidates " + std::to_string(g_cands.size());
         fw::diag_log(reshade::log::level::info, text.c_str());
+    }
+    // (diagnostic, every 600 presents: the textures copied into the final pictures, and what was drawn into them last frame -
+    // see g_feeders)
+    if (idle()) ++g_idle_presents;
+    for (auto it = g_feeders.begin(); it != g_feeders.end();) {
+        if (g_presents - it->seen > 300) { it = g_feeders.erase(it); rebuild_watch(); }
+        else ++it;
+    }
+    // (the drawings: from the last frame in the window's last 60 presents that drew into a feeder - with frame generation every
+    // other present is a generated image, no drawing before it)
+    static std::string drawn_text;
+    if (g_presents % 600 >= 540 && !g_feeders.empty() &&
+        std::any_of(g_log.begin(), g_log.end(), [](const Entry& e) { return is_feeder(e.res); })) {
+        drawn_text.clear();
+        char name[64];
+        for (const auto& f : g_feeders) {
+            std::snprintf(name, sizeof(name), " | %llx drawn", static_cast<unsigned long long>(f.res));
+            drawn_text += describe(f.res, name, true);
+        }
+    }
+    if (g_presents % 600 == 0) {
+        if (g_feed_copies || !g_feeders.empty()) {
+            std::string text = "XPAR HUD learning: copies into the final pictures " + std::to_string(g_feed_copies) + " (paused " +
+                               std::to_string(g_idle_presents) + " of 600 presents)";
+            char item[200];
+            for (const auto& f : g_feeders) {
+                const char* into = is_final(f.into) ? "a final picture" : is_feeder(f.into) ? "another feeder" : "a texture gone";
+                std::snprintf(item, sizeof(item), " | from %llx into %s (%llx), %ux%u format %u, %u copies",
+                              static_cast<unsigned long long>(f.res), into, static_cast<unsigned long long>(f.into), f.w, f.h, f.format, f.copies);
+                text += item;
+            }
+            text += drawn_text.empty() ? " | nothing drawn into them seen" : drawn_text;
+            fw::diag_log(reshade::log::level::info, text.c_str());
+        }
+        drawn_text.clear();
+        g_feed_copies = g_idle_presents = 0;
+        for (auto& f : g_feeders) f.copies = 0;
     }
     // The saved point (FrameWarp\profiles\hud_point.txt), once: locked from the start - no learning on every launch.
     if (!g_profile_read && !g_profile.empty()) {
@@ -491,6 +653,7 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
             g_used = 0;
             g_from_profile = false;
             g_tried.clear();
+            forget_drew();
         }
         // The learned point: locked once every candidate has been tried and the presenter picks one of them.
         if (learning && !g_locked && pick && g_cands.count(pick) &&
@@ -499,6 +662,7 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
             g_locked_role = g_cands[pick].role;
             g_since_drawn = 0;
             g_used = 0;
+            forget_drew();
             char text[128];
             std::snprintf(text, sizeof(text), "XPAR HUD learning: %08x learned (in the %s) - the HUD taken from there", pick,
                           g_locked_role ? "back buffer" : "final picture");
@@ -506,7 +670,14 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
         }
         if (g_locked) {
             // A frame the game drew where the learned point did not: no HUD (the game hides it - for as long as it does).
+            // A point in the final picture: only when the frame's final picture is one it drew into. Another one is another
+            // path to the screen, not a hidden HUD - Returnal with its frame generation on: its final picture a texture the point
+            // never draws into, every frame was given an empty HUD (the HUD warped, the panel saying it came from the point).
+            // Now it gives nothing there (the HUD from the other sources); a point from the profile, until it has drawn once.
+            // A saved point stays learned; one not saved yet is still dropped after 600 such frames and learned again once
+            // that path ends (the presenter keeps its scores: Returnal, learned again 1 s after frame generation went off).
             if (g_taken) {
+                if (g_locked_role == 0) note_drew(g_taken_res);
                 g_since_drawn = 0;
                 // (proven in gameplay - a minute of frames with the HUD from it: saved for the next launch)
                 if (++g_used >= 3600 && !g_saved && !g_profile.empty()) {
@@ -521,8 +692,8 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
                     }
                 }
             } else if (drew) {
-                ++g_since_drawn;
-                if (g_none) g_none();
+                ++g_since_drawn;  // (counted either way: an unsaved point locked on a title screen is still dropped - see above)
+                if (g_none && (g_locked_role == 1 || drew_into(pic))) g_none();
             }
             g_active = g_settle ? 0 : g_locked;
             g_held = 0;
@@ -563,6 +734,7 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
     g_taken_res = 0;
     g_bb_drawn = false;
     g_taken = false;
+    g_end_taken = false;
 }
 
 void set_profile(const std::wstring& path, const char* build) {

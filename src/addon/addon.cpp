@@ -781,7 +781,10 @@ void on_present(command_queue*, swapchain* chain, const rect*, const rect*, uint
         fw::ui_layer::on_present(chain);
         {
             const auto& sh = *g_producer->shared();
-            fw::hud_learn::on_present(chain, sh.settings.hud_learn != 0, g_producer->game_gives_hud(), sh.presenter.hud_learn_pick,
+            // (paused too while the game's frame generation hands the frames over - generation_active, the presents' own test:
+            // its comparison and the learned point's HUD go only with a present's frame, so nothing it does could reach the
+            // presenter. Returnal with DLSS FG: candidates tried for nothing, copies taken every frame. A learned point is kept.)
+            fw::hud_learn::on_present(chain, sh.settings.hud_learn != 0, g_producer->game_gives_hud() || g_producer->generation_active(), sh.presenter.hud_learn_pick,
                                       sh.presenter.hud_learn_fail, sh.settings.hud_relearn, sh.presents_without_frame < 3);  // (3: as the presenter's "has frames")
         }
         const auto learn = fw::hud_learn::status();
@@ -1419,6 +1422,8 @@ void draw_overlay(effect_runtime*) {
                 const auto& lh = g_producer->shared()->hooks;
                 if (g_producer->game_gives_hud())  // (see hud_learn::on_present: nothing tried or copied meanwhile)
                     ImGui::TextDisabled("HUD learning: paused - the game gives its HUD itself%s", lh.learn_locked ? " (a learned point kept)" : "");
+                else if (g_producer->generation_active())
+                    ImGui::TextDisabled("HUD learning: paused - not possible with the game's frame generation on%s", lh.learn_locked ? " (a learned point kept)" : "");
                 else if (lh.learn_locked)
                     ImGui::TextDisabled("HUD learning: learned (%08x), the HUD taken from there on %u frames", lh.learn_locked, lh.learn_used);
                 else

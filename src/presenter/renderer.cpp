@@ -326,24 +326,38 @@ float near_key(float d) {
 // Frame generation (the game's own), once per game frame per generated image. Its
 // depth: this frame's, moved back along the motion vectors to the image's moment (alpha: 0 the previous
 // frame .. 1 this one): the point at q in the image is the one at p with p + (1 - alpha) motion(p) = q. Flag 1:
-// the motion vector scale is known (otherwise this frame's depth as it is).
+// the motion vector scale is known (otherwise this frame's depth as it is); flag 16: depth reversed (nearer = larger).
+// Of the points the search visits, the one that lands nearest q; none within 4 pixels - scenery the frame has covered
+// by then, beside something that moves differently (the held weapon) - the farthest visited. (The search's last point
+// alone flipped between scenery and weapon there and often ended on the weapon: a band of scenery beside it with the
+// weapon's depth, thrown aside by the warp - Cyberpunk DLSS FG 2x seq_4, the hand smeared; offline 58180 -> 2460
+// such depth-grid pixels over 20 frames)
 Texture2D<float> gd_depth_t : register(t0);
 Texture2D<float2> gd_motion_t : register(t1);
 RWTexture2D<float> gd_out_u : register(u0);
 [numthreads(8, 8, 1)] void cs_gen_depth(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= grid)) return;
-    int2 p = int2(id.xy);
+    float z = gd_depth_t.Load(int3(id.xy, 0));
     if ((flags & 1) && all(id.xy >= rect.xy) && all(id.xy < rect.xy + rect.zw)) {
-        const float2 q = (float2(id.xy - rect.xy) + 0.5) / float2(rect.zw);
+        const float2 size = float2(rect.zw);
+        const float2 q = (float2(id.xy - rect.xy) + 0.5) / size;
         const int2 lo = int2(rect.xy), hi = int2(rect.xy + rect.zw) - 1;
+        const bool reversed = (flags & 16) != 0;
         float2 uv = q;
-        [unroll] for (int i = 0; i < 3; ++i) {
-            const int2 at = clamp(lo + int2(floor(uv * float2(rect.zw))), lo, hi);
-            uv = q - (1.0 - alpha) * gd_motion_t.Load(int3(min(uint2(at), mv_size - 1), 0)) * mv_scale;
+        float best = 1e30, best_z = z, far_z = z;
+        [unroll] for (int i = 0; i < 7; ++i) {
+            const int2 at = clamp(lo + int2(floor(uv * size)), lo, hi);
+            const float2 m = gd_motion_t.Load(int3(min(uint2(at), mv_size - 1), 0)) * mv_scale;
+            const float d = gd_depth_t.Load(int3(at, 0));
+            const float2 landed = (float2(at - lo) + 0.5) / size + (1.0 - alpha) * m;
+            const float miss = length((landed - q) * size);
+            if (miss < best) { best = miss; best_z = d; }
+            far_z = reversed ? min(far_z, d) : max(far_z, d);
+            uv = q - (1.0 - alpha) * m;
         }
-        p = clamp(lo + int2(floor(uv * float2(rect.zw))), lo, hi);
+        z = best <= 4.0 ? best_z : far_z;
     }
-    gd_out_u[id.xy] = gd_depth_t.Load(int3(p, 0));
+    gd_out_u[id.xy] = z;
 }
 // ...and, with the HUD-less picture and UI layer, the UI the image shows taken back out (the warp puts the
 // frame's UI back over it): c = scene (1 - ui.a) + ui.rgb solved for the scene where the UI lets enough
@@ -3459,10 +3473,36 @@ RWTexture2D<float2> tt_field_u : register(u1);
 // rendered pixel its own displacement plus the corrections of the blocks around it at its own distance (cs_tether_final).
 // (At every rendered pixel, its depth read and its nearness worked out again at each of the 8 neighbours in each of 20
 // passes, it cost 1.3-1.6 ms a refresh in game: refreshes missed in AC6, Requiem, Cyberpunk, RE2 - user 2026-11-07)
-float2 tether_target(uint2 p) {
+// (ow_dev 524288 - one of the game's generated images: what is carried with the camera - the weapon and hand, the mask's 0.65..0.9 -
+// stays where the image has it, which shows it at its own moment already. Moved by its share of the camera's movement since then
+// - at the weapon's depth a strafe's hundreds of pixels - and pulled along by the scenery beside it in the solve, it went 10-22 px
+// aside and tore, Cyberpunk DLSS FG seq_5: 5-30% of the weapon off the image. Pinned: no displacement asked, none taken from the
+// solve - its blocks nearer than anything, see cs_tether_init)
+// (The mask is the frame's, the image's weapon a few px off it - and its outline, the mask's 0.95, is no part of the 0.65..0.9:
+// up to 800 of the weapon's pixels outside it, up to 5 rendered px from it, Cyberpunk DLSS FG seq_6 strafing. Each asked for the
+// weapon's hundreds of pixels and, the nearest of its block, dragged the distant scenery above the weapon after it in a cone, up
+// to 6 px off what it asks for: the distance wobbled. So also a pixel with a carried one within 6 rendered px - 8 directions, 3
+// distances, in rendered px: the offset is the game's, the same at any output size - on the same surface as it: within a doubling
+// of its distance.)
+bool tether_gen_held(float2 s) {
+    if (!(ow_dev() & 524288u)) return false;
+    const float mo = ow_mask_t.Load(int3(min(uint2(s * float2(out_size)), out_size - 1), 0)).x;
+    if (mo >= 0.65 && mo < 0.9) return true;
+    const float n = ow_near(ow_depth(s));
+    [loop] for (int r = 2; r <= 6; r += 2)
+        [loop] for (int k = 0; k < 8; ++k) {
+            const float2 q = saturate(s + float2(kRetDirs[k] * r) / float2(rect.zw));
+            const float mq = ow_mask_t.Load(int3(min(uint2(q * float2(out_size)), out_size - 1), 0)).x;
+            if (mq >= 0.65 && mq < 0.9 && n >= ow_near(ow_depth(q)) - 32.0) return true;
+        }
+    return false;
+}
+// (held: tether_gen_held at p - handed back, so that its callers do not work it out a second time)
+float2 tether_target(uint2 p, out bool held) {
     const float2 s = (float2(p) + 0.5) / float2(rect.zw);
     const float3 f = ow_forward(s);
     float2 l = s;
+    held = tether_gen_held(s);
     if (f.z > 1e-6) {
         if (flags & 128) {
             // (with the follow share, the shares alone - ow_mask_at would also gather the HUD, laid over instead: see above)
@@ -3484,6 +3524,7 @@ float2 tether_target(uint2 p) {
         // distance of the scenery behind the glass, not moving with it)
         const float mo = ow_mask_t.Load(int3(min(uint2(s * float2(out_size)), out_size - 1), 0)).x;
         if (mo > 0.955 && mo < 0.97) l = s;
+        if (held) l = s;  // (a generated image's weapon: see tether_gen_held)
     }
     return (l - s) * float2(rect.zw);
 }
@@ -3516,8 +3557,11 @@ Texture2D<uint2> tt_pick_t : register(t20);
     if (any(id.xy >= tether_blocks())) return;
     const uint2 pick = tt_pick_t.Load(int3(id.xy, 0));
     const uint2 bp = uint2(pick.x & 0xFFFFu, pick.x >> 16);
-    const float bn = asfloat(pick.y);
-    const float2 d = tether_target(bp);
+    // (a generated image's weapon - tether_gen_held: its block nearer than anything by far - the solve's pulls weigh by nearness,
+    // so it takes none and what is beside it takes all; and no rendered pixel takes its correction, see tether_field_at)
+    bool held;
+    const float2 d = tether_target(bp, held);
+    const float bn = asfloat(pick.y) + (held ? 4096.0 : 0.0);
     tt_half_u[id.xy] = float4(d, bn, 0);
     tt_tb_u[id.xy] = d;
 }
@@ -3627,7 +3671,9 @@ float2 tether_field_at(uint2 id) {
         c += w * h.xy;  // (the block's correction - see cs_tether_step's last pass)
         wsum += w;
     }
-    return tether_target(id) + c / max(wsum, 1e-20);
+    bool held;
+    const float2 d = tether_target(id, held) + c / max(wsum, 1e-20);
+    return held ? float2(0, 0) : d;  // (a generated image's weapon: see tether_gen_held)
 }
 // (only where no claims are made - the forward splat off: the claims pass works it out otherwise)
 [numthreads(8, 8, 1)] void cs_tether_final(uint3 id : SV_DispatchThreadID) {
@@ -6957,7 +7003,8 @@ void Renderer::release_generated() {
         }
 }
 
-void Renderer::prepare_generated(const IngestedSource& src, float scale_x, float scale_y, bool scale_valid, bool use_ui_tags) {
+void Renderer::prepare_generated(const IngestedSource& src, float scale_x, float scale_y, bool scale_valid, bool use_ui_tags,
+                                 bool depth_inverted) {
     if (!src.generated || !src.has_depth || !private_[kPDepth].texture) return;
     const auto& depth = private_[kPDepth];
     const UINT w = depth.width, h = depth.height;
@@ -6969,7 +7016,7 @@ void Renderer::prepare_generated(const IngestedSource& src, float scale_x, float
     c.grid[0] = w; c.grid[1] = h;
     c.mv_size[0] = motion ? private_[kPMotion].width : 1; c.mv_size[1] = motion ? private_[kPMotion].height : 1;
     c.mv_scale[0] = scale_x; c.mv_scale[1] = scale_y;
-    c.flags = motion && scale_valid ? 1u : 0u;
+    c.flags = (motion && scale_valid ? 1u : 0u) | (depth_inverted ? 16u : 0u);
     float wc[kWConstants] = {};
     for (int i = 0; i < src.generated; ++i) {
         const auto z = static_cast<PrivateId>(kPGenZ0 + i), colour = static_cast<PrivateId>(kPGen0 + i);
@@ -7375,7 +7422,11 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
     // camera turns - the scenery's edge right beside a third-person character, edges along the turn (Requiem without an
     // upscaler's output: lines of held pixels along Leon's shoulder and on walls). A layer always over the whole screen
     // (RE4's) is never taken: detected, as before.
-    const bool hidden = hud && !from_hudless && !from_layer && !src.has_hudless &&
+    // Not where the last layer was the add-on's learned HUD point (hud_learned): that one says a hidden HUD itself, with an
+    // empty layer; none at all is no word on the HUD. Returnal: checked on the learned point's layer, then with frame
+    // generation on (the point gives nothing there) every frame was taken for a hidden HUD - nothing held, the HUD warped.
+    if (src.has_ui) layer_learned_ = src.hud_learned != 0;
+    const bool hidden = hud && !from_hudless && !from_layer && !src.has_hudless && !layer_learned_ &&
                         (layer_trust_ == 1 || (layer_trust_ == 0 && layer_taken_ && !scene_here));
     // Checking the layer (see cs_layer_check): with the upscaler's output, not on a frame that starts the score over.
     const bool check = from_layer && layer_trust_ == 0 && !reset && scene_here;
@@ -8036,6 +8087,8 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
     // Frame generation: one of the game's generated images, with its own depth (prepare_generated).
     const bool gen = generated >= 0 && generated < src.generated && shown(static_cast<PrivateId>(kPGen0 + generated)).width == ow &&
                      shown(static_cast<PrivateId>(kPGenZ0 + generated)).width == dw;
+    // (the weapon and hand held where a generated image has them in the continuous warp's field - see tether_target)
+    if (gen) c.threshold = float(static_cast<std::uint32_t>(c.threshold + 0.5f) | 524288u);
     // (the scenery under a colour layer, taken out of the frame - see cs_layer_unblend: moved as a HUD-less picture is, the
     // layer laid over it again; held pixels the frame as it is)
     const bool derived = !split && !gen && src.scene_derived && shown(kPHudless).texture && shown(kPHudless).width == ow &&
@@ -10296,7 +10349,7 @@ bool Renderer::record_frame(std::uint64_t tag, bool ui) {
         transition(src, k == 0 || k == 3 ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : before);
     }
     r.has_stencil = planes == 5;
-    r.output = false;
+    r.output = false; r.gen = -1;
     r.tag = tag; r.has_ui = ui; r.context = context_; r.fence = 0;
     r.state.store(1, std::memory_order_release);
     return true;
@@ -10350,7 +10403,62 @@ bool Renderer::record_output(std::uint64_t tag) {
     list_->CopyTextureRegion(&dst, 0, 0, 0, &from, nullptr);
     transition(private_[kPRecOut], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     transition(private_[kPOutput], out_before);
-    r.has_stencil = false; r.has_ui = false; r.output = true;
+    r.has_stencil = false; r.has_ui = false; r.output = true; r.gen = -1;
+    r.tag = tag; r.context = context_; r.fence = 0;
+    r.state.store(1, std::memory_order_release);
+    return true;
+}
+
+// Sequence recording (development): the game's generated image i of the frame just taken in (kPGen0 + i, as the game made it:
+// called before prepare_generated takes the UI out), shrunk by the factor the frame's picture is (record_frame) - through
+// kPRecColour on the intake's own list, before record_frame uses it - into a read-back slot, colour alone (as record_output).
+bool Renderer::record_generated(std::uint64_t tag, int i) {
+    if (i < 0 || i >= kMaxGenerated) return false;
+    const PrivateId gid = static_cast<PrivateId>(kPGen0 + i);
+    const auto& g = private_[gid];
+    const auto& c0 = private_[kPBackbuffer];
+    if (!g.texture || !c0.texture || g.width != c0.width || g.height != c0.height || !cs_rec_down_) return false;
+    int idx = -1;
+    for (int k = 0; k < kRecSlots && idx < 0; ++k) {
+        const int s = (rec_next_ + k) % kRecSlots;
+        if (rec_[s].state.load(std::memory_order_acquire) == 0) idx = s;
+    }
+    if (idx < 0) return false;
+    rec_next_ = (idx + 1) % kRecSlots;
+    RecSlot& r = rec_[idx];
+    const UINT f = std::max(1u, static_cast<UINT>(std::lround(double(c0.height) / 1080.0)));
+    const UINT cw = (c0.width + f - 1) / f, ch = (c0.height + f - 1) / f;
+    if (!ensure_private(kPRecColour, cw, ch, DXGI_FORMAT_R11G11B10_FLOAT)) return false;
+    const auto desc = private_[kPRecColour].texture->GetDesc();
+    UINT64 total = 0;
+    device_->GetCopyableFootprints(&desc, 0, 1, 0, &r.foot[0], nullptr, nullptr, &total);
+    if (!r.buffer[0] || r.buffer[0]->GetDesc().Width < total) {
+        r.buffer[0].Reset();
+        D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC bd{}; bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = total; bd.Height = 1;
+        bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&r.buffer[0]))))
+            return false;
+    }
+    r.width[0] = static_cast<std::uint32_t>(desc.Width); r.height[0] = desc.Height;
+    const UINT t = kXRec + UINT(idx) * 8;
+    for (UINT k = 0; k < kXSrvCount; ++k) set_x_srv(t + k, gid);
+    set_x_uav(t + kXSrvCount, kPRecColour);
+    set_x_uav(t + kXSrvCount + 1, kPRecColour);
+    const auto gen_before = private_[gid].state;
+    transition(private_[gid], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    transition(private_[kPRecColour], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    XConstants c{};
+    c.grid[0] = cw; c.grid[1] = ch; c.out_size[0] = g.width; c.out_size[1] = g.height; c.groups_x = f; c.flags = 4u;
+    x_dispatch(cs_rec_down_.Get(), &c, t, t + kXSrvCount, (cw + 7) / 8, (ch + 7) / 8);
+    transition(private_[kPRecColour], D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst{r.buffer[0].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+    dst.PlacedFootprint = r.foot[0];
+    D3D12_TEXTURE_COPY_LOCATION from{private_[kPRecColour].texture.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+    list_->CopyTextureRegion(&dst, 0, 0, 0, &from, nullptr);
+    transition(private_[kPRecColour], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    transition(private_[gid], gen_before);
+    r.has_stencil = false; r.has_ui = false; r.output = true; r.gen = i;
     r.tag = tag; r.context = context_; r.fence = 0;
     r.state.store(1, std::memory_order_release);
     return true;
@@ -10385,6 +10493,7 @@ bool Renderer::take_recorded(RecordedFrame& out) {
     out.tag = r.tag;
     out.cw = r.width[0]; out.ch = r.height[0]; out.dw = r.output ? 0 : r.width[1]; out.dh = r.output ? 0 : r.height[1];
     out.output = r.output;
+    out.gen = r.gen;
     r.state.store(0, std::memory_order_release);
     return true;
 }

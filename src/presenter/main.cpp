@@ -149,10 +149,17 @@ struct SequenceRecorder {
     void run(Renderer& renderer) {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
         std::vector<std::pair<std::string, RecordedFrame>> clip, shown;
+        std::vector<RecordedFrame> generated;  // (the game's generated images, by their frame's tag and number)
         std::size_t bytes = 0;
         for (;;) {
             RecordedFrame f;
             if (renderer.take_recorded(f)) {
+                if (f.gen >= 0) {
+                    bytes += f.colour.size();
+                    generated.push_back(std::move(f));
+                    if (bytes > kRecMaxBytes) active = false;
+                    continue;
+                }
                 std::string line;
                 {
                     std::lock_guard<std::mutex> lock(mu);
@@ -191,6 +198,8 @@ struct SequenceRecorder {
             std::fclose(index);
         }
         std::uint64_t written = 0;
+        std::map<std::uint64_t, std::size_t> index_of;  // (game frame -> its index in the clip: the generated images' file names)
+        for (std::size_t i = 0; i < clip.size(); ++i) index_of[clip[i].second.tag] = i;
         for (std::size_t i = 0; i < clip.size(); ++i) {
             const RecordedFrame& f = clip[i].second;
             FILE* out = nullptr;
@@ -236,6 +245,27 @@ struct SequenceRecorder {
             }
             shown[i].second = RecordedFrame{};
         }
+        // (frame generation: gen_<index>_<i>.bin - the game's generated image i of clip frame <index>, as the game made it, in the
+        // display files' layout; a frame not in the clip, its images not written)
+        std::size_t generated_written = 0;
+        for (RecordedFrame& f : generated) {
+            const auto it = index_of.find(f.tag);
+            if (it == index_of.end()) continue;
+            FILE* out = nullptr;
+            if (_wfopen_s(&out, (dir / (L"gen_" + std::to_wstring(it->second) + L"_" + std::to_wstring(f.gen) + L".bin")).c_str(), L"wb") == 0 && out) {
+                const std::uint32_t head[8] = {0x46525746u, 1u, std::uint32_t(f.tag), std::uint32_t(f.tag >> 32), f.cw, f.ch, 0u, 0u};
+                std::uint64_t sizes[8] = {};
+                sizes[0] = sizes[1] = f.colour.size();
+                std::fwrite(head, sizeof(head), 1, out);
+                std::fwrite(sizes, sizeof(sizes), 1, out);
+                std::fwrite(f.colour.data(), 1, f.colour.size(), out);
+                std::fclose(out);
+                written += sizeof(head) + sizeof(sizes) + f.colour.size();
+                ++generated_written;
+            }
+            f = RecordedFrame{};
+        }
+        if (generated_written) logf("sequence recording: %zu of the game's generated images written with the clip", generated_written);
         SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
         logf("sequence recording written: %zu frames and %zu shown over %.1f s (%llu not recorded: slots full - the clip has gaps there), %.2f GB in %.0f s: %ls",
              clip.size(), shown.size(), secs, static_cast<unsigned long long>(dropped.load()), double(written) / 1e9, now_seconds() - started - secs, dir.c_str());
@@ -1714,8 +1744,11 @@ void render_thread() {
                 // Frame generation (the game's own): its generated images made ready for the warp here.
                 renderer.pass_stamp(Renderer::kPassAnalyze);
                 if (own_engine_on() && s.generated > 0) {
+                    // (sequence recording: the generated images as the game made them - gen_<index>_<i>.bin, see SequenceRecorder)
+                    if (g_rec.active)
+                        for (int i = 0; i < s.generated; ++i) renderer.record_generated(m.frame_id, i);
                     renderer.prepare_generated(s, float(mv_scale.scale(0, s.depth_rect.w)), float(mv_scale.scale(1, s.depth_rect.h)), mv_scale.valid,
-                                               settings.use_ui_tags != 0);
+                                               settings.use_ui_tags != 0, cam.depth_inverted != 0);
                     last_generated = now_seconds();
                     if (!generation_logged) {
                         logf("frame generation: showing the game's generated images (%d per frame), each moved to the displayed camera", s.per_frame);
@@ -1825,6 +1858,11 @@ void render_thread() {
                     for (float v : cam.view_to_clip) len += std::snprintf(line + len, sizeof(line) - len, " %.9g", v);
                     len += std::snprintf(line + len, sizeof(line) - len, " clip_to_prev_clip");
                     for (float v : cam.clip_to_prev_clip) len += std::snprintf(line + len, sizeof(line) - len, " %.9g", v);
+                    // (frame generation shown with the frame: its images' numbers - gen_<index>_<i>.bin beside the frame)
+                    if (own_engine_on() && s.generated > 0) {
+                        len += std::snprintf(line + len, sizeof(line) - len, " per_frame %d gen_index", s.per_frame);
+                        for (int i = 0; i < s.generated; ++i) len += std::snprintf(line + len, sizeof(line) - len, " %d", s.gen_index[i]);
+                    }
                     g_rec.note(m.frame_id, line);
                 } else if (g_rec.active) {
                     ++g_rec.dropped;

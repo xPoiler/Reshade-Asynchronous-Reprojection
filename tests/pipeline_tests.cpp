@@ -459,7 +459,7 @@ int main(int argc, char** argv) {
                 EXPECT(gs.generated == 1 && gs.per_frame == 1, "frame generation: the image is taken in with the frame (%d of %d)", gs.generated,
                        gs.per_frame);
                 renderer.analyze_motion(gs, still.clip_to_prev_clip, 1.0f, 1.0f, true, true, true, false, fid);
-                renderer.prepare_generated(gs, 1.0f, 1.0f, true, true);
+                renderer.prepare_generated(gs, 1.0f, 1.0f, true, true, true);
                 renderer.finish_frame(false, 0);
                 renderer.wait_idle();
                 auto show_gen = [&](int which) {

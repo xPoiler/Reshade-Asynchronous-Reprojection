@@ -180,9 +180,10 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
         }
     }
     // The camera search also while an upscaler gives depth and motion but not the game's camera (NGX or FSR without Streamline): the camera is
-    // estimated there otherwise. Its values go with the frame the present closes (Producer::set_present_matrices). Paused once the game's own
-    // camera comes (Streamline), and while frame generation runs (its frames are not the game's).
-    const bool upscaler_search = p->shared()->settings.enabled && !wanted && !p->generation_active() && p->upscaler_camera_estimated();
+    // estimated there otherwise. Its values go with the frame the present closes (Producer::set_present_matrices) - with the game's frame
+    // generation, with the frame whose images were taken last (its presents are frame generation's). Paused once the game's own camera
+    // comes (Streamline). (Off during frame generation until 2026-11-13: Returnal's camera stayed estimated while it ran.)
+    const bool upscaler_search = p->shared()->settings.enabled && !wanted && p->upscaler_camera_estimated();
     if (wanted) { track_depth_buffers(); camera_search::resume(); } else release_depth_choice(runtime);
     if (upscaler_search) {
         camera_search::resume();

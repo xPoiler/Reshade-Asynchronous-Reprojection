@@ -250,6 +250,7 @@ private:
     std::atomic<std::int64_t> estimated_upscaler_qpc_{0};
     MatrixCandidate present_matrices_[kMatrixCandidates]{};
     std::uint32_t present_matrix_count_ = 0;
+    std::uint64_t matrices_frame_ = 0;  // (frame generation: the frame the next present's search values go with - set_present_matrices)
     std::atomic<std::int64_t> feed_qpc_{0};
     void note_frame(std::uint64_t f) { std::uint64_t h = highest_frame_.load(); while (f > h && !highest_frame_.compare_exchange_weak(h, f)) {} }
     std::uint64_t last_counted_frame_ = 0;  // frames_total counts each rendered frame once

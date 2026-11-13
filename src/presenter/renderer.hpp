@@ -55,6 +55,7 @@ struct RecordedFrame {
     std::vector<std::uint8_t> colour, depth, motion, ui;
     std::vector<std::uint8_t> stencil;  // (StencilMask=1: the game's stencil on the depth's grid, R8 - empty without; stencil_<i>.bin)
     bool output = false;  // (record_output: what the warp showed for game frame `tag` - colour alone, the picture's recorded size)
+    int gen = -1;         // (record_generated: the frame's generated image of this index - colour alone, as output)
 };
 
 // HUD detection frames: learned from, skipped for too few telling pixels, or held back by the
@@ -220,7 +221,7 @@ public:
     // the frame made ready for the warp - each one's depth (this frame's, moved back along the motion vectors
     // to the image's moment) and, with the HUD-less picture and UI layer, the UI they show taken back out
     // (the warp puts the frame's UI back over it, as on every frame).
-    void prepare_generated(const IngestedSource& src, float scale_x, float scale_y, bool scale_valid, bool use_ui_tags);
+    void prepare_generated(const IngestedSource& src, float scale_x, float scale_y, bool scale_valid, bool use_ui_tags, bool depth_inverted);
     // ...and once frame generation is off: whether its textures are still held, and letting them go (both
     // texture sets and the game's shared copies; waits for the GPU).
     bool has_generated() const;
@@ -411,8 +412,11 @@ public:
     void set_outlines_held(bool on) { outlines_held_ = on; }  // (the mask's outlines and sights, 0.95: held, or warped as carried)
     void set_own_depth_blind(bool on) { own_depth_blind_ = on; }  // (own motion spread over a character at any distance)
     // Sequence recording (development, see record_frame): queue the frame just taken in; collect finished ones.
-    static constexpr int kRecSlots = 10;
+    static constexpr int kRecSlots = 16;  // (with frame generation up to 5 a game frame: the frame, 3 generated images, a display)
     bool record_frame(std::uint64_t tag, bool ui);
+    // (and the game's generated image i of the frame just taken in, as the game made it - before prepare_generated takes the
+    // UI out - shrunk as the frame's picture is; seq_replay hands it over as the add-on does)
+    bool record_generated(std::uint64_t tag, int i);
     // (and what the warp just drew, shrunk as the frame's picture is - after own_warp, on the refresh's list: tag, the game frame shown)
     bool record_output(std::uint64_t tag);
     bool take_recorded(RecordedFrame& out);
@@ -448,7 +452,7 @@ public:
     double layer_drawn_over_share() const { return layer_covered_ ? double(layer_drawn_over_) / double(layer_covered_) : 0.0; }
     void reset_layer_trust() { layer_trust_ = 0; layer_covered_ = layer_drawn_over_ = layer_frames_ = 0; layer_taken_ = false; }
     // (frames without the layer show no HUD: checked, or taken unchecked - see build_no_warp_mask's hidden)
-    bool layer_hides_hud() const { return layer_trust_ == 1 || (layer_trust_ == 0 && layer_taken_); }
+    bool layer_hides_hud() const { return !layer_learned_ && (layer_trust_ == 1 || (layer_trust_ == 0 && layer_taken_)); }
     // (for the log while it runs: frames checked, the share of the screen the layer covers on them, of it drawn over)
     std::uint64_t layer_frames_checked() const { return layer_frames_; }
     double layer_cover_share() const { return layer_frames_ && layer_frame_samples_ > 0 ? double(layer_covered_) / (double(layer_frames_) * layer_frame_samples_) : 0.0; }
@@ -675,6 +679,7 @@ private:
         int context = 0;
         bool has_ui = false;
         bool output = false;  // (record_output: colour alone)
+        int gen = -1;         // (record_generated: which generated image - colour alone)
         std::atomic<int> state{0};  // 0 free, 1 queued on a list, 2 submitted (its fence known) - see take_recorded
     };
     RecSlot rec_[kRecSlots];
@@ -758,6 +763,7 @@ private:
     bool layer_cover_only_[kRing] = {};  // (that readback: the coverage alone - see build_no_warp_mask)
     bool layer_full_ = false;            // ...the latest one read back: 90% of the screen or more
     bool layer_taken_ = false;           // ...one read back with some of it, under 90%: taken as the HUD, unchecked
+    bool layer_learned_ = false;         // the last layer was the add-on's learned HUD point's (its absence: no word on the HUD)
     std::uint64_t layer_covered_ = 0, layer_drawn_over_ = 0, layer_frames_ = 0;
     double layer_frame_samples_ = 0;  // samples per frame (every second pixel each way)
     // Textures released once the GPU is past them (no waiting: no hitch), see retire.
