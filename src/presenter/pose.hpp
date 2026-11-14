@@ -424,6 +424,14 @@ public:
     bool camera_follows_mouse() const { return follows_; }
     const AxisParams& params(int axis) const { return params_[axis]; }
     double latency() const { return latency_; }
+    // The median of the same recent delays (s, 0: none yet): the game's latency from the camera's moment to the finished frame
+    // as the latency rows under the frame counter count it (main.cpp, LatencyRows).
+    double latency_median() const {
+        if (latencies_.empty()) return 0.0;
+        std::vector<double> sorted(latencies_.begin(), latencies_.end());
+        std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
+        return sorted[sorted.size() / 2];
+    }
     // The camera is displayed this far (s) past the time predict(now) is asked for by default (Auto latency's
     // "camera as of now"): a new frame's correction is then measured and faded in at the displayed time - at
     // Auto's time it left a small jump at every game frame (a gritty camera on small mouse movements).
@@ -434,9 +442,17 @@ public:
     void set_position_clock(double now) { position_clock_ = now; }
     // How far behind the newest game frame the position is shown, in game frames (0..1) - for the held weapon, shown at the
     // same moment (Renderer::set_held_between).
-    double position_frames_back() const {
+    // (shown: the frame on the screen. With split queues the model has the next frame a moment before it is shown - up to a
+    // refresh: counted from the newest there, the frame still shown was moved back a whole game frame for that refresh - a
+    // character shown between game frames (Renderer::set_objects_between) jumped back and forth at every game frame whose
+    // refresh fell into that moment, Cyberpunk at 30 fps, 2026-11-13; the weapon by its smaller motion. 0: the newest)
+    double position_frames_back(std::uint64_t shown = 0) const {
         if (frame_interval_ <= 0 || frames_.empty()) return 0.0;
-        return std::clamp((frames_.back().t - (position_clock_ - latency_ - frame_interval_)) / frame_interval_, 0.0, 1.0);
+        double t = frames_.back().t;
+        if (shown)
+            for (std::size_t i = frames_.size(); i-- > 0 && frames_.size() - i <= 4;)
+                if (frames_[i].id == shown) { t = frames_[i].t; break; }
+        return std::clamp((t - (position_clock_ - latency_ - frame_interval_)) / frame_interval_, 0.0, 1.0);
     }
     // ...and how it was turned then (unwrapped yaw, pitch - as Frame::theta), the same way.
     void theta_at(double t, double out[2]) const {

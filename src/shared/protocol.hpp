@@ -151,6 +151,15 @@ struct Settings {
     std::uint32_t reshade_on_output;   // default on: the game's ReShade effects drawn on XPAR's own picture, every refresh, instead of on the
                                        // game's (output_effects.hpp) - the picture shown then has them whichever way the frame was taken in
                                        // (back buffer, HUD-less picture, frame generation). Read when the presenter starts (saved per game)
+    std::uint32_t object_interp;       // default 2, on (0 off; 1 the newest frame shifted, development): what moves on its own - characters, other movers - shown between game
+                                       // frames where it was at the moment the camera's position is shown for, as the first-person weapon
+                                       // is (Renderer::set_objects_between; XPAR engine, follow share; saved per game)
+    float ui_scale;                    // the XPAR panel's text and controls, 1 (default) .. 4 times (add-on only; saved per game)
+    std::uint32_t fps_counter_scale;   // the frame counter's size, 1 (default) .. 4 times (saved per game)
+    std::uint32_t latency_counter;     // default off: two rows under the frame counter - LAT, the displayed camera's age when it
+                                       // reaches the screen (ms, the whole latency of a camera turn), and XPAR, what the warp
+                                       // adds (+) or takes off (-) against the game's own latency (LAT minus the game's input
+                                       // to finished frame) - see main.cpp, LatencyRows (saved per game)
 };
 
 // Presenter status, displayed by the add-on UI.

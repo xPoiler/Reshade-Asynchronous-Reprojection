@@ -60,6 +60,10 @@ void default_settings(Settings& s) {
     s.stretch_width = 1;
     s.background_memory = 1;  // what the warp uncovers comes from the scenery last seen there (XPAR engine)  // hold what stays nearly still on screen while the camera turns (orbit cameras)
     s.fps_counter = 2;  // the frame counter on, top right (user 2026-11-11: the Steam overlay's is hidden under the presenter)
+    s.fps_counter_scale = 1;  // (1 .. 4 times its size)
+    s.ui_scale = 1.0f;        // (the panel, 1 .. 4 times)
+    s.latency_counter = 0;    // (the latency rows under the frame counter: off by default, user 2026-11-14)
+    s.object_interp = 2;  // what moves on its own shown between game frames, the two frames blended (on since 2026-11-13; 0 off)
     s.reshade_on_output = 1;  // the game's ReShade effects on XPAR's picture (user 2026-11-12: on every path - HUD-less picture, frame generation - at their cost each refresh)
     s.memory_resolution = 2;  // (the background memory at a quarter of the picture's resolution: with the continuous warp it fills only
                               // the screen edges and behind the HUD - no difference seen against 1/2 or full, Requiem; full ~16x the video memory)

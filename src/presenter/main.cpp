@@ -1132,6 +1132,37 @@ void render_thread() {
     struct ShownPresent { UINT count = 0; double present_t = 0, camera_t = 0; bool done = true; std::int64_t target = 0; };
     ShownPresent shown_presents[64];
     std::vector<double> lat_behind, lat_display, lat_age, lat_queued;
+    // The latency rows under the frame counter (Settings::latency_counter), per picture shown that was warped and whose time on
+    // screen the swap chain's statistics give: LAT - the shown camera's age when it reaches the screen (screen - camera_t: the
+    // whole latency of a camera turn); XPAR - LAT minus what the game's frame alone would take: the game's input to finished
+    // frame (PoseModel::latency_median) and the present to the screen (taken the same as XPAR's). That is present_t - camera_t -
+    // game latency: the wait before XPAR presents, less how far ahead of the game's frame the camera is shown. Medians of the
+    // last second, every half second (a picture is presented for the counter when they change); blank with none.
+    struct LatencyRows {
+        std::deque<std::array<double, 3>> samples;  // (time, LAT, XPAR in ms)
+        double next = 0;
+        bool known = false;
+        float lat = 0, xpar = 0;
+        void add(double t, double lat_ms, double xpar_ms) {
+            samples.push_back({t, lat_ms, xpar_ms});
+            while (samples.size() > 2048) samples.pop_front();
+        }
+        void update(double now) {
+            if (now < next) return;
+            next = now + 0.5;
+            while (!samples.empty() && samples.front()[0] < now - 1.0) samples.pop_front();
+            known = !samples.empty();
+            if (!known) return;
+            auto median = [&](int k) {
+                std::vector<double> v;
+                v.reserve(samples.size());
+                for (const auto& e : samples) v.push_back(e[k]);
+                std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+                return float(v[v.size() / 2]);
+            };
+            lat = median(1); xpar = median(2);
+        }
+    } latency_rows;
     // Automatic present lead: as late as the warp still makes its refresh. Per warped frame, the time from the
     // planned wake-up to its GPU work finished (ready, a window of them), and the refreshes from its target vblank
     // to the screen: the usual count (the most common of a window) or more (late: missed its refresh).
@@ -1243,6 +1274,11 @@ void render_thread() {
             intake = {};
             intake.slot = newest;
             const bool wants_samples = m.camera.estimated != 0;
+            {  // (the two frames blended - Renderer::set_objects_between 2: only frames with none left out between them)
+                static std::uint64_t taken_before = 0;
+                renderer.set_frames_consecutive(m.frame_id == taken_before + 1);
+                taken_before = m.frame_id;
+            }
             intake.s = renderer.ingest(sh, newest, [&](const IngestedSource& early) {
                 if (wants_samples && early.has_depth && early.has_motion) intake.sampled = renderer.record_motion_samples(early, 80, 45);
             });
@@ -2305,10 +2341,33 @@ void render_thread() {
                 // weapon snapped at every game frame, Cyberpunk without DLSS strafing, 2026-10-31. There, how long the frame has been shown: from
                 // a whole game frame back to none as the next one is due)
                 const double interval = g_app.model.frame_interval();
-                const double held_back = !source_has_sim && interval > 0 ? std::clamp(1.0 - (now_seconds() - shown_since) / interval, 0.0, 1.0) : g_app.model.position_frames_back();
+                const double held_back = !source_has_sim && interval > 0 ? std::clamp(1.0 - (now_seconds() - shown_since) / interval, 0.0, 1.0) : g_app.model.position_frames_back(shown_frame);
                 // (MotionReference: whatever moves with the screen, a third-person character too - see Renderer::set_motion_reference)
                 static const bool motion_ref_between = GetEnvironmentVariableW(L"FW_MOTION_REF", nullptr, 0) != 0;
                 renderer.set_held_between(generated < 0 && (motion_ref_between || !g_app.model.orbited_within(g_app.model.source_time(), 10.0)), float(held_back));
+                // (Settings::object_interp, A/B: what moves on its own at that moment too - Renderer::set_objects_between. The camera
+                // still, the frame is no longer shown as it is while that moment lies before it: what moves in it is drawn at
+                // every refresh - whether anything in the frame does move is not known here, so every such refresh is warped)
+                // (not while the game's own frame generation delivers images: those show what moves at their own moments already. The real
+                // frame between them shifted back as well would step unevenly, and the passes behind it would run for nothing - with it
+                // everything is as before this option existed, the weapon's own shift included)
+                const bool objects_between = settings.object_interp != 0 && settings.follow_share != 0 && !(own_engine_on() && source.generated > 0);
+                renderer.set_objects_between(objects_between ? int(std::min<std::uint32_t>(settings.object_interp, 2u)) : 0, float(held_back));  // (1 shift, 2 the two frames blended)
+                // (the log, every 10 s while it is on: how many refreshes were drawn with the next frame already in the camera model
+                // but not yet shown - those the moment was once counted from the wrong frame for, see PoseModel::position_frames_back)
+                if (objects_between) {
+                    static double told = 0;
+                    static int early = 0, drawn = 0;
+                    ++drawn;
+                    if (g_app.model.position_frames_back() != g_app.model.position_frames_back(shown_frame)) ++early;
+                    if (now_seconds() - told > 10.0) {
+                        if (told > 0) logf("object interpolation: %d of %d refreshes drawn before the newest frame was shown, held back %.2f", early, drawn, held_back);
+                        told = now_seconds(); early = drawn = 0;
+                    }
+                }
+                // (...only where there is anything to draw them from - the game's motion vectors this frame, Renderer::objects_ready: on
+                // by default, a game without them drew every refresh of a still camera for nothing)
+                if (objects_between && generated < 0 && held_back > 0 && renderer.objects_ready()) unmoved = false;
                 renderer.set_edge_dither(settings.edge_fill == 2);
                 warped = unmoved || renderer.own_warp(source, settings.use_ui_tags != 0, inputs.no_warp_mask != nullptr, m.data(), inputs.depth_inverted,
                                                      settings.background_memory != 0, generated,
@@ -2328,6 +2387,7 @@ void render_thread() {
                     for (int e = 0; e < 16; ++e) len += std::snprintf(line + len, sizeof(line) - len, " %.9g", m.data()[e]);
                     len += std::snprintf(line + len, sizeof(line) - len, " input %d", int(input_part));
                     for (int e = 0; e < 16 && input_part; ++e) len += std::snprintf(line + len, sizeof(line) - len, " %.9g", m_input.data()[e]);
+                    len += std::snprintf(line + len, sizeof(line) - len, " objects_between %d", objects_between ? int(std::min<std::uint32_t>(settings.object_interp, 2u)) : 0);
                     g_rec.note_output(shown_frame, line);
                 }
             } else {
@@ -2347,7 +2407,10 @@ void render_thread() {
         // camera the GPU does nothing at all between game frames.
         // (the frame counter - Settings::fps_counter: its numbers as of the last half second; a picture is presented when they
         // change, twice a second at most, even when nothing else has)
-        renderer.set_fps_counter(settings.fps_counter, std::uint32_t(sh.presenter.source_fps + 0.5f), std::uint32_t(sh.presenter.output_fps + 0.5f));
+        renderer.set_fps_counter(settings.fps_counter, std::uint32_t(sh.presenter.source_fps + 0.5f), std::uint32_t(sh.presenter.output_fps + 0.5f),
+                                 settings.fps_counter_scale);
+        if (settings.fps_counter && settings.latency_counter) latency_rows.update(now_seconds());
+        renderer.set_latency_rows(settings.latency_counter != 0, latency_rows.known, latency_rows.lat, latency_rows.xpar);
         const bool as_is = !(warped && !unmoved) && !settings.overlay_debug && !settings.show_mask && g_app.has_frames && !g_rec.busy &&
                            !renderer.fps_counter_dirty();
         const bool same_picture = as_is && shown_frame && as_is_frame == shown_frame && as_is_w == renderer.width() && as_is_h == renderer.height();
@@ -2474,10 +2537,10 @@ void render_thread() {
                 char header[512];
                 std::snprintf(header, sizeof(header),
                               "settings follow_share %d share_from_input %d keep_attached %d no_warp_mask %d game_hud_layers %d use_ui_tags %d "
-                              "background_memory %d hold_reticles %d stretch_width %d measured_orbit %d warp_engine %d warp_splat %d edge_fill %d\n",
+                              "background_memory %d hold_reticles %d stretch_width %d measured_orbit %d warp_engine %d warp_splat %d edge_fill %d object_interp %d\n",
                               int(settings.follow_share), int(settings.share_from_input), int(settings.keep_attached), int(settings.no_warp_mask),
                               int(settings.game_hud_layers), int(settings.use_ui_tags), int(settings.background_memory), int(settings.hold_reticles),
-                              int(settings.stretch_width), int(measured_orbit()), int(settings.warp_engine), int(settings.warp_splat), int(settings.edge_fill));
+                              int(settings.stretch_width), int(measured_orbit()), int(settings.warp_engine), int(settings.warp_splat), int(settings.edge_fill), int(settings.object_interp));
                 g_rec.start(renderer, root, header);
                 logf("sequence recording started: %ls", g_rec.dir.c_str());
             } else if (g_rec.active) {
@@ -2543,6 +2606,9 @@ void render_thread() {
                     if (screen_t >= e.present_t && screen_t - e.present_t < 0.25) {
                         lat_display.push_back((screen_t - e.present_t) * 1000.0);
                         lat_age.push_back((screen_t - e.camera_t) * 1000.0);
+                        if (settings.fps_counter && settings.latency_counter && g_app.model.latency_median() > 0)
+                            latency_rows.add(now_seconds(), (screen_t - e.camera_t) * 1000.0,
+                                             (e.present_t - e.camera_t - g_app.model.latency_median()) * 1000.0);
                     }
                     if (e.target && vblank.period > 0) {
                         const long long r = std::llround(double(ps.sync_qpc - e.target) / vblank.period);

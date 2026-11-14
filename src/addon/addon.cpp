@@ -293,7 +293,9 @@ bool presenter_running() {
 // change, read when the game starts, back to the defaults after an update (as the options above). Not
 // remembered: Enable reprojection and the comparison/debug switches (Show original, Debug strip, Invert warp,
 // Show the mask) - those never stick.
-struct Persisted { const char* key; std::uint32_t fw::Settings::*u; float fw::Settings::*f; };
+// keep: also kept over an update (how big the panel and the counter are drawn - a reader who needs them bigger needs them so
+// after every update too).
+struct Persisted { const char* key; std::uint32_t fw::Settings::*u; float fw::Settings::*f; bool keep = false; };
 constexpr Persisted kPersisted[] = {
     {"UseMouse", &fw::Settings::use_mouse, nullptr},
     {"RotationExtrapolation", nullptr, &fw::Settings::rotation_extrapolation},
@@ -314,7 +316,11 @@ constexpr Persisted kPersisted[] = {
     {"EdgeFill", &fw::Settings::edge_fill, nullptr},
     {"MemoryResolution", &fw::Settings::memory_resolution, nullptr},
     {"FpsCounter", &fw::Settings::fps_counter, nullptr},
+    {"FpsCounterScale", &fw::Settings::fps_counter_scale, nullptr, true},
+    {"LatencyCounter", &fw::Settings::latency_counter, nullptr},
+    {"UiScale", nullptr, &fw::Settings::ui_scale, true},
     {"ReShadeOnOutput", &fw::Settings::reshade_on_output, nullptr},
+    {"ObjectInterpolation", &fw::Settings::object_interp, nullptr},
     {"EdgeLimit", nullptr, &fw::Settings::edge_limit_pct},
     {"EdgeUnlimited", &fw::Settings::edge_unlimited, nullptr},
     {"WarpEngine", &fw::Settings::warp_engine, nullptr},
@@ -349,7 +355,7 @@ void load_persisted(fw::Settings& s, bool reset) {
         const Persisted& p = kPersisted[i];
         char text[32] = "";
         size_t size = sizeof(text);
-        if (!reset && reshade::get_config_value(nullptr, "FrameWarp", p.key, text, &size) && text[0]) {
+        if ((!reset || p.keep) && reshade::get_config_value(nullptr, "FrameWarp", p.key, text, &size) && text[0]) {
             char* end = nullptr;
             const double v = std::strtod(text, &end);
             if (end != text && std::isfinite(v)) {
@@ -971,6 +977,17 @@ void draw_overlay(effect_runtime*) {
     auto& s = sh.settings;
     auto& h = sh.hooks;
     auto& p = sh.presenter;
+    // The panel's size (Settings::ui_scale, 1 .. 4 times): its font drawn bigger - the controls, sized by the font, with it.
+    // ReShade's own windows stay as they are.
+    struct PanelScale {
+        bool pushed = false;
+        explicit PanelScale(float k) {
+            if (!(k > 1.001f)) return;
+            ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * std::min(k, 4.0f));
+            pushed = true;
+        }
+        ~PanelScale() { if (pushed) ImGui::PopFont(); }
+    } panel_scale(s.ui_scale);
     {
         // Pulled out of ReShade's bar, the panel stays a loose window in the next sessions; docked again, a tab
         // (dock_panel_by_default). What is remembered is how the panel is, once it has been that way for a few
@@ -1009,6 +1026,31 @@ void draw_overlay(effect_runtime*) {
         hint("The presenter's own counter in a corner of the picture: GAME - the game's frames a second XPAR takes in; OUT - the "
              "refreshes a second it shows. Drawn by XPAR on its own picture, which covers the game's window - counters drawn into "
              "the game (the Steam overlay's, for one) stay under it. Remembered per game.");
+        ImGui::BeginDisabled(s.fps_counter == 0);
+        static const char* const kSizes[] = {"1x", "2x", "3x", "4x"};
+        int size = static_cast<int>(std::clamp<std::uint32_t>(s.fps_counter_scale, 1u, 4u)) - 1;
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 4.0f);
+        if (ImGui::Combo("Size###fps_size", &size, kSizes, 4)) s.fps_counter_scale = static_cast<std::uint32_t>(size + 1);
+        hint("How big the frame counter is drawn: 1x its usual size up to 4x. Kept over updates.");
+        bool latency = s.latency_counter != 0;
+        if (ImGui::Checkbox("Latency under the frame counter", &latency)) s.latency_counter = latency;
+        ImGui::EndDisabled();
+        hint("Two more rows under the frame counter (ms, the medians of the last second):\n"
+             "LAT - the whole latency of a camera turn: from the input the shown camera reflects to the moment its picture "
+             "reaches the screen.\n"
+             "XPAR - what the warp adds (+) or takes off (-) against the game's own latency: LAT minus the game's input to "
+             "finished frame. Negative: the warp shows a newer camera than the game's frame has.\n"
+             "Blank while nothing is warped or the display's timing is not measured. Off by default; remembered per game.");
+        float ui = std::clamp(s.ui_scale, 1.0f, 4.0f);
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9.0f);
+        // (applied when released: the panel growing under the mouse while dragging would move the slider away from it)
+        static float dragging = 0.0f;
+        if (ImGui::SliderFloat("Panel size", dragging > 0.0f ? &dragging : &ui, 1.0f, 4.0f, "%.2fx")) {
+            if (dragging <= 0.0f) dragging = ui;
+        }
+        if (dragging > 0.0f && !ImGui::IsItemActive()) { s.ui_scale = std::clamp(dragging, 1.0f, 4.0f); dragging = 0.0f; }
+        hint("This panel's text and controls, 1x up to 4x. Kept over updates.");
     }
     {
         bool on = s.reshade_on_output != 0;
@@ -1255,6 +1297,21 @@ void draw_overlay(effect_runtime*) {
                  "nothing reaches is filled from the scenery behind: near objects keep their shape and edges are not doubled "
                  "when strafing. Off (the default): the warp searches from each pixel of the screen - about a third less GPU time "
                  "per refresh, a weapon's or character's outline a little less exact. Remembered per game.", why_engine);
+        }
+        // (A/B, 2.4 development - Settings::object_interp: not hidden, it is there to be compared in game)
+        {
+            const char* const why = first({why_engine, !s.follow_share ? "\"Character/weapon by how much it follows the turn\" is off" : nullptr});
+            // (2: the two frames blended - the only mode offered. 1, the newest frame shifted, is left in the presenter for comparison:
+            // the ini key alone)
+            bool objects = s.object_interp != 0;
+            ImGui::BeginDisabled(why != nullptr);
+            if (ImGui::Checkbox("Interpolate moving objects between game frames (XPAR engine)", &objects)) s.object_interp = objects ? 2u : 0u;
+            ImGui::EndDisabled();
+            hint("Characters, the first-person weapon and whatever else moves on its own are shown at every refresh where they "
+                 "were at that moment: the game's last two frames blended along the motion, what a mover uncovers taken from the "
+                 "frame before - instead of stepping at the game's frame rate. Needs the game's motion vectors. With a still "
+                 "camera every refresh is drawn then (more GPU time). Not with the game's own frame generation, whose images "
+                 "move them already. On by default; remembered per game.", why);
         }
         bool memory = s.background_memory != 0;
         const char* const why_memory = first({why_engine, !any_mask ? "\"Keep still\" is Off - the memory is kept only with something kept still" : nullptr,
