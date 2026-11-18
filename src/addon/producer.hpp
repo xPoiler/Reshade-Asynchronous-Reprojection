@@ -83,6 +83,9 @@ public:
     // ...and that copy made small at the present, on the add-on's own list (d3d12_motion), as on_motion_d3d11. candidate 0: the found motion (kMotion).
     void want_motion_d3d12(Tex kind, std::uint64_t source, std::uint32_t width, std::uint32_t height, std::uint32_t candidate, std::uint32_t channels);
     bool on_motion_d3d11(std::uint64_t frame, Tex kind, ID3D11Resource* source, std::uint32_t width, std::uint32_t height, ID3D11DeviceContext* context);
+    // (Direct3D 11: the target being taken, cleared by the game after it drew into it this frame - made small at the clear, see on_motion_cleared_d3d11)
+    void on_motion_cleared_d3d11(ID3D11Resource* source, ID3D11DeviceContext* context);
+    void forget_motion_held() { std::lock_guard lock(mutex_); d11_motion_held_ = nullptr; }
     void on_tag_d3d11(std::uint64_t frame, Tex kind, ID3D11Resource* source, std::uint32_t ext_x, std::uint32_t ext_y,
                       std::uint32_t ext_w, std::uint32_t ext_h, ID3D11DeviceContext* context);
     std::uint64_t begin_present_d3d11(ID3D11Resource* backbuffer, ID3D11DeviceContext* context);
@@ -313,6 +316,9 @@ private:
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> d11_cover_cs_;
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> d11_motion_cs_;  // (on_motion_d3d11)
     Microsoft::WRL::ComPtr<ID3D11Texture2D> d11_motion_small_;
+    const ID3D11Resource* d11_motion_held_ = nullptr;  // (the target d11_motion_small_ holds from its clear this frame - compared, never used)
+    bool d11_motion_held_logged_ = false;
+    bool d11_shrink_motion(ID3D11DeviceContext* context, ID3D11Resource* source, std::uint32_t width, std::uint32_t height);
     bool d11_before_taken_ = false, d11_cs_failed_ = false, d11_none_ = false, d11_confirmed_ = false;
     void d3d11_cover(ID3D11DeviceContext* context, int slot);
     bool ensure_d11_cover_cs(ID3D11Device* device);

@@ -1066,6 +1066,7 @@ void render_thread() {
     std::vector<MotionSearch::Sample> search_samples;
     LONG motion_restarts_seen = 0;
     int search_frames = 0;           // (game frames of the motion search without a find)
+    int overlay_settle = 0;          // (game frames after the ReShade menu closed that are not learned from yet - see take_in_finish)
     bool scale_from_search = false;  // (the motion scale is the search's)
     // Whether the estimated camera can be learned from: the frame itself was explained, and so were most of the last 60.
     std::deque<bool> estimate_rejects;
@@ -1313,14 +1314,24 @@ void render_thread() {
                 logf("the game's motion vectors are gone (a new render target?): searching again");
             }
             // (nothing found for a good while: everything again - a target may have had a bad start, or the game was in a menu then. 3 minutes at 60 fps, a stopgap)
-            if (s.motion_candidate && !sh.motion_found && ++search_frames > 10800) {
+            // (counted also once every target is ruled out - then no candidate is handed over at all, and the count never ran: EDF6's six were
+            // ruled out in its first 6 s and never tried again in that session, 2026-11-18)
+            const bool any_ruled_out = std::any_of(std::begin(sh.motion_ruled_out), std::end(sh.motion_ruled_out), [](const auto& bits) { return bits != 0; });
+            if ((s.motion_candidate || any_ruled_out) && s.valid && !sh.motion_found && ++search_frames > 10800) {
                 search_frames = 0;
                 motion_search.reset();
                 for (auto& bits : sh.motion_ruled_out) bits = 0;
                 logf("motion search: nothing found so far, trying every target again");
             }
+            // The ReShade menu is drawn on the frames XPAR takes in: nothing is learned from them - the camera model, the motion search -
+            // nor from the first frames after it closes, measured against a frame with the menu on it. EDF6 (2026-11-18): the camera
+            // estimate turned 150-180 degrees in half a second with the menu open and the stick still, the camera model learned from it
+            // and the warp shook until it had learned again.
+            const bool overlay_frame = sh.overlay_open != 0 || overlay_settle > 0;
+            if (sh.overlay_open) overlay_settle = 3;
+            else if (overlay_settle > 0 && s.valid) --overlay_settle;
             // The motion search: this frame's candidate against the motion the picture shows (see motion_search.hpp).
-            if (sampled && s.valid && s.motion_candidate && !sh.motion_found) {
+            if (sampled && s.valid && s.motion_candidate && !sh.motion_found && !overlay_frame) {
                 constexpr std::size_t kCells = 80 * 45;
                 if (raw_samples.size() >= kCells * 8) {
                     search_samples.resize(kCells);
@@ -1354,6 +1365,11 @@ void render_thread() {
                                 float now = 0, before = 0;
                                 motion_search.timing(s.motion_candidate, now, before);
                                 logf("motion search: candidate %u follows the frame before (%.2f) better than its own (%.2f): a frame late, not used", s.motion_candidate, before, now);
+                            } else if (!(sh.motion_ruled_out[s.motion_candidate / 64] & bit)) {
+                                float q[2];
+                                motion_search.best_so_far(s.motion_candidate, q);
+                                logf("motion search: candidate %u ruled out - %d moving frames, best channels %.2f and %.2f (nothing shown: under %.2f, or next to nothing drawn)",
+                                     s.motion_candidate, counted, q[0], q[1], MotionSearch::kNothing);
                             }
                             sh.motion_ruled_out[s.motion_candidate / 64] |= bit;
                         }
@@ -1645,7 +1661,7 @@ void render_thread() {
                 source_frame = m.frame_id;
                 frame_times.emplace_back(m.frame_id, source_time);
                 if (frame_times.size() > 8) frame_times.pop_front();
-                g_app.model.set_camera_trusted(!cam.estimated || estimate_trusted);
+                g_app.model.set_camera_trusted((!cam.estimated || estimate_trusted) && !overlay_frame);
                 if (!cam.estimated || camera_followed_now || camera_agrees_now) game_camera_t = now_seconds();  // (the game's camera: see measured_orbit)
                 camera_agrees_now = false;
                 if (!cam.estimated) sh.presenter.estimate_unreliable_pct = 0;

@@ -649,7 +649,7 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
         g_active = 0;
     } else {
         // Learned again: from the panel (the profile forgotten too), or the presenter found the learned point no longer behaving
-        // like a HUD (the same), or - not proven yet (a minute of frames with the HUD from it) - it has not drawn for 600 frames
+        // like a HUD (the profile kept - see below), or - not proven yet (a minute of frames with the HUD from it) - it has not drawn for 600 frames
         // (a point locked on a title screen with the camera moving behind its menu: Elden Ring). A proven point (saved, or from
         // the profile) waits through menus and a HUD hidden for any length of time.
         const bool drew = g_final || g_bb_frame;  // (the game drew its picture this frame: not a loading screen)
@@ -661,7 +661,11 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
                               relearn != g_relearn_seen ? "Relearn" : fail == g_locked ? "it no longer behaves like a HUD" : "it has not drawn lately");
                 fw::diag_log(reshade::log::level::info, text);
             }
-            if (forget && learning && !g_profile.empty()) _wremove(g_profile.c_str());
+            // (the saved point is deleted only by Relearn. One the presenter drops is set aside for this run: the next launch
+            // starts from it again, and a point proven in this run replaces it. EDF6: its saved point dropped 12 s after the launch -
+            // its first checked frames changed 86% of the screen, stays on the screen 0.63 - and the file went with it, learned again
+            // on every launch)
+            if (relearn != g_relearn_seen && learning && !g_profile.empty()) _wremove(g_profile.c_str());
             if (forget) g_saved = false;
             g_relearn_seen = relearn;
             g_locked = 0;

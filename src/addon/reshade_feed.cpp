@@ -355,6 +355,7 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
         p->on_tag_d3d11(frame, kDepth, reinterpret_cast<ID3D11Resource*>(depth.handle), 0, 0, w, h,
                         reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native()));
         const resource handed = search.motion.handle ? search.motion : search.probe;
+        if (search.drawn) p->forget_motion_held();  // (drawn into after its clear: taken as it is now)
         if (handed.handle) {
             if (p->on_motion_d3d11(frame, search.motion.handle ? kMotion : kMotionProbe, reinterpret_cast<ID3D11Resource*>(handed.handle), small_w, small_h,
                                    reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native())))

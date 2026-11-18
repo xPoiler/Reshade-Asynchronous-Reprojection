@@ -1218,6 +1218,12 @@ static DXGI_FORMAT d11_srv_format(DXGI_FORMAT f) {
         default: return f;
     }
 }
+// A picture into a single-sampled texture of its size and format: copied, or resolved when multisampled.
+static void d11_copy_single(ID3D11DeviceContext* context, ID3D11Resource* picture, const D3D11_TEXTURE2D_DESC& pd, ID3D11Texture2D* into) {
+    if (pd.SampleDesc.Count > 1) context->ResolveSubresource(into, 0, picture, 0, d11_srv_format(pd.Format));
+    else if (pd.MipLevels == 1 && pd.ArraySize == 1) context->CopyResource(into, picture);
+    else context->CopySubresourceRegion(into, 0, 0, 0, 0, picture, 0, nullptr);
+}
 bool Producer::ensure_d11_cover_cs(ID3D11Device* device) {
     if (!d11_cover_cs_ && !d11_cs_failed_ && device) {
         ComPtr<ID3DBlob> code, errors;
@@ -1238,23 +1244,24 @@ ID3D11Resource* Producer::d11_readable(ID3D11DeviceContext* context, ID3D11Resou
     D3D11_TEXTURE2D_DESC pd{};
     if (!picture || FAILED(picture->QueryInterface(IID_PPV_ARGS(&texture)))) return nullptr;
     texture->GetDesc(&pd);
-    if (pd.BindFlags & D3D11_BIND_SHADER_RESOURCE) return picture;
-    if (pd.SampleDesc.Count != 1) return nullptr;
+    const bool multisampled = pd.SampleDesc.Count > 1;
+    if (!multisampled && (pd.BindFlags & D3D11_BIND_SHADER_RESOURCE)) return picture;
     D3D11_TEXTURE2D_DESC rd{};
     if (d11_readable_) d11_readable_->GetDesc(&rd);
     if (!d11_readable_ || rd.Width != pd.Width || rd.Height != pd.Height || rd.Format != pd.Format) {
         ComPtr<ID3D11Device> device;
         context->GetDevice(&device);
         D3D11_TEXTURE2D_DESC d = pd;
-        d.MipLevels = 1; d.ArraySize = 1; d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE; d.CPUAccessFlags = 0; d.MiscFlags = 0;
+        d.MipLevels = 1; d.ArraySize = 1; d.SampleDesc = {1, 0};
+        d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE; d.CPUAccessFlags = 0; d.MiscFlags = 0;
         d11_readable_.Reset();
         if (!device || FAILED(device->CreateTexture2D(&d, nullptr, &d11_readable_))) return nullptr;
     }
-    if (pd.MipLevels == 1 && pd.ArraySize == 1) context->CopyResource(d11_readable_.Get(), picture);
-    else context->CopySubresourceRegion(d11_readable_.Get(), 0, 0, 0, 0, picture, 0, nullptr);
+    d11_copy_single(context, picture, pd, d11_readable_.Get());
     if (!d11_readable_logged_) {
         d11_readable_logged_ = true;
-        set_message("HUD (Direct3D 11): the picture can not be read in a shader (made for display only) - compared through a copy");
+        set_message(multisampled ? "HUD (Direct3D 11): the picture is multisampled - compared through a resolved copy"
+                                 : "HUD (Direct3D 11): the picture can not be read in a shader (made for display only) - compared through a copy");
     }
     return d11_readable_.Get();
 }
@@ -1267,19 +1274,20 @@ void Producer::on_hud_probe_d3d11(ID3D11Resource* picture, ID3D11DeviceContext* 
     D3D11_TEXTURE2D_DESC pd{};
     if (FAILED(picture->QueryInterface(IID_PPV_ARGS(&texture)))) return;
     texture->GetDesc(&pd);
-    if (pd.SampleDesc.Count != 1) return;
+    // (a multisampled back buffer - EDF6 draws its HUD onto a 4K 8x one - is resolved: before this its points were never copied,
+    // never scored, and only the final picture's candidate was ever judged)
     D3D11_TEXTURE2D_DESC bd{};
     if (d11_probe_before_) d11_probe_before_->GetDesc(&bd);
     if (!d11_probe_before_ || bd.Width != pd.Width || bd.Height != pd.Height || bd.Format != pd.Format) {
         ComPtr<ID3D11Device> device;
         context->GetDevice(&device);
         D3D11_TEXTURE2D_DESC d = pd;
-        d.MipLevels = 1; d.ArraySize = 1; d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE; d.CPUAccessFlags = 0; d.MiscFlags = 0;
+        d.MipLevels = 1; d.ArraySize = 1; d.SampleDesc = {1, 0};
+        d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE; d.CPUAccessFlags = 0; d.MiscFlags = 0;
         d11_probe_before_.Reset();
         if (!device || FAILED(device->CreateTexture2D(&d, nullptr, &d11_probe_before_))) return;
     }
-    if (pd.MipLevels == 1 && pd.ArraySize == 1) context->CopyResource(d11_probe_before_.Get(), picture);
-    else context->CopySubresourceRegion(d11_probe_before_.Get(), 0, 0, 0, 0, picture, 0, nullptr);
+    d11_copy_single(context, picture, pd, d11_probe_before_.Get());
     d11_probe_picture_ = picture;
     d11_probe_taken_ = true;
     d11_probe_use_ = use;
@@ -2124,9 +2132,9 @@ RWTexture2D<float4> to : register(u0);
 }
 )";
 
-bool Producer::on_motion_d3d11(std::uint64_t frame, Tex kind, ID3D11Resource* source, std::uint32_t width, std::uint32_t height, ID3D11DeviceContext* context) {
-    std::lock_guard lock(mutex_);
-    if (!ready() || !d11_ || !source || !context || !width || !height) return false;
+// The target made small into d11_motion_small_ (width x height). Where the game still has it bound to draw into - at its clear - its render targets
+// are set aside for the pass and put back: Direct3D 11 reads nothing from a texture bound as one.
+bool Producer::d11_shrink_motion(ID3D11DeviceContext* context, ID3D11Resource* source, std::uint32_t width, std::uint32_t height) {
     ComPtr<ID3D11Texture2D> texture;
     if (FAILED(source->QueryInterface(IID_PPV_ARGS(&texture)))) return false;
     D3D11_TEXTURE2D_DESC sd{};
@@ -2155,14 +2163,20 @@ bool Producer::on_motion_d3d11(std::uint64_t frame, Tex kind, ID3D11Resource* so
     sv.Format = d11_srv_format(sd.Format); sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels = 1;
     if (FAILED(device->CreateShaderResourceView(source, &sv, &from_view)) ||
         FAILED(device->CreateUnorderedAccessView(d11_motion_small_.Get(), nullptr, &to_view))) return false;
-    const int slot = slot_for_frame(frame, true);
-    if (slot < 0) return false;
-    slot_list_[slot] = 0; slot_submitted_[slot] = true;  // (the immediate context: on the GPU's way at once)
-    collect_retired();
-    D3D12_RESOURCE_DESC desc{};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = width; desc.Height = height; desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    if (!ensure_texture(slot, kind, desc)) { ++shared_->hooks.copies_failed; return false; }
+    ID3D11RenderTargetView* old_rtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+    ID3D11DepthStencilView* old_dsv = nullptr;
+    context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, old_rtv, &old_dsv);
+    UINT bound = 0;
+    bool source_bound = false;
+    for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
+        if (!old_rtv[i]) continue;
+        bound = i + 1;
+        ComPtr<ID3D11Resource> r;
+        old_rtv[i]->GetResource(&r);
+        source_bound = source_bound || r.Get() == source;
+    }
+    // (the game's pixel shader UAVs stay as they are)
+    if (source_bound) context->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, D3D11_KEEP_UNORDERED_ACCESS_VIEWS, nullptr, nullptr);
     ComPtr<ID3D11ComputeShader> old_cs;
     ID3D11ClassInstance* raw_instances[256] = {};
     UINT instance_count = 256;
@@ -2182,9 +2196,45 @@ bool Producer::on_motion_d3d11(std::uint64_t frame, Tex kind, ID3D11Resource* so
     context->CSSetShader(old_cs.Get(), raw_instances, instance_count);
     context->CSSetShaderResources(0, 1, old_srv);
     context->CSSetUnorderedAccessViews(0, 1, old_uav, nullptr);
+    if (source_bound) context->OMSetRenderTargetsAndUnorderedAccessViews(bound, old_rtv, old_dsv, 0, D3D11_KEEP_UNORDERED_ACCESS_VIEWS, nullptr, nullptr);
     for (UINT i = 0; i < instance_count; ++i) if (raw_instances[i]) raw_instances[i]->Release();
     for (auto* v : old_srv) if (v) v->Release();
     for (auto* v : old_uav) if (v) v->Release();
+    for (auto* v : old_rtv) if (v) v->Release();
+    if (old_dsv) old_dsv->Release();
+    return true;
+}
+// The game clears the target it drew into this frame before its present (EDF6: its whole G-buffer, after the HUD): made small now, handed over at the
+// present - else the search and the warp got the clear value everywhere, and the target was ruled out without a word.
+void Producer::on_motion_cleared_d3d11(ID3D11Resource* source, ID3D11DeviceContext* context) {
+    std::lock_guard lock(mutex_);
+    if (!ready() || !d11_ || !source || !context || !d11_motion_small_) return;
+    D3D11_TEXTURE2D_DESC cd{};
+    d11_motion_small_->GetDesc(&cd);
+    if (!d11_shrink_motion(context, source, cd.Width, cd.Height)) return;
+    d11_motion_held_ = source;
+    if (!d11_motion_held_logged_) {
+        d11_motion_held_logged_ = true;
+        set_message("Motion (Direct3D 11): the game clears the target before its present - taken at the clear");
+    }
+}
+bool Producer::on_motion_d3d11(std::uint64_t frame, Tex kind, ID3D11Resource* source, std::uint32_t width, std::uint32_t height, ID3D11DeviceContext* context) {
+    std::lock_guard lock(mutex_);
+    const ID3D11Resource* held = d11_motion_held_;
+    d11_motion_held_ = nullptr;
+    if (!ready() || !d11_ || !source || !context || !width || !height) return false;
+    D3D11_TEXTURE2D_DESC cd{};
+    if (d11_motion_small_) d11_motion_small_->GetDesc(&cd);
+    // (taken at its clear this frame - see on_motion_cleared_d3d11; else as it is now)
+    if (!(held == source && cd.Width == width && cd.Height == height) && !d11_shrink_motion(context, source, width, height)) return false;
+    const int slot = slot_for_frame(frame, true);
+    if (slot < 0) return false;
+    slot_list_[slot] = 0; slot_submitted_[slot] = true;  // (the immediate context: on the GPU's way at once)
+    collect_retired();
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width; desc.Height = height; desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    if (!ensure_texture(slot, kind, desc)) { ++shared_->hooks.copies_failed; return false; }
     auto& t = textures_[slot][kind];
     copy_d3d11(context, d11_motion_small_.Get(), t.d11.Get());
     auto& info = shared_->slots[slot].tex[kind];

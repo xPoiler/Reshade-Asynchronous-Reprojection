@@ -41,6 +41,26 @@ public:
 
     // One frame's grid of one candidate. true: this frame counted.
     bool add(std::uint32_t candidate, const std::vector<Sample>& samples) {
+        const bool counted = add_frame(candidate, samples);
+        // Its timing judged at every kFramesNeeded frames it counted: late only when it follows the frame before better at two of them in a row. One
+        // comparison flips with the noise - EDF6 with a gamepad, whose smooth turns make this frame's and the frame before's alike: its candidate 3
+        // following this frame 0.88 against 0.62 was refused the next frame on 0.78 against 0.73, candidate 1 on 0.49 against 0.48 (2026-11-18).
+        // Enshrouded's late target followed the frame before at every check.
+        if (counted) {
+            const int n = frames(candidate);
+            Late& l = late_[candidate];
+            if (n >= kFramesNeeded && n % kFramesNeeded == 0 && n != l.checked) {
+                l.checked = n;
+                float now = 0, before = 0;
+                timing(candidate, now, before);
+                l.streak = before > now ? l.streak + 1 : 0;
+            }
+        }
+        return counted;
+    }
+
+private:
+    bool add_frame(std::uint32_t candidate, const std::vector<Sample>& samples) {
         std::vector<const Sample*> used;
         used.reserve(samples.size());
         for (const Sample& s : samples) if (s.valid > 0.5f && std::isfinite(s.rx) && std::isfinite(s.ry)) used.push_back(&s);
@@ -99,8 +119,8 @@ public:
         const bool counted = track(k, drawn);
         return track(relative_[candidate], own_used) || counted;
     }
-
-private:
+    struct Late { int checked = 0, streak = 0; };
+    std::map<std::uint32_t, Late> late_;
     struct Fit { bool ok = false; float scale = 0, quality = 0; };
     struct Channel { bool good = false, steady = false; float scale = 0, quality = 0, close = 0, roughly = 0; };
     struct Candidate {
@@ -254,11 +274,10 @@ public:
         f.full = full >= on_top;
         return f;
     }
-    // Follows the frame before better than this one, on the axis that moved most. (False until both are known.)
+    // Follows the frame before better than this one, on the axis that moved most, at two checks in a row (see add). (False until both are known.)
     bool late(std::uint32_t candidate) const {
-        float now = 0, before = 0;
-        timing(candidate, now, before);
-        return before > now;
+        const auto it = late_.find(candidate);
+        return it != late_.end() && it->second.streak >= 2;
     }
     // For the log: how well its best channel follows this frame's turn, and the frame before's (0 both: no turns both ways yet).
     void timing(std::uint32_t candidate, float& now, float& before) const {
@@ -344,7 +363,7 @@ public:
         out.low = v[v.size() / 10];
         return out;
     }
-    void reset() { candidates_.clear(); relative_.clear(); census_.clear(); }
+    void reset() { candidates_.clear(); relative_.clear(); census_.clear(); late_.clear(); }
 
 private:
 

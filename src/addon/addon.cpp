@@ -559,8 +559,15 @@ const char* addon_build() {
     return build;
 }
 
-void on_init_swapchain(swapchain* sc, bool) {
-    report_fullscreen_for(sc);
+// The swap chain the producer follows, and one made after it that takes over only once it presents. Helpers make
+// swap chains of their own that never present - Epic Online Services' overlay a 2x2 one on a device of its own, right
+// after EDF6's - and taking those at creation left the presenter on a 2x2 picture that never came (and the game's
+// device let go of when the helper's went away). A swap chain the game replaces its own with presents at once.
+std::atomic<swapchain*> g_attached_chain{nullptr};
+std::atomic<swapchain*> g_waiting_chain{nullptr};
+std::atomic<device*> g_attached_d3d11{nullptr};  // (the D3D11 device the producer opened its textures on)
+
+void attach_swapchain(swapchain* sc) {
     device* dev = sc->get_device();
     if (!g_producer) return;
     if (dev->get_api() == device_api::d3d12) {
@@ -569,9 +576,12 @@ void on_init_swapchain(swapchain* sc, bool) {
         if (!g_producer->attach_vulkan(dev)) return;
     } else if (dev->get_api() == device_api::d3d11) {
         if (!g_producer->attach_d3d11(dev)) return;
+        g_attached_d3d11 = dev;
     } else {
         return;
     }
+    g_attached_chain = sc;
+    if (g_waiting_chain == sc) g_waiting_chain = nullptr;
     const auto desc = dev->get_resource_desc(sc->get_current_back_buffer());
     g_producer->set_swapchain(static_cast<HWND>(sc->get_hwnd()), desc.texture.width, desc.texture.height,
                               static_cast<DXGI_FORMAT>(desc.texture.format), to_dxgi_color_space(sc->get_color_space()));
@@ -633,6 +643,29 @@ void on_init_swapchain(swapchain* sc, bool) {
         // What the presenter found out about the game's own camera in an earlier run (Shared::game_camera_check).
         InterlockedExchange(&shared->game_camera_check, std::clamp(saved("GameCameraCheck"), 0, 2));
     }
+}
+
+void on_init_swapchain(swapchain* sc, bool) {
+    report_fullscreen_for(sc);
+    swapchain* const attached = g_attached_chain;
+    if (attached && attached != sc) {
+        // (another swap chain is followed: this one takes over at its first present - see g_waiting_chain)
+        g_waiting_chain = sc;
+        const auto desc = sc->get_device()->get_resource_desc(sc->get_current_back_buffer());
+        char text[128];
+        std::snprintf(text, sizeof(text), "XPAR: another swap chain (%ux%u): followed once it presents", desc.texture.width, desc.texture.height);
+        fw::diag_log(reshade::log::level::info, text);
+        return;
+    }
+    attach_swapchain(sc);
+}
+
+void on_destroy_swapchain(swapchain* sc, bool resize) {
+    if (resize) return;
+    swapchain* expected = sc;
+    g_attached_chain.compare_exchange_strong(expected, nullptr);
+    expected = sc;
+    g_waiting_chain.compare_exchange_strong(expected, nullptr);
 }
 
 // The panel starts as a tab in ReShade's bar, next to Home. ReShade opens an add-on's panel as a loose window and
@@ -733,7 +766,9 @@ void on_destroy_device(device* dev) {
         g_pending_vk = {};
         g_producer->detach_vulkan();
     }
-    if (g_producer && dev->get_api() == device_api::d3d11) g_producer->detach_d3d11();
+    // (only the device the producer opened its textures on: a helper's device going away leaves the game's alone)
+    device* expected = dev;
+    if (g_producer && dev->get_api() == device_api::d3d11 && g_attached_d3d11.compare_exchange_strong(expected, nullptr)) g_producer->detach_d3d11();
 }
 
 // Vulkan games: the copy goes into the ReShade queue's immediate command buffer, which ReShade submits
@@ -778,6 +813,11 @@ void on_execute_command_list(command_queue*, command_list* cmd) {
     if (g_producer && cmd) g_producer->on_execute(cmd->get_native());
 }
 void on_present(command_queue*, swapchain* chain, const rect*, const rect*, uint32_t, const rect*) {
+    // (a swap chain made after the followed one presents: it is the game's now - see g_waiting_chain)
+    if (chain && chain == g_waiting_chain.load()) {
+        fw::diag_log(reshade::log::level::info, "XPAR: the newer swap chain presents: followed from now on");
+        attach_swapchain(chain);
+    }
     // (the game's colour space, see read_color_space: the presenter's output follows it)
     if (g_producer && g_producer->shared() && chain &&
         reinterpret_cast<std::uint64_t>(chain->get_hwnd()) == g_producer->shared()->game_hwnd) {
@@ -790,7 +830,10 @@ void on_present(command_queue*, swapchain* chain, const rect*, const rect*, uint
             // (paused too while the game's frame generation hands the frames over - generation_active, the presents' own test:
             // its comparison and the learned point's HUD go only with a present's frame, so nothing it does could reach the
             // presenter. Returnal with DLSS FG: candidates tried for nothing, copies taken every frame. A learned point is kept.)
-            fw::hud_learn::on_present(chain, sh.settings.hud_learn != 0, g_producer->game_gives_hud() || g_producer->generation_active(), sh.presenter.hud_learn_pick,
+            // (and while the ReShade menu is open: it is drawn on the picture the comparison reads, and taken for HUD - EDF6's saved
+            // point dropped when the menu was opened and closed while turning)
+            fw::hud_learn::on_present(chain, sh.settings.hud_learn != 0, g_producer->game_gives_hud() || g_producer->generation_active() || sh.overlay_open != 0,
+                                      sh.presenter.hud_learn_pick,
                                       sh.presenter.hud_learn_fail, sh.settings.hud_relearn, sh.presents_without_frame < 3);  // (3: as the presenter's "has frames")
         }
         const auto learn = fw::hud_learn::status();
@@ -1631,6 +1674,7 @@ void draw_overlay(effect_runtime*) {
 
 void register_callbacks() {
     reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
+    reshade::register_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);
     reshade::register_event<reshade::addon_event::reshade_present>(on_reshade_present);
     reshade::register_event<reshade::addon_event::reshade_finish_effects>(fw::on_reshade_finish_effects);
     reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(fw::on_reshade_reloaded_effects);
@@ -1720,6 +1764,7 @@ void unregister_callbacks() {
     reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(fw::on_reshade_reloaded_effects);
     reshade::unregister_event<reshade::addon_event::reshade_finish_effects>(fw::on_reshade_finish_effects);
     reshade::unregister_event<reshade::addon_event::reshade_present>(on_reshade_present);
+    reshade::unregister_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);
     reshade::unregister_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
 }
 }  // namespace

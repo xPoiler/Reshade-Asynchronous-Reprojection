@@ -23,6 +23,7 @@ struct Grab {
     int frame = 0, order = 0;
     std::uint64_t source = 0;
     bool back_buffer = false;
+    bool at_clear = false;  // (taken as the game clears it - before the present: see on_probe_clear)
 };
 struct Seen { std::uint64_t res; std::uint32_t w, h, fmt, draws; int frame; };
 struct Bound { std::vector<resource> targets; std::uint32_t draws = 0; std::size_t seen = 0; };
@@ -44,6 +45,10 @@ std::mutex g_search_mutex;
 std::vector<Candidate> g_candidates;
 Producer* g_producer = nullptr;
 std::atomic<std::uint32_t> g_wanted{0};  // (Direct3D 12: the candidate to copy when the game finishes writing it)
+// (Direct3D 11: the wanted candidate drawn into since the last motion_step - a clear after that is the frame's end, its content this frame's - and whether
+// this thread has it bound to draw into)
+std::atomic<bool> g_wanted_drawn{false};
+thread_local bool tl_wanted_bound = false;
 std::vector<std::pair<std::uint64_t, std::uint32_t>> g_this_frame;  // (the targets seen since the last motion_step, and their candidates; 0: not one)
 std::uint32_t g_depth_width = 0;  // (a change of it is a change of resolution: every target is another now)
 // Vulkan: the wanted target's copy, in copy_source between copies. The game's own command buffer takes the copy, as on Direct3D 12: nothing else can be done there.
@@ -152,6 +157,7 @@ void finish(command_list* cmd) {  // (under the lock)
 }
 void census_pass(device* dev, resource r);
 void on_bind(command_list* cmd, uint32_t n, const resource_view* rtvs, resource_view) {
+    bool wanted_bound = false;
     if (g_search && !g_paused.load(std::memory_order_relaxed) && cmd && rtvs) {
         device* dev = cmd->get_device();
         std::lock_guard<std::mutex> lock(g_search_mutex);
@@ -160,9 +166,11 @@ void on_bind(command_list* cmd, uint32_t n, const resource_view* rtvs, resource_
             const resource r = dev->get_resource_from_view(rtvs[i]);
             if (!r.handle) continue;
             census_pass(dev, r);  // (Direct3D: every target bound to draw into, for the log)
-            note_target(dev, r);
+            const std::uint32_t id = note_target(dev, r);
+            wanted_bound = wanted_bound || (id && id == g_wanted.load(std::memory_order_relaxed));
         }
     }
+    tl_wanted_bound = wanted_bound;
     if (!recording() || !cmd) return;
     std::lock_guard<std::mutex> lock(g_mutex);
     finish(cmd);
@@ -189,6 +197,20 @@ void drew(command_list* cmd) {
 }
 bool on_draw(command_list* cmd, uint32_t, uint32_t, uint32_t, uint32_t) { drew(cmd); return false; }
 bool on_draw_indexed(command_list* cmd, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) { drew(cmd); return false; }
+// A target of a format that can hold motion among other things, as the frame left it before the game clears it: EDF6 clears its whole G-buffer after the
+// HUD, before its present - the copies at the present held the clear value only (2026-11-18). Taken at its first clear of the frame.
+bool on_probe_clear(command_list* cmd, resource_view rtv, const float*, uint32_t, const rect*) {
+    if (!recording() || !cmd || !rtv.handle) return false;
+    device* dev = cmd->get_device();
+    const resource r = dev->get_resource_from_view(rtv);
+    if (!r.handle) return false;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (std::find_if(g_wide.begin(), g_wide.end(), [&](resource w) { return w.handle == r.handle; }) == g_wide.end()) return false;
+    const int frame = recording();
+    if (std::any_of(g_grabs.begin(), g_grabs.end(), [&](const Grab& g) { return g.at_clear && g.source == r.handle && g.frame == frame; })) return false;
+    if (grab(cmd, dev, r, dev->get_resource_desc(r), resource_usage::render_target, false)) g_grabs.back().at_clear = true;
+    return false;
+}
 
 void write_files(device* dev) {
     wchar_t exe[MAX_PATH] = {};
@@ -207,7 +229,7 @@ void write_files(device* dev) {
     for (const Grab& g : g_grabs) {
         subresource_data data{};
         if (dev->map_texture_region(g.staging, 0, nullptr, map_access::read_only, &data) && data.data) {
-            const std::wstring name = base + std::to_wstring(g.frame) + (g.back_buffer ? L"_back_" : L"_t") + std::to_wstring(g.order) + L".bin";
+            const std::wstring name = base + std::to_wstring(g.frame) + (g.back_buffer ? L"_back_" : g.at_clear ? L"_clear_t" : L"_t") + std::to_wstring(g.order) + L".bin";
             if (FILE* f = nullptr; !_wfopen_s(&f, name.c_str(), L"wb") && f) {
                 const std::uint32_t head[4] = {g.w, g.h, g.fmt, data.row_pitch};
                 std::fwrite(head, sizeof(head), 1, f);
@@ -375,6 +397,32 @@ void on_barrier(command_list* cmd, uint32_t n, const resource* resources, const 
                                                 reinterpret_cast<ID3D12GraphicsCommandList*>(cmd->get_native()), id);
     }
 }
+// Direct3D 11: a game that clears its G-buffer at the end of the frame, before its present (EDF6), leaves nothing in it to copy at the present - the
+// wanted candidate is taken at its clear instead, if it was drawn into this frame (a clear before the frame's draws holds the frame before's).
+bool on_search_draw(command_list*, uint32_t, uint32_t, uint32_t, uint32_t) {
+    if (tl_wanted_bound) g_wanted_drawn.store(true, std::memory_order_relaxed);
+    return false;
+}
+bool on_search_draw_indexed(command_list*, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) {
+    if (tl_wanted_bound) g_wanted_drawn.store(true, std::memory_order_relaxed);
+    return false;
+}
+bool on_search_clear(command_list* cmd, resource_view rtv, const float*, uint32_t, const rect*) {
+    if (!g_search || !g_producer || !cmd || !rtv.handle || g_paused.load(std::memory_order_relaxed) || !g_wanted_drawn.load(std::memory_order_relaxed)) return false;
+    device* dev = cmd->get_device();
+    if (!dev || dev->get_api() != device_api::d3d11) return false;
+    const resource r = dev->get_resource_from_view(rtv);
+    const std::uint32_t wanted = g_wanted.load(std::memory_order_relaxed);
+    if (!r.handle || !wanted) return false;
+    {
+        std::lock_guard<std::mutex> lock(g_search_mutex);
+        if (std::none_of(g_this_frame.begin(), g_this_frame.end(), [&](const auto& seen) { return seen.first == r.handle && seen.second == wanted; })) return false;
+    }
+    // (once per drawing: a second clear of it finds it blank, and draws after the clear make the copy old - see MotionStep::drawn)
+    g_wanted_drawn.store(false, std::memory_order_relaxed);
+    g_producer->on_motion_cleared_d3d11(reinterpret_cast<ID3D11Resource*>(r.handle), reinterpret_cast<ID3D11DeviceContext*>(cmd->get_native()));
+    return false;
+}
 // (the object gone: the candidate waits for the next one)
 void on_destroy_resource(device*, resource r) {
     std::lock_guard<std::mutex> lock(g_search_mutex);
@@ -455,6 +503,7 @@ MotionStep motion_step(bool found, std::uint32_t found_candidate, std::uint32_t 
     }
     for (Candidate& c : g_candidates) ++c.age;
     g_this_frame.clear();
+    out.drawn = g_wanted_drawn.exchange(false, std::memory_order_relaxed);
     // (whatever call its write came in: copies run in order, so the held image is the newest finished at the present)
     if (g_vk_taken && g_vk_taken == out.id) out.vulkan = g_vk_held;
     g_wanted.store(out.id, std::memory_order_relaxed);
@@ -492,13 +541,20 @@ void init() {
     if (g_search) reshade::register_event<reshade::addon_event::begin_render_pass>(on_census_pass);
     if (g_search) reshade::register_event<reshade::addon_event::end_render_pass>(on_end_pass);
     if (g_search) reshade::register_event<reshade::addon_event::close_command_list>(on_close_list);
+    if (g_search) reshade::register_event<reshade::addon_event::draw>(on_search_draw);
+    if (g_search) reshade::register_event<reshade::addon_event::draw_indexed>(on_search_draw_indexed);
+    if (g_search) reshade::register_event<reshade::addon_event::clear_render_target_view>(on_search_clear);
     if (!g_on) return;
     reshade::register_event<reshade::addon_event::draw>(on_draw);
     reshade::register_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
     reshade::register_event<reshade::addon_event::present>(on_present);
+    reshade::register_event<reshade::addon_event::clear_render_target_view>(on_probe_clear);
 }
 void shutdown() {
     if (!g_on && !g_search) return;
+    if (g_search) reshade::unregister_event<reshade::addon_event::clear_render_target_view>(on_search_clear);
+    if (g_search) reshade::unregister_event<reshade::addon_event::draw_indexed>(on_search_draw_indexed);
+    if (g_search) reshade::unregister_event<reshade::addon_event::draw>(on_search_draw);
     if (g_search) reshade::unregister_event<reshade::addon_event::close_command_list>(on_close_list);
     if (g_search) reshade::unregister_event<reshade::addon_event::end_render_pass>(on_end_pass);
     if (g_search) reshade::unregister_event<reshade::addon_event::begin_render_pass>(on_census_pass);
@@ -506,6 +562,7 @@ void shutdown() {
     reshade::unregister_event<reshade::addon_event::destroy_resource>(on_destroy_resource);
     reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(on_bind);
     if (!g_on) return;
+    reshade::unregister_event<reshade::addon_event::clear_render_target_view>(on_probe_clear);
     reshade::unregister_event<reshade::addon_event::present>(on_present);
     reshade::unregister_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
     reshade::unregister_event<reshade::addon_event::draw>(on_draw);

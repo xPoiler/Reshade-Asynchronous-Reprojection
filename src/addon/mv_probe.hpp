@@ -16,7 +16,9 @@ void shutdown();
 // one found, with nothing assumed about formats, channels or units. 0 both: nothing to hand over this frame.
 // lost: the target found is gone or no longer drawn: the search has to start over.
 // vulkan: that target as the game finished writing it this frame, in the add-on's own image, in copy_source (0: not written since the last call).
-struct MotionStep { reshade::api::resource motion{0}, probe{0}, vulkan{0}; std::uint32_t candidate = 0, id = 0; bool lost = false; };
+struct MotionStep { reshade::api::resource motion{0}, probe{0}, vulkan{0}; std::uint32_t candidate = 0, id = 0; bool lost = false;
+                   bool drawn = false;  // (Direct3D 11: the wanted target drawn into since its clear this frame, or this frame with no clear: a copy taken at a clear is old)
+};
 MotionStep motion_step(bool found, std::uint32_t found_candidate, std::uint32_t min_width, const std::uint64_t* ruled_out);
 // The feed is off: nothing is noted or copied until the next motion_step.
 void pause();

@@ -17,6 +17,8 @@
 namespace fw {
 std::atomic<std::int64_t> g_present_entered{0};  // (see renderer.hpp)
 namespace {
+// HUD learning: a point changing this share of the screen or more is no HUD (a stopgap: EDF6's HUD 9-17%, its menus 86%).
+constexpr double kHudPickArea = 0.6;
 
 const char kShaders[] = R"(
 Texture2D<float4> src : register(t0);
@@ -9867,18 +9869,22 @@ ID3D12GraphicsCommandList* Renderer::begin(int context) {
             const std::uint32_t* u = v + frame_index_ * 8;
             auto& sc = probe_scores_[probe_pending_cand_[frame_index_]];
             ++sc.frames;
-            sc.area += double(u[0]) / 256.0 / std::max(1u, probe_pending_tiles_[frame_index_]);
+            const double frame_area = double(u[0]) / 256.0 / std::max(1u, probe_pending_tiles_[frame_index_]);
+            sc.area += frame_area;
             if (u[2] + u[4] > 0) {
                 ++sc.scored;
                 sc.same_min += u[1] / 256.0; sc.same_max += u[2] / 256.0;
                 sc.world_min += u[3] / 256.0; sc.world_max += u[4] / 256.0;
             }
             // The learned point in use, checked over its recent frames: stays on the screen (0.8) and clearly more than
-            // it moves with the scenery (0.1), over 60 scored frames - else reported, and its scores dropped.
+            // it moves with the scenery (0.1), over 60 scored frames - else reported, and its scores dropped. Not on frames where it
+            // changes kHudPickArea of the screen or more - a menu or a loading screen the game draws with the HUD's shaders, never
+            // picked as a HUD either (hud_learn_pick). EDF6: its saved point, learned in a mission, dropped 12 s after each launch
+            // in its menus (86% of the screen, stays on the screen 0.63).
             const std::uint32_t cand = probe_pending_cand_[frame_index_];
             if (probe_pending_locked_[frame_index_]) {
                 if (cand != probe_locked_) { probe_locked_ = cand; probe_check_n_ = 0; probe_check_same_ = 1; probe_check_world_ = 0; }
-                if (u[2] > 0 && u[4] > 0) {
+                if (u[2] > 0 && u[4] > 0 && frame_area < kHudPickArea) {
                     const double a = 1.0 / std::min(60.0, double(++probe_check_n_));
                     probe_check_same_ += a * (u[1] / double(u[2]) - probe_check_same_);
                     probe_check_world_ += a * (u[3] / double(u[4]) - probe_check_world_);
@@ -10283,7 +10289,7 @@ std::uint32_t Renderer::hud_learn_pick() const {
     for (const auto& [cand, sc] : probe_scores_) {
         if (sc.scored < 30 || !sc.frames || sc.same_max <= 0 || sc.world_max <= 0) continue;
         const double area = sc.area / sc.frames, same = sc.same_min / sc.same_max, world = sc.world_min / sc.world_max;
-        if (area < 0.6 && same >= 0.9 && same - world >= 0.2 && area > pick_area) { pick = cand; pick_area = area; }
+        if (area < kHudPickArea && same >= 0.9 && same - world >= 0.2 && area > pick_area) { pick = cand; pick_area = area; }
     }
     return pick;
 }
