@@ -941,6 +941,23 @@ RWTexture2D<float> ah_u : register(u0);
         kept += g * v.xyz; wsum += g;
         if (rel < best) { best = rel; nearest = v.xyz; }
     }
+    // (none of the four at its distance: the nearest in distance of the 4 x 4 cells around - the cell of its own surface one
+    // further along. Of the four alone, a gauntlet's corner pixel at its diagonal edge, every cell around it the floor's, took
+    // the floor's share - 0.65 of the camera's motion at a hand's length from it, 9,962 px walking backwards, the floor dragged
+    // after it: specks, DOOM seq_3 f110)
+    // (...and none of those at its distance either - as the four's weights have it - no share measured on its own surface at
+    // all: what this pixel's own analysis finds decides. Attached, it is carried - none of the turn, as the attached rule below:
+    // a one pixel row of a gauntlet coming in at the screen's foot, no cell on it, took the floor's "all of its band" - all of
+    // the camera's motion at a hand's length, 2,400 px walking backwards - DOOM seq_2 f80)
+    if (wsum <= 1e-3) {
+        [unroll] for (int k = 0; k < 16; ++k) {
+            const int2 o = int2(k & 3, k >> 2) - 1;
+            const float4 v = su_half_t.Load(int3(clamp(i + o, int2(0, 0), int2(cells) - 1), 0));
+            const float rel = abs(log2(max(abs(v.w), 1e-9)) - l0);
+            if (rel < best) { best = rel; nearest = v.xyz; }
+        }
+        if (exp(-best * best * 25.0) <= 1e-3 && su_object_t.Load(int3(pr, 0)).w > 1.5) nearest.xy = 0;
+    }
     kept = wsum > 1e-3 ? kept / wsum : nearest;
     // (flag 1024: what this frame's analysis finds attached to the camera - it went where the camera took it - and its spot
     // measured following less than the scenery at its distance (kept under 0.75) follows none of the turn: one body carried as
@@ -1169,6 +1186,12 @@ groupshared uint2 oh_strip[8 * kHaloSide];
 uint2 oh_pack(float4 e) { return uint2(f32tof16(e.x) | (f32tof16(e.y) << 16), f32tof16(e.z) | (f32tof16(e.w) << 16)); }
 float4 oh_unpack(uint2 p) { return float4(f16tof32(p.x), f16tof32(p.x >> 16), f16tof32(p.y), f16tof32(p.y >> 16)); }
 groupshared uint oh_any[8];  // (each strip: anything in it moving - none, the search finds nothing there: not run)
+// (cs_own_halo_h keeps only what its search compares - each entry's twice its motion, a mover's; -1e30 none - and reads the
+// one it ends on again: half the groupshared memory of the whole entries, twice the groups at once on a GPU core, and each of
+// the search's 2 reach + 1 steps a single read with nothing to unpack. The search was nine tenths of the pass, the pass half
+// of what the two frames' blend costs a game frame (DOOM). The same values - through the same halves - compared in the
+// same order: the same result)
+groupshared float oh_key[8 * kHaloSide];
 [numthreads(8, 8, 1)] void cs_own_halo_h(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID, uint gi : SV_GroupIndex) {
     const int reach = int(groups_x);
     const int side = 8 + 2 * reach;
@@ -1183,9 +1206,10 @@ groupshared uint oh_any[8];  // (each strip: anything in it moving - none, the s
             const int2 q = int2(rect.xy) + int2(x, y);
             const float2 v = oh_in_t.Load(int3(q, 0)).xy;
             // (blended: a mover pixel by its own verdict - see below)
-            if (any(abs(v) > 0.01)) { e = float4(v, oh_near(q), 1); oh_any[row] = 1; }
+            if (any(abs(v) > 0.01)) { e = float4(v, 0, 1); oh_any[row] = 1; }
         }
-        oh_strip[row * kHaloSide + i % side] = oh_pack(e);
+        const float4 eh = oh_unpack(oh_pack(e));  // (as kept before: through the halves)
+        oh_key[row * kHaloSide + i % side] = eh.w > 0.5 ? 2.0 * length(eh.xy) : -1e30;
     }
     GroupMemoryBarrierWithGroupSync();
     if (any(id.xy >= rect.zw)) return;
@@ -1213,10 +1237,16 @@ groupshared uint oh_any[8];  // (each strip: anything in it moving - none, the s
         return;
     }
     const int base = int(gt.y) * kHaloSide + int(gt.x) + reach;
+    int at = 0;
+    bool found = false;
     if (oh_any[gt.y] != 0) [loop] for (int k = -reach; k <= reach; ++k) {
-        const float4 e = oh_unpack(oh_strip[base + k]);
-        const float m = 2.0 * length(e.xy) - abs(float(k));
-        if (e.w > 0.5 && m > most) { most = m; best = float4(e.xy, k, e.z); }
+        const float m = oh_key[base + k] - abs(float(k));
+        if (m > most) { most = m; at = k; found = true; }
+    }
+    if (found) {  // (the one it ended on, as kept before)
+        const int2 q = int2(rect.xy) + int2(int(id.x) + at, int(id.y));
+        const float4 e = oh_unpack(oh_pack(float4(oh_in_t.Load(int3(q, 0)).xy, oh_near(q), 1)));
+        best = float4(e.xy, at, e.z);
     }
     oh_out_u[int2(rect.xy + id.xy)] = best;
 }
@@ -4004,6 +4034,45 @@ Texture2D<uint2> tt_pick_t : register(t20);
     if (bn < 0) { bn = bn_any; bp = bp_any; }
     tt_pick_u[id.xy] = uint2(bp.x | (bp.y << 16), asuint(bn));
 }
+// How far each block's surface runs on unbroken in each of the 8 directions (kRetDirs), in blocks, up to 64 - one byte each,
+// directions 0-3 in x, 4-7 in y: every block on the way within 6 nearness steps a block of distance of the one before. From the
+// picks' nearness, so once per shown game frame with them: cs_tether_reach0 the first block, then cs_tether_reach doubling it
+// (alpha 1, 2, ..., 32). The solve's coarse passes pair blocks up to 64 apart: whether two are one surface is whether the run
+// reaches from one to the other - see tether_pull.
+Texture2D<uint2> tt_reach_t : register(t21);
+RWTexture2D<uint2> tt_reach_u : register(u0);
+uint tether_reach(uint2 r, int k) { return ((k < 4 ? r.x : r.y) >> (8u * uint(k & 3))) & 255u; }
+uint2 tether_reach_set(uint2 r, int k, uint v) {
+    const uint s = 8u * uint(k & 3);
+    if (k < 4) r.x = (r.x & ~(255u << s)) | (v << s); else r.y = (r.y & ~(255u << s)) | (v << s);
+    return r;
+}
+[numthreads(8, 8, 1)] void cs_tether_reach0(uint3 id : SV_DispatchThreadID) {
+    const int2 hs = int2(tether_blocks());
+    if (any(int2(id.xy) >= hs)) return;
+    const float n = asfloat(tt_pick_t.Load(int3(id.xy, 0)).y);
+    uint2 r = 0;
+    [unroll] for (int k = 0; k < 8; ++k) {
+        const int2 q = int2(id.xy) + kRetDirs[k];
+        if (any(q < 0) || any(q >= hs)) continue;
+        if (abs(asfloat(tt_pick_t.Load(int3(q, 0)).y) - n) <= 6.0 * length(float2(kRetDirs[k]))) r = tether_reach_set(r, k, 1u);
+    }
+    tt_reach_u[id.xy] = r;
+}
+[numthreads(8, 8, 1)] void cs_tether_reach(uint3 id : SV_DispatchThreadID) {
+    const int2 hs = int2(tether_blocks());
+    if (any(int2(id.xy) >= hs)) return;
+    const uint L = uint(alpha + 0.5);
+    const uint2 r = tt_reach_t.Load(int3(id.xy, 0));
+    uint2 o = r;
+    [unroll] for (int k = 0; k < 8; ++k) {
+        if (tether_reach(r, k) < L) continue;  // (broken within L: as it is)
+        const int2 q = int2(id.xy) + kRetDirs[k] * int(L);
+        const uint w = all(q >= 0) && all(q < hs) ? min(tether_reach(tt_reach_t.Load(int3(q, 0)), k), L) : 0u;
+        o = tether_reach_set(o, k, L + w);
+    }
+    tt_reach_u[id.xy] = o;
+}
 [numthreads(8, 8, 1)] void cs_tether_init(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= tether_blocks())) return;
     const uint2 pick = tt_pick_t.Load(int3(id.xy, 0));
@@ -4011,19 +4080,33 @@ Texture2D<uint2> tt_pick_t : register(t20);
     // (a generated image's weapon - tether_gen_held: its block nearer than anything by far - the solve's pulls weigh by nearness,
     // so it takes none and what is beside it takes all; and no rendered pixel takes its correction, see tether_field_at)
     bool held;
-    const float2 d = tether_target(bp, held);
+    float2 d = tether_target(bp, held);
+    // (asked to land off the screen: as far as a block past its edge - how far beyond does not show, but it is what the block
+    // holds the others to. A gauntlet's pixel coming in at the screen's foot, taken as scenery a hand's breadth from the lens,
+    // asked 9,962 px walking backwards and dragged the floor 50-290 px at the limit's slope - specks, DOOM seq_3 f110)
+    const float2 sp = float2(bp) + 0.5, m = float(tether_b());
+    const float2 tx = d > 0 ? (float2(rect.zw) + m - sp) / max(d, 1e-6) : d < 0 ? (-m - sp) / min(d, -1e-6) : float2(1, 1);
+    d *= saturate(min(tx.x, tx.y));
     const float bn = asfloat(pick.y) + (held ? 4096.0 : 0.0);
     tt_half_u[id.xy] = float4(d, bn, 0);
     tt_tb_u[id.xy] = d;
 }
-// One pair of blocks, dp and its neighbour dq in direction k, step blocks apart: the pull on dp if they part by more than the
-// limit, added to corr (true then)
-bool tether_pull(float3 dp, float3 dq, int k, int step, inout float2 corr) {
+// One pair of blocks, dp and its neighbour dq in direction k, step blocks apart (ap, aq: their displacements as asked for): the
+// pull on dp if they part by more than the limit, added to corr (true then)
+bool tether_pull(float3 dp, float3 dq, float2 ap, float2 aq, bool same, int k, int step, inout float2 corr) {
     const float len = length(float2(kRetDirs[k]));
     const float2 n = float2(kRetDirs[k]) / len;
     // (pulling apart along the pair, and sliding past each other across it: both bounded - a slide unbounded tore the
     // scenery above a held gun from the rows beside it, held back by the stretch; pushing together stays free)
-    const float2 dd = dq.xy - dp.xy;
+    // (one surface - same: every block from one to the other within 6 nearness steps of the one before, as "the same surface"
+    // everywhere else - keeps the shape it asks for: what bounds the pair is how far they part beyond what they asked for. Spreading apart as asked - nearer to the camera
+    // shown at an earlier moment, walking backwards - is the surface magnified, nothing uncovered: bounded as it is, the floor
+    // at the screen's foot, asking thousands of px off the screen, dragged the floor above it 100-250 px at the limit's slope -
+    // the floor speckled, DOOM seq_3 f110. Whether two blocks far apart are one surface is not how near their nearness is: 6
+    // steps a block of the way, the pillar beside the scenery behind it - 85 apart - was one surface 16 blocks apart and more,
+    // the coarse passes never dragged the scenery and the pillar filled the strip it tore from, 80 px too wide - f112; 6 steps
+    // at most, the floor 16 blocks apart was two and the coarse passes dragged it as before - specks)
+    const float2 dd = dq.xy - dp.xy - (same ? aq - ap : float2(0, 0));
     const float2 t = float2(-n.y, n.x);
     const float lim = kTetherL * float(tether_b()) * len * float(step);  // (a block is B rendered px)
     const float a = dot(dd, n) - lim, b = abs(dot(dd, t)) - lim;
@@ -4044,10 +4127,16 @@ bool tether_pull(float3 dp, float3 dq, int k, int step, inout float2 corr) {
     // overshot and the band came out streaked)
     float2 corr = 0;
     float count = 0;
+    const uint2 reach = tt_reach_t.Load(int3(p, 0));
     [unroll] for (int k = 0; k < 8; ++k) {
         const int2 q = p + kRetDirs[k] * step;
         if (any(q < 0) || any(q >= int2(hs))) continue;
-        if (tether_pull(dp.xyz, tt_half_t.Load(int3(q, 0)).xyz, k, step, corr)) count += 1.0;
+        const float4 dq = tt_half_t.Load(int3(q, 0));
+        // (one surface - see tether_pull: steps 1 and 2 through the block between, as cs_tether_fine; further, the run)
+        const float lim_z = 6.0 * length(float2(kRetDirs[k]));
+        const float zm = tt_half_t.Load(int3(p + kRetDirs[k] * (step >> 1), 0)).z;
+        const bool same = step <= 2 ? abs(dp.z - zm) <= lim_z && abs(zm - dq.z) <= lim_z : tether_reach(reach, k) >= uint(step);
+        if (tether_pull(dp.xyz, dq.xyz, tt_tb_t.Load(int3(p, 0)), tt_tb_t.Load(int3(q, 0)), same, k, step, corr)) count += 1.0;
     }
     const float2 solved = dp.xy + (count > 0 ? corr / count : float2(0, 0));
     tt_half_u[p] = float4(alpha < 0 ? solved - tt_tb_t.Load(int3(p, 0)) : solved, dp.z, 0);
@@ -4061,6 +4150,7 @@ static const int kTfOut = 16, kTfHalo = 6, kTfSide = kTfOut + 2 * kTfHalo;
 groupshared float2 tf_a[kTfSide * kTfSide];
 groupshared float2 tf_b[kTfSide * kTfSide];
 groupshared float tf_z[kTfSide * kTfSide];  // (the nearness: no pass changes it)
+groupshared float2 tf_t[kTfSide * kTfSide];  // (the displacement asked for - see tether_pull)
 [numthreads(16, 16, 1)] void cs_tether_fine(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID, uint gi : SV_GroupIndex) {
     const int2 hs = int2(tether_blocks());
     const int2 o = int2(gid.xy) * kTfOut - kTfHalo;
@@ -4069,6 +4159,7 @@ groupshared float tf_z[kTfSide * kTfSide];  // (the nearness: no pass changes it
         const float4 d = all(q >= 0) && all(q < hs) ? tt_half_t.Load(int3(q, 0)) : float4(0, 0, 0, 0);
         tf_a[i] = d.xy;
         tf_z[i] = d.z;
+        tf_t[i] = all(q >= 0) && all(q < hs) ? tt_tb_t.Load(int3(q, 0)) : float2(0, 0);
     }
     GroupMemoryBarrierWithGroupSync();
     [unroll] for (int it = 0; it < 5; ++it) {
@@ -4090,7 +4181,11 @@ groupshared float tf_z[kTfSide * kTfSide];  // (the nearness: no pass changes it
                 if (any(q < 0) || any(q >= hs)) continue;
                 const int2 lq = l + kRetDirs[k] * step;
                 const uint j = uint(lq.x + lq.y * kTfSide);
-                if (tether_pull(dp, float3((it & 1) ? tf_b[j] : tf_a[j], tf_z[j]), k, step, corr)) count += 1.0;
+                // (one surface - see tether_pull: through the block between at step 2; at step 1 that is the block itself)
+                const int2 lm = l + kRetDirs[k] * (step >> 1);
+                const float zm = tf_z[uint(lm.x + lm.y * kTfSide)], lim_z = 6.0 * length(float2(kRetDirs[k]));
+                const bool same = abs(dp.z - zm) <= lim_z && abs(zm - tf_z[j]) <= lim_z;
+                if (tether_pull(dp, float3((it & 1) ? tf_b[j] : tf_a[j], tf_z[j]), tf_t[c], tf_t[j], same, k, step, corr)) count += 1.0;
             }
             const float2 r = dp.xy + (count > 0 ? corr / count : float2(0, 0));
             if (it & 1) tf_a[c] = r; else tf_b[c] = r;
@@ -6132,7 +6227,7 @@ enum WTable : UINT { kWWarp, kWShown, kWJoinInit, kWJoinAB, kWJoinBA, kWJoinFina
                      kWStill, kWHoldInit, kWHoldAB, kWHoldBA, kWHoldFinal, kWHoldFill, kWHoldFillFinal, kWGrowInit, kWGrowAB, kWGrowBA,
                      kWGrowFinal, kWWarpArgs, kWShareMeasure, kWShareH, kWShareV, kWShareBins, kWShareUp, kWShareResid, kWResidBlurH, kWResidBlurV, kWOwnUp, kWOwnHaloH, kWOwnHaloV, kWToPrev, kWSeamH, kWSeamV, kWAttHist, kWBeside, kWHeld, kWWarpUp,
                      kWStenHist, kWStenCells, kWStenFloodAB, kWStenFloodBA, kWStenApply, kWStenCount,
-                     kWStenGrowInit, kWStenGrowAB, kWStenGrowBA, kWStenAge, kWStenClose, kWStenComp, kWStenPrune, kWStenLuma, kWStenElig, kWStenFringe, kWStenFringeApply, kWTetherInit, kWTetherAB, kWTetherBA, kWTetherFinal, kWTetherPick, kWFitSums, kWFitTotal, kWTables };
+                     kWStenGrowInit, kWStenGrowAB, kWStenGrowBA, kWStenAge, kWStenClose, kWStenComp, kWStenPrune, kWStenLuma, kWStenElig, kWStenFringe, kWStenFringeApply, kWTetherInit, kWTetherAB, kWTetherBA, kWTetherFinal, kWTetherPick, kWTetherReach0, kWTetherReachAB, kWTetherReachBA, kWFitSums, kWFitTotal, kWTables };
 constexpr UINT kWSrv(UINT table) { return kW + table * kWTableSize; }
 constexpr UINT kWUav(UINT table) { return kW + table * kWTableSize + kWSrvCount; }
 constexpr UINT kHeapSize = kW + kWTables * kWTableSize;
@@ -6373,7 +6468,15 @@ struct DispatchProfile {
         event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         return true;
     }
-    void name(ID3D12PipelineState* p, const char* entry) { if (on) names.emplace_back(p, entry); }
+    void name(ID3D12PipelineState* p, const char* entry) {
+        if (on) names.emplace_back(p, entry);
+        // (development, FW_SKIP="cs_a,cs_b": those shaders' dispatches left out - the picture goes wrong, the time they take
+        // is what a bench without them saves)
+        static const std::string skip = std::getenv("FW_SKIP") ? "," + std::string(std::getenv("FW_SKIP")) + "," : "";
+        if (!skip.empty() && skip.find("," + std::string(entry) + ",") != std::string::npos) skipped.push_back(p);
+    }
+    std::vector<ID3D12PipelineState*> skipped;
+    bool skips(ID3D12PipelineState* p) const { return !skipped.empty() && std::find(skipped.begin(), skipped.end(), p) != skipped.end(); }
     void before(ID3D12Device* d, ID3D12GraphicsCommandList* list) {
         if (!ready(d) || n) return;
         list->EndQuery(heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
@@ -6772,7 +6875,7 @@ bool Renderer::create_pipelines(std::string& error) {
         error = "warp root signature"; return false;
     }
     struct { const char* entry; ComPtr<ID3D12PipelineState>* pso; } ws[] = {
-        {"cs_own_warp", &cs_own_warp_}, {"cs_own_warp_reset", &cs_own_warp_reset_}, {"cs_own_warp_lean", &cs_own_warp_lean_}, {"cs_own_warp_seek", &cs_own_warp_seek_}, {"cs_own_warp_args", &cs_own_warp_args_}, {"cs_own_warp_rest", &cs_own_warp_rest_}, {"cs_warp_claims_clear", &cs_warp_claims_clear_}, {"cs_warp_claim", &cs_warp_claim_}, {"cs_warp_beside", &cs_warp_beside_}, {"cs_warp_held", &cs_warp_held_}, {"cs_own_warp_up", &cs_own_warp_up_}, {"cs_gen_depth", &cs_gen_depth_}, {"cs_gen_unui", &cs_gen_unui_}, {"cs_obj_join_init", &cs_obj_join_init_}, {"cs_obj_join", &cs_obj_join_}, {"cs_obj_join_final", &cs_obj_join_final_}, {"cs_still", &cs_still_}, {"cs_hold_fill", &cs_hold_fill_}, {"cs_grow_init", &cs_grow_init_}, {"cs_grow_clear", &cs_grow_clear_}, {"cs_grow", &cs_grow_}, {"cs_grow_final", &cs_grow_final_}, {"cs_share_measure", &cs_share_measure_}, {"cs_share_blur", &cs_share_blur_}, {"cs_share_bins", &cs_share_bins_}, {"cs_share_final", &cs_share_final_}, {"cs_share_up", &cs_share_up_}, {"cs_share_seam", &cs_share_seam_}, {"cs_att_hist", &cs_att_hist_}, {"cs_share_resid", &cs_share_resid_}, {"cs_resid_blur", &cs_resid_blur_}, {"cs_own_up", &cs_own_up_}, {"cs_own_halo_h", &cs_own_halo_h_}, {"cs_own_halo_v", &cs_own_halo_v_}, {"cs_to_prev", &cs_to_prev_}, {"cs_fit_sums", &cs_fit_sums_}, {"cs_fit_total", &cs_fit_total_}, {"cs_tether_init", &cs_tether_init_}, {"cs_tether_step", &cs_tether_step_}, {"cs_tether_fine", &cs_tether_fine_}, {"cs_tether_final", &cs_tether_final_}, {"cs_tether_pick", &cs_tether_pick_},
+        {"cs_own_warp", &cs_own_warp_}, {"cs_own_warp_reset", &cs_own_warp_reset_}, {"cs_own_warp_lean", &cs_own_warp_lean_}, {"cs_own_warp_seek", &cs_own_warp_seek_}, {"cs_own_warp_args", &cs_own_warp_args_}, {"cs_own_warp_rest", &cs_own_warp_rest_}, {"cs_warp_claims_clear", &cs_warp_claims_clear_}, {"cs_warp_claim", &cs_warp_claim_}, {"cs_warp_beside", &cs_warp_beside_}, {"cs_warp_held", &cs_warp_held_}, {"cs_own_warp_up", &cs_own_warp_up_}, {"cs_gen_depth", &cs_gen_depth_}, {"cs_gen_unui", &cs_gen_unui_}, {"cs_obj_join_init", &cs_obj_join_init_}, {"cs_obj_join", &cs_obj_join_}, {"cs_obj_join_final", &cs_obj_join_final_}, {"cs_still", &cs_still_}, {"cs_hold_fill", &cs_hold_fill_}, {"cs_grow_init", &cs_grow_init_}, {"cs_grow_clear", &cs_grow_clear_}, {"cs_grow", &cs_grow_}, {"cs_grow_final", &cs_grow_final_}, {"cs_share_measure", &cs_share_measure_}, {"cs_share_blur", &cs_share_blur_}, {"cs_share_bins", &cs_share_bins_}, {"cs_share_final", &cs_share_final_}, {"cs_share_up", &cs_share_up_}, {"cs_share_seam", &cs_share_seam_}, {"cs_att_hist", &cs_att_hist_}, {"cs_share_resid", &cs_share_resid_}, {"cs_resid_blur", &cs_resid_blur_}, {"cs_own_up", &cs_own_up_}, {"cs_own_halo_h", &cs_own_halo_h_}, {"cs_own_halo_v", &cs_own_halo_v_}, {"cs_to_prev", &cs_to_prev_}, {"cs_fit_sums", &cs_fit_sums_}, {"cs_fit_total", &cs_fit_total_}, {"cs_tether_init", &cs_tether_init_}, {"cs_tether_step", &cs_tether_step_}, {"cs_tether_fine", &cs_tether_fine_}, {"cs_tether_final", &cs_tether_final_}, {"cs_tether_pick", &cs_tether_pick_}, {"cs_tether_reach0", &cs_tether_reach0_}, {"cs_tether_reach", &cs_tether_reach_},
         {"cs_copy4", &cs_copy4_},
         {"cs_sten_clear", &cs_sten_clear_}, {"cs_sten_hist", &cs_sten_hist_}, {"cs_sten_cells", &cs_sten_cells_}, {"cs_sten_flood", &cs_sten_flood_},
         {"cs_sten_apply", &cs_sten_apply_}, {"cs_sten_count", &cs_sten_count_}, {"cs_sten_grow_init", &cs_sten_grow_init_}, {"cs_sten_grow", &cs_sten_grow_}, {"cs_sten_age", &cs_sten_age_}, {"cs_sten_close", &cs_sten_close_}, {"cs_sten_comp_clear", &cs_sten_comp_clear_}, {"cs_sten_comp_count", &cs_sten_comp_count_}, {"cs_sten_comp_max", &cs_sten_comp_max_}, {"cs_sten_prune", &cs_sten_prune_}, {"cs_sten_luma", &cs_sten_luma_}, {"cs_sten_elig", &cs_sten_elig_}, {"cs_sten_fringe", &cs_sten_fringe_}, {"cs_sten_fringe_apply", &cs_sten_fringe_apply_}};
@@ -6905,6 +7008,7 @@ void Renderer::w_dispatch(ID3D12PipelineState* pso, const void* constants, const
     list_->SetComputeRoot32BitConstants(1, kWConstants, w, 0);
     list_->SetComputeRootDescriptorTable(2, gpu(kWSrv(table)));
     list_->SetComputeRootDescriptorTable(3, gpu(kWUav(table)));
+    if (g_profile.skips(pso)) return;  // (development, FW_SKIP)
     g_profile.before(device_.Get(), list_.Get());
     list_->Dispatch(groups_x, groups_y, 1);
     g_profile.after(list_.Get(), pso);
@@ -8737,7 +8841,8 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
     PrivateId tether_solved = kPCount;
     if (tether_ && !no_depth && ensure_private(kPTetherA, hw, hh, DXGI_FORMAT_R32G32B32A32_FLOAT) &&
         ensure_private(kPTetherB, hw, hh, DXGI_FORMAT_R32G32B32A32_FLOAT) && ensure_private(kPTetherT, hw, hh, DXGI_FORMAT_R32G32_FLOAT) &&
-        ensure_private(kPTetherF, c.rect[2], c.rect[3], DXGI_FORMAT_R32G32_FLOAT) && ensure_private(kPTetherP, hw, hh, DXGI_FORMAT_R32G32_UINT)) {
+        ensure_private(kPTetherF, c.rect[2], c.rect[3], DXGI_FORMAT_R32G32_FLOAT) && ensure_private(kPTetherP, hw, hh, DXGI_FORMAT_R32G32_UINT) &&
+        ensure_private(kPTetherRA, hw, hh, DXGI_FORMAT_R32G32_UINT) && ensure_private(kPTetherRB, hw, hh, DXGI_FORMAT_R32G32_UINT)) {
         c.threshold = float(static_cast<std::uint32_t>(c.threshold + 0.5f) | 131072u);
         // (a block stands for a surface, not a lone point - see cs_tether_pick; FW_RULE_A_OFF, development: off)
         static const bool rule_a_off = std::getenv("FW_RULE_A_OFF") != nullptr;
@@ -8761,10 +8866,34 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
             set_x_uav(kWUav(kWTetherPick) + 0, kPTetherP); set_x_uav(kWUav(kWTetherPick) + 1, kPTetherP);
             transition(private_[kPTetherP], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             w_dispatch(cs_tether_pick_.Get(), &c, wc, kWTetherPick, gx, gy);
+            // (how far each block's surface runs on, from the picks - see cs_tether_reach0: 1, then doubled six times, ending in A)
+            transition(private_[kPTetherP], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            for (const UINT table : {UINT(kWTetherReach0), UINT(kWTetherReachAB), UINT(kWTetherReachBA)})
+                for (UINT i = 0; i < 19; ++i) set_x_srv(kWSrv(table) + i, bound[i].first, bound[i].second);
+            set_x_srv(kWSrv(kWTetherReach0) + 20, kPTetherP);
+            set_x_uav(kWUav(kWTetherReach0) + 0, kPTetherRA); set_x_uav(kWUav(kWTetherReach0) + 1, kPTetherRA);
+            set_x_srv(kWSrv(kWTetherReachAB) + 21, kPTetherRA);
+            set_x_uav(kWUav(kWTetherReachAB) + 0, kPTetherRB); set_x_uav(kWUav(kWTetherReachAB) + 1, kPTetherRB);
+            set_x_srv(kWSrv(kWTetherReachBA) + 21, kPTetherRB);
+            set_x_uav(kWUav(kWTetherReachBA) + 0, kPTetherRA); set_x_uav(kWUav(kWTetherReachBA) + 1, kPTetherRA);
+            transition(private_[kPTetherRA], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            w_dispatch(cs_tether_reach0_.Get(), &c, wc, kWTetherReach0, gx, gy);
+            XConstants rc = c;
+            bool r_in_a = true;
+            for (int L = 1; L <= 32; L *= 2) {
+                rc.alpha = float(L);
+                transition(private_[r_in_a ? kPTetherRA : kPTetherRB], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                transition(private_[r_in_a ? kPTetherRB : kPTetherRA], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                w_dispatch(cs_tether_reach_.Get(), &rc, wc, r_in_a ? kWTetherReachAB : kWTetherReachBA, gx, gy);
+                r_in_a = !r_in_a;
+            }
             tether_pick_key_ = pick_key;
             tether_pick_valid_ = true;
         }
         transition(private_[kPTetherP], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        transition(private_[kPTetherRA], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        set_x_srv(kWSrv(kWTetherAB) + 21, kPTetherRA);
+        set_x_srv(kWSrv(kWTetherBA) + 21, kPTetherRA);
         set_x_srv(kWSrv(kWTetherInit) + 20, kPTetherP);
         transition(private_[kPTetherA], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         transition(private_[kPTetherT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -10678,7 +10807,7 @@ void Renderer::release_stash() {
 }
 
 std::string Renderer::memory_report() {
-    static const char* const kNames[] = {"Backbuffer", "Hudless", "Ui", "Depth", "Motion", "ZeroUi", "Output", "Object", "ObjKindA", "ObjKindB", "Gen0", "Gen1", "Gen2", "GenZ0", "GenZ1", "GenZ2", "Previous", "HudScore", "Mask", "Scene", "Attached", "World", "Fill", "Mem0", "Mem1", "MemZ0", "MemZ1", "RampRows", "Ramp", "WarpMask", "HudKind", "StashColor", "StashDepth", "StashMotion", "StashHudless", "Stash2Color", "Stash2Hudless", "Stash2Depth", "Stash2Motion", "LumaA", "LumaB", "Feat", "FlowA", "FlowB", "RetCells", "RetEncl", "RetA", "RetB", "RetLayer", "HudLearned", "HudTiles", "WarpClaims", "Still", "GrowA", "GrowB", "Probe", "ProbeTilesA", "ProbeTilesB", "ShareA", "ShareB", "ShareT", "Share", "RetDirtyA", "RetDirtyB", "ShareT2", "ShareHalf", "RecColour", "RecUi", "ShareResid", "OwnMove", "Paths", "ShareSeam", "AttHist", "MemVis", "UiTiles", "WarpBeside", "WarpHeld", "LowScene", "MaskRaw", "MemF0", "MemF1", "MemFZ0", "MemFZ1", "GunMove", "MemRatio", "MotionProbe", "MotionGame", "Stencil", "StenCellsA", "StenCellsB", "StenMask", "StenGrowA", "StenGrowB", "StenAge", "StenLumaA", "StenLumaB", "StenElig", "StenFringeA", "StenFringeB", "DepthVA", "DepthVB", "MemMask", "ShareSm", "ShareSmA", "RecOut", "TetherA", "TetherB", "TetherT", "TetherF", "TetherP", "GunFlag", "OwnT", "ToPrev", "PrevCol", "PrevTo", "FitPart", "Fit"};
+    static const char* const kNames[] = {"Backbuffer", "Hudless", "Ui", "Depth", "Motion", "ZeroUi", "Output", "Object", "ObjKindA", "ObjKindB", "Gen0", "Gen1", "Gen2", "GenZ0", "GenZ1", "GenZ2", "Previous", "HudScore", "Mask", "Scene", "Attached", "World", "Fill", "Mem0", "Mem1", "MemZ0", "MemZ1", "RampRows", "Ramp", "WarpMask", "HudKind", "StashColor", "StashDepth", "StashMotion", "StashHudless", "Stash2Color", "Stash2Hudless", "Stash2Depth", "Stash2Motion", "LumaA", "LumaB", "Feat", "FlowA", "FlowB", "RetCells", "RetEncl", "RetA", "RetB", "RetLayer", "HudLearned", "HudTiles", "WarpClaims", "Still", "GrowA", "GrowB", "Probe", "ProbeTilesA", "ProbeTilesB", "ShareA", "ShareB", "ShareT", "Share", "RetDirtyA", "RetDirtyB", "ShareT2", "ShareHalf", "RecColour", "RecUi", "ShareResid", "OwnMove", "Paths", "ShareSeam", "AttHist", "MemVis", "UiTiles", "WarpBeside", "WarpHeld", "LowScene", "MaskRaw", "MemF0", "MemF1", "MemFZ0", "MemFZ1", "GunMove", "MemRatio", "MotionProbe", "MotionGame", "Stencil", "StenCellsA", "StenCellsB", "StenMask", "StenGrowA", "StenGrowB", "StenAge", "StenLumaA", "StenLumaB", "StenElig", "StenFringeA", "StenFringeB", "DepthVA", "DepthVB", "MemMask", "ShareSm", "ShareSmA", "RecOut", "TetherA", "TetherB", "TetherT", "TetherF", "TetherP", "GunFlag", "OwnT", "ToPrev", "PrevCol", "PrevTo", "FitPart", "Fit", "TetherRA", "TetherRB"};
     static_assert(sizeof(kNames) / sizeof(kNames[0]) == kPCount, "a name for every private texture");
     struct Item { std::string name; double mb; };
     std::vector<Item> items;

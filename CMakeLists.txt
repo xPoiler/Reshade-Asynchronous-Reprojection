@@ -74,6 +74,14 @@ add_dependencies(FrameWarpPresenterDll shader_pack)
 target_compile_definitions(FrameWarpPresenterDll PRIVATE FW_PRESENTER_DLL)
 set_target_properties(FrameWarpPresenterDll PROPERTIES OUTPUT_NAME "FrameWarpPresenter" MSVC_RUNTIME_LIBRARY "MultiThreadedDLL"
                       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>/FrameWarp")
+# Every build ends by checking the presenter it leaves is the one the sources make (fresh exe and dll, freshly baked
+# shaders built into both) - see cmake/verify_presenter.cmake. Runs on every build, also when nothing was rebuilt.
+add_custom_target(verify_presenter ALL
+                  COMMAND ${CMAKE_COMMAND} -DPACK=${FW_SHADER_PACK} -DEXE=$<TARGET_FILE:FrameWarpPresenter>
+                          -DDLL=$<TARGET_FILE:FrameWarpPresenterDll> -DSRC=${CMAKE_SOURCE_DIR}/src/presenter
+                          -P ${CMAKE_SOURCE_DIR}/cmake/verify_presenter.cmake
+                  COMMENT "Checking the presenter is fresh and carries the current shaders")
+add_dependencies(verify_presenter FrameWarpPresenter FrameWarpPresenterDll)
 if(EXISTS "${LATEWARP_DLL}")
   add_custom_command(TARGET FrameWarpPresenter POST_BUILD
                      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${LATEWARP_DLL}" "$<TARGET_FILE_DIR:FrameWarpPresenter>")
