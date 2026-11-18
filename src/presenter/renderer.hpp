@@ -168,20 +168,26 @@ public:
         fps_word_ = corner ? (std::min(corner, 4u) << 4) | (std::min(game, 999u) << 9) | (std::min(out, 999u) << 19) : 0u;
         fps_extra_ = (fps_extra_ & ~3u) | (std::clamp(scale, 1u, 4u) - 1u);
     }
-    // The latency rows under it (Settings::latency_counter): LAT, the whole latency of a camera turn, and XPAR, what the warp
-    // adds or takes off (ms, rounded; known false: shown blank).
-    void set_latency_rows(bool on, bool known, float lat_ms, float xpar_ms) {
+    // The latency rows under it (Settings::latency_counter): FT, the game's frame time, and XPAR, what the warp adds or takes
+    // off against the game's own latency (ms, rounded; each shown blank while not known).
+    void set_latency_rows(bool on, bool ft_known, float ft_ms, bool xpar_known, float xpar_ms) {
         std::uint32_t e = fps_extra_ & 3u;
         if (on) {
             e |= 4u;
-            if (known) {
-                const auto ms = [](float v) { return std::min(999u, static_cast<std::uint32_t>(std::fabs(v) + 0.5f)); };
-                e |= 8u | (ms(lat_ms) << 4) | (ms(xpar_ms) << 14) | (xpar_ms < 0.0f && ms(xpar_ms) ? 1u << 24 : 0u);
-            }
+            const auto ms = [](float v) { return std::min(999u, static_cast<std::uint32_t>(std::fabs(v) + 0.5f)); };
+            if (ft_known) e |= (1u << 25) | (ms(ft_ms) << 4);
+            if (xpar_known) e |= 8u | (ms(xpar_ms) << 14) | (xpar_ms < 0.0f && ms(xpar_ms) ? 1u << 24 : 0u);
         }
         fps_extra_ = e;
     }
-    bool fps_counter_dirty() const { return fps_word_ != fps_word_drawn_ || (fps_word_ && fps_extra_ != fps_extra_drawn_); }
+    // The "WITH FG:" row under GAME, while the game's frame generation runs (on): the frames a second with it, its generated
+    // images included (known false: blank).
+    void set_generated_row(bool on, bool known, float per_second) {
+        fps_extra2_ = on ? 1u | (known ? 2u | (std::min(999u, static_cast<std::uint32_t>(per_second + 0.5f)) << 2) : 0u) : 0u;
+    }
+    bool fps_counter_dirty() const {
+        return fps_word_ != fps_word_drawn_ || (fps_word_ && (fps_extra_ != fps_extra_drawn_ || fps_extra2_ != fps_extra2_drawn_));
+    }
     // The game's ReShade effects on the presented pictures (output_effects.hpp; Settings::reshade_on_output): attached to the swap chain
     // here (false: it could not start - fx->note() says why), driven around the final pass, made again when the swap chain's buffers or
     // colour space change. Set after init; outlives the renderer or is set back to null before it goes.
@@ -845,6 +851,7 @@ private:
     std::uint32_t color_space_ = 0;
     std::uint32_t fps_word_ = 0, fps_word_drawn_ = 0;  // (see set_fps_counter)
     std::uint32_t fps_extra_ = 0, fps_extra_drawn_ = 0;  // (its size and latency rows - set_fps_counter, set_latency_rows)
+    std::uint32_t fps_extra2_ = 0, fps_extra2_drawn_ = 0;  // (its "WITH FG:" row - set_generated_row)
     OutputEffects* fx_ = nullptr;  // (see set_output_effects)
     void apply_color_space(std::uint32_t color_space);
     ComPtr<ID3D12DescriptorHeap> heap_, rtv_heap_;

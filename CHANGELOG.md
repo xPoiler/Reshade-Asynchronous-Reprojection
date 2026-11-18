@@ -1,5 +1,104 @@
 # Changelog
 
+## 2.4.0
+
+**XPAR Frame Generation**: characters, weapons and everything else that moves on its own are now shown where they are
+at every refresh, not only the camera. The game's ReShade effects show on FrameWarp's picture on every path, the
+game's own frame generation works better (old Streamline included), walking backwards no longer breaks the floor
+or the gun apart, and the frame counter can show the game's frame time and the frame rate with frame generation.
+As with every update, the settings remembered per game go back to the defaults (*Record detailed diagnostics*, the
+panel's size and the frame counter's size stay).
+
+### XPAR Frame Generation
+
+* **New, on by default: moving things shown between the game's frames.** Until now only the camera, the
+  first-person weapon and the hands were shown at every refresh where they were at that moment; a character or
+  anything else moving on its own stayed where the game's last frame had it and stepped at the game's frame rate.
+  Now every refresh is drawn from the game's last two frames, blended along each moving thing's own motion, and what
+  a mover uncovers is taken from the frame before. Weapon animations, reloads and walking characters move at the
+  display's rate, without the small distortions the warp alone left on them.
+* Only the motion the camera does not explain is blended: things that move with the camera stay sharp, and a sight's
+  glass drawn without depth (Metro 2033 Redux) no longer leaves a copy beside the gun.
+* No black cracks beside the weapon or frayed outlines on movers in fast turns.
+* Needs the game's motion vectors (any game with DLSS or FSR, and games whose vectors FrameWarp finds) and the XPAR
+  warp engine. It does nothing while the game's own frame generation runs, whose images already show moving things:
+  the option is greyed out in the panel then. With a still camera, refreshes are drawn only where the game gives
+  motion vectors.
+* *XPAR Frame Generation* in the panel (Warp), `ObjectInterpolation=0` under `[FrameWarp]` turns it off.
+
+### Walking backwards and near the lens
+
+* **Walking backwards, the floor no longer breaks into specks** (DOOM Eternal): a few pixels of the hands right at
+  the screen's foot were taken for scenery a hand's breadth away and dragged the floor hundreds of pixels along.
+* **The first-person gun no longer shreds walking backwards** (DOOM Eternal): parts of it that were never drawn in the
+  frame before were moved by thousands of pixels.
+* **Single points right in front of the camera no longer tear the whole picture** (Returnal's grass).
+* **No more dark specks flying off a near object's outline while the camera turns** (Armored Core VI): specks per
+  frame 55 to 6 in a recorded turn, at no measurable cost.
+* **The camera no longer jumps a whole frame ahead when a game frame never reaches FrameWarp** (DOOM Eternal at 60 fps).
+
+### Weapons
+
+* **A spent casing no longer bends the scenery around it when firing** (Cyberpunk 2077): the game gives a casing a
+  motion vector back to the ejection port; such vectors are now checked against the frame before.
+* **A weapon or hand coming into the picture no longer makes it burst for a frame** (a weapon swap, the end of a
+  reload): a part still on its way in appears where the game drew it, whole.
+
+### The game's frame generation
+
+* **The weapon and hands are no longer smeared or pushed aside** on the generated images (Cyberpunk 2077, DLSS FG):
+  the scenery beside the weapon took the weapon's depth and was thrown aside, and while strafing the weapon was
+  pushed 10-22 px and the distance wobbled. Without frame generation nothing changes.
+* **DLSS Frame Generation with an old Streamline is taken** (Returnal): FrameWarp stood aside for good once frame
+  generation started.
+* The search for the game's camera also runs while the game's frame generation does (Returnal).
+
+### ReShade effects
+
+* **The game's ReShade effects are drawn on FrameWarp's picture, on every path** (GitHub issue 21, S.T.A.L.K.E.R. 2).
+  When FrameWarp took the game's picture without its HUD, or frame generation's images, the preset was missing.
+  FrameWarp now draws the game's preset on its own picture every refresh with the game's own ReShade, and switches
+  the game's effects off meanwhile, so they are never drawn twice. Edits in the ReShade menu carry over within a
+  fraction of a second; while the menu is open the game draws its effects as usual. The HUD is graded as with
+  ReShade alone. Cost: the preset's GPU time once a refresh instead of once a game frame (shown in the panel).
+  Depth-based effects get no depth on FrameWarp's picture. *ReShade effects on XPAR's picture* in the panel, on by
+  default; it takes effect when the presenter starts.
+* FrameWarp's own effect is now `XPAR.addonfx` (was `XPAR.fx`; the installer replaces it).
+
+### HUD
+
+* **HUD learning holds Metro 2033 Redux's whole HUD**, not only its ammo digits: the panel, the magazine and bullet
+  icons and the subtitles stay put. Other games are unchanged.
+* **HUD learning settles in games that copy their finished picture onto the screen** (Returnal): it used to try the
+  same few places round and round for the whole session.
+* A learned HUD point no longer lets the HUD warp when the game's frame generation is switched on.
+* HUD learning pauses while the game's frame generation runs, and takes no copies while the game shows no frames
+  (title screens, menus, loading): Armored Core VI's launch 7363 copies to 61, about 2.8 s of GPU time saved.
+
+### Frame counter and panel
+
+* **The frame counter can show more**:
+  - *Latency under the frame counter* (off by default) adds **FT**, the game's frame time in ms, and **XPAR**, what
+    FrameWarp adds (+) or takes off (-) against the game's own latency.
+  - While the game's own frame generation runs, **WITH FG:** under GAME shows the frames a second with it, generated
+    images included.
+* **Panel size** draws the XPAR panel 1x to 4x bigger, and the frame counter has its own size, 1x to 4x. Both are
+  kept over updates.
+* The XPAR panel opens as a tab in ReShade's bar, and stays a loose window if you pull it out.
+
+### Performance and stability
+
+* **Fixed: the presenter could freeze for good when it started in a heavy scene** (DOOM Eternal, Metro 2033 Redux):
+  a deadlock between its GPU queues and Windows' compositor.
+* The sight-reticle check costs less per game frame (Metro 2033 Redux at 4K: 0.66-0.75 to 0.25-0.46 ms), the warp's
+  plain-pixel pass 11-16% less, the learned HUD detection about 10% less; XPAR Frame Generation's passes were rewritten
+  to cost a fraction of their first version.
+
+### Diagnostics
+
+* The add-on's GPU line in `ReShade.log` is per real present, so a launch no longer reads far too high.
+* Sequence recordings (Ctrl+Shift+F8) keep the game's generated images.
+
 ## 2.3.0
 
 The character and the weapon are no longer cut out and held still: a continuous warp moves every pixel and leaves no

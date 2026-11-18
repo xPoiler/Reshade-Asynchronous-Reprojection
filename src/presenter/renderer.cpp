@@ -22,7 +22,7 @@ const char kShaders[] = R"(
 Texture2D<float4> src : register(t0);
 RWTexture2D<float4> dst4 : register(u0);
 RWTexture2D<float> dst1 : register(u0);
-cbuffer C : register(b0) { uint2 size; uint marker; uint counter; uint extra; };  // (extra: the frame counter's - set_fps_counter)
+cbuffer C : register(b0) { uint2 size; uint marker; uint counter; uint extra; uint extra2; };  // (extra, extra2: the frame counter's - set_fps_counter, set_generated_row)
 
 [numthreads(8, 8, 1)] void cs_color(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= size)) return;
@@ -40,7 +40,7 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
     float2 uv = float2((id << 1) & 2, id & 2);
     return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
 }
-static const uint kFpsGlyph[24 * 7] = {  // 5x7, a row a value, the leftmost pixel the highest of 5 bits: 0-9, G A M E O U T, space, L X P R - +
+static const uint kFpsGlyph[29 * 7] = {  // 5x7, a row a value, the leftmost pixel the highest of 5 bits: 0-9, G A M E O U T, space, L X P R - + F W I H :
     14, 17, 19, 21, 25, 17, 14,  // '0'
     4, 12, 4, 4, 4, 4, 14,  // '1'
     14, 17, 1, 2, 4, 8, 31,  // '2'
@@ -64,39 +64,57 @@ static const uint kFpsGlyph[24 * 7] = {  // 5x7, a row a value, the leftmost pix
     30, 17, 17, 30, 16, 16, 16,  // 'P'
     30, 17, 17, 30, 20, 18, 17,  // 'R'
     0, 0, 0, 31, 0, 0, 0,  // '-'
-    0, 4, 4, 31, 4, 4, 0  // '+'
+    0, 4, 4, 31, 4, 4, 0,  // '+'
+    31, 16, 16, 30, 16, 16, 16,  // 'F'
+    17, 17, 17, 21, 21, 21, 10,  // 'W'
+    14, 4, 4, 4, 4, 4, 14,  // 'I'
+    17, 17, 17, 31, 17, 17, 17,  // 'H'
+    0, 12, 12, 0, 12, 12, 0  // ':'
 };
 // The frame counter (marker bits 4-6 the corner, 1-4; 7-8 the text's brightness; 9-18 the game's frames a second, 19-28 the
-// refreshes shown; extra: bits 0-1 its size - 1, bit 2 the latency rows, bit 3 their values known, 4-13 LAT, 14-23 XPAR's
-// size, 24 XPAR negative - see Renderer::set_fps_counter): "GAME nnn" over "OUT  nnn" (and "LAT  nnn" over "XPAR-nnn"),
-// light grey with a one-pixel shadow and no box - out of sight unless looked at (user 2026-11-11: the first, boxed at 3x,
-// was too big and too noticeable). 47 x 16 units (34 with the latency rows) of size.y / 2160 px times its size (1 up to 4K
-// at 1x: 5 x 7 px characters), 6 units from the corner.
+// refreshes shown; extra: bits 0-1 its size - 1, bit 2 the latency rows, bit 3 XPAR known, 4-13 FT (the game's frame time),
+// 14-23 XPAR's size, 24 XPAR negative, 25 FT known; extra2: bit 0 the frame generation row, 1 its value known, 2-11 the
+// frames a second with the game's frame generation, generated images included - see Renderer::set_fps_counter,
+// set_latency_rows, set_generated_row): "GAME nnn" (then "WITH FG: nnn" while the game's frame generation runs) over
+// "OUT  nnn" (and "FT   nnn" over "XPAR-nnn"), light grey with a one-pixel shadow and no box - out of sight unless looked at
+// (user 2026-11-11: the first, boxed at 3x, was too big and too noticeable). 8 characters wide (12 with the frame generation
+// row), 6 units a character and 9 a row, of size.y / 2160 px times its size (1 up to 4K at 1x: 5 x 7 px characters), 6 units
+// from the corner.
+uint fps_rows() { return 2u + (extra2 & 1u) + ((extra & 4u) ? 2u : 0u); }
+uint fps_cols() { return (extra2 & 1u) ? 12u : 8u; }
 uint fps_digit_glyph(uint value, uint place) {  // (place 0 hundreds, 1 tens, 2 ones; no leading zeros: space)
     const uint digit = place == 0u ? value / 100u : place == 1u ? (value / 10u) % 10u : value % 10u;
     return (place == 0u && value < 100u) || (place == 1u && value < 10u) ? 17u : digit;
 }
 bool fps_lit(int2 u, uint game, uint shown) {  // (u: units from the text's top-left)
     if (any(u < 0)) return false;
-    const uint row = uint(u.y) / 9u, col = uint(u.x) / 6u, gx = uint(u.x) % 6u, gy = uint(u.y) % 9u;
-    const uint rows = (extra & 4u) ? 4u : 2u;
-    if (row >= rows || col > 7u || gx > 4u || gy > 6u) return false;
+    const uint shown_row = uint(u.y) / 9u, col = uint(u.x) / 6u, gx = uint(u.x) % 6u, gy = uint(u.y) % 9u;
+    if (shown_row >= fps_rows() || col >= fps_cols() || gx > 4u || gy > 6u) return false;
+    // (row as laid out with every row on: 0 GAME, 1 WITH FG, 2 OUT, 3 FT, 4 XPAR)
+    const uint row = shown_row == 0u || (extra2 & 1u) ? shown_row : shown_row + 1u;
     uint glyph = 17u;
-    if (row < 2u) {
+    if (row == 1u) {
+        // WITH FG: (blank number while not known)
+        static const uint kWithFg[8] = {25u, 26u, 16u, 27u, 17u, 24u, 10u, 28u};
+        if (col < 8u) glyph = kWithFg[col];
+        else if (col >= 9u && (extra2 & 2u)) glyph = fps_digit_glyph((extra2 >> 2) & 1023u, col - 9u);
+    } else if (col > 7u) {
+        return false;
+    } else if (row < 3u) {
         const uint value = row == 0u ? game : shown;
         if (col < 4u) glyph = row == 0u ? 10u + col : (col < 3u ? 14u + col : 17u);
         else if (col >= 5u) glyph = fps_digit_glyph(value, col - 5u);
     } else {
-        // LAT / XPAR (blank numbers while not known)
-        static const uint kLat[4] = {18u, 11u, 16u, 17u}, kXpar[4] = {19u, 20u, 11u, 21u};
-        const bool known = (extra & 8u) != 0u;
-        const uint value = row == 2u ? (extra >> 4) & 1023u : (extra >> 14) & 1023u;
-        if (col < 4u) glyph = row == 2u ? kLat[col] : kXpar[col];
+        // FT / XPAR (blank numbers while not known)
+        static const uint kFt[4] = {24u, 16u, 17u, 17u}, kXpar[4] = {19u, 20u, 11u, 21u};
+        const bool known = (extra & (row == 3u ? (1u << 25) : 8u)) != 0u;
+        const uint value = row == 3u ? (extra >> 4) & 1023u : (extra >> 14) & 1023u;
+        if (col < 4u) glyph = row == 3u ? kFt[col] : kXpar[col];
         else if (known) {
             if (col >= 5u) glyph = fps_digit_glyph(value, col - 5u);
             // (XPAR's sign right before its first digit; none at 0)
             const uint first = value >= 100u ? 5u : value >= 10u ? 6u : 7u;
-            if (row == 3u && value > 0u && col + 1u == first) glyph = (extra & (1u << 24)) ? 22u : 23u;
+            if (row == 4u && value > 0u && col + 1u == first) glyph = (extra & (1u << 24)) ? 22u : 23u;
         }
     }
     return ((kFpsGlyph[glyph * 7u + gy] >> (4u - gx)) & 1u) != 0u;
@@ -105,7 +123,7 @@ float4 fps_counter(int2 p, float4 c) {
     const uint corner = (marker >> 4) & 7u;
     if (corner == 0) return c;
     const int s = int(max(1u, size.y / 2160u) * ((extra & 3u) + 1u));
-    const int2 box = int2(48, (extra & 4u) ? 35 : 17) * s;  // (the text, 47 x 16 or 34, and its shadow one unit right and down)
+    const int2 box = int2(int(fps_cols()) * 6, int(fps_rows()) * 9 - 1) * s;  // (the text and its shadow one unit right and down)
     const int m = 6 * s;
     const int2 o = int2((corner == 2u || corner == 4u) ? int(size.x) - m - box.x : m, corner >= 3u ? int(size.y) - m - box.y : m);
     const int2 q = p - o;
@@ -6781,7 +6799,7 @@ bool Renderer::create_pipelines(std::string& error) {
     D3D12_DESCRIPTOR_RANGE uav{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0};
     D3D12_ROOT_PARAMETER params[3]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[0].Constants = {0, 0, 5};  // (the fifth: the frame counter's - kShaders, extra)
+    params[0].Constants = {0, 0, 6};  // (the fifth and sixth: the frame counter's - kShaders, extra and extra2)
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[1].DescriptorTable = {1, &srv};
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -10706,22 +10724,24 @@ void Renderer::finish_frame(bool warped, int marker, bool newest) {
         list_->DrawInstanced(3, 1, 0, 0);
         // The frame counter (see set_fps_counter): the same pass again, its counter bits on, only over the counter's own
         // rectangle (the scissor) - the full-screen draw above never draws it (its bits off: one bit test a pixel), the
-        // counter's pixels are drawn twice. Its place as the shader works it out (fps_counter): 48 x 17 units (35 with the
-        // latency rows) of height / 2160 px times its size, 6 units from the corner. Bits 7-8 how bright its text is: 1
-        // HDR10 PQ, 2 scRGB, 0 SDR.
+        // counter's pixels are drawn twice. Its place as the shader works it out (fps_counter): 48 (72 with the frame
+        // generation row) x (9 rows - 1) units of height / 2160 px times its size, 6 units from the corner. Bits 7-8 how
+        // bright its text is: 1 HDR10 PQ, 2 scRGB, 0 SDR.
         fps_word_drawn_ = fps_word_;
         fps_extra_drawn_ = fps_extra_;
+        fps_extra2_drawn_ = fps_extra2_;
         if (fps_word_) {
-            const LONG unit = LONG(std::max(1u, height_ / 2160u) * ((fps_extra_ & 3u) + 1u)), bw = 48 * unit,
-                       bh = ((fps_extra_ & 4u) ? 35 : 17) * unit, m = 6 * unit;
+            const LONG rows = 2 + LONG(fps_extra2_ & 1u) + ((fps_extra_ & 4u) ? 2 : 0);
+            const LONG unit = LONG(std::max(1u, height_ / 2160u) * ((fps_extra_ & 3u) + 1u)), bw = ((fps_extra2_ & 1u) ? 72 : 48) * unit,
+                       bh = (rows * 9 - 1) * unit, m = 6 * unit;
             const std::uint32_t corner = (fps_word_ >> 4) & 7u;
             const LONG x = (corner == 2 || corner == 4) ? LONG(width_) - m - bw : m, y = corner >= 3 ? LONG(height_) - m - bh : m;
             const D3D12_RECT box{std::max(0L, x), std::max(0L, y), std::min(LONG(width_), x + bw), std::min(LONG(height_), y + bh)};
             if (box.right > box.left && box.bottom > box.top) {
                 constants[2] |= fps_word_ | ((color_space_ == 12 ? 1u : color_space_ == 1 ? 2u : 0u) << 7);
-                const std::uint32_t extra = fps_extra_;
+                const std::uint32_t extra[2] = {fps_extra_, fps_extra2_};
                 list_->SetGraphicsRoot32BitConstants(0, 4, constants, 0);
-                list_->SetGraphicsRoot32BitConstants(0, 1, &extra, 4);
+                list_->SetGraphicsRoot32BitConstants(0, 2, extra, 4);
                 list_->RSSetScissorRects(1, &box);
                 list_->DrawInstanced(3, 1, 0, 0);
             }

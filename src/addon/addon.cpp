@@ -1023,7 +1023,8 @@ void draw_overlay(effect_runtime*) {
         int corner = static_cast<int>(std::min<std::uint32_t>(s.fps_counter, 4u));
         ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9.0f);
         if (ImGui::Combo("Frame counter", &corner, kCorners, 5)) s.fps_counter = static_cast<std::uint32_t>(corner);
-        hint("The presenter's own counter in a corner of the picture: GAME - the game's frames a second XPAR takes in; OUT - the "
+        hint("The presenter's own counter in a corner of the picture: GAME - the game's frames a second XPAR takes in; WITH FG - "
+             "only while the game's own frame generation runs: its frames a second with the generated images; OUT - the "
              "refreshes a second it shows. Drawn by XPAR on its own picture, which covers the game's window - counters drawn into "
              "the game (the Steam overlay's, for one) stay under it. Remembered per game.");
         ImGui::BeginDisabled(s.fps_counter == 0);
@@ -1037,11 +1038,10 @@ void draw_overlay(effect_runtime*) {
         if (ImGui::Checkbox("Latency under the frame counter", &latency)) s.latency_counter = latency;
         ImGui::EndDisabled();
         hint("Two more rows under the frame counter (ms, the medians of the last second):\n"
-             "LAT - the whole latency of a camera turn: from the input the shown camera reflects to the moment its picture "
-             "reaches the screen.\n"
-             "XPAR - what the warp adds (+) or takes off (-) against the game's own latency: LAT minus the game's input to "
-             "finished frame. Negative: the warp shows a newer camera than the game's frame has.\n"
-             "Blank while nothing is warped or the display's timing is not measured. Off by default; remembered per game.");
+             "FT - the game's frame time: how long the game takes for one frame (1000 / GAME).\n"
+             "XPAR - what the warp adds (+) or takes off (-) against the game's own latency. Negative: the warp shows a newer "
+             "camera than the game's frame has. Blank while nothing is warped or the display's timing is not measured.\n"
+             "Off by default; remembered per game.");
         float ui = std::clamp(s.ui_scale, 1.0f, 4.0f);
         ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9.0f);
         // (applied when released: the panel growing under the mouse while dragging would move the slider away from it)
@@ -1300,14 +1300,17 @@ void draw_overlay(effect_runtime*) {
         }
         // (A/B, 2.4 development - Settings::object_interp: not hidden, it is there to be compared in game)
         {
-            const char* const why = first({why_engine, !s.follow_share ? "\"Character/weapon by how much it follows the turn\" is off" : nullptr});
+            // (the game's own frame generation on: its images are shown instead, or XPAR is paused - the presenter skips this then)
+            const char* const why = first({why_engine, !s.follow_share ? "\"Character/weapon by how much it follows the turn\" is off" : nullptr,
+                                           alive && p.frame_generation != 0 ? "the game's own frame generation is on" : nullptr});
             // (2: the two frames blended - the only mode offered. 1, the newest frame shifted, is left in the presenter for comparison:
             // the ini key alone)
             bool objects = s.object_interp != 0;
             ImGui::BeginDisabled(why != nullptr);
-            if (ImGui::Checkbox("Interpolate moving objects between game frames (XPAR engine)", &objects)) s.object_interp = objects ? 2u : 0u;
+            // (named "Interpolate moving objects between game frames (XPAR engine)" until 2026-11-18 - user)
+            if (ImGui::Checkbox("XPAR Frame Generation", &objects)) s.object_interp = objects ? 2u : 0u;
             ImGui::EndDisabled();
-            hint("Characters, the first-person weapon and whatever else moves on its own are shown at every refresh where they "
+            hint("Moving objects interpolated between game frames (XPAR engine). Characters, the first-person weapon and whatever else moves on its own are shown at every refresh where they "
                  "were at that moment: the game's last two frames blended along the motion, what a mover uncovers taken from the "
                  "frame before - instead of stepping at the game's frame rate. Needs the game's motion vectors. With a still "
                  "camera every refresh is drawn then (more GPU time). Not with the game's own frame generation, whose images "

@@ -156,10 +156,10 @@ struct Settings {
                                        // is (Renderer::set_objects_between; XPAR engine, follow share; saved per game)
     float ui_scale;                    // the XPAR panel's text and controls, 1 (default) .. 4 times (add-on only; saved per game)
     std::uint32_t fps_counter_scale;   // the frame counter's size, 1 (default) .. 4 times (saved per game)
-    std::uint32_t latency_counter;     // default off: two rows under the frame counter - LAT, the displayed camera's age when it
-                                       // reaches the screen (ms, the whole latency of a camera turn), and XPAR, what the warp
-                                       // adds (+) or takes off (-) against the game's own latency (LAT minus the game's input
-                                       // to finished frame) - see main.cpp, LatencyRows (saved per game)
+    std::uint32_t latency_counter;     // default off: two rows under the frame counter - FT, the game's frame time (ms, 1000 /
+                                       // its frames a second; LAT, the whole latency, until 2026-11-18), and XPAR, what the warp
+                                       // adds (+) or takes off (-) against the game's own latency (the camera's age on screen
+                                       // minus the game's input to finished frame) - see main.cpp, LatencyRows (saved per game)
 };
 
 // Presenter status, displayed by the add-on UI.

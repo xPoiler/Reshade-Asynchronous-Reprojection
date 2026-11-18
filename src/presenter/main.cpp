@@ -1120,6 +1120,13 @@ void render_thread() {
     int fg_votes = 0;
     LONG fg_presents = 0, fg_frames = 0, fg_calls = 0;
     std::int64_t fg_window_start = 0;
+    // The frame counter's "WITH FG:" row (the game's frames a second plus these): the images the game's frame generation
+    // makes a second, per window - the larger of
+    // the presents beyond the rendered frames and the frames times the images the game makes for each (per_frame of a frame
+    // taken in, kept 1 s; where ReShade sees only the rendered frames' presents). Not known (blank): neither gives any.
+    std::uint32_t fg_per_frame = 0;
+    double fg_per_frame_t = -1e9, fg_gen_per_s = 0;
+    bool fg_gen_known = false;
     std::uint64_t waiting_frame = 0;  // newest game frame seen while waiting for a refresh, and since when
     std::int64_t waiting_since = 0;
     std::uint64_t intakes = 0;
@@ -1132,19 +1139,19 @@ void render_thread() {
     struct ShownPresent { UINT count = 0; double present_t = 0, camera_t = 0; bool done = true; std::int64_t target = 0; };
     ShownPresent shown_presents[64];
     std::vector<double> lat_behind, lat_display, lat_age, lat_queued;
-    // The latency rows under the frame counter (Settings::latency_counter), per picture shown that was warped and whose time on
-    // screen the swap chain's statistics give: LAT - the shown camera's age when it reaches the screen (screen - camera_t: the
-    // whole latency of a camera turn); XPAR - LAT minus what the game's frame alone would take: the game's input to finished
-    // frame (PoseModel::latency_median) and the present to the screen (taken the same as XPAR's). That is present_t - camera_t -
-    // game latency: the wait before XPAR presents, less how far ahead of the game's frame the camera is shown. Medians of the
-    // last second, every half second (a picture is presented for the counter when they change); blank with none.
+    // The XPAR row under the frame counter (Settings::latency_counter; the FT row above it is the game's frame time), per
+    // picture shown that was warped and whose time on screen the swap chain's statistics give: the shown camera's age on
+    // screen minus what the game's frame alone would take - the game's input to finished frame (PoseModel::latency_median)
+    // and the present to the screen (taken the same as XPAR's). That is present_t - camera_t - game latency: the wait before
+    // XPAR presents, less how far ahead of the game's frame the camera is shown. Median of the last second, every half
+    // second (a picture is presented for the counter when it changes); blank with none.
     struct LatencyRows {
-        std::deque<std::array<double, 3>> samples;  // (time, LAT, XPAR in ms)
+        std::deque<std::array<double, 2>> samples;  // (time, XPAR in ms)
         double next = 0;
         bool known = false;
-        float lat = 0, xpar = 0;
-        void add(double t, double lat_ms, double xpar_ms) {
-            samples.push_back({t, lat_ms, xpar_ms});
+        float xpar = 0;
+        void add(double t, double xpar_ms) {
+            samples.push_back({t, xpar_ms});
             while (samples.size() > 2048) samples.pop_front();
         }
         void update(double now) {
@@ -1153,14 +1160,11 @@ void render_thread() {
             while (!samples.empty() && samples.front()[0] < now - 1.0) samples.pop_front();
             known = !samples.empty();
             if (!known) return;
-            auto median = [&](int k) {
-                std::vector<double> v;
-                v.reserve(samples.size());
-                for (const auto& e : samples) v.push_back(e[k]);
-                std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
-                return float(v[v.size() / 2]);
-            };
-            lat = median(1); xpar = median(2);
+            std::vector<double> v;
+            v.reserve(samples.size());
+            for (const auto& e : samples) v.push_back(e[1]);
+            std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+            xpar = float(v[v.size() / 2]);
         }
     } latency_rows;
     // Automatic present lead: as late as the warp still makes its refresh. Per warped frame, the time from the
@@ -1904,6 +1908,7 @@ void render_thread() {
                     ++g_rec.dropped;
                 }
                 ++stat_sources;
+                if (s.per_frame > 0) { fg_per_frame = s.per_frame; fg_per_frame_t = now_seconds(); }
                 if (!renderer.split()) commit_incoming();
             }
             return s.valid;
@@ -2111,7 +2116,14 @@ void render_thread() {
         if (qpc_now() - fg_window_start >= g_qpc_frequency / 2) {
             const LONG presents = sh.presents_total, frames = sh.frames_total, calls = sh.generation_calls;
             const LONG dp = presents - fg_presents, df = frames - fg_frames, dc = calls - fg_calls;
+            const double window_s = double(qpc_now() - fg_window_start) / double(g_qpc_frequency);
             fg_presents = presents; fg_frames = frames; fg_calls = calls; fg_window_start = qpc_now();
+            {
+                const double per_frame = now_seconds() - fg_per_frame_t < 1.0 ? double(fg_per_frame) : 0.0;
+                const double images = std::max(double(std::max<LONG>(dp - df, 0)), per_frame * double(std::max<LONG>(df, 0)));
+                fg_gen_known = images > 0 && window_s > 0;
+                fg_gen_per_s = fg_gen_known ? images / window_s : 0.0;
+            }
             if (df >= 5) {  // the game is rendering (menus and loading screens present without it)
                 const double ratio = double(dp) / double(df), called = double(dc) / double(df);
                 if (ratio >= 1.6 || called >= 0.5) fg_votes = std::min(fg_votes + 1, 2);
@@ -2410,7 +2422,17 @@ void render_thread() {
         renderer.set_fps_counter(settings.fps_counter, std::uint32_t(sh.presenter.source_fps + 0.5f), std::uint32_t(sh.presenter.output_fps + 0.5f),
                                  settings.fps_counter_scale);
         if (settings.fps_counter && settings.latency_counter) latency_rows.update(now_seconds());
-        renderer.set_latency_rows(settings.latency_counter != 0, latency_rows.known, latency_rows.lat, latency_rows.xpar);
+        {
+            // (FT: the game's frame time, from the same half-second figure as the GAME row - user 2026-11-18: the whole input to
+            // screen latency shown before read as what XPAR adds)
+            const float game_fps = sh.presenter.source_fps;
+            renderer.set_latency_rows(settings.latency_counter != 0, game_fps >= 1.0f, game_fps >= 1.0f ? 1000.0f / game_fps : 0.0f,
+                                      latency_rows.known, latency_rows.xpar);
+            // ("WITH FG:" under GAME, only while the game's frame generation runs - detected, or its images coming with the
+            // frames: the game's frames a second plus the images its frame generation makes - user 2026-11-18)
+            const bool gen_on = frame_generation || now_seconds() - fg_per_frame_t < 1.0;
+            renderer.set_generated_row(gen_on, gen_on && fg_gen_known, game_fps + float(fg_gen_per_s));
+        }
         const bool as_is = !(warped && !unmoved) && !settings.overlay_debug && !settings.show_mask && g_app.has_frames && !g_rec.busy &&
                            !renderer.fps_counter_dirty();
         const bool same_picture = as_is && shown_frame && as_is_frame == shown_frame && as_is_w == renderer.width() && as_is_h == renderer.height();
@@ -2607,8 +2629,7 @@ void render_thread() {
                         lat_display.push_back((screen_t - e.present_t) * 1000.0);
                         lat_age.push_back((screen_t - e.camera_t) * 1000.0);
                         if (settings.fps_counter && settings.latency_counter && g_app.model.latency_median() > 0)
-                            latency_rows.add(now_seconds(), (screen_t - e.camera_t) * 1000.0,
-                                             (e.present_t - e.camera_t - g_app.model.latency_median()) * 1000.0);
+                            latency_rows.add(now_seconds(), (e.present_t - e.camera_t - g_app.model.latency_median()) * 1000.0);
                     }
                     if (e.target && vblank.period > 0) {
                         const long long r = std::llround(double(ps.sync_qpc - e.target) / vblank.period);

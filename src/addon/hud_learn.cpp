@@ -72,6 +72,14 @@ struct Entry { std::uint64_t res; std::uint32_t fp; std::uint8_t blend; std::uin
 std::vector<Entry> g_log;
 std::uint64_t g_final = 0, g_bb_frame = 0;  // (the back buffer drawn into this frame)
 bool g_bb_drawn = false, g_taken = false, g_end_taken = false;  // (g_end_taken: the end copy taken this frame - at a copy onto the back buffer or its first draw)
+// A candidate named by its place, not by a shader: the back buffer just after the picture is drawn onto it (before its second
+// group - consecutive draws by another pixel shader or blend than its first). Metro draws its HUD there in up to six groups
+// whose shaders and order change with what is shown (the ammo digits' shader learned alone: its panel and icons warped). Only
+// a frame whose back buffer has a second group has it - in the other games seen (2026-11-18) the back buffer gets one draw.
+constexpr std::uint32_t kAfterPicture = 0x00000002u;
+std::uint32_t g_bb_first_fp = 0;
+std::uint8_t g_bb_first_blend = 0;
+bool g_bb_after = false;  // (this frame: the back buffer's second group began)
 // Direct3D 12: per command list, the last back-buffer-sized texture drawn into, and - if it draws into a back buffer - the
 // last one before that; the lists in the order the game hands them to the GPU this frame. The final picture is the one
 // drawn into last before the back buffer's draw in that order (Elden Ring records its lists on several threads at once:
@@ -182,7 +190,7 @@ std::uint32_t fingerprint(const void* code, std::size_t size) {
     std::uint32_t h = 2166136261u;
     const auto* p = static_cast<const std::uint8_t*>(code);
     for (std::size_t i = 0; i < size; ++i) h = (h ^ p[i]) * 16777619u;
-    return h ? h : 1;
+    return h > kAfterPicture ? h : 1;  // (0, kAfterPicture: not a shader's)
 }
 std::uint8_t blend_kind(const blend_desc& b) {
     if (!b.blend_enable[0]) return 0;
@@ -275,6 +283,7 @@ void drawn(command_list* cmd) {
     const std::uint8_t blend = tl_blend_list == list ? tl_blend : 0;
     const std::uint64_t res = tl_target;
     bool take = false;
+    std::uint32_t take_cand = fp;
     std::uint64_t end_res = 0;
     std::uint32_t end_state = 0;
     bool in_final = false;
@@ -305,8 +314,13 @@ void drawn(command_list* cmd) {
                 if (st != g_fstate.end()) { end_res = from; end_state = st->second; }
             }
         }
+        // (the back buffer's second group: see kAfterPicture)
+        bool second = false;
+        if (bb && g_bb_drawn && !g_bb_after && (fp != g_bb_first_fp || blend != g_bb_first_blend)) { g_bb_after = true; second = true; }
         if (bb && !g_bb_drawn) {
             g_bb_drawn = true;
+            g_bb_first_fp = fp;
+            g_bb_first_blend = blend;
             // (Direct3D 11: the final picture is the texture drawn into last before the back buffer's first draw;
             // Direct3D 12: found at the present, in the order the lists ran)
             const std::uint64_t last = g_last_full.load(std::memory_order_relaxed);
@@ -319,12 +333,13 @@ void drawn(command_list* cmd) {
             const auto c = g_cands.find(fp);
             if (c != g_cands.end() && (c->second.role == 1) == bb) { g_taken = true; take = true; if (!bb) g_taken_res = res; in_final = !bb; }
         }
+        if (second && g_active == kAfterPicture && !g_taken && g_cands.count(kAfterPicture)) { g_taken = true; take = true; take_cand = kAfterPicture; }
     }
-    const bool use = g_locked && fp == g_locked;
+    const bool use = g_locked && take_cand == g_locked;
     if (tl_pass_list == list) return;  // (inside a render pass: nothing copied - see tl_pass_list)
     if (end_res) g_probe(end_res, false, end_state, list, g_active, true, false);
     // (in the final picture, Direct3D 12: compared only with the final picture as the back buffer's draw reads it - see end)
-    if (take) g_probe(res, g_api == device_api::d3d11, 0x4u /* D3D12_RESOURCE_STATE_RENDER_TARGET */ | (in_final ? 0x80000000u : 0u), list, fp, false, use);
+    if (take) g_probe(res, g_api == device_api::d3d11, 0x4u /* D3D12_RESOURCE_STATE_RENDER_TARGET */ | (in_final ? 0x80000000u : 0u), list, take_cand, false, use);
 }
 bool on_draw(command_list* cmd, uint32_t, uint32_t, uint32_t, uint32_t) { drawn(cmd); return false; }
 bool on_draw_indexed(command_list* cmd, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) { drawn(cmd); return false; }
@@ -550,6 +565,7 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
             c.last = g_presents;
         }
     }
+    if (!g_settle && g_bb_after) { auto& c = g_cands[kAfterPicture]; c.role = 1; c.last = g_presents; }
     for (auto it = g_cands.begin(); it != g_cands.end();)
         it = g_presents - it->second.last > 600 ? g_cands.erase(it) : std::next(it);
     // (every 600 presents, what the frame drawn last looked like)
@@ -733,6 +749,7 @@ void on_present(swapchain* chain, bool learning, bool paused, std::uint32_t pick
     g_taken_res_last = g_taken_res;
     g_taken_res = 0;
     g_bb_drawn = false;
+    g_bb_after = false;
     g_taken = false;
     g_end_taken = false;
 }

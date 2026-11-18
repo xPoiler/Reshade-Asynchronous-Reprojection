@@ -3,7 +3,8 @@
 // copied or drawn onto it); the HUD is what is drawn into it after some point of the frame. That point is learned:
 // - recorded (any Direct3D version): which texture reaches the back buffer, and the draws into it and into the back
 //   buffer, in groups of consecutive draws by one pixel shader - its fingerprint (a hash of its code: the same every
-//   frame and every launch) names the group;
+//   frame and every launch) names the group; one more candidate is named by its place - the back buffer after the picture's
+//   draw onto it, before whatever is drawn there next (a HUD drawn by shaders that change from frame to frame: Metro);
 // - tried: a candidate is "a copy of the picture just before the first draw of group X"; one at a time, a few frames
 //   each, one copy per frame. The add-on compares it with the final picture at the present (where they differ: what
 //   was drawn after that point) and hands that over for scoring only (kHudProbe, SlotMeta::hud_candidate);

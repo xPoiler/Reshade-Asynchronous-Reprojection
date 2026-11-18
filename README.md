@@ -31,6 +31,12 @@ in games without one, from ReShade and the picture itself:
 FrameWarp shows the generated images too, each moved to where the camera is now, so moving things get
 frame generation's smoothness while the camera keeps FrameWarp's low latency.
 
+**XPAR Frame Generation shows moving things at the display's rate too**: characters, weapons and anything
+else that moves on its own are drawn where they are at every refresh, blended from the game's last two frames
+along their own motion (needs the game's motion vectors; on by default).
+
+**Your ReShade preset stays on**: FrameWarp draws the game's ReShade effects on its own picture every refresh.
+
 **The HUD and your character or weapon stay right**: the HUD is taken from the step where the game draws it,
 which FrameWarp finds by itself in most tested games (exact from the first frame), and characters, weapons and
 car interiors are moved by how much of the camera's turn they really follow, learned as you play.
@@ -56,14 +62,14 @@ game, with its own warp engine (or, optionally, NVIDIA's Latewarp).
 | *Assassin's Creed Black Flag Resynced* (DLSS or FSR) | No launch options needed. The game's camera data doesn't match its picture: FrameWarp notices within the first seconds of camera movement on the first launch (the picture may warp wrongly until then), switches to working out the camera from the motion vectors, and remembers that for the game. Turn the camera for a few seconds after loading while it calibrates. |
 | *S.T.A.L.K.E.R. 2* (Steam, DLSS) | No launch options needed. With DLSS Frame Generation on, the game provides its camera and a HUD-less picture; without it, the game calls DLSS directly and FrameWarp works out the camera from DLSS's motion vectors (turn the camera for a minute after loading while it calibrates). The game's NVIDIA Reflex works with FrameWarp. |
 | *Red Dead Redemption 2* (DirectX 12, DLSS) | Choose DirectX 12 in the game's settings. The game calls DLSS without Streamline, so FrameWarp works out the camera from DLSS's motion vectors; turn the camera for a few seconds after loading while it calibrates. The game crashes when the ReShade menu opens unless ReShade's Generic Depth add-on is off (see Troubleshooting). Installed under Program Files, run `install.bat` as administrator. |
-| *Returnal* (Steam, DLSS) | No launch options needed. The game calls DLSS without Streamline, so FrameWarp works out the camera from DLSS's motion vectors; turn the camera for a few seconds after loading while it calibrates. |
+| *Returnal* (Steam, DLSS) | Add the launch options `-slforcetagging -slviewextension` (see Install). DLSS Frame Generation works with FrameWarp (the game's older Streamline is supported since 2.4). Where FrameWarp doesn't find the game's camera, it works out the camera from the motion vectors; turn the camera for a few seconds after loading while it calibrates. |
 | *Resident Evil 2* (Steam, DirectX 11, no DLSS or FSR) | FrameWarp finds the depth buffer and the game's own camera and motion vectors by itself. The HUD is taken from a copy of the picture made just before the game draws it. |
 | *Resident Evil 4 Remake* (Steam, DirectX 12) | The game's FSR 2 is built into its executable and can't be used: FrameWarp takes the depth from ReShade and works out the motion and the camera from the picture (the depth buffer is found within seconds; turn the camera for a few seconds after loading). |
 | *Elden Ring* (Steam, DirectX 12, no DLSS or FSR) | Like any ReShade setup for this game, it has to run without Easy Anti-Cheat (offline). FrameWarp finds the depth buffer and works out the motion and the camera from the picture; the camera circles the character, and the character and the ground around it follow just as much of each turn as they do in the game. When the GPU is the limit, *Prevent GPU queueing* stands aside by itself. |
 | *Dark Souls Remastered* (Steam, DirectX 11, no DLSS or FSR) | FrameWarp finds the depth buffer, the game's own camera and its motion vectors (drawn only on what moves by itself; the scenery's motion comes from the camera), and takes the HUD from a copy made just before the game draws it. |
 | *Hi-Fi Rush* (Steam, DirectX 12) | FrameWarp works out the motion from the picture and takes the HUD from a copy of the picture made just before the game draws it onto the screen. |
 | *Assassin's Creed Black Flag Resynced* (upscaler off) | The same as above, in DirectX 12. |
-| *Metro 2033 Redux* (Steam, DirectX 11, no DLSS or FSR) | The game only runs in exclusive fullscreen: tick **Force a borderless window** in the XPAR panel and restart the game. FrameWarp finds the depth buffer and works out the motion from the picture. |
+| *Metro 2033 Redux* (Steam, DirectX 11, no DLSS or FSR) | The game only runs in exclusive fullscreen: tick **Force a borderless window** in the XPAR panel and restart the game. FrameWarp finds the depth buffer and works out the motion from the picture. The whole HUD (ammo panel, subtitles) is learned and kept still. |
 | *Cyber Hook* (Steam, DirectX 11, no DLSS or FSR) | The game has no usable depth buffer: FrameWarp reprojects camera turns only (walking and strafing move at the game's frame rate). |
 
 Other games may work but are untested.
@@ -140,16 +146,21 @@ Advanced: both files also accept a game name or folder directly (`install.bat "E
 The panel has four sections: **Camera motion**, **Latency**, **Warp** and **Debug**; rest the mouse on an option
 to see what it does. The settings are remembered per game (in the game's `ReShade.ini`), except **Enable
 reprojection** and the comparison and debug switches (Show original, Debug strip, Invert warp, Show the mask).
-Updating FrameWarp resets them to the defaults (except *Record detailed diagnostics*), and **Reset all settings
+Updating FrameWarp resets them to the defaults (except *Record detailed diagnostics*, *Panel size* and the frame
+counter's size), and **Reset all settings
 to defaults** at the top of the panel does the same at any time.
 
 | Setting | What it does |
 |---|---|
 | **Enable reprojection (N Hz)** | Turns reprojection on or off. N is the refresh rate of the display the game is on, from its current display mode. |
 | **Show original (A/B)** | Shows the game's own frames, for comparison. |
-| **Frame counter** | On by default, remembered per game. A small grey counter in a corner of FrameWarp's picture: **GAME**, the game's frames per second that FrameWarp takes in, and **OUT**, the refreshes per second it shows. Pick the corner (top right by default) or turn it off. Counters drawn into the game, such as the Steam overlay's, are hidden under FrameWarp's picture. |
+| **Frame counter** | On by default, remembered per game. A small grey counter in a corner of FrameWarp's picture: **GAME**, the game's frames per second that FrameWarp takes in, and **OUT**, the refreshes per second it shows. While the game's own frame generation runs, **WITH FG:** under GAME shows the frames per second with it, generated images included. Pick the corner (top right by default) or turn it off, and its size (1x to 4x, kept over updates). Counters drawn into the game, such as the Steam overlay's, are hidden under FrameWarp's picture. |
+| **Latency under the frame counter** | Off by default, remembered per game. Two more rows: **FT**, the game's frame time in ms, and **XPAR**, what FrameWarp adds (+) or takes off (-) against the game's own latency (median of the last second; blank while nothing is warped). |
+| **Panel size** | Draws the XPAR panel 1x to 4x its usual size (applied when the slider is released). Kept over updates. |
 | **Auto latency** | How far behind the newest game frame the displayed camera sits. **Lowest latency without edge fill** (default): every refresh, the camera as late as it can be without revealing anything the game hasn't rendered - the camera as of now (your mouse up to this moment) while you aim or turn slowly, falling back as far as one game frame during fast turns, where what the warp reveals comes from the game's last two frames (keep *Background memory* on). **Camera as of now (edge-limited)**: always as close to now as the uncovered screen edge allows (*Extra uncovered edge*: how much more of the edge than *Auto* may be uncovered; *No edge limit*: always now). **Auto**: 1/2 game frame behind, 1/4 in games without HUD layers, a whole frame in games without DLSS or FSR. **1 frame**, **1/2**, **1/4**, or **Off** to set the latency by hand. |
 | **Prevent GPU queueing** | On by default, remembered per game. FrameWarp measures the rate the game can sustain and paces its frames to reduce GPU queueing. It stands aside for the game's Reflex and frame generation. When the GPU is the limit, it instead limits the game to one queued frame, then periodically retries pacing. DirectX 12 and 11. Performance still depends on the GPU load shared by the game and presenter. |
+| **XPAR Frame Generation** | On by default, remembered per game, XPAR engine. Characters, the weapon and anything else moving on its own are shown at every refresh where they are at that moment: the game's last two frames blended along each thing's own motion, what a mover uncovers taken from the frame before. Needs the game's motion vectors. Greyed out while the game's own frame generation runs, whose images show moving things already. |
+| **ReShade effects on XPAR's picture** | On by default, remembered per game; takes effect when the presenter starts. FrameWarp draws the game's ReShade preset on its own picture every refresh and switches the game's effects off meanwhile, so they are never drawn twice; edits in the ReShade menu carry over at once. Costs the preset's GPU time once a refresh instead of once a game frame (shown in the panel). Depth-based effects get no depth on FrameWarp's picture. |
 | **Uncovered screen edges** | XPAR engine, remembered per game. What a fast turn uncovers past the edge of the game's frame, where background memory has nothing. **Dithered** (default): the game's frame as it is there, mixed into the warped picture in a fine pattern near the edge - noisy, not smeared. **Soft**: a blur of the scenery along the edge, wider further out. **Extended edge pixels**: the edge repeated (sharper close to it, streaks further out). |
 | **Controller right stick drives rotation** | On by default, remembered per game. The right stick of a controller (XInput: Xbox pads, or others through Steam Input) moves the reprojected camera between the game's frames, as the mouse does; how fast the stick turns the camera and the game's response curve are learned from the game's own camera (shown under the camera model). |
 | **Force a borderless window** | Off by default, remembered per game, applies when the game is restarted. For games that only run in exclusive fullscreen, where nothing can be shown over the game: the game stays in a window that covers the screen and is told it is fullscreen. |
@@ -193,6 +204,9 @@ fine-tuning and troubleshooting.
 
 * Frame rates that swing a lot degrade the result, because the camera model assumes a steady frame
   cadence.
+* XPAR Frame Generation works from the game's last two frames: what both of them hide can't be shown, limbs on
+  arcs are moved along straight lines, and two movers passing each other (one leg past the other) can leave a thin
+  seam. Without the game's motion vectors it does nothing.
 * With frame generation, moving things are shown one game frame late, as frame generation always does
   (the camera is not delayed). FSR 3.0 frame generation (the older FidelityFX SDK) and XeSS frame
   generation aren't used: FrameWarp pauses while they are on. Beyond 4x, three generated images per game
