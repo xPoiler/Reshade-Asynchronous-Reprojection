@@ -496,7 +496,43 @@ static void worker_fit_matches() {
     }
 }
 
+// Walking backwards at 60 fps, the presenter taking two frames in three (frame numbers skip: DOOM Eternal while recording a clip,
+// 2026-11-15). The position shown is the walk's a game frame and the latency back: over a skipped number it was put at the
+// newer frame's position a whole step early - ahead of that, while the older picture was still shown. Behind it (waiting
+// for the next frame over the gap) is allowed: a frame the presenter never took cannot be shown.
+static void position_across_skipped_frames() {
+    for (const int drop_every : {0, 3}) {  // (every other frame missing: no frame interval is measured, nothing held back - open, dev/TODO.md)
+        PoseModel model;
+        const double fps = 60.0, speed = 120.0, latency = 0.030;  // (units a second, backwards along the view)
+        auto camera_then = [&](double t) { CameraBasis c = camera_at(0, 0); c.pos = c.fwd * (-speed * t); return c; };
+        std::uint64_t frame = 0;
+        double next_frame_t = 0, worst_back = 0, worst_ahead = 0, prev = 0;
+        bool have = false;
+        for (int r = 0; r < 600; ++r) {
+            const double now = r / 120.0;
+            while (next_frame_t + latency <= now) {
+                ++frame;
+                if (!drop_every || frame % drop_every)
+                    model.add_source(frame, next_frame_t, next_frame_t + latency, camera_then(next_frame_t), false, next_frame_t + latency);
+                next_frame_t += 1.0 / fps;
+            }
+            if (now < 1.0) continue;  // (the frame interval and the latency learnt)
+            model.set_position_clock(now);
+            const Prediction p = model.predict(now);
+            const double along = -dot(p.camera.pos, camera_at(0, 0).fwd);  // (how far back it has walked)
+            if (have) worst_back = std::max(worst_back, prev - along);
+            worst_ahead = std::max(worst_ahead, along - speed * (now - latency - 1.0 / fps));
+            prev = along; have = true;
+        }
+        const double per_refresh = speed / 120.0;
+        EXPECT(worst_back < 0.05 * per_refresh && worst_ahead < 0.05 * per_refresh,
+               "every %d-th frame missing: the position shown went back the walk %.2f, ahead of it %.2f (walk %.2f a refresh)",
+               drop_every, worst_back, worst_ahead, per_refresh);
+    }
+}
+
 int main() {
+    position_across_skipped_frames();
     frame_clock_tests();
     rotation_conventions();
     right_handed_projection();

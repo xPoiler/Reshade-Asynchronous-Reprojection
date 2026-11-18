@@ -1020,6 +1020,44 @@ RWTexture2D<unorm float4> ss_out_u : register(u0);
 // depth. The warp carries it on past the frame (ow_own). Held by their share alone, a character walking or turning its body -
 // RE2's Claire, Armored Core VI's machine - stayed where the game frame had it until the next one: the parts of it the shares
 // moved apart from the rest, the gap where it had been filled with pieces of it.
+// (a spot's motion on screen to the frame before, render px, by the game's vector itself - t5, mv_scale/mv_size set; 0 where the
+// vector is unusable. Not the analysis' own motion plus the camera's again: near the plane the camera stood in a frame before -
+// a first-person gun walking backwards - the camera's part runs into the thousands of px and the two cancel; the own motion kept
+// in half floats lost the difference, or past 65504 px became infinite, and the gun carried on along it between game frames was
+// shredded - DOOM seq_5 2026-11-15, blend mode)
+Texture2D<float2> gv_motion_t : register(t5);
+float2 game_px(int2 pr) {
+    const float2 g = gv_motion_t.Load(int3(min(pr, int2(mv_size) - 1), 0));
+    return all(abs(g) < 1e4) ? g * mv_scale * float2(rect.zw) : float2(0, 0);
+}
+// (...and the part of it the shares sh explain - what the warp moves the spot by: the turn and the camera's movement each by its
+// share (flag 4: the whole motion by one). None where the spot was behind the camera a frame before - the warp moves none there
+// either - and no term whose share is 0: the camera's part can be enormous there)
+// (whether the spot was in front of the camera a frame before: behind it, where it was then means nothing to show it between
+// frames - by its vector, grass a third-person camera backs into went 1000+ px a game frame, Returnal seq_2 2026-11-16)
+// In front of the camera means past its near plane - the game's own clipping: depth 1 with the depth inverted (flag 16), 0
+// otherwise. A point between the camera and its near plane is never drawn, so where the camera alone puts it there is not
+// where it was: a gun at hand's length walking backwards - half of it behind the camera of the frame before, the other half
+// between it and its near plane, where the camera's part runs into thousands of px - carried on by it, 3,400 px median, up to
+// 70,000, and the solve dragged the whole gun 330 px off (DOOM seq_2 frame 56). Behind or in front of the near plane alike.
+bool past_near(float4 c) { return c.w > 0 && ((flags & 16) ? c.z <= c.w : c.z >= 0); }
+bool seen_before(float2 uv, float d) { return past_near(mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, d, 1), clip_to_prev)); }
+float2 share_cam_px(float2 uv, float d, float4 sh) {
+    const float4 prev = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, d, 1), clip_to_prev);
+    const float4 far = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, (flags & 16) ? 0.0 : 1.0, 1), clip_to_prev);  // (infinitely far)
+    if (!past_near(prev) || far.w <= 0) return float2(0, 0);
+    const float2 cam_px = (float2(prev.x / prev.w * 0.5 + 0.5, 0.5 - prev.y / prev.w * 0.5) - uv) * float2(rect.zw);
+    const float2 turn_px = (float2(far.x / far.w * 0.5 + 0.5, 0.5 - far.y / far.w * 0.5) - uv) * float2(rect.zw);
+    // (flag 4 and no share of the movement - what is at hand's length, cs_share_up: the warp turns it and moves it none, so
+    // the turn alone. By the whole motion the gun's share of the turn took the camera's movement too - thousands of px there:
+    // the gun's top smeared and the scenery round it given infinite motion, DOOM seq_1 2026-11-16)
+    const float2 whole = (flags & 4) && sh.z > 0 ? cam_px : turn_px;
+    const float2 t = (flags & 4) ? float2(0, 0) : cam_px - turn_px;
+    const bool rest = (flags & 32) && !(flags & 64);
+    const float s = rest ? sh.y : sh.x;
+    const float2 r = (s > 0 ? whole * s : float2(0, 0)) + (sh.z > 0 ? t * sh.z : float2(0, 0));
+    return all(abs(r) < 1e5) ? r : float2(0, 0);  // (never anything infinite: it spreads to what is around)
+}
 Texture2D<float4> sr_object_t : register(t0);
 Texture2D<float> sr_depth_t : register(t1);
 Texture2D<float4> sr_share_t : register(t2);
@@ -1038,17 +1076,7 @@ RWTexture2D<float4> sr_resid_u : register(u0);
     float2 resid = 0;
     if (own && (flags & 1)) {
         const float2 uv = (float2(pr - int2(rect.xy)) + 0.5) / float2(rect.zw);
-        const float4 prev = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, d, 1), clip_to_prev);
-        const float4 far = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, (flags & 16) ? 0.0 : 1.0, 1), clip_to_prev);  // (infinitely far)
-        if (prev.w > 0 && far.w > 0) {
-            const float2 cam_px = (float2(prev.x / prev.w * 0.5 + 0.5, 0.5 - prev.y / prev.w * 0.5) - uv) * float2(rect.zw);
-            const float2 turn_px = (float2(far.x / far.w * 0.5 + 0.5, 0.5 - far.y / far.w * 0.5) - uv) * float2(rect.zw);
-            const float2 whole = (flags & 4) ? cam_px : turn_px;
-            const float2 t = (flags & 4) ? float2(0, 0) : cam_px - turn_px;
-            const float4 sh = sr_share_t.Load(int3(pr, 0));
-            const bool rest = (flags & 32) && !(flags & 64);
-            resid = (o.xy + cam_px) - whole * (rest ? sh.y : sh.x) - t * sh.z;
-        }
+        if (seen_before(uv, d)) resid = game_px(pr) - share_cam_px(uv, d, sr_share_t.Load(int3(pr, 0)));
     }
     sr_resid_u[id.xy] = float4(resid, own ? 1.0 : 0.0, d);
 }
@@ -1131,9 +1159,36 @@ float oh_near(int2 pr) {
     const float d = oh_depth_t.Load(int3(pr, 0));
     return 1.0 + saturate((log2(max((flags & 16) ? d : 1.0 - d, 1e-12)) + 30.0) / 32.0) * 1022.0;  // (ow_near)
 }
-[numthreads(8, 8, 1)] void cs_own_halo_h(uint3 id : SV_DispatchThreadID) {
-    if (any(id.xy >= rect.zw)) return;
+// (each 8 x 8 group reads its rows' - _v: its columns' - strip once, reach to either side, into groupshared: every pixel read
+// up to 2 x 64 + 1 texels of it from memory itself, its neighbours the same ones - 7 + 4.4 ms a game frame at 1440p, Metro's
+// refreshes down to 80/s. The same values, the same comparisons in the same order: the same result, bit for bit)
+static const int kHaloSide = 8 + 2 * 64 + 1;  // (one more: a strip's start in a different bank from the next's)
+// (as halves, two to a uint: every value in it comes from a half-float texture - the nearness goes to one, so rounded the same -
+// so the same bits, in half the groupshared memory: twice the groups at once on a GPU core)
+groupshared uint2 oh_strip[8 * kHaloSide];
+uint2 oh_pack(float4 e) { return uint2(f32tof16(e.x) | (f32tof16(e.y) << 16), f32tof16(e.z) | (f32tof16(e.w) << 16)); }
+float4 oh_unpack(uint2 p) { return float4(f16tof32(p.x), f16tof32(p.x >> 16), f16tof32(p.y), f16tof32(p.y >> 16)); }
+groupshared uint oh_any[8];  // (each strip: anything in it moving - none, the search finds nothing there: not run)
+[numthreads(8, 8, 1)] void cs_own_halo_h(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID, uint gi : SV_GroupIndex) {
     const int reach = int(groups_x);
+    const int side = 8 + 2 * reach;
+    const int x0 = int(gid.x) * 8 - reach;
+    if (gi < 8) oh_any[gi] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    // (xy the motion, z the nearness, w 1 where it moves - over 0.01 on either axis; outside the picture none)
+    for (int i = int(gi); i < 8 * side; i += 64) {
+        const int row = i / side, x = x0 + i % side, y = int(gid.y) * 8 + row;
+        float4 e = float4(0, 0, 0, 0);
+        if (x >= 0 && x < int(rect.z) && y < int(rect.w)) {
+            const int2 q = int2(rect.xy) + int2(x, y);
+            const float2 v = oh_in_t.Load(int3(q, 0)).xy;
+            // (blended: a mover pixel by its own verdict - see below)
+            if (any(abs(v) > 0.01)) { e = float4(v, oh_near(q), 1); oh_any[row] = 1; }
+        }
+        oh_strip[row * kHaloSide + i % side] = oh_pack(e);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (any(id.xy >= rect.zw)) return;
     // (the mover in the row that reaches farthest past this pixel - twice its motion less the way to it: its motion, how far,
     // its nearness. The nearest instead, a foot swung past the standing leg lost the floor beside it to the leg's ankle, hardly
     // moving: its end cut off. A mover's own pixel keeps its own)
@@ -1149,50 +1204,53 @@ float oh_near(int2 pr) {
             const float4 o = oh_object_t.Load(int3(pr, 0));
             const float d = oh_depth_t.Load(int3(pr, 0));
             const float2 uv = (float2(id.xy) + 0.5) / float2(rect.zw);
-            const float4 prev = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, d, 1), clip_to_prev);
-            const float4 far = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, (flags & 16) ? 0.0 : 1.0, 1), clip_to_prev);
-            if (o.w > 0.5 && prev.w > 0 && far.w > 0) {
-                const float2 cam_px = (float2(prev.x / prev.w * 0.5 + 0.5, 0.5 - prev.y / prev.w * 0.5) - uv) * float2(rect.zw);
-                const float2 turn_px = (float2(far.x / far.w * 0.5 + 0.5, 0.5 - far.y / far.w * 0.5) - uv) * float2(rect.zw);
-                const float2 whole = (flags & 4) ? cam_px : turn_px;
-                const float2 t = (flags & 4) ? float2(0, 0) : cam_px - turn_px;
-                const float4 sh = oh_share_t.Load(int3(pr, 0));
-                const bool rest = (flags & 32) && !(flags & 64);
-                own = -((o.xy + cam_px) - whole * (rest ? sh.y : sh.x) - t * sh.z);
+            if (o.w > 0.5 && seen_before(uv, d)) {
+                own = -(game_px(pr) - share_cam_px(uv, d, oh_share_t.Load(int3(pr, 0))));  // (see game_px)
                 if (!any(abs(own) > 0.01)) own = float2(0.011, 0);  // (still a mover's pixel)
             }
         }
         oh_out_u[int2(rect.xy + id.xy)] = float4(own, 0, oh_near(int2(rect.xy + id.xy)));
         return;
     }
-    [loop] for (int k = -reach; k <= reach; ++k) {
-        const int x = int(id.x) + k;
-        if (x < 0 || x >= int(rect.z)) continue;
-        const int2 q = int2(rect.xy) + int2(x, id.y);
-        const float2 v = oh_in_t.Load(int3(q, 0)).xy;
-        const float m = 2.0 * length(v) - abs(float(k));
-        if (any(abs(v) > 0.01) && m > most) { most = m; best = float4(v, k, oh_near(q)); }
+    const int base = int(gt.y) * kHaloSide + int(gt.x) + reach;
+    if (oh_any[gt.y] != 0) [loop] for (int k = -reach; k <= reach; ++k) {
+        const float4 e = oh_unpack(oh_strip[base + k]);
+        const float m = 2.0 * length(e.xy) - abs(float(k));
+        if (e.w > 0.5 && m > most) { most = m; best = float4(e.xy, k, e.z); }
     }
     oh_out_u[int2(rect.xy + id.xy)] = best;
 }
-[numthreads(8, 8, 1)] void cs_own_halo_v(uint3 id : SV_DispatchThreadID) {
-    if (any(id.xy >= rect.zw)) return;
+[numthreads(8, 8, 1)] void cs_own_halo_v(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID, uint gi : SV_GroupIndex) {
     const int reach = int(groups_x);
+    const int side = 8 + 2 * reach;
+    const int y0 = int(gid.y) * 8 - reach;
+    if (gi < 8) oh_any[gi] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    // (the column strip as cs_own_halo_h wrote it; outside the picture z 2e3 - over 1e3: no mover, as skipped before)
+    for (int i = int(gi); i < 8 * side; i += 64) {
+        const int col = i % 8, yi = i / 8, y = y0 + yi, x = int(gid.x) * 8 + col;  // (a row of the group's 8 columns at a time)
+        float4 e = float4(0, 0, 2e3, 0);
+        if (y >= 0 && y < int(rect.w) && x < int(rect.z)) e = oh_in_t.Load(int3(int2(rect.xy) + int2(x, y), 0));
+        if (e.z <= 1e3) oh_any[col] = 1;
+        oh_strip[col * kHaloSide + yi] = oh_pack(e);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (any(id.xy >= rect.zw)) return;
     const int2 pr = int2(rect.xy + id.xy);
     const float4 here = oh_in_t.Load(int3(pr, 0));
     if (here.z == 0.0) { oh_out_u[pr] = float4(here.xy, 1, 1); return; }
     const float n0 = oh_near(pr);
     float2 v_take = 0, v_near = 0;
     float take = 0, most = -1e9;
-    [loop] for (int k = -reach; k <= reach; ++k) {
-        const int y = int(id.y) + k;
-        if (y < 0 || y >= int(rect.w)) continue;
-        const float4 c = oh_in_t.Load(int3(int2(pr.x, int(rect.y) + y), 0));
+    const int base = int(gt.x) * kHaloSide + int(gt.y) + reach;
+    if (oh_any[gt.x] != 0) [loop] for (int k = -reach; k <= reach; ++k) {
+        const float4 c = oh_unpack(oh_strip[base + k]);
         if (c.z > 1e3 || n0 > c.w + 6.0) continue;
         const float2 r = float2(c.z, k);  // (to the mover)
         const float dist = length(r), vl = max(length(c.xy), 1e-3);
         if (dist > float(reach)) continue;
         if (vl - dist > most) { most = vl - dist; v_near = c.xy; }  // (the one reaching farthest past here)
+        if (alpha > 1.5) continue;  // (blended: v_near alone is used - see below)
         const float f = saturate(1.0 - dist / min(2.0 * vl, float(reach))) * smoothstep(0.0, 0.5, dot(-r, c.xy) / (dist * vl));
         if (f > take) { take = f; v_take = c.xy; }
     }
@@ -1208,6 +1266,111 @@ Texture2D<float4> tp_object_t : register(t0);
 Texture2D<float> tp_depth_t : register(t1);
 Texture2D<float4> tp_own_t : register(t2);
 RWTexture2D<float4> tp_out_u : register(u0);
+// (2026-11-17: the camera's own error measured per frame - how far the game's vectors run off the camera's motion on
+// the scenery (the analysis' verdict): fitted per axis, least squares, as a + b cam.x + c cam.y + d x + e y - the camera's
+// motion and the place on the screen. Metro's estimated camera: mostly a constant sideways offset (-2.3 px, +4.5 px in a fast
+// turn) and a few percent of scale; what the fit leaves is 0.2 px median, under 1 px at the 99th percentile. cs_fit_sums per
+// 8x8 group of samples - one rendered pixel in 4 x 4: five numbers fitted from a quarter million or so, at a sixteenth of the cost
+// (all of them: 3.1 ms a game frame at 1440p) - the 15 sums of the normal matrix and the 10 of the right-hand sides, 7 texels side
+// by side - cs_fit_total the frame's, solved, into 3 texels: the 5 coefficients for x, then for y)
+float fit_x5(float2 cam, float2 uv, uint k) {  // (the k-th term, scaled to about 1)
+    return k == 0 ? 1.0 : k == 1 ? cam.x / 64.0 : k == 2 ? cam.y / 64.0 : k == 3 ? uv.x - 0.5 : uv.y - 0.5;
+}
+RWTexture2D<float4> fs_part_u : register(u0);
+groupshared float fs_sum[64][27];
+[numthreads(8, 8, 1)] void cs_fit_sums(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
+    float v[27];  // (and 25, 26: the squares of the gaps - what the fit leaves, see cs_fit_total)
+    [unroll] for (uint z = 0; z < 27; ++z) v[z] = 0;
+    const uint2 sp = id.xy * 4 + 1;  // (the sample's rendered pixel)
+    if (all(sp < rect.zw)) {
+        const int2 pr = int2(rect.xy + sp);
+        const float4 o = tp_object_t.Load(int3(pr, 0));
+        const float d = tp_depth_t.Load(int3(pr, 0));
+        const float2 uv = (float2(sp) + 0.5) / float2(rect.zw);
+        const float4 prev = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, d, 1), clip_to_prev);
+        if (o.w < 0.5 && past_near(prev)) {
+            const float2 cam = (float2(prev.x / prev.w * 0.5 + 0.5, 0.5 - prev.y / prev.w * 0.5) - uv) * float2(rect.zw);
+            const float2 r = game_px(pr) - cam;
+            if (all(abs(r) < 64.0) && all(abs(cam) < 4096.0)) {
+                float x[5];
+                [unroll] for (uint a = 0; a < 5; ++a) x[a] = fit_x5(cam, uv, a);
+                uint n = 0;
+                [unroll] for (uint a2 = 0; a2 < 5; ++a2)
+                    [unroll] for (uint b = a2; b < 5; ++b) v[n++] = x[a2] * x[b];
+                [unroll] for (uint a3 = 0; a3 < 5; ++a3) { v[15 + a3] = x[a3] * r.x; v[20 + a3] = x[a3] * r.y; }
+                v[25] = r.x * r.x; v[26] = r.y * r.y;
+            }
+        }
+    }
+    [unroll] for (uint z2 = 0; z2 < 27; ++z2) fs_sum[gi][z2] = v[z2];
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (uint k = 32; k > 0; k >>= 1) {
+        if (gi < k) [unroll] for (uint z3 = 0; z3 < 27; ++z3) fs_sum[gi][z3] += fs_sum[gi + k][z3];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0)
+        [unroll] for (uint t = 0; t < 7; ++t)
+            fs_part_u[uint2(gid.x * 7 + t, gid.y)] = float4(fs_sum[0][t * 4], fs_sum[0][t * 4 + 1], fs_sum[0][t * 4 + 2], t * 4 + 3 < 27 ? fs_sum[0][min(t * 4 + 3, 26u)] : 0);
+}
+Texture2D<float4> ft_part_t : register(t0);
+RWTexture2D<float4> ft_out_u : register(u0);
+groupshared float ft_sum[256][27];
+[numthreads(256, 1, 1)] void cs_fit_total(uint gi : SV_GroupIndex) {
+    const uint2 n = ((rect.zw + 3) / 4 + 7) / 8;  // (cs_fit_sums' groups)
+    float v[27];
+    [unroll] for (uint z = 0; z < 27; ++z) v[z] = 0;
+    for (uint i = gi; i < n.x * n.y; i += 256) {
+        const uint2 g = uint2(i % n.x, i / n.x);
+        [unroll] for (uint t = 0; t < 7; ++t) {
+            const float4 q = ft_part_t.Load(int3(g.x * 7 + t, g.y, 0));
+            [unroll] for (uint c = 0; c < 4; ++c) v[min(t * 4 + c, 26u)] += t * 4 + c < 27 ? q[c] : 0.0;
+        }
+    }
+    [unroll] for (uint z2 = 0; z2 < 27; ++z2) ft_sum[gi][z2] = v[z2];
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (uint k = 128; k > 0; k >>= 1) {
+        if (gi < k) [unroll] for (uint z3 = 0; z3 < 27; ++z3) ft_sum[gi][z3] += ft_sum[gi + k][z3];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi != 0) return;
+    // (the normal equations, both axes at once: Gauss-Jordan with partial pivoting on [A | rx ry])
+    float m[5][7];
+    uint idx = 0;
+    [unroll] for (uint a = 0; a < 5; ++a)
+        [unroll] for (uint b = a; b < 5; ++b) { m[a][b] = ft_sum[0][idx]; m[b][a] = ft_sum[0][idx]; ++idx; }
+    [unroll] for (uint a2 = 0; a2 < 5; ++a2) { m[a2][5] = ft_sum[0][15 + a2]; m[a2][6] = ft_sum[0][20 + a2]; }
+    const float count = m[0][0];
+    bool ok = count > 1000.0;
+    [unroll] for (uint col = 0; col < 5; ++col) {
+        uint piv = col;
+        [unroll] for (uint row = col + 1; row < 5; ++row) if (abs(m[row][col]) > abs(m[piv][col])) piv = row;
+        [unroll] for (uint e = 0; e < 7; ++e) { const float tmp = m[col][e]; m[col][e] = m[piv][e]; m[piv][e] = tmp; }
+        const float p = m[col][col];
+        if (abs(p) < 1e-6 * count) { ok = false; break; }
+        [unroll] for (uint e2 = 0; e2 < 7; ++e2) m[col][e2] /= p;
+        [unroll] for (uint row2 = 0; row2 < 5; ++row2)
+            if (row2 != col) { const float f = m[row2][col]; [unroll] for (uint e3 = 0; e3 < 7; ++e3) m[row2][e3] -= f * m[col][e3]; }
+    }
+    // (what is left: the gap's spread before the fit and after it, rendered px - sum r^2 less the fitted part, coefficients
+    // times the right-hand sides)
+    float fx = 0, fy = 0;
+    [unroll] for (uint a4 = 0; a4 < 5; ++a4) { fx += m[a4][5] * ft_sum[0][15 + a4]; fy += m[a4][6] * ft_sum[0][20 + a4]; }
+    const float before = sqrt((ft_sum[0][25] + ft_sum[0][26]) / max(count, 1.0));
+    const float after = sqrt(max(ft_sum[0][25] - fx + ft_sum[0][26] - fy, 0.0) / max(count, 1.0));
+    ft_out_u[uint2(0, 0)] = ok ? float4(m[0][5], m[1][5], m[2][5], m[3][5]) : 0;
+    ft_out_u[uint2(1, 0)] = ok ? float4(m[4][5], m[0][6], m[1][6], m[2][6]) : 0;
+    ft_out_u[uint2(2, 0)] = float4(ok ? m[3][6] : 0, ok ? m[4][6] : 0, before, ok ? after : before);
+}
+// (the camera's error at a pixel, rendered px - see cs_fit_total)
+float2 fit_error(Texture2D<float4> f, float2 cam, float2 uv) {
+    const float4 t0 = f.Load(int3(0, 0, 0)), t1 = f.Load(int3(1, 0, 0)), t2 = f.Load(int3(2, 0, 0));
+    const float cx[5] = {t0.x, t0.y, t0.z, t0.w, t1.x}, cy[5] = {t1.y, t1.z, t1.w, t2.x, t2.y};
+    float2 e = 0;
+    [unroll] for (uint k = 0; k < 5; ++k) { const float x = fit_x5(cam, uv, k); e += float2(cx[k], cy[k]) * x; }
+    return e;
+}
+Texture2D<float4> tp_fit_t : register(t3);
+Texture2D<float4> tp_share_t : register(t4);  // (the shares - see share_cam_px)
 [numthreads(8, 8, 1)] void cs_to_prev(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= rect.zw)) return;
     const int2 pr = int2(rect.xy + id.xy);
@@ -1218,9 +1381,32 @@ RWTexture2D<float4> tp_out_u : register(u0);
     float2 v = float2(0, 0);
     // (what the analysis has as scenery by the camera alone: its vector differs from the camera's motion by less than the
     // analysis' own limit, and the camera's is the one the whole warp goes by)
-    if (prev.w > 0) v = (float2(prev.x / prev.w * 0.5 + 0.5, 0.5 - prev.y / prev.w * 0.5) - uv) * float2(rect.zw) + (o.w > 0.5 ? o.xy : float2(0, 0));
+    // (what moves on its own: by the game's vector itself - see game_px)
+    // (how much of the frame before is mixed in - see ow_two_frames: by the motion the camera does not explain, the game's
+    // vector less the camera's motion at the pixel's depth, in rendered px - none at 0, all from one rendered pixel up: below
+    // that, what shifting by it leaves wrong is under a pixel. Where the camera of the frame before did not see the spot, the
+    // analysis' verdict)
+    float blend = o.w > 0.5 ? 1.0 : 0.0;
+    if (past_near(prev)) {
+        const float2 cam = (float2(prev.x / prev.w * 0.5 + 0.5, 0.5 - prev.y / prev.w * 0.5) - uv) * float2(rect.zw);
+        // (the camera's own error this frame - cs_fit_total, alpha 1 when measured: what the vectors of the scenery have over
+        // the camera, fitted. The scenery's place in the frame before is the camera's motion with it - read 1-3 px off without
+        // it in Metro; and what the camera does not explain is what is left over beyond the fit's own spread this frame)
+        const float2 err = alpha > 0.5 ? fit_error(tp_fit_t, cam, uv) : float2(0, 0);
+        const float spread = alpha > 0.5 ? tp_fit_t.Load(int3(2, 0, 0)).w : 0.0;
+        v = o.w > 0.5 ? game_px(pr) : cam + err;
+        // (explained by the camera: as the warp itself moves the spot - its share of the turn and of the movement, see share_cam_px.
+        // The hands and weapon carried through a turn, a character the view follows: none of that is their own, the warp takes it
+        // as without the blend; only what is left - a reload, a stride - is blended. By the world's camera alone a hand held
+        // still through a turn had all of the turn as its own: blended in full, the outline's gaps filled from the frame before)
+        const float2 expl = share_cam_px(uv, d, tp_share_t.Load(int3(pr, 0)));
+        blend = saturate(length(game_px(pr) - expl - err) - spread);
+    }
     const float n = 1.0 + saturate((log2(max((flags & 16) ? d : 1.0 - d, 1e-12)) + 30.0) / 32.0) * 1022.0;  // (ow_near)
-    tp_out_u[pr] = float4(v, n, tp_own_t.Load(int3(pr, 0)).w);
+    // (w: a mover 0.51..1, anything else 0..0.49 - over 0.5 still says a mover; the rest of it the blend's weight, see
+    // ow_two_frames)
+    const bool mover = tp_own_t.Load(int3(pr, 0)).w > 0.5;
+    tp_out_u[pr] = float4(v, n, mover ? 0.51 + 0.49 * blend : 0.49 * blend);
 }
 // ...and holes in it (cs_hold_fill): a spot not held, enclosed by held pixels at its own distance (within 15%) in at least
 // 7 of 8 directions within 3% of the screen height (the frame's edge counts, a character cut off by it), before anything
@@ -3449,6 +3635,11 @@ float4 ow_two_frames(float4 c, float2 uv, float2 src) {
     // its nearest pixel's by a quarter of a pixel at most - the continuous warp's limit)
     const bool on_one = all(abs(dl - ow_tether_t.Load(int3(ow_rpx(src) - int2(rect.xy), 0))) < 0.5);
     if (on_one && all(abs(miss * float2(out_size)) < 0.5)) {
+        // (the user's rule, 2026-11-17: the frame before mixed in by the motion the camera does not explain - none
+        // where it explains all of it, the warp by the camera shows that exactly; all from a rendered pixel of the pixel's own
+        // motion up - see cs_to_prev)
+        const float wb = tn.w > 0.5 ? (tn.w - 0.51) / 0.49 : tn.w / 0.49;
+        if (wb <= 0.0) return c;
         const float2 q = src + tn.xy / rs;
         if (any(q < 0) || any(q > 1)) return c;
         const float4 tq = ow_prevto_t.Load(int3(ow_rpx(q), 0));
@@ -3461,12 +3652,13 @@ float4 ow_two_frames(float4 c, float2 uv, float2 src) {
         const bool alike = tn.w > 0.5 ? all(around > 0.5) : !any(around > 0.5);
         if (abs(tq.z - tn.z) > 6.0 || !alike) return dbg ? lerp(c, float4(0, 0, 1, 1), 0.6) : c;
         if ((flags & 2) && ow_held(int3(min(uint2(q * float2(out_size)), out_size - 1), 0))) return c;
-        if (dbg) return lerp(lerp(c, ow_prevc_t.SampleLevel(ow_linear, q, 0), saturate(-wproj.w)), float4(0, 1, 0, 1), tn.w > 0.5 ? 0.5 : 0.0);
-        return lerp(c, ow_prevc_t.SampleLevel(ow_linear, q, 0), saturate(-wproj.w));
+        if (dbg) return lerp(lerp(c, ow_prevc_t.SampleLevel(ow_linear, q, 0), saturate(-wproj.w) * saturate(wb)), float4(0, 1, 0, 1), tn.w > 0.5 ? 0.5 : 0.0);
+        return lerp(c, ow_prevc_t.SampleLevel(ow_linear, q, 0), saturate(-wproj.w) * saturate(wb));
     }
     const int2 pu = ow_rpx(uv);
     const float4 ou = ow_own_t.Load(int3(pu, 0));
     float2 dc, tp;
+    float ref_n = -1.0;  // (the nearness the hidden scenery has beside it, where known - see below)
     if (ou.w < 0.5) {
         // (scenery at uv, the search's end between a mover's outline pixel and the scenery: the shown frame's pixels right at
         // the mover's front. Their colour has the mover's edge in it - the picture is finer than the rendered pixels that say
@@ -3477,10 +3669,13 @@ float4 ow_two_frames(float4 c, float2 uv, float2 src) {
         if (!any(ow_own_t.GatherAlpha(ow_linear, (float2(rect.xy) + clamp(corner, 1.0, rs - 1.0)) / float2(mw, mh)) > 0.5))
             return dbg ? lerp(c, float4(1, 1, 0, 1), 0.6) : c;
         dc = ow_asked(pu - int2(rect.xy), true);
-        tp = ow_toprev_t.Load(int3(pu, 0)).xy;
+        const float4 tu = ow_toprev_t.Load(int3(pu, 0));
+        tp = tu.xy;
+        ref_n = tu.z;
     } else if (tn.w < 0.5) {
         dc = ow_asked(ow_rpx(src) - int2(rect.xy), true);
         tp = tn.xy;
+        ref_n = tn.z;
     } else {
         dc = ow_asked(pu - int2(rect.xy), false);
         tp = ow_toprev_t.Load(int3(pu, 0)).xy + ou.xy;
@@ -3489,6 +3684,12 @@ float4 ow_two_frames(float4 c, float2 uv, float2 src) {
     if (any(q < 0) || any(q > 1)) return c;
     // (whatever the frame before shows there - the mover too, if it covered the spot then as well: it does now)
     if ((flags & 2) && ow_held(int3(min(uint2(q * float2(out_size)), out_size - 1), 0))) return c;
+    // (2026-11-18: ...only scenery from the frame before - what was there then moved on its own (a mover, the weapon), or
+    // is not as near as the scenery beside the strip (within 6 steps, as above): the strip's scenery was not there to take. In a
+    // fast turn the frame before had the weapon or a mover's edge at that spot: a black crack beside the weapon, the outline frayed
+    // - Cyberpunk seq_3 f190/196. Then the shown frame's own)
+    const float4 tq = ow_prevto_t.Load(int3(ow_rpx(q), 0));
+    if (tq.w > 0.5 || (ref_n >= 0.0 && abs(tq.z - ref_n) > 6.0)) return dbg ? lerp(c, float4(1, 0, 1, 1), 0.6) : c;
     if (dbg) return lerp(ow_prevc_t.SampleLevel(ow_linear, q, 0), float4(1, 0, 0, 1), 0.6);
     return ow_prevc_t.SampleLevel(ow_linear, q, 0);
 }
@@ -3773,18 +3974,34 @@ RWTexture2D<float2> tt_out_u : register(u0);
 // (each block's nearest pixel, x | y << 16, and its nearness: from the depth alone, so once per shown game frame - cs_tether_pick, for
 // every refresh of it; picked again at each, it was B x B depth reads a block, 16 at 1080p, 64 at 4K)
 RWTexture2D<uint2> tt_pick_u : register(u0);
+static const int2 kTpDirs[8] = {int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1), int2(1, 1), int2(1, -1), int2(-1, 1), int2(-1, -1)};
 Texture2D<uint2> tt_pick_t : register(t20);
 [numthreads(8, 8, 1)] void cs_tether_pick(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= tether_blocks())) return;
     const uint bs = tether_b();
-    float bn = -1.0;
-    uint2 bp = id.xy * bs;
+    float bn = -1.0, bn_any = -1.0;
+    uint2 bp = id.xy * bs, bp_any = id.xy * bs;
+    // (ow_dev 8388608, default - a surface, not a point: the nearest pixel that has a neighbour on its own surface (within 6
+    // nearness steps, ~14% of the distance - as the two frames' same-surface test). A pixel alone at its distance - Returnal's
+    // specks at the lens, ~375 of them in grass, each nearer than anything and none with a neighbour at its depth - stood for
+    // its block and held the scenery around to its own motion, 1,000-20,000 px: the picture torn (seq_3 frame 114). Such a pixel
+    // still moves by its own motion; it only no longer holds others. A block of such pixels alone keeps its nearest)
+    const bool surface = (uint(threshold + 0.5) & 8388608u) != 0;
     [loop] for (uint k = 0; k < bs * bs; ++k) {
         const uint2 p = id.xy * bs + uint2(k % bs, k / bs);
         if (any(p >= rect.zw)) continue;
         const float n = ow_near_at(int2(p));
-        if (n > bn) { bn = n; bp = p; }
+        if (n > bn_any) { bn_any = n; bp_any = p; }
+        if (n <= bn) continue;
+        bool alone = surface;
+        [unroll] for (int j = 0; j < 8 && alone; ++j) {
+            const int2 qq = int2(p) + kTpDirs[j];
+            if (any(qq < 0) || any(qq >= int2(rect.zw))) continue;
+            alone = abs(ow_near_at(qq) - n) > 6.0;
+        }
+        if (!alone) { bn = n; bp = p; }
     }
+    if (bn < 0) { bn = bn_any; bp = bp_any; }
     tt_pick_u[id.xy] = uint2(bp.x | (bp.y << 16), asuint(bn));
 }
 [numthreads(8, 8, 1)] void cs_tether_init(uint3 id : SV_DispatchThreadID) {
@@ -5915,7 +6132,7 @@ enum WTable : UINT { kWWarp, kWShown, kWJoinInit, kWJoinAB, kWJoinBA, kWJoinFina
                      kWStill, kWHoldInit, kWHoldAB, kWHoldBA, kWHoldFinal, kWHoldFill, kWHoldFillFinal, kWGrowInit, kWGrowAB, kWGrowBA,
                      kWGrowFinal, kWWarpArgs, kWShareMeasure, kWShareH, kWShareV, kWShareBins, kWShareUp, kWShareResid, kWResidBlurH, kWResidBlurV, kWOwnUp, kWOwnHaloH, kWOwnHaloV, kWToPrev, kWSeamH, kWSeamV, kWAttHist, kWBeside, kWHeld, kWWarpUp,
                      kWStenHist, kWStenCells, kWStenFloodAB, kWStenFloodBA, kWStenApply, kWStenCount,
-                     kWStenGrowInit, kWStenGrowAB, kWStenGrowBA, kWStenAge, kWStenClose, kWStenComp, kWStenPrune, kWStenLuma, kWStenElig, kWStenFringe, kWStenFringeApply, kWTetherInit, kWTetherAB, kWTetherBA, kWTetherFinal, kWTetherPick, kWTables };
+                     kWStenGrowInit, kWStenGrowAB, kWStenGrowBA, kWStenAge, kWStenClose, kWStenComp, kWStenPrune, kWStenLuma, kWStenElig, kWStenFringe, kWStenFringeApply, kWTetherInit, kWTetherAB, kWTetherBA, kWTetherFinal, kWTetherPick, kWFitSums, kWFitTotal, kWTables };
 constexpr UINT kWSrv(UINT table) { return kW + table * kWTableSize; }
 constexpr UINT kWUav(UINT table) { return kW + table * kWTableSize + kWSrvCount; }
 constexpr UINT kHeapSize = kW + kWTables * kWTableSize;
@@ -6555,7 +6772,7 @@ bool Renderer::create_pipelines(std::string& error) {
         error = "warp root signature"; return false;
     }
     struct { const char* entry; ComPtr<ID3D12PipelineState>* pso; } ws[] = {
-        {"cs_own_warp", &cs_own_warp_}, {"cs_own_warp_reset", &cs_own_warp_reset_}, {"cs_own_warp_lean", &cs_own_warp_lean_}, {"cs_own_warp_seek", &cs_own_warp_seek_}, {"cs_own_warp_args", &cs_own_warp_args_}, {"cs_own_warp_rest", &cs_own_warp_rest_}, {"cs_warp_claims_clear", &cs_warp_claims_clear_}, {"cs_warp_claim", &cs_warp_claim_}, {"cs_warp_beside", &cs_warp_beside_}, {"cs_warp_held", &cs_warp_held_}, {"cs_own_warp_up", &cs_own_warp_up_}, {"cs_gen_depth", &cs_gen_depth_}, {"cs_gen_unui", &cs_gen_unui_}, {"cs_obj_join_init", &cs_obj_join_init_}, {"cs_obj_join", &cs_obj_join_}, {"cs_obj_join_final", &cs_obj_join_final_}, {"cs_still", &cs_still_}, {"cs_hold_fill", &cs_hold_fill_}, {"cs_grow_init", &cs_grow_init_}, {"cs_grow_clear", &cs_grow_clear_}, {"cs_grow", &cs_grow_}, {"cs_grow_final", &cs_grow_final_}, {"cs_share_measure", &cs_share_measure_}, {"cs_share_blur", &cs_share_blur_}, {"cs_share_bins", &cs_share_bins_}, {"cs_share_final", &cs_share_final_}, {"cs_share_up", &cs_share_up_}, {"cs_share_seam", &cs_share_seam_}, {"cs_att_hist", &cs_att_hist_}, {"cs_share_resid", &cs_share_resid_}, {"cs_resid_blur", &cs_resid_blur_}, {"cs_own_up", &cs_own_up_}, {"cs_own_halo_h", &cs_own_halo_h_}, {"cs_own_halo_v", &cs_own_halo_v_}, {"cs_to_prev", &cs_to_prev_}, {"cs_tether_init", &cs_tether_init_}, {"cs_tether_step", &cs_tether_step_}, {"cs_tether_fine", &cs_tether_fine_}, {"cs_tether_final", &cs_tether_final_}, {"cs_tether_pick", &cs_tether_pick_},
+        {"cs_own_warp", &cs_own_warp_}, {"cs_own_warp_reset", &cs_own_warp_reset_}, {"cs_own_warp_lean", &cs_own_warp_lean_}, {"cs_own_warp_seek", &cs_own_warp_seek_}, {"cs_own_warp_args", &cs_own_warp_args_}, {"cs_own_warp_rest", &cs_own_warp_rest_}, {"cs_warp_claims_clear", &cs_warp_claims_clear_}, {"cs_warp_claim", &cs_warp_claim_}, {"cs_warp_beside", &cs_warp_beside_}, {"cs_warp_held", &cs_warp_held_}, {"cs_own_warp_up", &cs_own_warp_up_}, {"cs_gen_depth", &cs_gen_depth_}, {"cs_gen_unui", &cs_gen_unui_}, {"cs_obj_join_init", &cs_obj_join_init_}, {"cs_obj_join", &cs_obj_join_}, {"cs_obj_join_final", &cs_obj_join_final_}, {"cs_still", &cs_still_}, {"cs_hold_fill", &cs_hold_fill_}, {"cs_grow_init", &cs_grow_init_}, {"cs_grow_clear", &cs_grow_clear_}, {"cs_grow", &cs_grow_}, {"cs_grow_final", &cs_grow_final_}, {"cs_share_measure", &cs_share_measure_}, {"cs_share_blur", &cs_share_blur_}, {"cs_share_bins", &cs_share_bins_}, {"cs_share_final", &cs_share_final_}, {"cs_share_up", &cs_share_up_}, {"cs_share_seam", &cs_share_seam_}, {"cs_att_hist", &cs_att_hist_}, {"cs_share_resid", &cs_share_resid_}, {"cs_resid_blur", &cs_resid_blur_}, {"cs_own_up", &cs_own_up_}, {"cs_own_halo_h", &cs_own_halo_h_}, {"cs_own_halo_v", &cs_own_halo_v_}, {"cs_to_prev", &cs_to_prev_}, {"cs_fit_sums", &cs_fit_sums_}, {"cs_fit_total", &cs_fit_total_}, {"cs_tether_init", &cs_tether_init_}, {"cs_tether_step", &cs_tether_step_}, {"cs_tether_fine", &cs_tether_fine_}, {"cs_tether_final", &cs_tether_final_}, {"cs_tether_pick", &cs_tether_pick_},
         {"cs_copy4", &cs_copy4_},
         {"cs_sten_clear", &cs_sten_clear_}, {"cs_sten_hist", &cs_sten_hist_}, {"cs_sten_cells", &cs_sten_cells_}, {"cs_sten_flood", &cs_sten_flood_},
         {"cs_sten_apply", &cs_sten_apply_}, {"cs_sten_count", &cs_sten_count_}, {"cs_sten_grow_init", &cs_sten_grow_init_}, {"cs_sten_grow", &cs_sten_grow_}, {"cs_sten_age", &cs_sten_age_}, {"cs_sten_close", &cs_sten_close_}, {"cs_sten_comp_clear", &cs_sten_comp_clear_}, {"cs_sten_comp_count", &cs_sten_comp_count_}, {"cs_sten_comp_max", &cs_sten_comp_max_}, {"cs_sten_prune", &cs_sten_prune_}, {"cs_sten_luma", &cs_sten_luma_}, {"cs_sten_elig", &cs_sten_elig_}, {"cs_sten_fringe", &cs_sten_fringe_}, {"cs_sten_fringe_apply", &cs_sten_fringe_apply_}};
@@ -6840,6 +7057,7 @@ void Renderer::analyze_motion(const IngestedSource& src, const float clip_to_pre
     c.grid[0] = w; c.grid[1] = h;
     c.mv_size[0] = private_[kPMotion].width; c.mv_size[1] = private_[kPMotion].height;
     c.mv_scale[0] = scale_x; c.mv_scale[1] = scale_y;
+    analyzed_mv_scale_[0] = scale_x; analyzed_mv_scale_[1] = scale_y;
     c.threshold = 1.0f;
     c.groups_x = gx;
     c.flags = (scale_valid ? 1u : 0u) | (depth_inverted ? 16u : 0u) | (near_rule ? 0u : 64u) | (turn_rule ? 128u : 0u) |
@@ -7455,6 +7673,9 @@ void Renderer::follow_share(const IngestedSource& src, const float clip_to_prev_
         !ensure_private(kPShareHalf, cw, ch, DXGI_FORMAT_R16G16B16A16_FLOAT) || !ensure_private(kPShare, w, h, DXGI_FORMAT_R16G16B16A16_UNORM))
         return;
     c.grid[0] = w; c.grid[1] = h;
+    // (the game's vectors, for what moves on its own - game_px)
+    c.mv_size[0] = private_[kPMotion].width; c.mv_size[1] = private_[kPMotion].height;
+    c.mv_scale[0] = analyzed_mv_scale_[0]; c.mv_scale[1] = analyzed_mv_scale_[1];
     // (the game's own camera - set_share_whole: measured against its whole motion, see share_measure_at's flag 256)
     const bool auto_whole = share_whole_ && !whole_motion;
     c.flags = (scale_valid ? 1u : 0u) | (whole_motion ? 4u : 0u) | (depth_inverted ? 16u : 0u) | (fresh || share_reset_ ? 8u : 0u) |
@@ -7548,7 +7769,8 @@ void Renderer::follow_share(const IngestedSource& src, const float clip_to_prev_
         b.flags |= 8192u;
     }
     b.flags |= att_cut_ == 1 ? 16384u : att_cut_ == 2 ? 32768u : 0u;
-    if (share_scenery_ && (game_vectors_ || attached_est_)) b.flags |= 262144u;  // (not on XPAR's own estimate: it does not find the gun, synthetic attached +57-89%)    if (att_absolute_) b.flags |= 131072u;  // (see cs_share_up)
+    if (share_scenery_ && (game_vectors_ || attached_est_)) b.flags |= 262144u;  // (not on XPAR's own estimate: it does not find the gun, synthetic attached +57-89%)
+    if (att_absolute_) b.flags |= 131072u;  // (see cs_share_up)
     share_orbit_ = whole_motion && attached_carried_ && (game_vectors_ || attached_est_);  // (the warp's claims too - see ow_beside_carried)
     if (orbit_kind_ && share_orbit_) b.flags |= 64u;  // (see cs_share_up)
     att_hist_valid_ = att_hist;
@@ -7590,6 +7812,7 @@ void Renderer::follow_share(const IngestedSource& src, const float clip_to_prev_
         for (UINT i = 0; i < kWSrvCount; ++i) set_x_srv(kWSrv(kWShareResid) + i, kPDepth);
         set_x_srv(kWSrv(kWShareResid) + 0, kPObject);
         set_x_srv(kWSrv(kWShareResid) + 2, kPShare);
+        if (private_[kPMotion].texture) set_x_srv(kWSrv(kWShareResid) + 5, kPMotion);  // (game_px)
         set_x_uav(kWUav(kWShareResid) + 0, kPShareResid); set_x_uav(kWUav(kWShareResid) + 1, kPShareResid);
         transition(private_[kPShareResid], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         XConstants rc = c;
@@ -7635,6 +7858,7 @@ void Renderer::follow_share(const IngestedSource& src, const float clip_to_prev_
                 set_x_srv(kWSrv(kWOwnHaloH) + 0, kPOwnMove); set_x_srv(kWSrv(kWOwnHaloV) + 0, kPOwnT);
                 if (objects_blend_) {  // (each pixel's own motion - see cs_own_halo_h: with cs_share_resid's flags)
                     set_x_srv(kWSrv(kWOwnHaloH) + 2, kPObject); set_x_srv(kWSrv(kWOwnHaloH) + 3, kPShare);
+                    if (private_[kPMotion].texture) set_x_srv(kWSrv(kWOwnHaloH) + 5, kPMotion);  // (game_px)
                     hr.flags = rc.flags;
                 }
                 set_x_uav(kWUav(kWOwnHaloH) + 0, kPOwnT); set_x_uav(kWUav(kWOwnHaloH) + 1, kPOwnT);
@@ -7655,9 +7879,33 @@ void Renderer::follow_share(const IngestedSource& src, const float clip_to_prev_
                 for (UINT i = 0; i < kWSrvCount; ++i) set_x_srv(kWSrv(kWToPrev) + i, kPDepth);
                 set_x_srv(kWSrv(kWToPrev) + 0, kPObject);
                 set_x_srv(kWSrv(kWToPrev) + 2, kPOwnMove);
+                set_x_srv(kWSrv(kWToPrev) + 4, kPShare);  // (share_cam_px)
+                if (private_[kPMotion].texture) set_x_srv(kWSrv(kWToPrev) + 5, kPMotion);  // (game_px)
                 set_x_uav(kWUav(kWToPrev) + 0, kPToPrev); set_x_uav(kWUav(kWToPrev) + 1, kPToPrev);
                 transition(private_[kPToPrev], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-                w_dispatch(cs_to_prev_.Get(), &c, wc, kWToPrev, (c.rect[2] + 7) / 8, (c.rect[3] + 7) / 8);
+                XConstants tc = c;
+                tc.flags = rc.flags;  // (the shares as cs_share_resid applies them - see share_cam_px)
+                tc.alpha = 0.0f;
+                // (the camera's own error this frame - see cs_fit_sums)
+                const UINT fgx = ((c.rect[2] + 3) / 4 + 7) / 8, fgy = ((c.rect[3] + 3) / 4 + 7) / 8;  // (a sample in 4 x 4 - see cs_fit_sums)
+                if (private_[kPMotion].texture && ensure_private(kPFitPart, fgx * 7, fgy, DXGI_FORMAT_R32G32B32A32_FLOAT) &&
+                    ensure_private(kPFit, 3, 1, DXGI_FORMAT_R32G32B32A32_FLOAT)) {
+                    for (UINT i = 0; i < kWSrvCount; ++i) { set_x_srv(kWSrv(kWFitSums) + i, kPDepth); set_x_srv(kWSrv(kWFitTotal) + i, kPDepth); }
+                    set_x_srv(kWSrv(kWFitSums) + 0, kPObject);
+                    set_x_srv(kWSrv(kWFitSums) + 5, kPMotion);
+                    set_x_uav(kWUav(kWFitSums) + 0, kPFitPart); set_x_uav(kWUav(kWFitSums) + 1, kPFitPart);
+                    transition(private_[kPFitPart], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    w_dispatch(cs_fit_sums_.Get(), &c, wc, kWFitSums, fgx, fgy);
+                    transition(private_[kPFitPart], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    set_x_srv(kWSrv(kWFitTotal) + 0, kPFitPart);
+                    set_x_uav(kWUav(kWFitTotal) + 0, kPFit); set_x_uav(kWUav(kWFitTotal) + 1, kPFit);
+                    transition(private_[kPFit], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    w_dispatch(cs_fit_total_.Get(), &c, wc, kWFitTotal, 1, 1);
+                    transition(private_[kPFit], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    set_x_srv(kWSrv(kWToPrev) + 3, kPFit);
+                    tc.alpha = 1.0f;
+                }
+                w_dispatch(cs_to_prev_.Get(), &tc, wc, kWToPrev, (c.rect[2] + 7) / 8, (c.rect[3] + 7) / 8);
                 transition(private_[kPToPrev], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 info_p_.to_prev = info_p_.serial;
             }
@@ -8491,6 +8739,9 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
         ensure_private(kPTetherB, hw, hh, DXGI_FORMAT_R32G32B32A32_FLOAT) && ensure_private(kPTetherT, hw, hh, DXGI_FORMAT_R32G32_FLOAT) &&
         ensure_private(kPTetherF, c.rect[2], c.rect[3], DXGI_FORMAT_R32G32_FLOAT) && ensure_private(kPTetherP, hw, hh, DXGI_FORMAT_R32G32_UINT)) {
         c.threshold = float(static_cast<std::uint32_t>(c.threshold + 0.5f) | 131072u);
+        // (a block stands for a surface, not a lone point - see cs_tether_pick; FW_RULE_A_OFF, development: off)
+        static const bool rule_a_off = std::getenv("FW_RULE_A_OFF") != nullptr;
+        if (!rule_a_off) c.threshold = float(static_cast<std::uint32_t>(c.threshold + 0.5f) | 8388608u);
         const auto bound = warp_srv_;
         for (const UINT table : {UINT(kWTetherInit), UINT(kWTetherAB), UINT(kWTetherBA), UINT(kWTetherFinal)})
             for (UINT i = 0; i < 19; ++i) set_x_srv(kWSrv(table) + i, bound[i].first, bound[i].second);
@@ -8780,7 +9031,16 @@ void Renderer::execute() {
     if (context_ == 1 && release_wait_) q->Wait(fences_[0].Get(), release_wait_);
     // The intake between the warps (see set_intake_gate): this piece after the warp of the first gap between refreshes it fits in by
     // its measured time - gap 1 from now to the next warp, gap k after the warp k-1 refreshes later; a piece longer than a gap takes a
-    // gap of its own. At most 4 gaps ahead.
+    // gap of its own. At most 3 gaps ahead: a wait on a warp further ahead deadlocks the GPU. That warp is not submitted yet,
+    // and before drawing it the refresh queue waits for DWM to give back the swap chain buffer of present N-3 (3 buffers),
+    // which DWM does once a newer present reaches it. Each present waits for every queue that worked since the present
+    // before, the intake too, so a present behind this piece's wait never goes out. At 4 gaps ahead the buffer needs
+    // exactly such a present: the refresh, intake and present queues wait on each other for good and the presenter freezes
+    // (a late start in a heavy scene: Metro 2033 Redux, DOOM Eternal, 2026-11-15/17 - WPR GPU trace, dev/hang_doom_2026-11-15_stacks.txt).
+    // 3 ahead needs at most present P+2 (P: presents called so far - every warp submitted has had its Present) to be
+    // drawn, whose buffer comes back with present P, already sent (DWM was seen to give a buffer back on the next present).
+    // Played: 3 ahead thousands of times (Metro 2033 Redux a third of its pieces, DOOM, AC6, Returnal), 4 ahead only in the freezes.
+    constexpr int kGateGaps = 3;
     if (context_ == 1 && split_ && gate_on_ && warp_fence_ && gate_period_ > 0 && gate_tick_ > 0) {
         LARGE_INTEGER qn, qf; QueryPerformanceCounter(&qn); QueryPerformanceFrequency(&qf);
         const double f = double(qf.QuadPart);
@@ -8792,12 +9052,12 @@ void Renderer::execute() {
         const std::int64_t start = std::max(now, gate_last_end_);
         int k = 1;
         std::int64_t s0 = start;
-        for (; k <= 4; ++k) {
+        for (; k <= kGateGaps; ++k) {
             const std::int64_t gap_start = k == 1 ? now : tick + (k - 2) * period + warp, gap_end = tick + (k - 1) * period - margin;
             s0 = std::max(start, gap_start);
-            if (s0 + span <= gap_end || k == 4 || (k > 1 && s0 == gap_start && span > gap_end - gap_start)) break;
+            if (s0 + span <= gap_end || k == kGateGaps || (k > 1 && s0 == gap_start && span > gap_end - gap_start)) break;
         }
-        k = std::min(k, 4);
+        k = std::min(k, kGateGaps);
         const std::uint64_t target = warps_signaled_ + std::uint64_t(k - 1);
         q->Wait(warp_fence_.Get(), target);
         gate_requested_ = std::max(gate_requested_, target);
@@ -10418,7 +10678,7 @@ void Renderer::release_stash() {
 }
 
 std::string Renderer::memory_report() {
-    static const char* const kNames[] = {"Backbuffer", "Hudless", "Ui", "Depth", "Motion", "ZeroUi", "Output", "Object", "ObjKindA", "ObjKindB", "Gen0", "Gen1", "Gen2", "GenZ0", "GenZ1", "GenZ2", "Previous", "HudScore", "Mask", "Scene", "Attached", "World", "Fill", "Mem0", "Mem1", "MemZ0", "MemZ1", "RampRows", "Ramp", "WarpMask", "HudKind", "StashColor", "StashDepth", "StashMotion", "StashHudless", "Stash2Color", "Stash2Hudless", "Stash2Depth", "Stash2Motion", "LumaA", "LumaB", "Feat", "FlowA", "FlowB", "RetCells", "RetEncl", "RetA", "RetB", "RetLayer", "HudLearned", "HudTiles", "WarpClaims", "Still", "GrowA", "GrowB", "Probe", "ProbeTilesA", "ProbeTilesB", "ShareA", "ShareB", "ShareT", "Share", "RetDirtyA", "RetDirtyB", "ShareT2", "ShareHalf", "RecColour", "RecUi", "ShareResid", "OwnMove", "Paths", "ShareSeam", "AttHist", "MemVis", "UiTiles", "WarpBeside", "WarpHeld", "LowScene", "MaskRaw", "MemF0", "MemF1", "MemFZ0", "MemFZ1", "GunMove", "MemRatio", "MotionProbe", "MotionGame", "Stencil", "StenCellsA", "StenCellsB", "StenMask", "StenGrowA", "StenGrowB", "StenAge", "StenLumaA", "StenLumaB", "StenElig", "StenFringeA", "StenFringeB", "DepthVA", "DepthVB", "MemMask", "ShareSm", "ShareSmA", "RecOut", "TetherA", "TetherB", "TetherT", "TetherF", "TetherP", "GunFlag", "OwnT", "ToPrev", "PrevCol", "PrevTo"};
+    static const char* const kNames[] = {"Backbuffer", "Hudless", "Ui", "Depth", "Motion", "ZeroUi", "Output", "Object", "ObjKindA", "ObjKindB", "Gen0", "Gen1", "Gen2", "GenZ0", "GenZ1", "GenZ2", "Previous", "HudScore", "Mask", "Scene", "Attached", "World", "Fill", "Mem0", "Mem1", "MemZ0", "MemZ1", "RampRows", "Ramp", "WarpMask", "HudKind", "StashColor", "StashDepth", "StashMotion", "StashHudless", "Stash2Color", "Stash2Hudless", "Stash2Depth", "Stash2Motion", "LumaA", "LumaB", "Feat", "FlowA", "FlowB", "RetCells", "RetEncl", "RetA", "RetB", "RetLayer", "HudLearned", "HudTiles", "WarpClaims", "Still", "GrowA", "GrowB", "Probe", "ProbeTilesA", "ProbeTilesB", "ShareA", "ShareB", "ShareT", "Share", "RetDirtyA", "RetDirtyB", "ShareT2", "ShareHalf", "RecColour", "RecUi", "ShareResid", "OwnMove", "Paths", "ShareSeam", "AttHist", "MemVis", "UiTiles", "WarpBeside", "WarpHeld", "LowScene", "MaskRaw", "MemF0", "MemF1", "MemFZ0", "MemFZ1", "GunMove", "MemRatio", "MotionProbe", "MotionGame", "Stencil", "StenCellsA", "StenCellsB", "StenMask", "StenGrowA", "StenGrowB", "StenAge", "StenLumaA", "StenLumaB", "StenElig", "StenFringeA", "StenFringeB", "DepthVA", "DepthVB", "MemMask", "ShareSm", "ShareSmA", "RecOut", "TetherA", "TetherB", "TetherT", "TetherF", "TetherP", "GunFlag", "OwnT", "ToPrev", "PrevCol", "PrevTo", "FitPart", "Fit"};
     static_assert(sizeof(kNames) / sizeof(kNames[0]) == kPCount, "a name for every private texture");
     struct Item { std::string name; double mb; };
     std::vector<Item> items;
@@ -10484,7 +10744,7 @@ std::uint32_t Renderer::warp_rest_blocks() {
 bool Renderer::read_back(int which, std::vector<std::uint16_t>& pixels, std::uint32_t& w, std::uint32_t& h) {
     static const PrivateId kWhich[] = {kPBackbuffer, kPOutput, kPScene, kPDepth, kPMotion, kPObject, kPMask, kPHudScore, kPWorld, kPFill,
                                        kPStashColor, kPStashDepth, kPStashMotion, kPFlowB, kPStashHudless, kPStash2Color, kPStash2Hudless,
-                                       kPStash2Depth, kPStash2Motion, kPHudless, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPUi, kPWarpMask, kPRetLayer, kPDepth, kPDepth, kPDepth, kPHudLearned, kPHudTiles, kPHudKind, kPShare, kPRetEncl, kPAttached, kPMem0, kPPaths, kPStenCellsA, kPStenMask, kPShareSm, kPRamp, kPGunMove, kPTetherF, kPTetherA, kPRetCells, kPOwnMove, kPToPrev};
+                                       kPStash2Depth, kPStash2Motion, kPHudless, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPUi, kPWarpMask, kPRetLayer, kPDepth, kPDepth, kPDepth, kPHudLearned, kPHudTiles, kPHudKind, kPShare, kPRetEncl, kPAttached, kPMem0, kPPaths, kPStenCellsA, kPStenMask, kPShareSm, kPRamp, kPGunMove, kPTetherF, kPTetherA, kPRetCells, kPOwnMove, kPToPrev, kPTetherT, kPFit};
     if (which < 0 || which >= int(std::size(kWhich))) return false;
     // (the sight reticles' layer: the history texture written last)
     // (the background memory: the one written last)
@@ -10599,7 +10859,7 @@ bool Renderer::read_back(int which, std::vector<std::uint16_t>& pixels, std::uin
 bool Renderer::write_back(int which, const std::vector<std::uint16_t>& pixels, std::uint32_t w, std::uint32_t h) {
     static const PrivateId kWhich[] = {kPBackbuffer, kPOutput, kPScene, kPDepth, kPMotion, kPObject, kPMask, kPHudScore, kPWorld, kPFill,
                                        kPStashColor, kPStashDepth, kPStashMotion, kPFlowB, kPStashHudless, kPStash2Color, kPStash2Hudless,
-                                       kPStash2Depth, kPStash2Motion, kPHudless, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPUi, kPWarpMask, kPRetLayer, kPDepth, kPDepth, kPDepth, kPHudLearned, kPHudTiles, kPHudKind, kPShare, kPRetEncl, kPAttached, kPMem0, kPPaths, kPStenCellsA, kPStenMask, kPShareSm, kPRamp, kPGunMove, kPTetherF, kPTetherA, kPRetCells, kPOwnMove, kPToPrev};
+                                       kPStash2Depth, kPStash2Motion, kPHudless, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPUi, kPWarpMask, kPRetLayer, kPDepth, kPDepth, kPDepth, kPHudLearned, kPHudTiles, kPHudKind, kPShare, kPRetEncl, kPAttached, kPMem0, kPPaths, kPStenCellsA, kPStenMask, kPShareSm, kPRamp, kPGunMove, kPTetherF, kPTetherA, kPRetCells, kPOwnMove, kPToPrev, kPTetherT, kPFit};
     if (which < 0 || which >= int(std::size(kWhich)) || pixels.size() < std::size_t(w) * h * 4) return false;
     auto& p = kWhich[which] == kPMem0 ? private_[kPMem0 + std::max(mem_shown_, 0)]
             : split_ && shown_id(kWhich[which]) ? front_[kWhich[which]] : private_[kWhich[which]];

@@ -461,7 +461,7 @@ public:
         for (std::size_t i = frames_.size(); i-- > 1 && frames_.size() - i < 64;) {
             const Frame& b = frames_[i];
             const Frame& a = frames_[i - 1];
-            if (!b.consecutive) { out[0] = b.theta[0]; out[1] = b.theta[1]; return; }
+            if (!b.continuous) { out[0] = b.theta[0]; out[1] = b.theta[1]; return; }
             if (a.t <= t) {
                 const double w = (t - a.t) / (b.t - a.t);
                 for (int k = 0; k < 2; ++k) out[k] = a.theta[k] + (b.theta[k] - a.theta[k]) * w;
@@ -480,7 +480,7 @@ public:
         for (std::size_t i = frames_.size(); i-- > 1 && frames_.size() - i < 64;) {
             const Frame& b = frames_[i];
             const Frame& a = frames_[i - 1];
-            if (!b.consecutive) return b.pos;
+            if (!b.continuous) return b.pos;
             if (a.t <= t) return a.pos + (b.pos - a.pos) * ((t - a.t) / (b.t - a.t));
         }
         return frames_[frames_.size() - std::min<std::size_t>(frames_.size(), 64)].pos;
@@ -545,6 +545,10 @@ public:
             f.theta[0] = prev.theta[0] + dyaw;
             f.consecutive = !reset && epoch == prev.epoch && id == prev.id + 1 && t > prev.t && t - prev.t < 0.25 && std::fabs(dyaw) < 0.3 &&
                             std::fabs(f.theta[1] - prev.theta[1]) < 0.3;
+            // (the same with game frames missing in between - frames the presenter did not take: what is shown between the two is
+            // still on the way from one to the other)
+            f.continuous = f.consecutive || (!reset && epoch == prev.epoch && id > prev.id && t > prev.t && t - prev.t < 0.25 &&
+                                             std::fabs(dyaw) < 0.3 && std::fabs(f.theta[1] - prev.theta[1]) < 0.3);
         }
         frames_.push_back(f);
         while (frames_.size() > 1200) frames_.pop_front();
@@ -721,7 +725,7 @@ public:
             for (std::size_t i = frames_.size(); i-- > 1 && frames_.size() - i < 64;) {
                 const Frame& b = frames_[i];
                 const Frame& a = frames_[i - 1];
-                if (!b.consecutive) break;
+                if (!b.continuous) break;
                 if (a.t <= target_t) {
                     const double w = (target_t - a.t) / (b.t - a.t);
                     for (int k = 0; k < 2; ++k) theta[k] = a.theta[k] + (b.theta[k] - a.theta[k]) * w;
@@ -1188,10 +1192,16 @@ private:
         double theta[2];  // unwrapped yaw, pitch (elevation)
         bool gate;
         Vec3 fwd;
-        bool consecutive = false;
+        bool consecutive = false;  // (the frame right after the one before: the fits, the frame interval, the velocity)
         Vec3 pos{};
         std::uint32_t epoch = 0;
         Vec3 right{}, up{};
+        // Cut-free from the frame before, frames missing in between or not: what the camera shown between frames goes through
+        // (position_at, theta_at, predict). Required consecutive, a game frame the presenter did not take - DOOM Eternal took two
+        // in three while a clip was recorded - put the camera at the newer frame's position a whole step early while the older
+        // picture was still shown: walking backwards, the camera swung between ~0.9 of a step behind the picture and a whole
+        // step past it from one game frame to the next (2026-11-15).
+        bool continuous = false;
     };
     struct Source {
         double t = 0;
