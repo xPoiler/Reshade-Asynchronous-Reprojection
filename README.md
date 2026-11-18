@@ -1,4 +1,7 @@
-DISABLE GLOBAL FRAME LIMITERS, INCLUDING BACKGROUND FRAME LIMITERS (CHECK NVIDIA CONTROL PANEL) OR THE REPROJECTION WON'T WORK.
+If you like the addon, you can support me at https://ko-fi.com/xpoiler
+
+
+**IMPORTANT: Disable global frame limiters, including background frame limiters (check nvidia control panel) or the reprojection won't work.**
 
  
 # FrameWarp
