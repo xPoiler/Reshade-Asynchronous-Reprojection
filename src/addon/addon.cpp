@@ -321,6 +321,8 @@ constexpr Persisted kPersisted[] = {
     {"UiScale", nullptr, &fw::Settings::ui_scale, true},
     {"ReShadeOnOutput", &fw::Settings::reshade_on_output, nullptr},
     {"ObjectInterpolation", &fw::Settings::object_interp, nullptr},
+    {"EvenPacing", &fw::Settings::even_pacing, nullptr},
+    {"WholePixels", &fw::Settings::whole_pixels, nullptr},
     {"EdgeLimit", nullptr, &fw::Settings::edge_limit_pct},
     {"EdgeUnlimited", &fw::Settings::edge_unlimited, nullptr},
     {"WarpEngine", &fw::Settings::warp_engine, nullptr},
@@ -1188,6 +1190,12 @@ void draw_overlay(effect_runtime*) {
             s.use_controller = controller;
             reshade::set_config_value(nullptr, "FrameWarp", "Controller", controller ? "1" : "0");
         }
+        bool even = s.even_pacing != 0;
+        if (ImGui::Checkbox("Even pacing (controller)", &even)) s.even_pacing = even;
+        hint("While the right stick turns the camera, the turn shown follows the stick, matched to the game's camera over its "
+             "last frames, instead of when each game frame arrived: even at any frame rate, also in games whose frames carry "
+             "uneven game time (fixed simulation steps). Off: the turn between game frames, as they came. The mouse is "
+             "unaffected either way.");
         if (shown_in_ui(kHiddenFromUi.rotation_extrapolation)) ImGui::SliderFloat("Rotation extrapolation", &s.rotation_extrapolation, 0.0f, 1.0f);
         static const char* const kAutoModes[] = {"Off (manual slider)", "Auto (1/2, 1/4 without HUD layers, 1 without DLSS/FSR)", "1 game frame", "1/2 game frame",
                                                  "1/4 game frame", "Camera as of now (edge-limited)", "Lowest latency without edge fill (default)"};
@@ -1393,6 +1401,16 @@ void draw_overlay(effect_runtime*) {
                  "the scenery along the edge more the further out, slightly less saturated; extended edge pixels repeat the "
                  "edge (sharper close to it, streaks further out); dithered shows the game's frame as it is there, mixed into "
                  "the warped picture in a fine pattern near the edge - noisy, not smeared. Remembered per game.", why_engine);
+        }
+        {
+            ImGui::BeginDisabled(why_engine != nullptr);
+            bool whole = s.whole_pixels != 0;
+            if (ImGui::Checkbox("Whole pixels (XPAR engine)", &whole)) s.whole_pixels = whole;
+            ImGui::EndDisabled();
+            hint("The warped picture takes the nearest of the game's own pixels, never a blend of neighbours: as sharp as the "
+                 "game's frame on every refresh. Off: blended (bilinear) - fine detail softens by how far between pixels the "
+                 "warp lands, so a turn can go sharp and soft with its speed. On, things sit up to half a pixel from their exact "
+                 "place. Remembered per game.", why_engine);
         }
         if (!latewarp && shown_in_ui(kHiddenFromUi.warp_engine))
             ImGui::TextDisabled("NVIDIA Latewarp is not installed (optional: nvngx_latewarp.dll, NVIDIA GPUs only)");

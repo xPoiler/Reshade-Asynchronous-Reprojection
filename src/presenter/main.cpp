@@ -32,6 +32,8 @@
 
 namespace fw {
 namespace {
+// (development, AlwaysWarp - FW_ALWAYS_WARP: see where it is read)
+bool g_always_warp = false;
 
 double g_qpc_to_seconds = 0;
 std::int64_t g_qpc_frequency = 10000000;
@@ -126,6 +128,11 @@ struct SequenceRecorder {
         std::lock_guard<std::mutex> lock(mu);
         out_lines[frame] = std::move(line);
     }
+    // (Page Down's clips: a 1280x720 window in the middle of the screen at full size, of every refresh drawn - display_<k>.bin,
+    // displays.txt with each one's time - and of each game frame the warp read - source_<frame>.bin; no game frames for
+    // seq_replay: ~0.66 GB a second at 120 Hz, the whole 10 s held. For judging fine detail and motion refresh by refresh)
+    std::atomic<bool> crop{false};
+    static constexpr std::uint32_t kCropW = 1280, kCropH = 720;
     void start(Renderer& renderer, const std::filesystem::path& root, const std::string& settings_line) {
         std::error_code ec;
         std::filesystem::create_directories(root, ec);
@@ -150,6 +157,7 @@ struct SequenceRecorder {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
         std::vector<std::pair<std::string, RecordedFrame>> clip, shown;
         std::vector<RecordedFrame> generated;  // (the game's generated images, by their frame's tag and number)
+        std::vector<RecordedFrame> sources;    // (crop: the pictures the warp read, by game frame)
         std::size_t bytes = 0;
         for (;;) {
             RecordedFrame f;
@@ -166,6 +174,12 @@ struct SequenceRecorder {
                     auto& from = f.output ? out_lines : lines;
                     const auto it = from.find(f.tag);
                     if (it != from.end()) { line = std::move(it->second); from.erase(from.begin(), std::next(it)); }
+                }
+                if (f.source) {
+                    bytes += f.colour.size();
+                    sources.push_back(std::move(f));
+                    if (bytes > kRecMaxBytes) active = false;
+                    continue;
                 }
                 if (f.output) {
                     if (line.empty()) continue;
@@ -244,6 +258,21 @@ struct SequenceRecorder {
                 written += sizeof(head) + sizeof(sizes) + f.colour.size();
             }
             shown[i].second = RecordedFrame{};
+        }
+        for (RecordedFrame& f : sources) {
+            FILE* out = nullptr;
+            const std::uint64_t frame = f.tag & ~(std::uint64_t(1) << 61);
+            if (_wfopen_s(&out, (dir / (L"source_" + std::to_wstring(frame) + L".bin")).c_str(), L"wb") == 0 && out) {
+                const std::uint32_t head[8] = {0x46525746u, 1u, std::uint32_t(frame), std::uint32_t(frame >> 32), f.cw, f.ch, 0u, 0u};
+                std::uint64_t sizes[8] = {};
+                sizes[0] = sizes[1] = f.colour.size();
+                std::fwrite(head, sizeof(head), 1, out);
+                std::fwrite(sizes, sizeof(sizes), 1, out);
+                std::fwrite(f.colour.data(), 1, f.colour.size(), out);
+                std::fclose(out);
+                written += sizeof(head) + sizeof(sizes) + f.colour.size();
+            }
+            f = RecordedFrame{};
         }
         // (frame generation: gen_<index>_<i>.bin - the game's generated image i of clip frame <index>, as the game made it, in the
         // display files' layout; a frame not in the clip, its images not written)
@@ -985,6 +1014,7 @@ void render_thread() {
         if (env_on(L"FW_CARRIED_FREE")) { renderer.set_carried_free(true); logf("carried pixels not held by the warp (development: CarriedFree)"); }
         if (env_on(L"FW_MEM_POS")) { renderer.set_mem_pos(true); logf("the background memory carried with its own positions (development: MemoryPositions)"); }
         if (env_on(L"FW_ATT_ABS")) { renderer.set_att_absolute(true); logf("the attached rule by the share a spot takes (development: AttachedAbsolute)"); }
+        if (env_on(L"FW_ALWAYS_WARP")) { g_always_warp = true; logf("every refresh warped and presented, also with nothing moved and with the ReShade overlay open (development: AlwaysWarp)"); }
         if (env_on(L"FW_DITHER_NO_BAND")) { renderer.set_edge_dither_band(false); logf("dithered screen edges without their band inside the picture (development: EdgeDitherNoBand)"); }
         if (env_on(L"FW_DITHER_HOLES")) { renderer.set_dither_holes(true); logf("what no frame has dithered (development: DitherHoles)"); }
         if (env_on(L"FW_ATT_EST")) { renderer.set_attached_estimated(true); logf("the attached rule with XPAR's own motion estimate too (development: AttachedEstimated)"); }
@@ -1185,6 +1215,8 @@ void render_thread() {
     PlannedFrame planned[16];
     int planned_at = 0;
     std::int64_t frame_tick = 0, frame_vblank = 0, timing_seen = 0;
+    std::deque<std::pair<double, double>> paced_allowed;  // (Auto latency 6 with even pacing: the allowed times of the last second)
+    std::uint64_t log_paced = 0;  // (presents whose turn even pacing made, since the last log line)
     // Auto latency "camera as of now": the time ahead of Auto's camera in use (s).
     double now_ahead = 0;
     std::uint32_t log_presents = 0, capped_windows = 0;
@@ -1903,7 +1935,7 @@ void render_thread() {
                     }
                 }
                 // Sequence recording: this frame, as taken in, and its line in frames.txt.
-                if (g_rec.active && renderer.record_frame(m.frame_id, s.has_ui)) {
+                if (g_rec.active && !g_rec.crop && renderer.record_frame(m.frame_id, s.has_ui)) {
                     char line[1600];
                     int len = std::snprintf(line, sizeof(line),
                         "frame %llu time %.6f color_rect %u %u %u %u depth_rect %u %u %u %u mv_scale %.9g %.9g %d depth_inverted %u estimated %u "
@@ -2086,6 +2118,7 @@ void render_thread() {
         PoseSettings ps;
         ps.use_mouse = settings.use_mouse != 0;
         ps.use_stick = settings.use_controller != 0;
+        ps.input_paced = settings.even_pacing != 0;  // (Even pacing: the stick's turn shown evenly - PoseModel::input_paced_theta)
         ps.async_fit = true;  // (the fit runs on its own thread: tens of ms with a controller)
         ps.rotation_extrapolation = settings.rotation_extrapolation;
         ps.prediction = settings.prediction_ms / 1000.0;
@@ -2227,7 +2260,7 @@ void render_thread() {
         Prediction applied{};
         // FrameWarp's own warp engine when chosen, or when Latewarp is not available.
         const bool own_engine = settings.warp_engine == 1 || !latewarp.ready();
-        if (source.valid && settings.enabled && !settings.show_original && !sh.overlay_open && source.has_depth) {
+        if (source.valid && settings.enabled && !settings.show_original && (!sh.overlay_open || g_always_warp) && source.has_depth) {
             // (paced: the camera as of the planned wake-up, a fixed time before the refresh it is meant for - not
             // the moment the loop got there, which varies by a fraction of a millisecond and would jitter the motion)
             const double t_camera = frame_tick && seconds(frame_tick) <= now ? seconds(frame_tick) : now;
@@ -2295,12 +2328,26 @@ void render_thread() {
                     }
                     allowed = lo;
                 }
-                now_ahead = std::clamp(now_ahead + std::clamp(allowed - now_ahead, -1.5e-3, turning ? 0.25e-3 : 0.0), oldest, ahead);
+                // (even pacing driving the turn - PoseModel::input_paced_theta: the allowed time steps back whenever a game frame
+                // carrying less game time comes - EDF6's one-tick frames - and following it took back up to 1.5 ms of the turn in
+                // a refresh: a dip of a fifth of its step, now and then (2026-11-19, seq_4). So the lowest allowed time of the last
+                // second, followed at most 0.1 ms a refresh either way: the pace of the turn stays the stick's; now and then a
+                // sliver of edge, a fraction of a tick, may want the edge fill)
+                const bool paced = g_app.model.paced_last();
+                paced_allowed.emplace_back(now, allowed);
+                while (!paced_allowed.empty() && paced_allowed.front().first < now - 1.0) paced_allowed.pop_front();
+                if (paced) {
+                    double low = allowed;
+                    for (const auto& a : paced_allowed) low = std::min(low, a.second);
+                    now_ahead = std::clamp(now_ahead + std::clamp(low - now_ahead, -0.1e-3, 0.1e-3), oldest, ahead);
+                } else
+                    now_ahead = std::clamp(now_ahead + std::clamp(allowed - now_ahead, -1.5e-3, turning ? 0.25e-3 : 0.0), oldest, ahead);
                 if (now_ahead != 0) p = g_app.model.predict(t_camera + now_ahead);
             } else {
                 now_ahead = 0;
             }
             g_app.model.set_display_ahead(now_ahead);
+            if (g_app.model.paced_last()) ++log_paced;
             if (settings.invert_warp) p.camera = apply_rotation(source_basis, g_app.model.world_up(), -p.yaw, -p.pitch, source_basis.pos);
             applied = p;
             const Vec3 origin = source_basis.pos;
@@ -2336,6 +2383,7 @@ void render_thread() {
                 // warp pass.)
                 unmoved = !settings.show_mask && generated < 0;
                 for (int i = 0; i < 16 && unmoved; ++i) unmoved = std::fabs(m.data()[i] - (i % 5 == 0 ? 1.0f : 0.0f)) < 2e-6f;
+                if (g_always_warp) unmoved = false;  // (development, AlwaysWarp: warped even so - a misfiring "nothing moved" would show)
                 renderer.set_warp_splat(settings.warp_splat != 0);
                 // (two shares, Settings::share_from_input: the input's part of the predicted turn on its own - the frame's
                 // camera turned by it - for the warp to move each spot by its share of each part; not around an orbit)
@@ -2397,13 +2445,24 @@ void render_thread() {
                 // by default, a game without them drew every refresh of a still camera for nothing)
                 if (objects_between && generated < 0 && held_back > 0 && renderer.objects_ready()) unmoved = false;
                 renderer.set_edge_dither(settings.edge_fill == 2);
+                renderer.set_whole_pixels(settings.whole_pixels != 0);
                 warped = unmoved || renderer.own_warp(source, settings.use_ui_tags != 0, inputs.no_warp_mask != nullptr, m.data(), inputs.depth_inverted,
                                                      settings.background_memory != 0, generated,
                                                      settings.edge_fill == 1, input_part ? m_input.data() : nullptr);
                 // Sequence recording: the first refresh drawn for each game frame shown, as drawn - and its warp's inputs, for
                 // seq_replay FW_MATCH to draw it again from the clip (see Renderer::record_output)
-                static std::uint64_t recorded_shown = 0;
-                if (g_rec.active && warped && !unmoved && shown_frame != recorded_shown && renderer.record_output(shown_frame)) {
+                static std::uint64_t recorded_shown = 0, crop_serial = 0, crop_source = 0;
+                const bool crop = g_rec.active && g_rec.crop;
+                const std::uint32_t crop_x = (renderer.width() > SequenceRecorder::kCropW ? (renderer.width() - SequenceRecorder::kCropW) / 2 : 0),
+                                    crop_y = (renderer.height() > SequenceRecorder::kCropH ? (renderer.height() - SequenceRecorder::kCropH) / 2 : 0);
+                // (crop: the game frame the warp read, once - tag bit 61 - and every refresh drawn - tag bit 62 and a running number)
+                if (crop && warped && !unmoved && shown_frame != crop_source &&
+                    renderer.record_crop((std::uint64_t(1) << 61) | shown_frame, true, crop_x, crop_y, SequenceRecorder::kCropW, SequenceRecorder::kCropH))
+                    crop_source = shown_frame;
+                const std::uint64_t crop_tag = (std::uint64_t(1) << 62) | ++crop_serial;
+                if (g_rec.active && warped && !unmoved && (crop || shown_frame != recorded_shown) &&
+                    (crop ? renderer.record_crop(crop_tag, false, crop_x, crop_y, SequenceRecorder::kCropW, SequenceRecorder::kCropH)
+                          : renderer.record_output(shown_frame))) {
                     recorded_shown = shown_frame;
                     char line[1600];
                     int len = std::snprintf(line, sizeof(line), "frame %llu since %.6f held_back %.6f held_between %d generated %d use_ui_tags %d use_mask %d "
@@ -2416,7 +2475,9 @@ void render_thread() {
                     len += std::snprintf(line + len, sizeof(line) - len, " input %d", int(input_part));
                     for (int e = 0; e < 16 && input_part; ++e) len += std::snprintf(line + len, sizeof(line) - len, " %.9g", m_input.data()[e]);
                     len += std::snprintf(line + len, sizeof(line) - len, " objects_between %d", objects_between ? int(std::min<std::uint32_t>(settings.object_interp, 2u)) : 0);
-                    g_rec.note_output(shown_frame, line);
+                    // (crop: when it was drawn, the camera's horizon, the window's corner)
+                    if (crop) len += std::snprintf(line + len, sizeof(line) - len, " t %.6f horizon_ms %.4f crop %u %u", now_seconds(), applied.horizon * 1000.0, crop_x, crop_y);
+                    g_rec.note_output(crop ? crop_tag : shown_frame, line);
                 }
             } else {
                 warped = latewarp.evaluate(list, inputs, first_eval, view_matrix(p.camera, origin, z_sign),
@@ -2563,7 +2624,9 @@ void render_thread() {
         }
         g_app.dump_was_down = dump_down;
         // Ctrl+Shift+F8 (development): starts / stops a sequence recording (see SequenceRecorder). (Not R: AMD's recording key; not P: RE2 pauses.)
-        const bool record_down = keys_on && (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000) && (GetAsyncKeyState(VK_F8) & 0x8000);
+        // Page Down alone does the same (one hand free for the stick - user, 2026-11-19).
+        const bool page_down = keys_on && (GetAsyncKeyState(VK_NEXT) & 0x8000);  // (its clips keep the shown pictures at full size - see full_display)
+        const bool record_down = page_down || (keys_on && (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000) && (GetAsyncKeyState(VK_F8) & 0x8000));
         if (record_down && !g_app.record_was_down) {
             if (!g_rec.busy) {
                 wchar_t local[MAX_PATH] = {}, exe[MAX_PATH] = {};
@@ -2579,6 +2642,7 @@ void render_thread() {
                               int(settings.follow_share), int(settings.share_from_input), int(settings.keep_attached), int(settings.no_warp_mask),
                               int(settings.game_hud_layers), int(settings.use_ui_tags), int(settings.background_memory), int(settings.hold_reticles),
                               int(settings.stretch_width), int(measured_orbit()), int(settings.warp_engine), int(settings.warp_splat), int(settings.edge_fill), int(settings.object_interp));
+                g_rec.crop = page_down;
                 g_rec.start(renderer, root, header);
                 logf("sequence recording started: %ls", g_rec.dir.c_str());
             } else if (g_rec.active) {
@@ -2883,6 +2947,9 @@ void render_thread() {
                     logf("refresh loop: %.1f presents/s | per present: Present call %.2f ms (max %.1f), swapchain wait %.2f ms | display %.1f Hz",
                          log_presents / span, log_presents ? log_present_call_ms / log_presents : 0.0, log_present_call_max,
                          log_presents ? log_swap_wait_ms / log_presents : 0.0, st.display_hz);
+                    if (log_paced)
+                        logf("even pacing: the stick's turn shown evenly on %.0f%% of presents", 100.0 * double(log_paced) / std::max(1.0, double(log_presents)));
+                    log_paced = 0;
                     log_swap_wait_ms = log_present_call_ms = log_present_call_max = 0; log_presents = 0; log_since = now;
                 }
             }

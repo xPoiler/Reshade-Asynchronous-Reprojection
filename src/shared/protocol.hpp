@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 91;  // (90: a test build installed 2026-11-12, never committed)
+constexpr std::uint32_t kVersion = 93;  // (93: Settings::whole_pixels; 92: Settings::even_pacing; 90: a test build installed 2026-11-12, never committed)
 // (four: the presenter taking one in, one ready, and the add-on writing two - a game that starts its next frame before
 // the last one is presented (its tags and constants come first: Cyberpunk, Enshrouded) has two being written. Three
 // slots, 2026-10-28, dropped 43-55% of their frames before the presenter saw them - the reprojection fed at half the
@@ -160,6 +160,12 @@ struct Settings {
                                        // its frames a second; LAT, the whole latency, until 2026-11-18), and XPAR, what the warp
                                        // adds (+) or takes off (-) against the game's own latency (the camera's age on screen
                                        // minus the game's input to finished frame) - see main.cpp, LatencyRows (saved per game)
+    std::uint32_t even_pacing;         // default on: while the controller's right stick turns the camera, the turn shown goes with the stick,
+                                       // fitted to the game's camera over its last frames, not with when the game's frames came - even at any
+                                       // frame rate, also where frames carry uneven game time (PoseSettings::input_paced; saved per game)
+    std::uint32_t whole_pixels;        // default on: the warp's picture from the nearest of the game's pixels, never a blend of neighbours -
+                                       // a blend softened fine detail by how far between pixels the warp landed, a turn going sharp and soft
+                                       // with its speed (Renderer::set_whole_pixels; saved per game)
 };
 
 // Presenter status, displayed by the add-on UI.

@@ -58,6 +58,7 @@ struct RecordedFrame {
     std::vector<std::uint8_t> stencil;  // (StencilMask=1: the game's stencil on the depth's grid, R8 - empty without; stencil_<i>.bin)
     bool output = false;  // (record_output: what the warp showed for game frame `tag` - colour alone, the picture's recorded size)
     int gen = -1;         // (record_generated: the frame's generated image of this index - colour alone, as output)
+    bool source = false;  // (record_output with a crop and source: the picture the warp read, not what it showed)
 };
 
 // HUD detection frames: learned from, skipped for too few telling pixels, or held back by the
@@ -367,6 +368,8 @@ public:
     // What a turn uncovers past the frame's edge, where the background memory has nothing: dithered - the frame as it is
     // there, and a dithered band inside the edge (the "Uncovered screen edges" setting, 2) - instead of soft/extended.
     void set_edge_dither(bool on) { edge_dither_ = on; }
+    // The warp's picture from the nearest of the game's pixels, never a blend of neighbours (the "Whole pixels" setting - see ow_pick).
+    void set_whole_pixels(bool on) { whole_pixels_ = on; }
     // Development (seq_replay FW_CLAIM_OLD): the claim rule beside held pixels as before 2026-10-20 - nothing within 2
     // rendered px of a held pixel claims - to trace what the current one changes.
     void set_claim_rule_old(bool on) { claim_rule_old_ = on; }  // (uncovered areas: the fill looks out to 128 render px)
@@ -456,6 +459,9 @@ public:
     bool record_generated(std::uint64_t tag, int i);
     // (and what the warp just drew, shrunk as the frame's picture is - after own_warp, on the refresh's list: tag, the game frame shown)
     bool record_output(std::uint64_t tag);
+    // ...a window of it at full size (crop w x h at x0, y0 of the output), or of the picture the warp read last (source) -
+    // Page Down's clips: every refresh, fine detail kept
+    bool record_crop(std::uint64_t tag, bool source, std::uint32_t x0, std::uint32_t y0, std::uint32_t w, std::uint32_t h);
     bool take_recorded(RecordedFrame& out);
     bool recording_in_flight() const { for (const auto& r : rec_) if (r.state.load() != 0) return true; return false; }  // (debug: the warp writes the way it found each pixel - see ow_path)
     void set_warp_stop(int stage) { warp_stop_ = stage; }
@@ -681,7 +687,7 @@ private:
     bool infill_est_ = false, flow_ui_ = false, flow_ui_masked_ = false, flow_ui_off_ = false;  // (the motion estimate this frame: the HUD layer given / left out - fl_under_hud)
     unsigned mem_res_ = 2;
     bool ui_synth_last_ = false, colour_unblend_ = true, unblend_exact_ = false;  // (kPUi holds the layer cs_hudless_ui made from the last frame)
-    bool share_whole_ = false, att_smooth_ = true, att_hist_valid_ = false, share_full_mask_ = false, mem_fringe_ = false, ui_from_hudless_ = true,  mem_vis_off_ = false, mem_pos_ = false, mem_nearest_ = false, share_seam_ = false, mem_age_old_ = false, mem_front_ = false, mem_static_ = false, mem_two_ = false, mem_front_valid_ = false, hud_keep_check_ = false, attached_est_ = false, ring_old_ = false, fill_inside_old_ = false, memory_scenery_ = false, attached_carried_ = true, chars_carried_ = false, splat_turns_ = true, own_carried_only_ = false, own_depth_blind_ = false, paths_capture_ = false, in_paths_ = false, outlines_held_ = true, outline_scenery_ = false, carried_free_ = false, carried_edge_ = true, outline_wide_ = false, memory_margin_ = true, infill_mirror_ = false, infill_memory_ = true, infill_wide_ = false, game_vectors_ = false, edge_dither_ = false, claim_rule_old_ = false;
+    bool share_whole_ = false, att_smooth_ = true, att_hist_valid_ = false, share_full_mask_ = false, mem_fringe_ = false, ui_from_hudless_ = true,  mem_vis_off_ = false, mem_pos_ = false, mem_nearest_ = false, share_seam_ = false, mem_age_old_ = false, mem_front_ = false, mem_static_ = false, mem_two_ = false, mem_front_valid_ = false, hud_keep_check_ = false, attached_est_ = false, ring_old_ = false, fill_inside_old_ = false, memory_scenery_ = false, attached_carried_ = true, chars_carried_ = false, splat_turns_ = true, own_carried_only_ = false, own_depth_blind_ = false, paths_capture_ = false, in_paths_ = false, outlines_held_ = true, outline_scenery_ = false, carried_free_ = false, carried_edge_ = true, outline_wide_ = false, memory_margin_ = true, infill_mirror_ = false, infill_memory_ = true, infill_wide_ = false, game_vectors_ = false, edge_dither_ = false, claim_rule_old_ = false, whole_pixels_ = true;
     int rim_mode_ = 2;
     bool claims_reuse_ = false, claims_valid_ = false, ui_tiles_off_ = false, claims_turn_only_ = false;
     std::uint64_t shown_serial_ = 0, claims_serial_ = ~0ull;
@@ -730,6 +736,7 @@ private:
         bool has_ui = false;
         bool output = false;  // (record_output: colour alone)
         int gen = -1;         // (record_generated: which generated image - colour alone)
+        bool source = false;  // (record_output: the warp's source picture, not its output)
         std::atomic<int> state{0};  // 0 free, 1 queued on a list, 2 submitted (its fence known) - see take_recorded
     };
     RecSlot rec_[kRecSlots];

@@ -72,6 +72,8 @@ void default_settings(Settings& s) {
                                // without HUD layers (shorter warps hide mask misses), 1 without DLSS/FSR (XPAR's own motion); 1: full, 2: half, 4: quarter
     s.manual_gain_x = s.manual_gain_y = 0.0f; s.manual_delay_ms = 0.0f;
     s.use_controller = 1;  // the right stick drives rotation too
+    s.even_pacing = 1;     // the stick's turn shown evenly (PoseSettings::input_paced)
+    s.whole_pixels = 1;    // the warp's picture from whole game pixels (Renderer::set_whole_pixels)
 }
 
 Producer::Producer() {

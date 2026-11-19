@@ -388,6 +388,9 @@ struct PoseSettings {
     bool freeze_fit = false;  // (testing: the mouse parameters stay as seeded)
     bool use_stick = false;   // the controller's right stick drives rotation too (it is learned either way)
     bool async_fit = false;   // fit on a worker thread (the presenter: the render thread only copies the history)
+    int input_paced_frames = 12;        // (the game frames the fit takes)
+    double input_paced_residual = 0.05; // (an axis used only where the fit leaves under this share of the turn over its frames unexplained)
+    bool input_paced = false; // Even pacing: between game frames the turn shown goes with the input, not the frames' times (see input_paced_theta)
 };
 
 struct Prediction {
@@ -436,6 +439,8 @@ public:
     // "camera as of now"): a new frame's correction is then measured and faded in at the displayed time - at
     // Auto's time it left a small jump at every game frame (a gritty camera on small mouse movements).
     void set_display_ahead(double ahead) { display_ahead_ = ahead; }
+    // Whether the last prediction was made with even pacing's turn (input_paced_theta).
+    bool paced_last() const { return paced_last_; }
     // The wall time the camera's position is shown for, set before each refresh's predictions: the position follows the wall
     // clock alone (a game frame and the game's latency behind it - see predict), not the time asked for the turn, which the
     // edge limit and Auto latency move about.
@@ -708,6 +713,7 @@ public:
     // Camera for display at wall time `now`, relative to the newest source.
     Prediction predict(double now) const {
         Prediction out;
+        paced_last_ = false;
         if (!have_source_) return out;
         // prediction > 0 shows the camera ahead of the game's own latency (more extrapolation);
         // prediction < 0 shows it further in the past, down to interpolating between the last two
@@ -734,6 +740,15 @@ public:
                     break;
                 }
                 theta[0] = a.theta[0]; theta[1] = a.theta[1]; pos = a.pos; reached = a.t;
+            }
+            // (even pacing: the turn the input gives, fitted to the game's camera over its last frames - see input_paced_theta)
+            if (input_paced_now(now)) {
+                double paced[2];
+                bool axis[2] = {false, false};
+                if (input_paced_theta(target_t, paced, axis)) {
+                    for (int k = 0; k < 2; ++k) if (axis[k]) theta[k] = paced[k];
+                    paced_last_ = true;
+                }
             }
             const double fade = std::exp(-(now - blend_t_) / std::max(settings_.blend_tau, 1e-4));
             for (int k = 0; k < 2; ++k) delta[k] = theta[k] - src_.theta[k] + blend_[k] * fade;
@@ -777,6 +792,16 @@ public:
             const double fade = std::exp(-(now - blend_t_) / std::max(settings_.blend_tau, 1e-4));
             blended[k] = blend_[k] * fade;
             delta[k] += blended[k];
+        }
+        // (even pacing: past the newest frame too, the same fitted turn - with the learned gain here and the fit before it, the
+        // shown turn changed speed each time the displayed time crossed the newest frame: half the refreshes at Auto's half frame)
+        if (input_paced_now(now)) {
+            double paced[2];
+            bool axis[2] = {false, false};
+            if (input_paced_theta(src_.t + h, paced, axis)) {
+                for (int k = 0; k < 2; ++k) if (axis[k]) { delta[k] = paced[k] - src_.theta[k] + blended[k]; going_on[k] = 0; }
+                paced_last_ = true;
+            }
         }
         out.camera = apply_rotation(src_.basis, up_.get(), delta[0], delta[1], orbit_pivot());
         out.camera.pos = out.camera.pos + shown_movement(delta) + blend_pos_ * std::exp(-(now - blend_t_) / std::max(settings_.blend_tau, 1e-4));
@@ -834,7 +859,7 @@ public:
     // The camera's turn between frame times a and b (yaw, pitch; radians) that the input explains, as predict applies it:
     // the camera at time t takes the input up to t + delay, smoothed - the difference of that at b and at a. false: no
     // input model (no gain fitted, the input not followed - a menu - or not used).
-    bool input_turn(double a, double b, double out[2]) const {
+    bool input_turn(double a, double b, double out[2], bool stick_only = false) const {
         out[0] = out[1] = 0;
         bool any = false;
         for (int k = 0; k < 2; ++k) {
@@ -842,7 +867,7 @@ public:
             const double tau = p.tau;
             const double settled = std::max(10.0 * tau, 0.05);  // (input older than this counts in full at both)
             const double g = gain(k);
-            if (settings_.use_mouse && gate_ && follows_ && g != 0.0) {
+            if (!stick_only && settings_.use_mouse && gate_ && follows_ && g != 0.0) {
                 const double d = settings_.manual_gain ? settings_.manual_delay : p.delay;
                 const double lo = a + d - settled;
                 out[k] += g * (mouse.filtered(k, lo, b + d, b + d, tau) - mouse.filtered(k, lo, a + d, a + d, tau));
@@ -854,6 +879,62 @@ public:
                                           stick.filtered(k, lo, a + p.delay, a + p.delay, tau, p.stick_power));
                 any = true;
             }
+        }
+        return any;
+    }
+    // Even pacing is the stick's (the mouse lately: none - a hand's own movement is uneven and the game follows it closely: a
+    // fitted line only lagged behind a flick, replays of DOOM, RE2, AC6 - the shown camera 3-17 mrad further off the game's)
+    bool input_paced_now(double now) const {
+        return settings_.input_paced && settings_.use_stick && stick.deflected(src_.t - kInputLately, now) &&
+               !(settings_.use_mouse && mouse.moved(src_.t - kInputLately, now));
+    }
+    // Even pacing (PoseSettings::input_paced): the camera's turn at time t (unwrapped yaw, pitch) from the input, not from when
+    // the game's frames came. A game's frames can carry uneven game time while they come evenly - Earth Defense Force 6
+    // simulates in 60 Hz ticks, drawn at ~47 fps its frames carry one tick or two, a held stick turns its camera 0.476 or 0.952
+    // degrees a frame - and between frames timed as they came the turn shown ran at 21 and 43 degrees a second in turn. The
+    // input is sampled far more often than the screen refreshes and is even where the hand is: the turn it explains (input_turn,
+    // its learned gain and delay), fitted to the game's camera over its last 12 frames (0.1 s at least) - theta = A + s x the
+    // input's turn since the first of them, least squares - follows the game's own scale (a gain learned off, a sight's slower
+    // turn, a response curve) within a few frames, and an unevenly timed frame moves the fit only a little. Per axis, only where
+    // the input explains the turn (it turned 0.3 degrees or more over them, the scale 0.25..4): otherwise false for the axis.
+    bool input_paced_theta(double t, double out[2], bool axis[2]) const {
+        axis[0] = axis[1] = false;
+        if (frames_.size() < 5) return false;
+        std::size_t first = frames_.size() - 1;
+        const std::size_t want = std::size_t(std::clamp(settings_.input_paced_frames, 3, 12));
+        while (first > 0 && frames_.size() - first < want && frames_[first].continuous) --first;
+        const std::size_t n = frames_.size() - first;
+        const double t0 = frames_[first].t;
+        if (n < std::min<std::size_t>(5, want) || frames_.back().t - t0 < 0.05) return false;
+        double sx[2] = {0, 0}, sy[2] = {0, 0}, sxx[2] = {0, 0}, sxy[2] = {0, 0};
+        double xs[12][2];
+        for (std::size_t i = 0; i < n; ++i) {
+            const Frame& f = frames_[first + i];
+            double x[2];
+            if (!input_turn(t0, f.t, x, true)) return false;
+            for (int k = 0; k < 2; ++k) {
+                xs[i][k] = x[k];
+                sx[k] += x[k]; sy[k] += f.theta[k]; sxx[k] += x[k] * x[k]; sxy[k] += x[k] * f.theta[k];
+            }
+        }
+        double at[2];
+        if (!input_turn(t0, t, at, true)) return false;
+        bool any = false;
+        for (int k = 0; k < 2; ++k) {
+            const double mx = sx[k] / double(n), my = sy[k] / double(n);
+            const double vxx = sxx[k] / double(n) - mx * mx, vxy = sxy[k] / double(n) - mx * my;
+            double xmin = xs[0][k], xmax = xs[0][k];
+            for (std::size_t i = 1; i < n; ++i) { xmin = std::min(xmin, xs[i][k]); xmax = std::max(xmax, xs[i][k]); }
+            if (xmax - xmin < 0.3 * 3.14159265358979 / 180.0 || vxx <= 0) continue;
+            const double s = vxy / vxx;
+            if (s < 0.25 || s > 4.0) continue;
+            if (settings_.input_paced_residual > 0) {
+                double r2 = 0;
+                for (std::size_t i = 0; i < n; ++i) { const double r = frames_[first + i].theta[k] - (my + s * (xs[i][k] - mx)); r2 += r * r; }
+                if (std::sqrt(r2 / double(n)) > settings_.input_paced_residual * s * (xmax - xmin)) continue;
+            }
+            out[k] = my + s * (at[k] - mx);
+            axis[k] = any = true;
         }
         return any;
     }
@@ -1236,6 +1317,7 @@ private:
     int since_fit_ = 0;
     std::deque<double> intervals_;
     double frame_interval_ = 0;
+    mutable bool paced_last_ = false;  // (the last prediction made with the stick's paced turn - see paced_last)
     std::uint64_t generation_ = 0;  // bumped by reset_fit and seed: fits from before are dropped
     std::thread worker_;
     std::mutex job_mutex_;

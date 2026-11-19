@@ -22,6 +22,8 @@ inline constexpr DevKey kDevKeys[] = {
     {"ClaimsBesideHeld", "FW_CLAIMS_BESIDE", L"FW_CLAIMS_BESIDE", '1', false},
     {"AttachedAbsolute", "FW_ATT_ABS", L"FW_ATT_ABS", '1', false},
     {"EdgeDitherNoBand", "FW_DITHER_NO_BAND", L"FW_DITHER_NO_BAND", '1', false},
+    {"AlwaysWarp", "FW_ALWAYS_WARP", L"FW_ALWAYS_WARP", '1', false},
+    {"FeedGridKey", "FW_FEED_KEY", L"FW_FEED_KEY", '1', false},
     {"MaskSmooth", "FW_MASK_SMOOTH", L"FW_MASK_SMOOTH", '1', false},
     {"DitherHoles", "FW_DITHER_HOLES", L"FW_DITHER_HOLES", '1', false},
     {"CameraUse", "FW_CAMERA_USE", L"FW_CAMERA_USE", '1', true},

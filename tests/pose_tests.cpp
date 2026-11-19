@@ -393,6 +393,58 @@ static void frame_clock_tests() {
     EXPECT(gap == 10.0, "a skipped frame starts again from the presented time");
 }
 
+static double tick_rand(std::uint32_t& s) { s = s * 1664525u + 1013904223u; return double(s >> 8) / double(1u << 24); }
+
+// Even pacing (PoseSettings::input_paced): a game simulating in 60 Hz ticks, drawn at ~47 fps, its frames coming evenly with
+// one tick or two of turn (EDF6), the right stick held throughout, the learned stick gain 60% off (as EDF6's was) - the turn
+// shown at 120 Hz in the steady part, one frame back (Auto). Off: its steps follow the frames' ticks; on: even.
+static double paced_turn_spread(bool paced, double* mean_step = nullptr) {
+    PoseModel m;
+    PoseSettings ps; ps.auto_fraction = 0.5; ps.use_stick = true; ps.use_mouse = false; ps.freeze_fit = true; ps.input_paced = paced;
+    m.configure(ps);
+    AxisParams yaw{}, pitch{};
+    yaw.stick_gain = 0.8; yaw.stick_power = 1; yaw.tau = 0; yaw.delay = 0;
+    m.seed(yaw, pitch);
+    m.set_mouse_gate(true);
+    const double rate = 0.5, tick = 1.0 / 60.0, frame = 1.0 / 47.0;
+    std::uint32_t seed = 3;
+    double theta = 0, next_tick = tick, next_frame = frame, next_refresh = 0;
+    std::uint64_t id = 1;
+    struct Pending { double at, content; std::uint64_t id; };
+    std::vector<Pending> pending;
+    std::vector<double> shown;
+    for (double t = 0; t < 4.0; t += 0.0005) {
+        const bool held = t >= 0.2;
+        m.stick.add(t, held ? 1.0 : 0.0, 0.0);
+        while (t >= next_tick) { if (held) theta += rate * tick; next_tick += tick; }
+        if (t >= next_frame) { pending.push_back({next_frame + 0.006 + 0.004 * tick_rand(seed), theta, id++}); next_frame += frame; }
+        for (std::size_t i = 0; i < pending.size();)
+            if (t >= pending[i].at) {
+                m.add_source(pending[i].id, pending[i].at, t, camera_at(pending[i].content, 0), false, t);
+                pending.erase(pending.begin() + std::ptrdiff_t(i));
+            } else ++i;
+        if (t >= next_refresh) {
+            m.set_position_clock(t);
+            const Prediction p = m.predict(t);
+            if (t > 2.0) shown.push_back(m.source_theta(0) + p.yaw);
+            next_refresh += 1.0 / 120.0;
+        }
+    }
+    double sum = 0, sq = 0;
+    for (std::size_t i = 1; i < shown.size(); ++i) { const double d = shown[i] - shown[i - 1]; sum += d; sq += d * d; }
+    const double n = double(shown.size() - 1), mean = sum / n;
+    if (mean_step) *mean_step = mean;
+    return std::sqrt(std::max(sq / n - mean * mean, 0.0));
+}
+static void input_paced_tests() {
+    double mean_off = 0, mean_on = 0;
+    const double off = paced_turn_spread(false, &mean_off), on = paced_turn_spread(true, &mean_on);
+    std::printf("input-paced turn: a refresh's step %.3f / %.3f mrad (true %.3f), spread off %.3f mrad, on %.3f mrad\n",
+                mean_off * 1000, mean_on * 1000, 0.5 / 120 * 1000, off * 1000, on * 1000);
+    EXPECT(on < off * 0.3, "the turn shown is even with input pacing (spread %.3f against %.3f mrad)", on * 1000, off * 1000);
+    EXPECT(std::fabs(mean_on / (0.5 / 120) - 1.0) < 0.05, "...at the game's own rate (%.3f against %.3f mrad)", mean_on * 1000, 0.5 / 120 * 1000);
+}
+
 // A game played with a controller: the camera turns at a rate the right stick sets, through a squared
 // response curve. The model learns gain and curve; predicting with the held stick beats both holding the
 // frame and the same model with the controller option off.
@@ -534,6 +586,7 @@ static void position_across_skipped_frames() {
 int main() {
     position_across_skipped_frames();
     frame_clock_tests();
+    input_paced_tests();
     rotation_conventions();
     right_handed_projection();
     fit_recovers_smoothed_camera();

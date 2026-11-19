@@ -351,7 +351,9 @@ cbuffer W : register(b1) {
     row_major float4x4 wmat;  // cs_own_warp: the previous frame's clip -> the displayed camera's
     float4 wproj;             // the projection's depth terms (a, b, c, e): clip z = vz a + b, clip w = vz c + e
     float4 wh0, wh1;          // (claims made for an earlier refresh of this frame - see ow_claims_uv: the homography from
-    float2 wh2;               // this refresh's NDC to theirs, rows h00 h01 h02 h10 / h11 h12 h20 h21 / h22; wh2.y 1 in use)
+    float2 wh2;               // this refresh's NDC to theirs, rows h00 h01 h02 h10 / h11 h12 h20 h21 / h22; wh2.y 1 in use;
+                              // wh2.y + 4: the "Whole pixels" setting - see ow_pick, ow_claims_kind)
+float ow_claims_kind() { return wh2.y >= 3.5 ? wh2.y - 4.0 : wh2.y; }
 };
 // View distance (clip w) of a point from its stored depth, whichever way round depth is stored.
 float view_w(float d) {
@@ -3403,6 +3405,10 @@ float ow_cover(float4 l) { return saturate((max(max(l.r, l.g), l.b) - 0.03) / 0.
 RWTexture2D<float4> ow_out_u : register(u0);
 SamplerState ow_linear : register(s0);  // bilinear, clamped to the edge
 float4 ow_bilinear(float2 uv) { return ow_color_t.SampleLevel(ow_linear, uv, 0); }
+// The warp's picture: the nearest of the game's own pixels, never a blend of neighbours - a blend softens fine detail by how far
+// between pixels the warp lands (up to half its contrast at half a pixel, none at a whole one), so a turn went from sharp to soft
+// and back with its speed (Dark Souls, 2026-11-19). Things sit up to half a pixel from their exact place instead.
+float4 ow_nearest(float2 uv) { uint w, h; ow_color_t.GetDimensions(w, h); return ow_color_t.Load(int3(min(uint2(uv * float2(w, h)), uint2(w - 1, h - 1)), 0)); }
 // (held: the HUD - 1 - and, with the follow share, what follows none of the turn - 0.9: shown as the frame has it and never
 // taken as scenery for what the turn uncovers beside it, as when it was held; following any of it, the mask is at most
 // 0.9 * (1 - 1/64))
@@ -3861,6 +3867,8 @@ uint ow_beside_held(int2 r) {
 // (the warp's development switches, carried in `threshold` - no flag bits left: bits 0-1 the rim mode, 4 ow_behind's steps at
 // the far surface's own share - see ow_behind)
 uint ow_dev() { return uint(threshold + 0.5); }
+// (wh2.y 4 and up - the "Whole pixels" setting: the warp's picture from the nearest game pixel, see ow_nearest; off: bilinear)
+float4 ow_pick(float2 uv) { return wh2.y >= 3.5 ? ow_nearest(uv) : ow_bilinear(uv); }
 bool ow_rim(float2 s, float nk) {
     if ((ow_dev() & 3u) == 0) return false;
     const float m = ow_mask_t.Load(int3(min(uint2(saturate(s) * float2(out_size)), out_size - 1), 0)).x;
@@ -4464,7 +4472,7 @@ static float ow_hole_near = 1e9;  // (ow_claimed, a hole: the nearest claim arou
 // claims_reuse_), where uv's spot was for that refresh's camera - between two refreshes the camera mostly turns, which
 // moves every point alike (a homography, at any depth); the steps then find the spot for this refresh's camera as ever.
 float2 ow_claims_uv(float2 uv) {
-    if (wh2.y < 0.5) return uv;
+    if (ow_claims_kind() < 0.5) return uv;
     const float3 p = float3(uv.x * 2 - 1, 1 - uv.y * 2, 1);
     const float3 q = float3(dot(p, float3(wh0.x, wh0.w, wh1.z)), dot(p, float3(wh0.y, wh1.x, wh1.w)), dot(p, float3(wh0.z, wh1.y, wh2.x)));
     if (q.z <= 1e-6) return uv;
@@ -4475,7 +4483,7 @@ float2 ow_claims_uv(float2 uv) {
     // spot is now, as the warp's own reads at the output)
     const float f = (flags & 128) ? ow_follow(uv) : 1.0;
     const float2 turned = lerp(uv, float2(n.x * 0.5 + 0.5, 0.5 - n.y * 0.5), f);
-    if (wh2.y < 1.5) return turned;
+    if (ow_claims_kind() < 1.5) return turned;
     // (wh2.y 2 - by depth: the camera moving too, Armored Core VI's orbit around the mech, a near thing shifts against a far
     // one between two refreshes - the turn's map put it up to ~20 rendered px off its claims. The claim found by the turn
     // tells which rendered pixel claimed there and the cell it landed in for that refresh's camera; where it lands for this
@@ -4759,7 +4767,7 @@ float4 ow_scene_from(uint2 id, float2 uv, float2 src, bool valid) {
         const float2 half_px = 0.5 / float2(out_size);
         const float2 inside = clamp(src, half_px, 1.0 - half_px);
         if (all(inside == src)) {
-            c = ow_bilinear(src);
+            c = ow_pick(src);
             c = ow_two_frames(c, uv, src);
             if ((flags & 16777216) && !ow_dither_warped(id, uv, src)) return ow_color_t.Load(int3(id.xy, 0));
             // Held (masked) pixels are no scene: a warped pixel landing on them would copy the HUD or the
@@ -4987,7 +4995,7 @@ bool ow_lean(uint2 p) {
         if (any(src < half_px) || any(src > 1.0 - half_px)) return false;
         if ((flags & 2) && ow_held(int3(clamp(int2(src * float2(out_size)), int2(0, 0), int2(out_size) - 1), 0))) return false;
         if ((flags & 16777216) && any(min(src, 1.0 - src) * float2(out_size) < 0.03 * float(out_size.y))) return false;  // (dithered edges' band: the full path)
-        c = ow_bilinear(src);
+        c = ow_pick(src);
         c = ow_two_frames(c, uv, src);
         if (flags & 2048) {
             const float4 here = ow_layer_t.Load(pi), there = ow_layer_t.SampleLevel(ow_linear, src, 0);
@@ -5053,7 +5061,7 @@ bool ow_seek(uint2 p) {
         const float2 half_px = 0.5 / float2(out_size);
         if (!all(clamp(src, half_px, 1.0 - half_px) == src)) return false;  // (ow_scene_from's: the frame's edge)
         if ((flags & 2) && ow_held(int3(clamp(int2(src * float2(out_size)), int2(0, 0), int2(out_size) - 1), 0))) return false;
-        c = ow_bilinear(src);
+        c = ow_pick(src);
         c = ow_two_frames(c, uv, src);
         if ((flags & 16777216) && !ow_dither_warped(p, uv, src)) c = ow_color_t.Load(pi);  // (dithered edges: see ow_scene_from)
     }
@@ -6202,9 +6210,11 @@ RWTexture2D<float4> rec_ui_u : register(u1);
     const uint f = max(groups_x, 1u);
     float3 c = 0;
     float4 u = 0;
+    // (flag 8: a window at full size - rect.xy its corner in the picture, f 1: record_crop)
+    const uint2 origin = (flags & 8) ? rect.xy : uint2(0, 0);
     for (uint y = 0; y < f; ++y)
         for (uint x = 0; x < f; ++x) {
-            const int3 q = int3(min(id.xy * f + uint2(x, y), out_size - 1), 0);
+            const int3 q = int3(min(origin + id.xy * f + uint2(x, y), out_size - 1), 0);
             c += rec_colour_t.Load(q).rgb;
             if (flags & 1) u += rec_ui_t.Load(q);
         }
@@ -8771,6 +8781,7 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
               (remembered ? 64u : 0u) | (stretched ? 128u : 0u) | (soft_edge ? 1024u : 0u) |
               (mask && share_mask ? 16384u : 0u) | (warp_paths_ ? 32768u : 0u);
     float wc[kWConstants] = {};
+    wc[29] = whole_pixels_ ? 4.0f : 0.0f;  // (the "Whole pixels" setting, on top of the claims' kind - see ow_pick, ow_claims_kind)
     // (the characters carried on along their own motion - see ow_own: the cells of the shown frame, this many game frames on)
     // (set_objects_between: back instead - negative; not on one of the game's generated images, which has them at its own moment)
     const float own_frames = objects_between_ ? (generated >= 0 ? 0.0f : -std::clamp(objects_back_, -1.0f, 1.0f)) : warp_ahead_;
@@ -9057,7 +9068,7 @@ bool Renderer::own_warp(const IngestedSource& src, bool use_ui_tags, bool use_ma
             for (int r = 0; r < 3; ++r)
                 for (int k = 0; k < 3; ++k) h[r * 3 + k] = inv[r * 3 + 0] * ac[0 * 3 + k] + inv[r * 3 + 1] * ac[1 * 3 + k] + inv[r * 3 + 2] * ac[2 * 3 + k];
             for (int i = 0; i < 9; ++i) wc[20 + i] = float(h[i]);
-            wc[29] = claims_turn_only_ ? 1.0f : 2.0f;
+            wc[29] = (claims_turn_only_ ? 1.0f : 2.0f) + (whole_pixels_ ? 4.0f : 0.0f);
             set_x_srv(t + 12, kPWarpClaims);
             c.flags |= 4096u;
             stamp(kPassWarpClaim);
@@ -11187,8 +11198,11 @@ bool Renderer::record_frame(std::uint64_t tag, bool ui) {
 // the same grid, pixel for pixel, as the picture seq_replay warps - into a read-back slot on this refresh's list; tag: the game
 // frame it showed. seq_replay FW_MATCH redraws the same refresh from the clip and compares the two: a recording whose replay
 // does not match what was on the screen is not to be trusted.
-bool Renderer::record_output(std::uint64_t tag) {
-    const auto& o = private_[kPOutput];
+bool Renderer::record_output(std::uint64_t tag) { return record_crop(tag, false, 0, 0, 0, 0); }
+bool Renderer::record_crop(std::uint64_t tag, bool source, std::uint32_t x0, std::uint32_t y0, std::uint32_t w, std::uint32_t h) {
+    const bool crop = w > 0 && h > 0;
+    const PrivateId src_id = source ? warp_colour_ : kPOutput;
+    Private& o = source && split_ && shown_id(src_id) ? front_[src_id] : private_[src_id];
     const auto& c0 = private_[kPBackbuffer];
     if (!o.texture || !c0.texture || !cs_rec_down_) return false;
     int idx = -1;
@@ -11199,8 +11213,9 @@ bool Renderer::record_output(std::uint64_t tag) {
     if (idx < 0) return false;
     rec_next_ = (idx + 1) % kRecSlots;
     RecSlot& r = rec_[idx];
-    const UINT f = std::max(1u, static_cast<UINT>(std::lround(double(c0.height) / 1080.0)));
-    const UINT cw = (o.width + f - 1) / f, ch = (o.height + f - 1) / f;
+    if (crop && (x0 + w > o.width || y0 + h > o.height)) return false;
+    const UINT f = crop ? 1u : std::max(1u, static_cast<UINT>(std::lround(double(c0.height) / 1080.0)));
+    const UINT cw = crop ? w : (o.width + f - 1) / f, ch = crop ? h : (o.height + f - 1) / f;
     if (!ensure_private(kPRecOut, cw, ch, DXGI_FORMAT_R11G11B10_FLOAT)) return false;
     const auto desc = private_[kPRecOut].texture->GetDesc();
     UINT64 total = 0;
@@ -11215,14 +11230,14 @@ bool Renderer::record_output(std::uint64_t tag) {
     }
     r.width[0] = static_cast<std::uint32_t>(desc.Width); r.height[0] = desc.Height;
     const UINT t = kXRec + UINT(idx) * 8;
-    for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(t + i, kPOutput);
+    for (UINT i = 0; i < kXSrvCount; ++i) set_x_srv(t + i, src_id, source);
     set_x_uav(t + kXSrvCount, kPRecOut);
     set_x_uav(t + kXSrvCount + 1, kPRecOut);
-    const auto out_before = private_[kPOutput].state;
-    transition(private_[kPOutput], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    const auto out_before = o.state;
+    transition(o, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     transition(private_[kPRecOut], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     XConstants c{};
-    c.grid[0] = cw; c.grid[1] = ch; c.out_size[0] = o.width; c.out_size[1] = o.height; c.groups_x = f; c.flags = 4u;
+    c.grid[0] = cw; c.grid[1] = ch; c.out_size[0] = o.width; c.out_size[1] = o.height; c.groups_x = f; c.flags = 4u | (crop ? 8u : 0u); c.rect[0] = x0; c.rect[1] = y0;
     x_dispatch(cs_rec_down_.Get(), &c, t, t + kXSrvCount, (cw + 7) / 8, (ch + 7) / 8);
     transition(private_[kPRecOut], D3D12_RESOURCE_STATE_COPY_SOURCE);
     D3D12_TEXTURE_COPY_LOCATION dst{r.buffer[0].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
@@ -11230,8 +11245,8 @@ bool Renderer::record_output(std::uint64_t tag) {
     D3D12_TEXTURE_COPY_LOCATION from{private_[kPRecOut].texture.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
     list_->CopyTextureRegion(&dst, 0, 0, 0, &from, nullptr);
     transition(private_[kPRecOut], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    transition(private_[kPOutput], out_before);
-    r.has_stencil = false; r.has_ui = false; r.output = true; r.gen = -1;
+    transition(o, out_before);
+    r.has_stencil = false; r.has_ui = false; r.output = true; r.gen = -1; r.source = source;
     r.tag = tag; r.context = context_; r.fence = 0;
     r.state.store(1, std::memory_order_release);
     return true;
@@ -11322,6 +11337,7 @@ bool Renderer::take_recorded(RecordedFrame& out) {
     out.cw = r.width[0]; out.ch = r.height[0]; out.dw = r.output ? 0 : r.width[1]; out.dh = r.output ? 0 : r.height[1];
     out.output = r.output;
     out.gen = r.gen;
+    out.source = r.source; r.source = false;
     r.state.store(0, std::memory_order_release);
     return true;
 }

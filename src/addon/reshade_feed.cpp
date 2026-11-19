@@ -263,6 +263,26 @@ void on_reshade_finish_effects(effect_runtime* runtime, command_list* cmd_list, 
             if (sw && shh && gd.texture.width >= sw && gd.texture.height >= shh) scene_depth_size(rw, rh);
             fw_ = std::min(rw, cap_w); fh_ = std::min(rh, cap_h);
         }
+        // (development, FeedGridKey=1: Page Up switches the size between half the picture and a quarter of it - an A/B of the grid the
+        // presenter analyses the motion on; the game's motion vectors are looked for again after each switch, their scale found on the grid)
+        static int forced_div = 0, restart_in = 0;
+        static bool page_up_was = false;
+        if (sw && shh && GetEnvironmentVariableW(L"FW_FEED_KEY", nullptr, 0)) {
+            const bool down = (GetAsyncKeyState(VK_PRIOR) & 0x8000) != 0;
+            if (down && !page_up_was) {
+                forced_div = forced_div == 4 ? 2 : 4;
+                restart_in = 30;  // (once frames at the new size come: the effect is rebuilt with it first)
+                char text[160];
+                std::snprintf(text, sizeof(text), "XPAR: FeedGridKey: the grid set to %ux%u (Page Up switches; the motion vectors looked for again)", sw / forced_div, shh / forced_div);
+                fw::diag_log(reshade::log::level::info, text);
+            }
+            page_up_was = down;
+            if (forced_div) { fw_ = sw / forced_div; fh_ = shh / forced_div; }
+            if (restart_in > 0 && --restart_in == 0 && g_producer && g_producer->shared()) {
+                InterlockedExchange(&g_producer->shared()->motion_found, 0);
+                InterlockedIncrement(&g_producer->shared()->motion_restarts);
+            }
+        }
         static uint32_t asked_w = 0, asked_h = 0;
         if (fw_ >= 64 && fh_ >= 64 && (fw_ != w || fh_ != h) && (fw_ != asked_w || fh_ != asked_h)) {
             asked_w = fw_; asked_h = fh_;
