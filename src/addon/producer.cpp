@@ -124,6 +124,11 @@ bool Producer::attach(ID3D12Device* device) {
         release_textures();
         if (fence_handle_) CloseHandle(fence_handle_);
         fence_handle_ = nullptr; fence_.Reset(); device_.Reset(); fence_value_ = 0;
+        // (frame generation's marker buffer belongs to the old device too: its GPU address on the new device's lists would be
+        // another device's memory. Made again on the next generated frame - see ensure_markers; frames waiting on it dropped)
+        if (markers_) { markers_->Unmap(0, nullptr); markers_.Reset(); }
+        marker_values_ = nullptr;
+        pending_publish_.clear(); pending_count_ = 0;
         for (auto& m : shared_->slots) { m.state = kFree; m.frame_id = 0; }
         shared_->latest_ready_frame = 0;
         shared_->session = static_cast<std::uint64_t>(qpc_now());
@@ -1778,6 +1783,10 @@ void Producer::poll_markers() {
     if (pending_count_.load() == 0) return;
     std::lock_guard lock(mutex_);
     if (!fence_ || !marker_values_) return;
+    // (the same fence the presents signal on the GPU: a value set from here while one of theirs is still queued would mark that
+    // frame's copy done before it is - and the queued signal then set the fence back. Only once every signal sent is in: the
+    // moment frame generation comes on, the present before it may still be on its way - a quarter of a millisecond later)
+    if (fence_->GetCompletedValue() < fence_value_) return;
     for (auto it = pending_publish_.begin(); it != pending_publish_.end();) {
         if (marker_values_[it->marker % kMarkers] == it->marker) {
             const int slot = slot_for_frame(it->frame, false);
@@ -2335,8 +2344,14 @@ void Producer::finish_present_vk(reshade::api::command_queue* queue, std::uint64
     if (slot < 0) return;
     // The GPU signals the timeline semaphore after the copies; the completion thread then signals the
     // shared D3D12 fence to the same value, which the presenter checks before taking the frame.
-    vk_->signal(queue, ++fence_value_);
     auto& m = shared_->slots[slot];
+    // (a signal that could not be sent: nothing would ever mark the copies done - the frame is dropped, its slot free again)
+    if (!vk_->signal(queue, fence_value_ + 1)) {
+        InterlockedExchange(&m.state, kFree);
+        ++shared_->hooks.slots_dropped;
+        return;
+    }
+    ++fence_value_;
     m.fence_value = fence_value_;
     InterlockedExchange(&m.state, kReady);
     InterlockedExchange64(&shared_->latest_ready_frame, static_cast<LONG64>(frame));

@@ -231,13 +231,14 @@ void VkTransport::copy(VkCommandBuffer cb, VkImage source, VkImageAspectFlags ba
     CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 2, after);
 }
 
-void VkTransport::signal(command_queue* queue, std::uint64_t value) {
-    if (!queue || !fence_ || !queue->signal(fence{fence_}, value)) return;
+bool VkTransport::signal(command_queue* queue, std::uint64_t value) {
+    if (!queue || !fence_ || !queue->signal(fence{fence_}, value)) return false;
     {
         std::lock_guard lock(mutex_);
         pending_.push_back(value);
     }
     wake_.notify_one();
+    return true;
 }
 
 void VkTransport::completion_thread() {

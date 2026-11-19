@@ -45,7 +45,7 @@ public:
 
     // After the frame's copies: signals `value` on the game's queue; `on_complete(value)` runs on the
     // completion thread once the GPU has passed it.
-    void signal(reshade::api::command_queue* queue, std::uint64_t value);
+    bool signal(reshade::api::command_queue* queue, std::uint64_t value);  // false: not sent (nothing will reach `value`)
     void set_on_complete(std::function<void(std::uint64_t)> f) { on_complete_ = std::move(f); }
 
 private:

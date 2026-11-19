@@ -2150,9 +2150,11 @@ void render_thread() {
             logf("calibration reset");
         }
 
-        // Return slots whose conversion has finished on the GPU.
+        // Return slots whose conversion has finished on the GPU - not the one still being taken in: its second step
+        // (take_in_finish) reads the slot's camera, matrices and times, and a slot given back can be rewritten by the
+        // game before that (its first step done just after the refresh deadline, the second left for the next refresh).
         for (auto it = held.begin(); it != held.end();) {
-            if (renderer.intake_completed(it->release_value)) {
+            if (it->slot != intake.slot && renderer.intake_completed(it->release_value)) {
                 InterlockedCompareExchange(&sh.slots[it->slot].state, kFree, kReading);
                 it = held.erase(it);
             } else ++it;
@@ -2795,6 +2797,13 @@ void render_thread() {
         }
         if (now - stat_start >= 0.5) {
             const HRESULT removed = renderer.device_removed_reason();
+            {  // (a wait for the GPU that ran out over a second: its command allocator replaced, not reset - see Renderer::reset_allocator)
+                static std::uint64_t replaced_logged = 0;
+                if (renderer.allocators_replaced() != replaced_logged) {
+                    replaced_logged = renderer.allocators_replaced();
+                    logf("GPU work still running after the wait for it ran out: command allocator replaced (%llu so far)", static_cast<unsigned long long>(replaced_logged));
+                }
+            }
             if (removed != S_OK && !device_loss_logged) {
                 logf("GPU DEVICE LOST: reason 0x%08lX - presenter exits; use 'Start presenter' in the ReShade panel",
                      static_cast<unsigned long>(removed));

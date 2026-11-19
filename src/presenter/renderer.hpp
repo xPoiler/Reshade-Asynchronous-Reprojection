@@ -265,7 +265,9 @@ public:
     HRESULT device_removed_reason() const { return device_ ? device_->GetDeviceRemovedReason() : S_OK; }
     // Notes about shared buffers opened during ingest (size/format changes), drained for logging.
     std::vector<std::string> take_notes() { std::vector<std::string> n; n.swap(notes_); return n; }
-    void wait_idle();
+    bool wait_idle();  // false: a queue's work had not completed when the wait ran out (2 s)
+    // How often a command allocator was still in use by the GPU when it was to be reset (a wait that ran out): replaced by a new one.
+    std::uint64_t allocators_replaced() const { return allocators_replaced_; }
     void wait_for(std::uint64_t value);
     void flush_and_wait();  // submit what is recorded, wait for it, continue recording the same frame  // until the GPU completed `value` (see submitted_value)
     float last_gpu_ms() const { return gpu_ms_; }
@@ -830,6 +832,11 @@ private:
     void retire_texture(ComPtr<ID3D12Resource>& r);
     void retire(PrivateId id);
     void collect_retired();
+    // Command allocators the GPU may still be running (a wait that ran out before them): kept until their queue is past `after`.
+    struct RetiredAllocator { ComPtr<ID3D12CommandAllocator> allocator; int context; std::uint64_t after; };
+    std::vector<RetiredAllocator> retired_allocators_;
+    std::uint64_t allocators_replaced_ = 0;
+    void reset_allocator(std::uint64_t needed);  // this frame's allocator reset, or replaced if its queue has not reached `needed`
     ComPtr<ID3D12QueryHeap> scene_stamps_;
     bool hud_pending_[kRing] = {}, hud_scene_pending_[kRing] = {}, hud_from_scene_ = false;
     double hud_scene_pixels_ = 1;

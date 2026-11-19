@@ -9286,7 +9286,7 @@ void Renderer::flush_and_wait() {
     execute();
     signal();
     wait_idle();
-    allocators_[frame_index_]->Reset();
+    reset_allocator(fence_values_[frame_index_ >= 3 ? 1 : 0]);
     list_->Reset(allocators_[frame_index_].Get(), nullptr);
     ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
     list_->SetDescriptorHeaps(1, heaps);
@@ -9413,7 +9413,8 @@ void Renderer::swap_shown() {
 bool Renderer::set_split(bool on) {
     if (on && !iqueue_) on = false;
     if (on == split_) return false;
-    wait_idle();
+    // (the sets swap and their descriptors are rewritten: only once the GPU is done with them - otherwise tried again next refresh)
+    if (!wait_idle()) return false;
     // Turning on: what was taken in so far becomes the shown set. Turning off: the shown set goes back to
     // where the single queue reads everything.
     swap_shown();
@@ -9796,7 +9797,28 @@ void Renderer::retire(PrivateId id) {
     retire_texture(private_[id].texture);
     private_[id] = Private{};
 }
+void Renderer::reset_allocator(std::uint64_t needed) {
+    auto& a = allocators_[frame_index_];
+    const int ctx = frame_index_ >= 3 ? 1 : 0;
+    // (a wait for the GPU that ran out - begin's 1 s, wait_idle's 2 s - and the work recorded with this allocator may still run:
+    // resetting it then is undefined. A new allocator instead, the old one kept until its queue is past that work - see collect_retired)
+    if (fences_[ctx] && fences_[ctx]->GetCompletedValue() < needed) {
+        ComPtr<ID3D12CommandAllocator> fresh;
+        if (SUCCEEDED(device_->CreateCommandAllocator(lists_[ctx]->GetType(), IID_PPV_ARGS(&fresh)))) {
+            retired_allocators_.push_back({std::move(a), ctx, needed});
+            a = std::move(fresh);
+            ++allocators_replaced_;
+            return;  // (new: nothing to reset)
+        }
+    }
+    a->Reset();
+}
+
 void Renderer::collect_retired() {
+    if (!retired_allocators_.empty())
+        retired_allocators_.erase(std::remove_if(retired_allocators_.begin(), retired_allocators_.end(), [&](const RetiredAllocator& r) {
+                                      return !fences_[r.context] || fences_[r.context]->GetCompletedValue() >= r.after;
+                                  }), retired_allocators_.end());
     if (retired_.empty() || !fences_[0]) return;
     const std::uint64_t done0 = fences_[0]->GetCompletedValue(), done1 = fences_[1] ? fences_[1]->GetCompletedValue() : 0;
     // (past both queues' next submission after it was retired; the intake queue only counts with split queues - without,
@@ -10099,7 +10121,7 @@ ID3D12GraphicsCommandList* Renderer::begin(int context) {
         }
     }
     pass_count_[frame_index_] = 0;
-    allocators_[frame_index_]->Reset();
+    reset_allocator(frame_values_[frame_index_]);
     list_->Reset(allocators_[frame_index_].Get(), nullptr);
     if (timestamps_) list_->EndQuery(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, frame_index_ * 2);
     stages_marked_ = 0;
@@ -10863,7 +10885,7 @@ void Renderer::stash_source(int set, bool hudless) {
         if (from.texture && (i < 3 || hudless)) ensure_private(to_set[i], from.width, from.height, from.format);
         else private_[to_set[i]] = Private{};
     }
-    allocators_[frame_index_]->Reset();
+    reset_allocator(fence_values_[0]);
     list_->Reset(allocators_[frame_index_].Get(), nullptr);
     for (int i = 0; i < 4; ++i) {
         auto& from = split_ && shown_id(kFrom[i]) ? front_[kFrom[i]] : private_[kFrom[i]];
@@ -10940,7 +10962,7 @@ std::uint32_t Renderer::warp_rest_blocks() {
     bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     ComPtr<ID3D12Resource> buffer;
     if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)))) return 0;
-    allocators_[frame_index_]->Reset();
+    reset_allocator(fence_values_[0]);
     list_->Reset(allocators_[frame_index_].Get(), nullptr);
     list_->CopyBufferRegion(buffer.Get(), 0, warp_list_.Get(), 0, 4);
     list_->Close();
@@ -10973,7 +10995,7 @@ bool Renderer::read_back(int which, std::vector<std::uint16_t>& pixels, std::uin
     bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     ComPtr<ID3D12Resource> buffer;
     if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)))) return false;
-    allocators_[frame_index_]->Reset();
+    reset_allocator(fence_values_[0]);
     list_->Reset(allocators_[frame_index_].Get(), nullptr);
     const auto before = p.state;
     transition(p, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -11342,8 +11364,8 @@ bool Renderer::take_recorded(RecordedFrame& out) {
     return true;
 }
 
-void Renderer::wait_idle() {
-    if (!queue_ || !fences_[0]) return;
+bool Renderer::wait_idle() {
+    if (!queue_ || !fences_[0]) return true;
     release_intake_gate();  // (pieces waiting for refreshes that will not come while we wait)
     if (iqueue_ && fences_[1]) {
         iqueue_->Signal(fences_[1].Get(), ++fence_values_[1]);
@@ -11357,6 +11379,8 @@ void Renderer::wait_idle() {
         fences_[0]->SetEventOnCompletion(fence_values_[0], fence_event_);
         WaitForSingleObject(fence_event_, 2000);
     }
+    // (whether it all completed: a wait that ran out leaves work running - see set_split)
+    return fences_[0]->GetCompletedValue() >= fence_values_[0] && (!iqueue_ || !fences_[1] || fences_[1]->GetCompletedValue() >= fence_values_[1]);
 }
 
 }  // namespace fw
