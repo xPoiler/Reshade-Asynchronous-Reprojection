@@ -5573,6 +5573,46 @@ float fl_prev(uint k, float2 pos) {
         }
     fl_flow_u[id.xy] = float4(shift, 0, 0);
 }
+// ...the same search, a group per pixel (the coarsest level, reach 12: 625 shifts). One thread a pixel left most of the GPU
+// idle - ~500 pixels at a 960x540 render, 8 groups - each thread through all 625 shifts in turn: 0.77 ms a game frame,
+// the costliest pass of XPAR's own motion estimate. Here the 64 threads take every 64th shift each, and the group keeps the
+// smallest error, the earlier shift on a tie: each shift's error summed as above, in the same order - the same result.
+groupshared float fs_err[64];
+groupshared int fs_at[64];
+[numthreads(64, 1, 1)] void cs_flow_search_par(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
+    const uint k = rect.x;
+    const int2 size = int2(fl_size(k)), o = int2(fl_origin(k));
+    const int2 p = int2(gid.xy);  // (one group per pixel of the level: always inside it)
+    float c[25];
+    [unroll] for (int j = 0; j < 25; ++j)
+        c[j] = fl_feat_t.Load(int3(o + clamp(p + int2(j % 5 - 2, j / 5 - 2), int2(0, 0), size - 1), 0)).x;
+    const int reach = int(rect.z), side = 2 * reach + 1;
+    float best = 1e9;
+    int at = 0x7fffffff;
+    [loop] for (int i = int(gi); i < side * side; i += 64) {
+        const int sx = i % side - reach, sy = i / side - reach;
+        float e = 1e-4 * float(abs(sx) + abs(sy)) * 25.0;  // (equal matches: the smaller displacement)
+        [unroll] for (int j2 = 0; j2 < 25; ++j2) {
+            const int2 q = clamp(clamp(p + int2(j2 % 5 - 2, j2 / 5 - 2), int2(0, 0), size - 1) + int2(sx, sy), int2(0, 0), size - 1);
+            e += abs(c[j2] - fl_prev_t.Load(int3(o + q, 0)));
+        }
+        if (e < best) { best = e; at = i; }
+    }
+    fs_err[gi] = best; fs_at[gi] = at;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (uint s = 32; s > 0; s >>= 1) {
+        if (gi < s) {
+            const float e2 = fs_err[gi + s];
+            const int a2 = fs_at[gi + s];
+            if (e2 < fs_err[gi] || (e2 == fs_err[gi] && a2 < fs_at[gi])) { fs_err[gi] = e2; fs_at[gi] = a2; }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0) {
+        const int a = fs_at[0];
+        fl_flow_u[p] = float4(a == 0x7fffffff ? int2(0, 0) : int2(a % side - reach, a / side - reach), 0, 0);
+    }
+}
 // One refinement of a pixel's displacement; z of the result: confident (written by the last pass, flags bit 1).
 [numthreads(8, 8, 1)] void cs_flow_lk(uint3 id : SV_DispatchThreadID) {
     const uint k = rect.x;
@@ -6868,7 +6908,7 @@ bool Renderer::create_pipelines(std::string& error) {
         {"cs_scene_tiles", &cs_scene_tiles_}, {"cs_scene_hud", &cs_scene_hud_}, {"cs_scene_fill", &cs_scene_fill_}, {"cs_scene_grey", &cs_scene_grey_},
         {"cs_scene_grey_finish", &cs_scene_grey_finish_}, {"cs_scene_wash", &cs_scene_wash_}, {"cs_scene_wash_finish", &cs_scene_wash_finish_},
         {"cs_attached", &cs_attached_}, {"cs_probe_tiles", &cs_probe_tiles_}, {"cs_probe_clear", &cs_probe_clear_}, {"cs_probe_score", &cs_probe_score_}, {"cs_memory", &cs_memory_}, {"cs_mem_ratio", &cs_mem_ratio_}, {"cs_mem_relight", &cs_mem_relight_}, {"cs_gun_motion", &cs_gun_motion_}, {"cs_gun_check", &cs_gun_check_}, {"cs_ref_pick", &cs_ref_pick_}, {"cs_ref_frac", &cs_ref_frac_}, {"cs_depth_vec", &cs_depth_vec_}, {"cs_mem_mask", &cs_mem_mask_}, {"cs_share_weights", &cs_share_weights_}, {"cs_ref_raw", &cs_ref_raw_}, {"cs_share_rows", &cs_share_rows_}, {"cs_share_cols", &cs_share_cols_}, {"cs_hudless_ui", &cs_hudless_ui_}, {"cs_hudless_keep", &cs_hudless_keep_}, {"cs_ui_tiles", &cs_ui_tiles_}, {"cs_layer_unblend", &cs_layer_unblend_}, {"cs_layer_seam_clear", &cs_layer_seam_clear_}, {"cs_mem_vis", &cs_mem_vis_}, {"cs_ramp_rows", &cs_ramp_rows_}, {"cs_ramp", &cs_ramp_},
-        {"cs_flow_luma", &cs_flow_luma_}, {"cs_flow_feat", &cs_flow_feat_}, {"cs_flow_search", &cs_flow_search_}, {"cs_flow_lk", &cs_flow_lk_},
+        {"cs_flow_luma", &cs_flow_luma_}, {"cs_flow_feat", &cs_flow_feat_}, {"cs_flow_search", &cs_flow_search_}, {"cs_flow_search_par", &cs_flow_search_par_},{"cs_flow_lk", &cs_flow_lk_},
         {"cs_flow_median", &cs_flow_median_}, {"cs_flow_motion", &cs_flow_motion_}, {"cs_flow_fill", &cs_flow_fill_},
         {"cs_ret_cells", &cs_ret_cells_}, {"cs_ret_cells_flat", &cs_ret_cells_flat_}, {"cs_ret_enclose", &cs_ret_enclose_}, {"cs_ret_layer", &cs_ret_layer_},
         {"cs_ret_align", &cs_ret_align_}, {"cs_ret_pick", &cs_ret_pick_}, {"cs_ret_args", &cs_ret_args_}, {"cs_ret_shift", &cs_ret_shift_}};
@@ -10160,7 +10200,12 @@ bool Renderer::estimate_motion(DXGI_FORMAT colour, bool write_motion, const Part
         };
         // Coarsest level: whole-pixel search, then the refinements; every level ends with a median.
         c.rect[0] = kLevels - 1; c.rect[1] = 0; c.rect[2] = 12;
-        run(cs_flow_search_.Get(), table(kFlowSearch, kPFeat, before, kPFeat, kPFlowA), kPFlowA, level_w(kLevels - 1), level_h(kLevels - 1));
+        {  // (a group per pixel - see cs_flow_search_par)
+            const UINT base = table(kFlowSearch, kPFeat, before, kPFeat, kPFlowA);
+            transition(private_[kPFlowA], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            x_dispatch(cs_flow_search_par_.Get(), &c, base, base + 6, level_w(kLevels - 1), level_h(kLevels - 1));
+            transition(private_[kPFlowA], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
         step(cs_flow_median_.Get(), kLevels - 1);
         static constexpr int kRefinements[kLevels] = {1, 2, 3, 3, 4};
         for (int k = kLevels - 1; k >= 0; --k) {
