@@ -5086,13 +5086,16 @@ groupshared uint os_rest[8 * 8];
 }
 [numthreads(1, 1, 1)] void cs_own_warp_args(uint3 id : SV_DispatchThreadID) {
     // (a thread per pixel of each block - at the game's resolution, ow_low, one: the block's first pixel alone)
-    ow_args_u.Store3(0, uint3((ow_list_u.Load(0) * (ow_low() ? 1 : 4) + 63) / 64, 1, 1));
+    // (rows of 1024 groups: one row of all of them passed D3D12's 65535 a dimension at 4K once half the blocks were listed)
+    const uint groups = (ow_list_u.Load(0) * (ow_low() ? 1 : 4) + 63) / 64;
+    ow_args_u.Store3(0, uint3(min(groups, 1024u), (groups + 1023) / 1024, 1));
 }
-[numthreads(64, 1, 1)] void cs_own_warp_rest(uint3 id : SV_DispatchThreadID) {
+[numthreads(64, 1, 1)] void cs_own_warp_rest(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID) {
     // (a thread per pixel of each listed block: its four in parallel, those not left idle)
     const uint per = ow_low() ? 1u : 4u;
-    if (id.x / per >= ow_list_u.Load(0)) return;
-    const uint e = ow_list_u.Load(16 + 4 * (id.x / per)), k = id.x % per;
+    const uint t = (gid.y * 1024 + gid.x) * 64 + gt.x;
+    if (t / per >= ow_list_u.Load(0)) return;
+    const uint e = ow_list_u.Load(16 + 4 * (t / per)), k = t % per;
     if (!((e >> (24 + k)) & 1u)) return;
     const uint2 p = uint2(e & 4095u, (e >> 12) & 4095u) * 2 + uint2(k & 1, k >> 1);
     const float2 uv = (float2(p) + 0.5) / float2(out_size);
@@ -6301,6 +6304,11 @@ enum WTable : UINT { kWWarp, kWShown, kWJoinInit, kWJoinAB, kWJoinBA, kWJoinFina
 constexpr UINT kWSrv(UINT table) { return kW + table * kWTableSize; }
 constexpr UINT kWUav(UINT table) { return kW + table * kWTableSize + kWSrvCount; }
 constexpr UINT kHeapSize = kW + kWTables * kWTableSize;
+// (every descriptor is written into a heap the shaders do not see, and each dispatch binds its own copy of its table, made as it
+// is recorded, in the bank of its command allocator: a warp still running on the GPU kept reading the table the next one rewrote,
+// and swap_shown rewrote the per-texture ones - D3D12 wants a bound descriptor unchanged until the GPU is past it. A bank is used
+// again once its allocator's frame is complete - see begin)
+constexpr UINT kBanks = 6, kBankSize = 16384;
 constexpr float kMemMargin = 0.125f;  // as in the shaders
 // Scene HUD fit buffer (see cs_scene_*): curve accumulators and curves, wash-out accumulators and
 // values, 2 tile sets, HUD pixel count (same layout as the shader's constants).
@@ -6607,7 +6615,19 @@ Renderer::~Renderer() {
 }
 
 D3D12_CPU_DESCRIPTOR_HANDLE Renderer::cpu(UINT index) const {
-    auto h = heap_->GetCPUDescriptorHandleForHeapStart(); h.ptr += SIZE_T(index) * descriptor_size_; return h;
+    // (the staging heap - see table)
+    auto h = staging_->GetCPUDescriptorHandleForHeapStart(); h.ptr += SIZE_T(index) * descriptor_size_; return h;
+}
+D3D12_GPU_DESCRIPTOR_HANDLE Renderer::table(UINT index, UINT count) {
+    const UINT b = frame_index_ % kBanks;
+    UINT& used = bank_used_[b];
+    if (used + count > kBankSize) { used = 0; ++bank_overflows_; }
+    const UINT at = b * kBankSize + used;
+    used += count;
+    bank_peak_ = std::max(bank_peak_, used);
+    auto dst = heap_->GetCPUDescriptorHandleForHeapStart(); dst.ptr += SIZE_T(at) * descriptor_size_;
+    device_->CopyDescriptorsSimple(count, dst, cpu(index), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    return gpu(at);
 }
 D3D12_GPU_DESCRIPTOR_HANDLE Renderer::gpu(UINT index) const {
     auto h = heap_->GetGPUDescriptorHandleForHeapStart(); h.ptr += UINT64(index) * descriptor_size_; return h;
@@ -6700,8 +6720,10 @@ bool Renderer::init(const LUID& adapter_luid, HWND window, std::uint32_t width, 
 
     static_assert(kSrcSrv + kSlots * kTexCount <= kPrivUav && kPrivUav + kPCount <= kPrivSrv && kPrivSrv + kPCount <= kX,
                   "descriptor ranges overlap");
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kHeapSize, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kBanks * kBankSize, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     if (FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap_)))) { error = "descriptor heap"; return false; }
+    D3D12_DESCRIPTOR_HEAP_DESC staging_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kHeapSize, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    if (FAILED(device_->CreateDescriptorHeap(&staging_desc, IID_PPV_ARGS(&staging_)))) { error = "descriptor staging heap"; return false; }
     D3D12_DESCRIPTOR_HEAP_DESC rd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     if (FAILED(device_->CreateDescriptorHeap(&rd, IID_PPV_ARGS(&rtv_heap_)))) { error = "rtv heap"; return false; }
     descriptor_size_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -7076,8 +7098,8 @@ void Renderer::w_dispatch(ID3D12PipelineState* pso, const void* constants, const
     list_->SetPipelineState(pso);
     list_->SetComputeRoot32BitConstants(0, 32, constants, 0);
     list_->SetComputeRoot32BitConstants(1, kWConstants, w, 0);
-    list_->SetComputeRootDescriptorTable(2, gpu(kWSrv(table)));
-    list_->SetComputeRootDescriptorTable(3, gpu(kWUav(table)));
+    list_->SetComputeRootDescriptorTable(2, this->table(kWSrv(table), kWSrvCount));
+    list_->SetComputeRootDescriptorTable(3, this->table(kWUav(table), 2));
     if (g_profile.skips(pso)) return;  // (development, FW_SKIP)
     g_profile.before(device_.Get(), list_.Get());
     list_->Dispatch(groups_x, groups_y, 1);
@@ -7091,8 +7113,8 @@ void Renderer::w_dispatch_indirect(ID3D12PipelineState* pso, const void* constan
     list_->SetPipelineState(pso);
     list_->SetComputeRoot32BitConstants(0, 32, constants, 0);
     list_->SetComputeRoot32BitConstants(1, kWConstants, w, 0);
-    list_->SetComputeRootDescriptorTable(2, gpu(kWSrv(table)));
-    list_->SetComputeRootDescriptorTable(3, gpu(kWUav(table)));
+    list_->SetComputeRootDescriptorTable(2, this->table(kWSrv(table), kWSrvCount));
+    list_->SetComputeRootDescriptorTable(3, this->table(kWUav(table), 2));
     g_profile.before(device_.Get(), list_.Get());
     list_->ExecuteIndirect(dispatch_sig_.Get(), 1, args, 0, nullptr, 0);
     g_profile.after(list_.Get(), pso);
@@ -7151,8 +7173,8 @@ void Renderer::x_dispatch(ID3D12PipelineState* pso, const void* constants, UINT 
     std::memcpy(c, constants, sizeof(c));
     if (color_space_ == 1) c[31] |= 32768u;
     list_->SetComputeRoot32BitConstants(0, 32, c, 0);
-    list_->SetComputeRootDescriptorTable(1, gpu(srv_table));
-    list_->SetComputeRootDescriptorTable(2, gpu(uav_table));
+    list_->SetComputeRootDescriptorTable(1, table(srv_table, kXSrvCount));
+    list_->SetComputeRootDescriptorTable(2, table(uav_table, 2));
     g_profile.before(device_.Get(), list_.Get());
     if (args) list_->ExecuteIndirect(dispatch_sig_.Get(), 1, args, args_offset, nullptr, 0);
     else list_->Dispatch(groups_x, groups_y, 1);
@@ -9841,6 +9863,9 @@ ID3D12GraphicsCommandList* Renderer::begin(int context) {
         fences_[context]->SetEventOnCompletion(frame_values_[frame_index_], fence_event_);
         WaitForSingleObject(fence_event_, 1000);
     }
+    // (this allocator's table copies free again once its frame is complete; still running - a wait that ran out - they stay, the
+    // next copies after them)
+    if (fences_[context]->GetCompletedValue() >= frame_values_[frame_index_]) bank_used_[frame_index_ % 6] = 0;
     // GPU time of the frame that last used this allocator (a skipped refresh has none).
     const bool skipped = skipped_slot_[frame_index_];
     skipped_slot_[frame_index_] = false;
@@ -10170,15 +10195,15 @@ void Renderer::convert(ID3D12Resource* source, DXGI_FORMAT source_format, int sl
     const bool resample = target != kPDepth && source_w && source_h && (source_w != w || source_h != h);
     const std::uint32_t constants[4] = {w, h, resample ? source_w : 0u, resample ? source_h : 0u};
     list_->SetComputeRoot32BitConstants(0, 4, constants, 0);
-    list_->SetComputeRootDescriptorTable(1, gpu(index));
-    list_->SetComputeRootDescriptorTable(2, gpu(kPrivUav + target));
+    list_->SetComputeRootDescriptorTable(1, table(index, 1));
+    list_->SetComputeRootDescriptorTable(2, table(kPrivUav + target, 1));
     g_profile.before(device_.Get(), list_.Get());
     list_->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
     g_profile.after(list_.Get(), target == kPDepth ? cs_depth_.Get() : cs_color_.Get());
     transition(p, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 }
 
-bool Renderer::estimate_motion(DXGI_FORMAT colour, bool write_motion, const PartialMotion* game) {
+int Renderer::estimate_motion(DXGI_FORMAT colour, bool write_motion, const PartialMotion* game, PrivateId from) {
     const UINT W = private_[kPDepth].width, H = private_[kPDepth].height;
     const UINT w0 = std::max(1u, W / 2), h0 = std::max(1u, H / 2);  // level 0: half the render grid
     constexpr UINT kLevels = 5;
@@ -10188,8 +10213,11 @@ bool Renderer::estimate_motion(DXGI_FORMAT colour, bool write_motion, const Part
     const bool same = private_[kPLumaA].texture && private_[kPLumaA].width == aw && private_[kPLumaA].height == ah;
     if (!ensure_private(kPLumaA, aw, ah, DXGI_FORMAT_R16_FLOAT) || !ensure_private(kPLumaB, aw, ah, DXGI_FORMAT_R16_FLOAT) ||
         !ensure_private(kPFeat, aw, ah, DXGI_FORMAT_R16G16B16A16_FLOAT) || !ensure_private(kPFlowA, aw, ah + 8, DXGI_FORMAT_R16G16B16A16_FLOAT) ||
-        !ensure_private(kPFlowB, aw, ah + 8, DXGI_FORMAT_R16G16B16A16_FLOAT)) return false;  // (+8: room for the fill's smallest levels)
+        !ensure_private(kPFlowB, aw, ah + 8, DXGI_FORMAT_R16G16B16A16_FLOAT)) return -1;  // (+8: room for the fill's smallest levels)
     if (!same) flow_previous_ = false;
+    // (the picture read changed - the HUD-less one came or went: the frame before in the other is no previous picture, a grade or
+    // post-processing step between the two would read as motion)
+    if (from != flow_from_) { flow_previous_ = false; flow_from_ = from; }
     const bool had_previous = flow_previous_;
     const PrivateId now = flow_luma_ ? kPLumaA : kPLumaB, before = flow_luma_ ? kPLumaB : kPLumaA;  // (flow_luma_: which one holds the previous frame)
     XConstants c{};
@@ -10214,7 +10242,7 @@ bool Renderer::estimate_motion(DXGI_FORMAT colour, bool write_motion, const Part
     c.flags = tone;
     if (flow_stamps_) pass_stamp(kPassFlowStart);
     {  // (one 16x16 group per pixel of level 4, see cs_flow_luma)
-        const UINT base = table(kFlowLuma, kPBackbuffer, kPBackbuffer, kPBackbuffer, now);
+        const UINT base = table(kFlowLuma, from, from, from, now);
         transition(private_[now], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         x_dispatch(cs_flow_luma_.Get(), &c, base, base + 6, (w0 + 15) / 16, (h0 + 15) / 16);
         transition(private_[now], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -10304,7 +10332,7 @@ bool Renderer::estimate_motion(DXGI_FORMAT colour, bool write_motion, const Part
     if (flow_stamps_) pass_stamp(kPassFlowOut);
     flow_luma_ ^= 1;
     flow_previous_ = true;
-    return had_previous;
+    return had_previous ? 1 : 0;
 }
 
 void Renderer::score_hud_probe(const IngestedSource& src, const float clip_to_prev_clip[16]) {
@@ -10393,7 +10421,7 @@ std::string Renderer::hud_learn_report() const {
 
 bool Renderer::picture_motion() {
     if (!private_[kPDepth].texture || !private_[kPBackbuffer].texture) return false;
-    return estimate_motion(private_[kPBackbuffer].format, false);
+    return estimate_motion(private_[kPBackbuffer].format, false) > 0;
 }
 
 // The two frames blended, one queue: the frame about to be replaced kept - its picture, as the warp read it, and its cs_to_prev -
@@ -10417,7 +10445,10 @@ void Renderer::keep_previous_frame() {
 }
 
 IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::function<void(const IngestedSource&)>& after_depth) {
-    ++shown_serial_;  // (see swap_shown)
+    // (see swap_shown. With split queues the intake writes the other set and the shown frame stays as it is until the swap, which
+    // counts it: counted here too, each refresh before the swap rebuilt the continuous warp's picks and reaches - eight passes -
+    // from the same depth)
+    if (!split_) ++shown_serial_;
     back_valid_ = false;  // (the set written from here on no longer holds the frame before whole - see own_warp)
     IngestedSource out;
     const auto& m = shared.slots[slot];
@@ -10427,6 +10458,20 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
     for (int k = 0; k < kTexCount; ++k)
         if (m.tex[k].valid) sources[k] = shared_texture(slot, k, m.tex[k].generation);
     if (!sources[kBackbuffer]) return out;
+    {  // (the textures every frame is written into made first: one that could not be - the GPU's memory full - leaves this frame out,
+       // the last one stays shown. Found missing halfway, its barriers and passes went to a texture that was not there)
+        const DXGI_FORMAT c0 = colour_format(static_cast<DXGI_FORMAT>(bb.format));
+        const auto& d0 = m.tex[kDepth];
+        const ID3D12Resource* colour_before = private_[kPBackbuffer].texture.Get();
+        if (!ensure_private(kPBackbuffer, bb.width, bb.height, c0) || !ensure_private(kPOutput, bb.width, bb.height, c0) ||
+            (sources[kDepth] && (!ensure_private(kPDepth, d0.width, d0.height, DXGI_FORMAT_R32_FLOAT) ||
+                                 !ensure_private(kPMotion, d0.width, d0.height, DXGI_FORMAT_R16G16_FLOAT)))) {
+            ++intakes_unallocated_;
+            return out;
+        }
+        // (made anew - a new size or format: the frame before's copy - keep_previous_frame, next - would be of the empty new one)
+        colour_remade_ = private_[kPBackbuffer].texture.Get() != colour_before;
+    }
     pending_game_waits_[context_] = std::max(pending_game_waits_[context_], m.fence_value);
 
     // Shared textures live in COMMON between the two devices' queues.
@@ -10437,11 +10482,34 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
     mark_stage();  // shared textures made readable
     keep_previous_frame();
     info_p_.serial = ++ingest_serial_;
-    info_p_.consecutive = frames_consecutive_;
+    {  // (the two frames blended only over the same rendered area and without a camera cut between them: the frame before's
+       // map is read at this frame's area - a dynamic resolution change inside the same textures read it a third off)
+        const auto& d = m.tex[kDepth];
+        const std::array<std::uint32_t, 6> area = {d.ext_x, d.ext_y, d.ext_w, d.ext_h, d.width, d.height};
+        info_p_.consecutive = frames_consecutive_ && !m.camera.reset && area == consecutive_area_ && !colour_remade_;
+        consecutive_area_ = area;
+    }
 
     const DXGI_FORMAT colour = colour_format(static_cast<DXGI_FORMAT>(bb.format));
     // The game's picture (and the copy of the previous one the HUD detection compares it with).
+    // The HUD-less picture, once a frame: taken before the motion estimate where there is one, which then reads it - with no HUD in it
+    // a still subtitle or crosshair does not vote for no motion over the scenery moving behind it
+    bool hudless_taken = false, hudless_tried = false;
+    auto take_hudless = [&]() {
+        if (hudless_tried) return hudless_taken;
+        hudless_tried = true;
+        const auto& h = m.tex[kHudless];
+        if (sources[kHudless] && h.width == bb.width && h.height == bb.height &&
+            ensure_private(kPHudless, bb.width, bb.height, colour_format(static_cast<DXGI_FORMAT>(h.format)))) {
+            convert(sources[kHudless], static_cast<DXGI_FORMAT>(h.format), slot, kHudless, kPHudless, bb.width, bb.height);
+            hudless_taken = true;
+        }
+        return hudless_taken;
+    };
+    bool colour_taken = false;  // (once: the estimate takes it first, and may then fail - see estimate_motion's -1)
     auto take_colour = [&]() {
+    if (colour_taken) return;
+    colour_taken = true;
     ensure_private(kPBackbuffer, bb.width, bb.height, colour);
     ensure_private(kPOutput, bb.width, bb.height, colour);  // the warped frame: the same values as the game's
     if (keep_previous_ && ingested_ && split_) {
@@ -10484,7 +10552,7 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
         convert(sources[kUi], static_cast<DXGI_FORMAT>(ui.format), slot, kUi, kPUi, bb.width, bb.height);
         out.has_ui = true;
     }
-    flow_ui_ = out.has_ui && !sources[kHudless];  // (with a HUD-less picture the estimate reads that one: no HUD in it)
+    flow_ui_ = out.has_ui && !(sources[kHudless] && m.tex[kHudless].width == bb.width && m.tex[kHudless].height == bb.height);  // (with a HUD-less picture the estimate reads that one: no HUD in it - see take_hudless)
     flow_ui_masked_ = false;
     if (sources[kDepth]) {
         ensure_private(kPDepth, dp.width, dp.height, DXGI_FORMAT_R32_FLOAT);
@@ -10506,12 +10574,14 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
             convert(sources[kMotion], static_cast<DXGI_FORMAT>(mv.format), slot, kMotion, kPMotionGame, dp.width, dp.height, mv.width, mv.height);
             take_colour();
             const PartialMotion game{{shared.motion_clear_x, shared.motion_clear_y}, {shared.motion_scale_x, shared.motion_scale_y}};
-            estimate_motion(colour, true, &game);
-            out.has_motion = true;
-            own_motion_ = true;  // (its confidence: what XPAR's own is trusted on, and what the game drew)
-            partial_motion_ = true;
-            partial_clear_[0] = shared.motion_clear_x; partial_clear_[1] = shared.motion_clear_y;
-            last_depth_rect_ = {dp.ext_x, dp.ext_y, dp.ext_w, dp.ext_h};
+            const bool clean = take_hudless();
+            if (estimate_motion(clean ? private_[kPHudless].format : colour, true, &game, clean ? kPHudless : kPBackbuffer) >= 0) {
+                out.has_motion = true;
+                own_motion_ = true;  // (its confidence: what XPAR's own is trusted on, and what the game drew)
+                partial_motion_ = true;
+                partial_clear_[0] = shared.motion_clear_x; partial_clear_[1] = shared.motion_clear_y;
+                last_depth_rect_ = {dp.ext_x, dp.ext_y, dp.ext_w, dp.ext_h};
+            }
         } else if (sources[kMotion]) {
             // (motion vectors at another resolution than the depth - output resolution: sampled at the matching
             // positions over the depth's grid, not cropped to its corner)
@@ -10529,10 +10599,13 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
             out.has_motion = true;
         } else if (estimate) {
             take_colour();
-            estimate_motion(colour);
-            out.has_motion = true;
-            out.motion_estimated = true;
-            own_motion_ = true;
+            // (-1: its textures could not be made, nothing written - the frame without motion, not with what was there before)
+            const bool clean = take_hudless();
+            if (estimate_motion(clean ? private_[kPHudless].format : colour, true, nullptr, clean ? kPHudless : kPBackbuffer) >= 0) {
+                out.has_motion = true;
+                out.motion_estimated = true;
+                own_motion_ = true;
+            }
         }
         out.depth_rect = {dp.ext_x, dp.ext_y, dp.ext_w, dp.ext_h};
         out.has_depth = true;
@@ -10550,17 +10623,12 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
 
     out.color_w = bb.width; out.color_h = bb.height;
     out.color_rect = {0, 0, bb.width, bb.height};
-    if (!own_motion_) take_colour();
+    take_colour();
 
-    const auto& hl = m.tex[kHudless];
     // The HUD-less picture in its own format where that holds its values exactly (colour_format: 8-bit, 10-bit HDR10, R11G11B10
     // as they are; half-float - scRGB - as it is): only its colour is read (cs_hudless_*, the warp, cs_gen_unui, the
     // history). Half-float for every game before 2026-10-20: 64 MB at 4K for an 8-bit picture, twice with split queues.
-    if (sources[kHudless] && hl.width == bb.width && hl.height == bb.height &&
-        ensure_private(kPHudless, bb.width, bb.height, colour_format(static_cast<DXGI_FORMAT>(hl.format)))) {
-        convert(sources[kHudless], static_cast<DXGI_FORMAT>(hl.format), slot, kHudless, kPHudless, bb.width, bb.height);
-        out.has_hudless = true;
-    }
+    if (take_hudless()) out.has_hudless = true;
     // A HUD-less picture without a UI layer: the layer taken from the two (see cs_hudless_ui) - split as a game that sends both
     // A UI layer with its colour and no HUD-less picture: the scenery under it taken out of the frame (cs_layer_unblend), into
     // the HUD-less picture's texture - not reported as one (the HUD stays the layer's, held where it lets too little through)
@@ -10798,7 +10866,7 @@ void Renderer::finish_frame(bool warped, int marker, bool newest) {
         list_->SetGraphicsRootSignature(root_.Get());
         std::uint32_t constants[4] = {width_, height_, static_cast<std::uint32_t>(marker), static_cast<std::uint32_t>(present_counter_++)};
         list_->SetGraphicsRoot32BitConstants(0, 4, constants, 0);
-        list_->SetGraphicsRootDescriptorTable(1, gpu(kPrivSrv + source));
+        list_->SetGraphicsRootDescriptorTable(1, table(kPrivSrv + source, 1));
         const D3D12_VIEWPORT vp{0, 0, float(width_), float(height_), 0, 1};
         const D3D12_RECT sr{0, 0, LONG(width_), LONG(height_)};
         list_->RSSetViewports(1, &vp);

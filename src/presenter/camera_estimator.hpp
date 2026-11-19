@@ -187,10 +187,15 @@ public:
         for (const auto& p : s) motion.push_back(std::hypot(p.mx, p.my));
         std::nth_element(motion.begin(), motion.begin() + motion.size() / 2, motion.end());
         const double agree = std::max(kAgree, 0.04 * motion[motion.size() / 2]);
-        auto agreeing = [&](const V3& o) {
+        // (need: stop once even every sample left agreeing could not reach it - the count then below need, not exact. A candidate
+        // that can still win is counted to the end: the same result, a quarter less time on frames that come here)
+        auto agreeing = [&](const V3& o, int need = 0) {
             const M3 R = rotation(o);
-            int n = 0;
-            for (const auto& p : s) if (sample_error(p, R, w, h, f, fp) <= agree) ++n;
+            int n = 0, left = int(s.size());
+            for (const auto& p : s) {
+                if (sample_error(p, R, w, h, f, fp) <= agree) ++n;
+                if (n + --left < need) break;
+            }
             return n;
         };
         V3 best = linear_rotation(s, w, h, f, fp);
@@ -202,19 +207,19 @@ public:
             for (auto& p : three) { seed = seed * 1664525u + 1013904223u; p = s[(seed >> 8) % s.size()]; }
             const V3 o = linear_rotation(three, w, h, f, fp);
             if (!std::isfinite(o[0] + o[1] + o[2])) continue;
-            const int n = agreeing(o);
+            const int n = agreeing(o, best_n + 1);
             if (n > best_n) { best = o; best_n = n; }
         }
         omega = best;
+        int n = best_n;  // (omega's count, kept as it changes)
         for (int it = 0; it < 3; ++it) {
             const M3 R = rotation(omega);
             std::vector<MotionSample> in;
             for (const auto& p : s) if (sample_error(p, R, w, h, f, fp) <= agree) in.push_back(p);
             if (in.size() < 24) break;
             V3 o = linear_rotation(in, w, h, f, fp);
-            if (agreeing(o) >= agreeing(omega)) omega = o;
+            if (const int on = agreeing(o, n); on >= n) { omega = o; n = on; }
         }
-        const int n = agreeing(omega);
         share = double(n) / double(s.size());
         return n >= 24 && share >= 0.25;
     }

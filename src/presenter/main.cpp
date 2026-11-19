@@ -2803,6 +2803,23 @@ void render_thread() {
                     replaced_logged = renderer.allocators_replaced();
                     logf("GPU work still running after the wait for it ran out: command allocator replaced (%llu so far)", static_cast<unsigned long long>(replaced_logged));
                 }
+                static std::uint64_t unallocated_logged = 0;
+                if (renderer.intakes_unallocated() != unallocated_logged) {
+                    unallocated_logged = renderer.intakes_unallocated();
+                    logf("game frame left out: a texture it needs could not be made - GPU memory full? (%llu so far)",
+                         static_cast<unsigned long long>(unallocated_logged));
+                }
+                static unsigned peak_logged = 0;  // (the most descriptor copies one command list used: logged as it doubles)
+                if (renderer.bank_peak() >= 1024 && renderer.bank_peak() >= 2 * peak_logged) {
+                    peak_logged = renderer.bank_peak();
+                    logf("descriptor tables: at most %u copies in one command list so far (a bank holds 16384)", peak_logged);
+                }
+                static std::uint64_t overflows_logged = 0;
+                if (renderer.bank_overflows() != overflows_logged) {
+                    overflows_logged = renderer.bank_overflows();
+                    logf("descriptor tables: a command list used more than its bank holds (%llu so far, most %u)",
+                         static_cast<unsigned long long>(overflows_logged), renderer.bank_peak());
+                }
             }
             if (removed != S_OK && !device_loss_logged) {
                 logf("GPU DEVICE LOST: reason 0x%08lX - presenter exits; use 'Start presenter' in the ReShade panel",

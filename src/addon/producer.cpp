@@ -129,6 +129,17 @@ bool Producer::attach(ID3D12Device* device) {
         if (markers_) { markers_->Unmap(0, nullptr); markers_.Reset(); }
         marker_values_ = nullptr;
         pending_publish_.clear(); pending_count_ = 0;
+        // (and every other object made on it - the HUD, learned-point and motion passes with their heaps and copies, the timestamps,
+        // the stencil's: kept, the new device's lists were handed the old device's. Each made again where it is first needed)
+        if (ts_readback_ && ts_mapped_) ts_readback_->Unmap(0, nullptr);
+        ts_heap_.Reset(); ts_readback_.Reset(); ts_mapped_ = nullptr; ts_next_ = 0; ts_failed_ = false;
+        ui_pending_.Reset(); ui_pending_valid_ = false; hudless_pending_.Reset(); hudless_age_ = 2;
+        ui_alpha_.Reset(); ui_root_.Reset(); ui_pso_.Reset(); ui_pso_inverted_.Reset(); ui_heap_.Reset(); ui_ring_ = 0; ui_pass_failed_ = false;
+        probe_pending_.Reset(); probe_cov_.Reset(); probe_end_.Reset(); probe_zero_.Reset(); probe_age_ = 2; probe_end_age_ = 2;
+        probe_root_.Reset(); probe_pso_.Reset(); probe_heap_.Reset(); probe_ring_ = 0; probe_failed_ = false;
+        motion_pending_.Reset(); motion_small_.Reset(); motion_root_.Reset(); motion_pso_.Reset(); motion_heap_.Reset();
+        motion_ring_ = 0; motion_failed_ = false; motion_taken_ = 0; motion_age_ = 8;
+        stencil_reads_.clear(); stencil_stage_.Reset(); stencil_stage_bytes_ = 0; stencil_staged_ = false;
         for (auto& m : shared_->slots) { m.state = kFree; m.frame_id = 0; }
         shared_->latest_ready_frame = 0;
         shared_->session = static_cast<std::uint64_t>(qpc_now());

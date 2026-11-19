@@ -268,6 +268,10 @@ public:
     bool wait_idle();  // false: a queue's work had not completed when the wait ran out (2 s)
     // How often a command allocator was still in use by the GPU when it was to be reset (a wait that ran out): replaced by a new one.
     std::uint64_t allocators_replaced() const { return allocators_replaced_; }
+    // Descriptor table copies: most one command list used, and how often a list needed more than a bank holds (wrapped around).
+    unsigned bank_peak() const { return bank_peak_; }
+    std::uint64_t bank_overflows() const { return bank_overflows_; }
+    std::uint64_t intakes_unallocated() const { return intakes_unallocated_; }
     void wait_for(std::uint64_t value);
     void flush_and_wait();  // submit what is recorded, wait for it, continue recording the same frame  // until the GPU completed `value` (see submitted_value)
     float last_gpu_ms() const { return gpu_ms_; }
@@ -597,6 +601,7 @@ private:
     ID3D12Resource* shared_texture(int slot, int kind, std::uint32_t generation);
     D3D12_CPU_DESCRIPTOR_HANDLE cpu(UINT index) const;
     D3D12_GPU_DESCRIPTOR_HANDLE gpu(UINT index) const;
+    D3D12_GPU_DESCRIPTOR_HANDLE table(UINT index, UINT count);  // a copy of the table at index for this dispatch, in this allocator's bank
     void convert(ID3D12Resource* source, DXGI_FORMAT source_format, int slot, int kind, PrivateId target, std::uint32_t w, std::uint32_t h,
                  std::uint32_t source_w = 0, std::uint32_t source_h = 0);
     void create_swapchain_views();
@@ -643,7 +648,10 @@ private:
     // motion samples.
     // The game's vectors drawn only on what moves on its own (Shared::motion_partial): the raw value where nothing is drawn, and their units in px of the depth.
     struct PartialMotion { float clear[2]; float scale[2]; };
-    bool estimate_motion(DXGI_FORMAT colour, bool write_motion = true, const PartialMotion* game = nullptr);  // false: no previous picture
+    // 1: estimated; 0: no previous picture yet (motion written as none); -1: its textures could not be made (nothing written)
+    // from: the picture read - the frame, or its HUD-less picture
+    int estimate_motion(DXGI_FORMAT colour, bool write_motion = true, const PartialMotion* game = nullptr, PrivateId from = kPBackbuffer);
+    PrivateId flow_from_ = kPBackbuffer;  // (the picture the brightness pyramid of the frame before was read from)
     int flow_luma_ = 0;            // which brightness pyramid holds the previous frame
     bool flow_previous_ = false;   // ...and whether it does (false: no motion this frame)
     bool own_motion_ = false;      // the current frame's motion vectors are XPAR's own (samples: confident ones only)
@@ -708,6 +716,8 @@ private:
     // count kPToPrev was written at)
     struct SetInfo { std::uint64_t serial = 0, to_prev = ~0ull; bool consecutive = false; };
     SetInfo info_p_, info_f_, info_prev_;  // (private_, front_, and the copies' - single queue)
+    bool colour_remade_ = false;  // (this intake made the picture's texture anew - see ingest)
+    std::array<std::uint32_t, 6> consecutive_area_{};  // (the depth's rendered area and size of the frame taken in before - see ingest)
     std::uint64_t ingest_serial_ = 0;
     bool back_valid_ = false;       // (split queues: the set the intake writes next still holds the frame shown before - whole)
     bool warp_read_back_ = false;   // (the warp being recorded reads it: the intake waits for it - see signal)
@@ -869,6 +879,10 @@ private:
     OutputEffects* fx_ = nullptr;  // (see set_output_effects)
     void apply_color_space(std::uint32_t color_space);
     ComPtr<ID3D12DescriptorHeap> heap_, rtv_heap_;
+    ComPtr<ID3D12DescriptorHeap> staging_;  // every descriptor as written; the shaders read copies (see table)
+    std::uint64_t intakes_unallocated_ = 0;  // game frames left out: a texture they need could not be made (see ingest)
+    UINT bank_used_[6]{}, bank_peak_ = 0;
+    std::uint64_t bank_overflows_ = 0;
     UINT descriptor_size_ = 0, rtv_size_ = 0;
     ComPtr<ID3D12QueryHeap> timestamps_;
     ComPtr<ID3D12Resource> readback_;
