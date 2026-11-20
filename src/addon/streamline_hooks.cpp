@@ -1,4 +1,5 @@
 #include "addon/streamline_hooks.hpp"
+#include "addon/streamline_layout.hpp"
 #include "addon/ui_probe.hpp"
 #include "common/inline_hook.hpp"
 #include <array>
@@ -8,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <wrl/client.h>
 
 // Streamline 2.x ABI notes (sl.h / sl_consts.h), all structs derive from BaseStructure
 // { BaseStructure* next; StructType type (16 bytes); size_t version; } = 32 bytes:
@@ -43,7 +45,8 @@ std::atomic<std::uint32_t> g_pcl_attempts{0};
 
 enum Marker : std::uint32_t { kSimulationStart = 0, kSimulationEnd = 1, kRenderSubmitStart = 2, kRenderSubmitEnd = 3,
                               kPresentStart = 4, kPresentEnd = 5 };
-enum BufferType : std::uint32_t { kSlDepth = 0, kSlMotionVectors = 1, kSlHudless = 2, kSlScalingOutputColor = 4, kSlUiColorAlpha = 23 };
+enum BufferType : std::uint32_t { kSlDepth = 0, kSlMotionVectors = 1, kSlHudless = 2, kSlScalingInputColor = 3, kSlScalingOutputColor = 4,
+                                  kSlUiColorAlpha = 23 };
 
 HookStats* stats() { return g_producer && g_producer->shared() ? &g_producer->shared()->hooks : nullptr; }
 
@@ -72,24 +75,28 @@ bool is_unit_basis(const float* up, const float* right, const float* fwd) {
 
 // Converts sl::Constants at base offset b. Returns false when the basis does not look like a camera.
 bool read_constants(const std::uint8_t* c, int b, Camera& cam) {
-    std::uint8_t raw[424];
+    std::uint8_t raw[sl_layout::kConstantsBytes];
     if (!safe_read(c + b, raw, sizeof(raw))) return false;
-    std::memcpy(cam.view_to_clip, raw + 0, 64);
-    std::memcpy(cam.clip_to_view, raw + 64, 64);
-    std::memcpy(cam.clip_to_prev_clip, raw + 192, 64);
-    std::memcpy(cam.jitter, raw + 320, 8);
-    std::memcpy(cam.mvec_scale, raw + 328, 8);
-    std::memcpy(cam.pos, raw + 344, 12);
-    std::memcpy(cam.up, raw + 356, 12);
-    std::memcpy(cam.right, raw + 368, 12);
-    std::memcpy(cam.fwd, raw + 380, 12);
-    std::memcpy(&cam.near_plane, raw + 392, 4);
-    std::memcpy(&cam.far_plane, raw + 396, 4);
-    std::memcpy(&cam.fov, raw + 400, 4);
-    std::memcpy(&cam.aspect, raw + 404, 4);
-    cam.depth_inverted = raw[412] == 1;
-    cam.reset = raw[415] == 1;
+    sl_layout::parse_constants(raw, cam);
     return is_unit_basis(cam.up, cam.right, cam.fwd);
+}
+
+// Direct3D 11: the size of the depth as last published (its area: see sl_layout::depth_area), 0 before the first.
+std::atomic<std::uint32_t> g_d11_depth_w{0}, g_d11_depth_h{0};
+std::atomic<bool> g_estimated_noted{false};
+
+// Direct3D 11: constants with no camera (sl_layout::estimated_camera) published as an estimated camera, its motion
+// vector scale in pixels of the depth published with it - so not before a depth has been tagged.
+// (Direct3D 12 Streamline games are left as they were: not seen without a camera yet, so not checked.)
+void publish_estimated_d3d11(const std::uint8_t* c, int b, std::uint64_t frame) {
+    const std::uint32_t w = g_d11_depth_w, h = g_d11_depth_h;
+    std::uint8_t raw[sl_layout::kConstantsBytes];
+    Camera cam{};
+    if (!w || !h || !safe_read(c + b, raw, sizeof(raw)) || !sl_layout::estimated_camera(raw, cam)) return;
+    sl_layout::scale_to_pixels(cam, w, h);
+    if (!g_estimated_noted.exchange(true))
+        g_producer->set_message("Streamline constants carry no camera: camera estimated from the motion vectors");
+    g_producer->on_constants(frame, cam);
 }
 
 void try_hook_pcl();
@@ -128,6 +135,8 @@ int hk_set_constants(const void* values, const void* frame, const void* viewport
         }
         // (a camera found unusable is left out: the upscaler's hooks publish the frames, camera estimated)
         if (ok && !g_producer->game_camera_unusable() && !g_producer->feed_publishing()) g_producer->on_constants(id, cam);
+        else if (!ok && g_producer->d3d11() && !g_producer->feed_publishing())
+            publish_estimated_d3d11(static_cast<const std::uint8_t*>(values), base >= 0 ? base : 32, id);
         if (!g_marker_hook.installed() && g_pcl_attempts < 200 && (g_pcl_attempts++ % 20) == 0) try_hook_pcl();
     }
     return reinterpret_cast<SetConstantsFn>(g_constants_hook.original())(values, frame, viewport);
@@ -191,6 +200,92 @@ std::size_t tag_stride(const std::uint8_t* tags, std::uint32_t count, int b) {
     return 0;
 }
 
+// Direct3D 11: which of our textures a tag is - the same choice as handle_tags makes for Direct3D 12.
+Tex classify_tag_d3d11(std::uint32_t type, DXGI_FORMAT format, std::uint64_t width) {
+    if (type == kSlDepth && is_depth_format(format)) return kDepth;
+    if (type == kSlMotionVectors) return kMotion;
+    if (type == kSlHudless && is_rgba8(format)) return kHudless;
+    // E33 (UE StreamlineCore): UI colour + alpha from the UI hint extraction pass, full-res BGRA8.
+    if (type == kSlUiColorAlpha && is_rgba8(format) && g_producer->shared() && width == g_producer->shared()->backbuffer_width) return kUi;
+    return kTexCount;
+}
+
+// QueryInterface on a pointer the game handed to Streamline, guarded (no C++ objects here: __try).
+template <class T>
+T* query_guarded(void* p) {
+    T* out = nullptr;
+    __try {
+        if (FAILED(static_cast<IUnknown*>(p)->QueryInterface(__uuidof(T), reinterpret_cast<void**>(&out)))) out = nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { out = nullptr; }
+    return out;
+}
+
+// Direct3D 11: the render size, from the upscaler's input colour or else the motion vectors (sl_layout::tag_size), as
+// last tagged. Tagged depth larger than it is taken from its top left (sl_layout::depth_area).
+std::atomic<std::uint32_t> g_d11_colour_w{0}, g_d11_colour_h{0}, g_d11_motion_w{0}, g_d11_motion_h{0};
+std::atomic<bool> g_d11_deferred_noted{false};
+
+// Direct3D 11 tags: the command buffer is the game's device context and Resource::native an ID3D11Texture2D. Each
+// tag is copied right away (Producer::on_tag_d3d11, on the immediate context): a tag's contents are only certain
+// while it is being tagged (eOnlyValidNow).
+void handle_tags_d3d11(std::uint64_t frame, const std::uint8_t* tags, std::uint32_t count, int b, std::size_t stride, void* command_buffer) {
+    using Microsoft::WRL::ComPtr;
+    ComPtr<ID3D11DeviceContext> context;
+    context.Attach(query_guarded<ID3D11DeviceContext>(command_buffer));
+    if (!context) return;
+    // (a deferred context's commands run when the game executes them, later than the copies made here)
+    if (context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) {
+        if (!g_d11_deferred_noted.exchange(true)) g_producer->set_message("Streamline tags (Direct3D 11) on a deferred context: not taken");
+        return;
+    }
+    struct Tagged { std::uint32_t type; sl_layout::Rect extent; ComPtr<ID3D11Texture2D> texture; D3D11_TEXTURE2D_DESC desc; };
+    constexpr std::uint32_t kMaxTags = 32;
+    Tagged list[kMaxTags];
+    std::uint32_t n = 0;
+    auto* s = stats();
+    for (std::uint32_t i = 0; i < count && n < kMaxTags; ++i) {
+        const std::uint8_t* tag = tags + i * stride;
+        const std::uint8_t* resource = nullptr; std::uint32_t type = 0; const std::uint32_t* extent = nullptr;
+        if (!safe_read(tag + b, &resource, 8) || !safe_read(tag + b + 8, &type, 4) || !safe_read(tag + b + 16, &extent, 8)) continue;
+        if (s && type < 64) ++s->tag_count[type];
+        std::uint8_t resource_type = 0xFF; void* native = nullptr;
+        if (!resource || !safe_read(resource + b, &resource_type, 1) || !safe_read(resource + b + 8, &native, 8)) continue;
+        if (!native || resource_type != 0) continue;  // (a texture: sl::ResourceType::eTex2d)
+        Tagged& t = list[n];
+        t.texture.Attach(query_guarded<ID3D11Texture2D>(native));
+        if (!t.texture) continue;
+        t.texture->GetDesc(&t.desc);
+        std::uint32_t ext[4]{};  // top, left, width, height
+        if (extent) safe_read(extent, ext, sizeof(ext));
+        t.type = type;
+        t.extent = {ext[1], ext[0], ext[2], ext[3]};
+        if (s && type < 64) { s->tag_format[type] = t.desc.Format; s->tag_width[type] = t.desc.Width; s->tag_height[type] = t.desc.Height; }
+        ++n;
+    }
+    // (the render size first: the depth's area depends on it, and the depth may come before the colour in the list)
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const sl_layout::Rect size = sl_layout::tag_size(list[i].extent, list[i].desc.Width, list[i].desc.Height);
+        if (list[i].type == kSlScalingInputColor) { g_d11_colour_w = size.w; g_d11_colour_h = size.h; }
+        else if (list[i].type == kSlMotionVectors) { g_d11_motion_w = size.w; g_d11_motion_h = size.h; }
+    }
+    const bool colour = g_d11_colour_w && g_d11_colour_h;
+    const std::uint32_t render_w = colour ? g_d11_colour_w : g_d11_motion_w, render_h = colour ? g_d11_colour_h : g_d11_motion_h;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        Tagged& t = list[i];
+        const Tex kind = classify_tag_d3d11(t.type, t.desc.Format, t.desc.Width);
+        if (kind == kTexCount) continue;
+        sl_layout::Rect area = t.extent;
+        if (kind == kDepth) {
+            g_last_depth_qpc = qpc_now();
+            g_producer->note_game_depth();
+            area = sl_layout::depth_area(t.desc.Width, t.desc.Height, t.extent, render_w, render_h);
+            // (published at its area's size, which the estimated camera's motion vector scale follows)
+            g_d11_depth_w = area.w; g_d11_depth_h = area.h;
+        }
+        g_producer->on_tag_d3d11(frame, kind, t.texture.Get(), area.x, area.y, area.w, area.h, context.Get());
+    }
+}
+
 void handle_tags(std::uint64_t frame, const void* tags_ptr, std::uint32_t count, void* command_buffer) {
     if (!g_producer || !tags_ptr || !count || !command_buffer || g_producer->game_camera_unusable()) return;
     auto* tags = static_cast<const std::uint8_t*>(tags_ptr);
@@ -207,6 +302,7 @@ void handle_tags(std::uint64_t frame, const void* tags_ptr, std::uint32_t count,
         g_producer->set_message(text);
         return;
     }
+    if (g_producer->d3d11()) { handle_tags_d3d11(frame, tags, count, b, stride, command_buffer); return; }
     auto* list = static_cast<ID3D12GraphicsCommandList*>(command_buffer);
     for (std::uint32_t i = 0; i < count; ++i) {
         const std::uint8_t* tag = tags + i * stride;

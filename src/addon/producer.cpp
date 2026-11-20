@@ -2118,6 +2118,7 @@ void Producer::detach_d3d11() {
     if (!d11_) return;
     release_textures();  // (their D3D11 views belong to the device going away)
     for (auto& m : shared_->slots) { m.state = kFree; m.frame_id = 0; }
+    d11_depth_ = D11Depth{};
     d11_fence_.Reset();
     d11_.Reset();
 }
@@ -2268,6 +2269,114 @@ bool Producer::on_motion_d3d11(std::uint64_t frame, Tex kind, ID3D11Resource* so
     return true;
 }
 
+static const char kD11DepthShader[] = R"(
+cbuffer area : register(b0) { uint2 origin; };
+Texture2D<float> from : register(t0);
+RWTexture2D<float> to : register(u0);
+[numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
+    uint w, h;
+    to.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    to[id.xy] = from.Load(int3(origin + id.xy, 0));
+}
+)";
+
+// The depth plane of a depth texture as a shader reads it; DXGI_FORMAT_UNKNOWN: none (a typed depth format such as
+// D32_FLOAT is not readable by shaders).
+static DXGI_FORMAT d11_depth_read_format(DXGI_FORMAT f) {
+    switch (f) {
+        case DXGI_FORMAT_R24G8_TYPELESS: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        case DXGI_FORMAT_R32G8X24_TYPELESS: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+        case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_R32_FLOAT: return DXGI_FORMAT_R32_FLOAT;
+        case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_R16_UNORM: return DXGI_FORMAT_R16_UNORM;
+        default: return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+// (under mutex_) The part (x, y, w, h) of a depth texture as an R32F texture of the part's size: Direct3D 11 opens that
+// shared, and its grid is the motion vectors' (the presenter spreads motion vectors over the whole depth texture it is
+// given). Null when the format can not be read. The game's compute shader and its b0, t0 and u0 are put back.
+ID3D11Texture2D* Producer::d11_depth_area(ID3D11DeviceContext* context, ID3D11Resource* source, const D3D11_TEXTURE2D_DESC& sd, std::uint32_t x,
+                                          std::uint32_t y, std::uint32_t w, std::uint32_t h) {
+    auto& d = d11_depth_;
+    const DXGI_FORMAT read = d11_depth_read_format(sd.Format);
+    if (read == DXGI_FORMAT_UNKNOWN || sd.SampleDesc.Count != 1 || !w || !h || x + w > sd.Width || y + h > sd.Height) return nullptr;
+    ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    if (!device) return nullptr;
+    if (!d.cs) {
+        ComPtr<ID3DBlob> code, errors;
+        D3D11_BUFFER_DESC bd{};
+        bd.ByteWidth = 16; bd.Usage = D3D11_USAGE_DEFAULT; bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        if (FAILED(D3DCompile(kD11DepthShader, sizeof(kD11DepthShader) - 1, "depth", nullptr, nullptr, "main", "cs_5_0", 0, 0, &code, &errors)) ||
+            FAILED(device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &d.cs)) ||
+            FAILED(device->CreateBuffer(&bd, nullptr, &d.origin))) {
+            d.cs.Reset(); d.origin.Reset();
+            return nullptr;
+        }
+        d.x = d.y = ~0u;
+    }
+    D3D11_TEXTURE2D_DESC cd{}, rd{};
+    if (d.copy) d.copy->GetDesc(&cd);
+    if (d.r32) d.r32->GetDesc(&rd);
+    if (!d.copy || cd.Width != sd.Width || cd.Height != sd.Height || cd.Format != sd.Format) {
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = sd.Width; td.Height = sd.Height; td.MipLevels = 1; td.ArraySize = 1; td.Format = sd.Format;
+        td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = read; sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels = 1;
+        d.copy.Reset(); d.copy_view.Reset();
+        if (FAILED(device->CreateTexture2D(&td, nullptr, &d.copy)) || FAILED(device->CreateShaderResourceView(d.copy.Get(), &sv, &d.copy_view))) {
+            d.copy.Reset(); d.copy_view.Reset();
+            return nullptr;
+        }
+    }
+    if (!d.r32 || rd.Width != w || rd.Height != h) {
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1; td.Format = DXGI_FORMAT_R32_FLOAT;
+        td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+        d.r32.Reset(); d.r32_view.Reset();
+        if (FAILED(device->CreateTexture2D(&td, nullptr, &d.r32)) || FAILED(device->CreateUnorderedAccessView(d.r32.Get(), nullptr, &d.r32_view))) {
+            d.r32.Reset(); d.r32_view.Reset();
+            return nullptr;
+        }
+    }
+    if (d.x != x || d.y != y) {
+        const std::uint32_t origin[4] = {x, y, 0, 0};
+        context->UpdateSubresource(d.origin.Get(), 0, nullptr, origin, 0, 0);
+        d.x = x; d.y = y;
+    }
+    // (all of mip 0: a depth-stencil texture can only be copied whole)
+    context->CopySubresourceRegion(d.copy.Get(), 0, 0, 0, 0, source, 0, nullptr);
+    ComPtr<ID3D11ComputeShader> old_cs;
+    ID3D11ClassInstance* raw_instances[256] = {};
+    UINT instance_count = 256;
+    context->CSGetShader(&old_cs, raw_instances, &instance_count);
+    ID3D11Buffer* old_cb[1] = {};
+    ID3D11ShaderResourceView* old_srv[1] = {};
+    ID3D11UnorderedAccessView* old_uav[1] = {};
+    context->CSGetConstantBuffers(0, 1, old_cb);
+    context->CSGetShaderResources(0, 1, old_srv);
+    context->CSGetUnorderedAccessViews(0, 1, old_uav);
+    ID3D11Buffer* cbs[1] = {d.origin.Get()};
+    ID3D11ShaderResourceView* srvs[1] = {d.copy_view.Get()};
+    ID3D11UnorderedAccessView* uavs[1] = {d.r32_view.Get()};
+    context->CSSetShader(d.cs.Get(), nullptr, 0);
+    context->CSSetConstantBuffers(0, 1, cbs);
+    context->CSSetShaderResources(0, 1, srvs);
+    context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+    context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+    context->CSSetShader(old_cs.Get(), raw_instances, instance_count);
+    context->CSSetConstantBuffers(0, 1, old_cb);
+    context->CSSetShaderResources(0, 1, old_srv);
+    context->CSSetUnorderedAccessViews(0, 1, old_uav, nullptr);
+    for (UINT i = 0; i < instance_count; ++i) if (raw_instances[i]) raw_instances[i]->Release();
+    for (auto* v : old_cb) if (v) v->Release();
+    for (auto* v : old_srv) if (v) v->Release();
+    for (auto* v : old_uav) if (v) v->Release();
+    return d.r32.Get();
+}
+
 void Producer::on_tag_d3d11(std::uint64_t frame, Tex kind, ID3D11Resource* source, std::uint32_t ext_x, std::uint32_t ext_y,
                             std::uint32_t ext_w, std::uint32_t ext_h, ID3D11DeviceContext* context) {
     std::lock_guard lock(mutex_);
@@ -2277,6 +2386,27 @@ void Producer::on_tag_d3d11(std::uint64_t frame, Tex kind, ID3D11Resource* sourc
     D3D11_TEXTURE2D_DESC sd{};
     texture->GetDesc(&sd);
     if (sd.SampleDesc.Count != 1) return;
+    // Depth in a format Direct3D 11 can not open shared (a depth buffer's own: R24G8, R32G8X24, R32 / R16 typeless), or
+    // with the frame in part of it: that part as R32F (d11_depth_area), published whole.
+    const bool part = ext_w && ext_h && (ext_x || ext_y || ext_w < sd.Width || ext_h < sd.Height);
+    if (kind == kDepth && d11_depth_read_format(sd.Format) != DXGI_FORMAT_UNKNOWN && (sd.Format != DXGI_FORMAT_R32_FLOAT || part)) {
+        if (!part) { ext_x = ext_y = 0; ext_w = sd.Width; ext_h = sd.Height; }
+        ID3D11Texture2D* area = d11_depth_area(context, source, sd, ext_x, ext_y, ext_w, ext_h);
+        if (!area) {
+            ++shared_->hooks.copies_failed;
+            if (!d11_depth_.failed_noted) {
+                d11_depth_.failed_noted = true;
+                char text[128];
+                std::snprintf(text, sizeof(text), "Depth (Direct3D 11): %ux%u format %d could not be read as R32F", sd.Width, sd.Height, int(sd.Format));
+                set_message(text);
+            }
+            return;
+        }
+        texture = area;
+        source = area;
+        texture->GetDesc(&sd);
+        ext_x = ext_y = 0; ext_w = sd.Width; ext_h = sd.Height;
+    }
     const int slot = slot_for_frame(frame, true);
     if (slot < 0) return;
     slot_list_[slot] = 0; slot_submitted_[slot] = true;  // (the immediate context: on the GPU's way at once)

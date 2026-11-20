@@ -316,6 +316,20 @@ private:
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> d11_cover_cs_;
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> d11_motion_cs_;  // (on_motion_d3d11)
     Microsoft::WRL::ComPtr<ID3D11Texture2D> d11_motion_small_;
+    // Direct3D 11 depth that can not be shared as it is - a depth buffer's own format (Streamline games tag theirs), or
+    // a frame in part of it: copied (copy: it may still be bound for drawing), then that part written as R32F by a
+    // compute pass (r32, the part's size). See d11_depth_area.
+    struct D11Depth {
+        Microsoft::WRL::ComPtr<ID3D11ComputeShader> cs;
+        Microsoft::WRL::ComPtr<ID3D11Buffer> origin;  // (the part's top left, cbuffer b0)
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> copy, r32;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> copy_view;
+        Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> r32_view;
+        std::uint32_t x = ~0u, y = ~0u;  // (the top left the buffer holds)
+        bool failed_noted = false;
+    } d11_depth_;
+    ID3D11Texture2D* d11_depth_area(ID3D11DeviceContext* context, ID3D11Resource* source, const D3D11_TEXTURE2D_DESC& sd, std::uint32_t x,
+                                    std::uint32_t y, std::uint32_t w, std::uint32_t h);
     const ID3D11Resource* d11_motion_held_ = nullptr;  // (the target d11_motion_small_ holds from its clear this frame - compared, never used)
     bool d11_motion_held_logged_ = false;
     bool d11_shrink_motion(ID3D11DeviceContext* context, ID3D11Resource* source, std::uint32_t width, std::uint32_t height);
