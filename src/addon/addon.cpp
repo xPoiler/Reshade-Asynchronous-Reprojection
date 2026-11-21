@@ -834,7 +834,7 @@ void on_present(command_queue*, swapchain* chain, const rect*, const rect*, uint
             // presenter. Returnal with DLSS FG: candidates tried for nothing, copies taken every frame. A learned point is kept.)
             // (and while the ReShade menu is open: it is drawn on the picture the comparison reads, and taken for HUD - EDF6's saved
             // point dropped when the menu was opened and closed while turning)
-            fw::hud_learn::on_present(chain, sh.settings.hud_learn != 0, g_producer->game_gives_hud() || g_producer->generation_active() || sh.overlay_open != 0,
+            fw::hud_learn::on_present(chain, fw::hud_learn_on(sh.settings), g_producer->game_gives_hud() || g_producer->generation_active() || sh.overlay_open != 0,
                                       sh.presenter.hud_learn_pick,
                                       sh.presenter.hud_learn_fail, sh.settings.hud_relearn, sh.presents_without_frame < 3);  // (3: as the presenter's "has frames")
         }
@@ -1620,6 +1620,56 @@ void draw_overlay(effect_runtime*) {
         hint("Frame-by-frame recordings in the FrameWarp\\logs folder; remembered for this game.");
     }
 
+    // Feature test (development, ShowAllSettings=1 only - Settings::dev_features_off): each category of work switched off by what
+    // it does in the picture, over the settings above (which keep their values); never saved - all on at each launch. The
+    // presenter's log writes the GPU lines of the time before each change (detailed diagnostics on), then the new state.
+    if (shown_in_ui(true) && ImGui::CollapsingHeader("Feature test (development)")) {
+        struct Category { std::uint32_t bit; const char* name; const char* what; };
+        static const Category categories[] = {
+            {fw::kDevCarried, "Weapon / character carried with the camera",
+             "Off: the first-person weapon and a third-person character are warped as scenery (follow share, attached pixels, "
+             "whole-character hold and sight reticles off)."},
+            {fw::kDevTether, "No tears between near and far (continuous warp)",
+             "Off: no displacement field - the old holding way, gaps beside what is held filled from elsewhere."},
+            {fw::kDevHud, "HUD kept still",
+             "Off: the HUD is warped with the picture (the game's HUD layers, HUD detection and learning off - in the add-on too)."},
+            {fw::kDevMemory, "Uncovered areas from the scenery seen before (background memory)",
+             "Off: what a turn uncovers is filled without the memory."},
+            {fw::kDevBetween, "Movement between game frames (two frames blended, the weapon's own motion)",
+             "Off: what moves on its own stays where the game frame shows it until the next one."},
+            {fw::kDevEdges, "Dithered screen edges",
+             "Off: past the frame's edge its edge pixels are extended."},
+            {fw::kDevLimits, "Passes limited to where they matter (same picture)",
+             "On: the blend's halo passes skip what has nothing moving within reach, the mask what has nothing carried or "
+             "attached around it, the continuous warp's field what has no tear between near and far within reach - the "
+             "same picture (but for a few pixels at the screen's edge). Off: every pass over the whole picture, as before."},
+            {fw::kDevProgressive, "Progressive work (2026-11-20)",
+             "On: the warp's field solved on coarser blocks while the view is still or slow, the learned HUD detection looking "
+             "closely only where HUD was found, the field's untorn blocks skipped, the search pass also with a sight's reticle "
+             "layer. Off: each as before - to compare GPU time and picture."},
+        };
+        ImGui::TextUnformatted("Unticked = switched off now (not saved). Each change is logged with the GPU time before it.");
+        for (const auto& c : categories) {
+            bool on = !fw::dev_off(s, c.bit);
+            if (ImGui::Checkbox(c.name, &on)) s.dev_features_off = on ? (s.dev_features_off & ~c.bit) : (s.dev_features_off | c.bit);
+            hint(c.what);
+        }
+        // (variants: ticked = tried instead of the shipped way)
+        static const Category variants[] = {
+            {fw::kDevBlendNear, "Variant: blend the frame before only near movers",
+             "XPAR frame generation mixes in the frame before only where something moves on its own within reach - not on "
+             "scenery whose vectors differ a little from the camera's. Needs \"Passes limited to where they matter\" on."},
+        };
+        ImGui::Separator();
+        ImGui::TextUnformatted("Variants (ticked = tried instead of the shipped way):");
+        for (const auto& c : variants) {
+            bool on = fw::dev_off(s, c.bit);
+            if (ImGui::Checkbox(c.name, &on)) s.dev_features_off = on ? (s.dev_features_off | c.bit) : (s.dev_features_off & ~c.bit);
+            hint(c.what);
+        }
+        if (ImGui::Button("All as shipped")) s.dev_features_off = 0;
+    }
+
     if (ImGui::CollapsingHeader("FSR diagnostics (AMD FidelityFX 2 / 3.0 / 3.1 / 4)")) {
         const auto& f = sh.fsr;
         ImGui::Text("Hooks: amd_fidelityfx_dx12 %s, loader %s, upscaler %s", (f.hooks & 3) ? "yes" : "no", (f.hooks & 12) ? "yes" : "no",
@@ -1705,25 +1755,25 @@ void register_callbacks() {
     fw::shader_scan::init();
     fw::hud_learn::init(
         [](std::uint64_t picture, bool d3d11, std::uint32_t state, std::uint64_t list, std::uint32_t candidate, bool end, bool use) {
-            if (!g_producer || !g_producer->shared() || !g_producer->shared()->settings.hud_learn) return;
+            if (!g_producer || !g_producer->shared() || !fw::hud_learn_on(g_producer->shared()->settings)) return;
             if (d3d11) g_producer->on_hud_probe_d3d11(reinterpret_cast<ID3D11Resource*>(picture), reinterpret_cast<ID3D11DeviceContext*>(list), candidate, use);
             else g_producer->on_hud_probe(reinterpret_cast<ID3D12Resource*>(picture), static_cast<D3D12_RESOURCE_STATES>(state),
                                           reinterpret_cast<ID3D12GraphicsCommandList*>(list), candidate, end, use);
         },
-        [] { if (g_producer && g_producer->shared() && g_producer->shared()->settings.hud_learn) g_producer->on_hud_none(); });
+        [] { if (g_producer && g_producer->shared() && fw::hud_learn_on(g_producer->shared()->settings)) g_producer->on_hud_none(); });
     fw::ui_layer::init(
         [](std::uint64_t layer, std::uint32_t state, std::uint64_t list, bool inverted) {
-            if (g_producer && g_producer->shared() && g_producer->shared()->settings.game_hud_layers)
+            if (g_producer && g_producer->shared() && fw::hud_layers_on(g_producer->shared()->settings))
                 g_producer->on_ui_layer(reinterpret_cast<ID3D12Resource*>(layer), static_cast<D3D12_RESOURCE_STATES>(state),
                                         reinterpret_cast<ID3D12GraphicsCommandList*>(list), inverted);
         },
         [](std::uint64_t picture, std::uint32_t state, std::uint64_t list) {
-            if (g_producer && g_producer->shared() && g_producer->shared()->settings.game_hud_layers)
+            if (g_producer && g_producer->shared() && fw::hud_layers_on(g_producer->shared()->settings))
                 g_producer->on_hudless_copy(reinterpret_cast<ID3D12Resource*>(picture), static_cast<D3D12_RESOURCE_STATES>(state),
                                             reinterpret_cast<ID3D12GraphicsCommandList*>(list));
         },
         [](std::uint64_t image, std::uint32_t format, std::uint32_t width, std::uint32_t height, std::uint32_t state, std::uint64_t cb) {
-            if (!g_producer || !g_producer->shared() || !g_producer->shared()->settings.game_hud_layers) return;
+            if (!g_producer || !g_producer->shared() || !fw::hud_layers_on(g_producer->shared()->settings)) return;
             // (the layer's state as the D3D12 one it maps to - back to the Vulkan layout it is in: VkImageLayout values)
             std::uint32_t layout = 1;  // GENERAL
             if (state & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) layout = 1;
@@ -1736,11 +1786,11 @@ void register_callbacks() {
                                        reinterpret_cast<void*>(cb));
         },
         [](std::uint64_t picture, std::uint32_t kind, std::uint64_t context) {
-            if (g_producer && g_producer->shared() && g_producer->shared()->settings.game_hud_layers)
+            if (g_producer && g_producer->shared() && fw::hud_layers_on(g_producer->shared()->settings))
                 g_producer->on_hud_before_d3d11(reinterpret_cast<ID3D11Resource*>(picture), kind, reinterpret_cast<ID3D11DeviceContext*>(context));
         },
         [](std::uint64_t image, std::uint32_t format, std::uint32_t width, std::uint32_t height, std::uint32_t layout, std::uint64_t cb) {
-            if (g_producer && g_producer->shared() && g_producer->shared()->settings.game_hud_layers)
+            if (g_producer && g_producer->shared() && fw::hud_layers_on(g_producer->shared()->settings))
                 g_producer->on_hudless_vk(image, static_cast<DXGI_FORMAT>(format), width, height, layout, reinterpret_cast<void*>(cb));
         });
     reshade::register_event<reshade::addon_event::finish_present>(on_finish_present);

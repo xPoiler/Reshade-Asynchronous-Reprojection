@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 93;  // (93: Settings::whole_pixels; 92: Settings::even_pacing; 90: a test build installed 2026-11-12, never committed)
+constexpr std::uint32_t kVersion = 94;  // (94: Settings::dev_features_off; 93: Settings::whole_pixels; 92: Settings::even_pacing; 90: a test build installed 2026-11-12, never committed)
 // (four: the presenter taking one in, one ready, and the add-on writing two - a game that starts its next frame before
 // the last one is presented (its tags and constants come first: Cyberpunk, Enshrouded) has two being written. Three
 // slots, 2026-10-28, dropped 43-55% of their frames before the presenter saw them - the reprojection fed at half the
@@ -166,7 +166,35 @@ struct Settings {
     std::uint32_t whole_pixels;        // default on: the warp's picture from the nearest of the game's pixels, never a blend of neighbours -
                                        // a blend softened fine detail by how far between pixels the warp landed, a turn going sharp and soft
                                        // with its speed (Renderer::set_whole_pixels; saved per game)
+    std::uint32_t dev_features_off;    // development (the panel's "Feature test", shown with ShowAllSettings=1; never saved, 0 each launch):
+                                       // categories of work switched off by what they do in the picture - DevFeature bits, applied over the
+                                       // settings above by the presenter (main.cpp, apply_feature_test) and the add-on's HUD capture
 };
+// (Settings::dev_features_off: each bit one category, by what it does in the final picture)
+enum DevFeature : std::uint32_t {
+    kDevCarried = 1u,    // the weapon / character carried with the camera moves with it (follow share, attached, hold, sight reticles)
+    kDevTether = 2u,     // no tears between near and far (the continuous warp's field; off: the old holding way)
+    kDevHud = 4u,        // the HUD kept still (game HUD layers, HUD detection and learning, fill behind the HUD)
+    kDevMemory = 8u,     // what a turn uncovers shown from the scenery seen before (background memory)
+    kDevBetween = 16u,   // what moves on its own shown between game frames (two frames blended, the weapon's own motion)
+    kDevEdges = 32u,     // the screen's edges past the frame dithered (off: the frame's edge pixels extended)
+    kDevLimits = 64u,    // not a picture category: each pass only where it can change its result (Renderer::set_pass_limits,
+                         // set_tether_skip) - the same picture (the solve's skip: but for a few pixels at the screen's edge);
+                         // off: every pass over the whole picture, as before, for the A/B
+    // (variants - set: tried instead of the shipped way)
+    kDevNearSolve = 128u,  // (no box: the near-steps solve, 8 x 2, 4 x 3, is the shipped one since 2026-11-20)
+    kDevBlendNear = 256u,  // the frame before blended in only where something moves on its own within reach (not the scenery's own)
+    kDevAdaptSolve = 512u,  // (no box: tried 2026-11-20, came out as the shipped solve) the field solve's steps chosen per area
+    // (a category again - set: off) the progressive work of 2026-11-20 - the field solve's blocks by the camera's speed, the
+    // learned HUD detection by tile, the solve's untorn blocks skipped, the search pass with a sight-reticle layer; off: each as
+    // before, for the A/B in game. (What gives the same picture bit for bit - the sight search near the centre, the pick in
+    // pieces, the HUD work packed - has no way back)
+    kDevProgressive = 1024u,
+};
+inline bool dev_off(const Settings& s, std::uint32_t bit) { return (s.dev_features_off & bit) != 0; }
+// (the add-on's HUD capture - the game's HUD layers and HUD learning - as the feature test leaves it)
+inline bool hud_layers_on(const Settings& s) { return s.game_hud_layers != 0 && !dev_off(s, kDevHud); }
+inline bool hud_learn_on(const Settings& s) { return s.hud_learn != 0 && !dev_off(s, kDevHud); }
 
 // Presenter status, displayed by the add-on UI.
 struct PresenterStatus {

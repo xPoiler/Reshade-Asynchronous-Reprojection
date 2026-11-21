@@ -681,6 +681,53 @@ struct MemoryGuard {
     }
 };
 
+// Feature test (development - Settings::dev_features_off, the panel's "Feature test", shown with ShowAllSettings=1): each
+// category of work switched off over the settings by what it does in the picture, so that a game shows what each costs and
+// what it gives. Each change first writes the GPU lines of the time before it (main loop, g_feature_flush), then the new state.
+bool g_tether_env = true;          // (ContinuousWarp as the game's ini has it: the field is off only while the test switches it off)
+std::uint32_t g_features_off = 0;  // (the categories off as last applied)
+std::uint32_t g_features_before = 0;
+bool g_feature_flush = false;      // (a change: the GPU lines now, for the time before it)
+std::string feature_names(std::uint32_t off) {
+    static const char* const names[] = {"weapon/character carried", "no tears (continuous warp)", "HUD kept still", "background memory",
+                                        "movement between frames", "dithered edges", "passes limited to where they matter",
+                                        "field solve near steps only (8 x 2, 4 x 3)", "blend only near movers",
+                                        "field solve steps per area", "progressive work (2026-11-20)"};
+    if (!(off & 2047u)) return "everything on, as shipped";
+    std::string out;
+    for (const int i : {0, 1, 2, 3, 4, 5, 6, 10})  // (categories: off when set)
+        if (off & (1u << i)) { out += out.empty() ? "off: " : ", "; out += names[i]; }
+    for (int i = 7; i < 10; ++i)  // (variants: on when set)
+        if (off & (1u << i)) { out += out.empty() ? "variant: " : (out.find("variant") == std::string::npos ? " | variant: " : ", "); out += names[i]; }
+    return out;
+}
+void apply_feature_test(Settings& s, Renderer& renderer) {
+    const std::uint32_t off = s.dev_features_off & 2047u;
+    if (off & kDevCarried) { s.keep_attached = 0; s.follow_share = 0; s.hold_characters = 0; s.hold_reticles = 0; }
+    if (off & kDevHud) { s.no_warp_mask = 0; s.use_ui_tags = 0; s.game_hud_layers = 0; s.hud_learn = 0; s.hud_fill = 0; }
+    if (off & kDevMemory) s.background_memory = 0;
+    if (off & kDevBetween) s.object_interp = 0;
+    if (off & kDevEdges) s.edge_fill = 0;
+    renderer.set_tether(g_tether_env && !(off & kDevTether));
+    renderer.set_pass_limits(!(off & kDevLimits));
+    renderer.set_tether_skip(!(off & (kDevLimits | kDevProgressive)));  // (the solve's untorn blocks left - one of the pass limits)
+    renderer.set_tether_by_speed(!(off & kDevProgressive));
+    renderer.set_hud_sparse(!(off & kDevProgressive));
+    renderer.set_seek_layer(!(off & kDevProgressive));
+    renderer.set_progressive_exact(!(off & kDevProgressive));
+    renderer.set_flow_light(!(off & kDevProgressive));
+    renderer.set_seek_rim(!(off & kDevProgressive));
+    renderer.set_blend_near_movers((off & kDevBlendNear) != 0);
+    renderer.set_tether_adaptive((off & kDevAdaptSolve) != 0);
+    if (off == g_features_off) return;
+    const std::uint32_t now_off = off & ~g_features_off;
+    if (now_off & kDevMemory) renderer.release_memory();          // (made again once it is used again)
+    if (now_off & kDevCarried) renderer.release_reticle_layers();  // (...the same)
+    g_features_before = g_features_off;
+    g_features_off = off;
+    g_feature_flush = true;
+}
+
 // Scale that maps the game's motion vectors to uv (per axis), measured against the camera-only motion of
 // every pixel. Only frames that fit almost perfectly count (cuts, camera animations and large moving
 // areas do not), and the scale locks once several agree. Motion vectors in render pixels (Unreal) are
@@ -1009,7 +1056,7 @@ void render_thread() {
         // Renderer::set_carried_free, set_mem_pos, set_attached_estimated)
         const auto env_on = [](const wchar_t* name) { wchar_t v[4]{}; return GetEnvironmentVariableW(name, v, 4) && v[0] == L'1'; };
         // (the continuous warp, on by default: ContinuousWarp=0 - FW_TETHER=0 - holds the character/weapon the old way)
-        { wchar_t v[4]{}; const bool off = GetEnvironmentVariableW(L"FW_TETHER", v, 4) && v[0] == L'0'; renderer.set_tether(!off);
+        { wchar_t v[4]{}; const bool off = GetEnvironmentVariableW(L"FW_TETHER", v, 4) && v[0] == L'0'; renderer.set_tether(!off); g_tether_env = !off;
           logf(off ? "continuous warp off: the character/weapon held the old way (ContinuousWarp=0)" : "continuous warp: nothing held but the HUD, no gaps"); }
         if (env_on(L"FW_CARRIED_FREE")) { renderer.set_carried_free(true); logf("carried pixels not held by the warp (development: CarriedFree)"); }
         if (env_on(L"FW_MEM_POS")) { renderer.set_mem_pos(true); logf("the background memory carried with its own positions (development: MemoryPositions)"); }
@@ -1249,6 +1296,9 @@ void render_thread() {
         }
         if (memory_guard.level >= 1) settings.hold_reticles = 0;
         if (memory_guard.level >= 2) settings.background_memory = 0;
+        // (development, the panel's "Feature test" - Settings::dev_features_off: categories switched off over the settings, by
+        // what they do in the picture; logged with the GPU time of the time before each change - see apply_feature_test)
+        apply_feature_test(settings, renderer);
         const bool memory_aside = memory_guard.level >= 3;
         sh.presenter.memory_guard = static_cast<std::uint32_t>(memory_guard.level);
         apply_gpu_priority(settings.gpu_priority);
@@ -2422,7 +2472,8 @@ void render_thread() {
                 const double held_back = !source_has_sim && interval > 0 ? std::clamp(1.0 - (now_seconds() - shown_since) / interval, 0.0, 1.0) : g_app.model.position_frames_back(shown_frame);
                 // (MotionReference: whatever moves with the screen, a third-person character too - see Renderer::set_motion_reference)
                 static const bool motion_ref_between = GetEnvironmentVariableW(L"FW_MOTION_REF", nullptr, 0) != 0;
-                renderer.set_held_between(generated < 0 && (motion_ref_between || !g_app.model.orbited_within(g_app.model.source_time(), 10.0)), float(held_back));
+                renderer.set_held_between(generated < 0 && !dev_off(settings, kDevCarried | kDevBetween) &&  // (the feature test: either category off)
+                                          (motion_ref_between || !g_app.model.orbited_within(g_app.model.source_time(), 10.0)), float(held_back));
                 // (Settings::object_interp, A/B: what moves on its own at that moment too - Renderer::set_objects_between. The camera
                 // still, the frame is no longer shown as it is while that moment lies before it: what moves in it is drawn at
                 // every refresh - whether anything in the frame does move is not known here, so every such refresh is warped)
@@ -2857,7 +2908,12 @@ void render_thread() {
             st.mv_fit_quality = float(mv_scale.quality);
             st.moving_fraction = float(mv_scale.moving_fraction);
             // What the presenter costs the GPU (shared with the game), every 10 s.
-            if (diag() && now - last_usage_log >= 10.0) {
+            // (the feature test changed: the lines now, for the time before the change - each block of lines one state alone)
+            if (diag() && (now - last_usage_log >= 10.0 || g_feature_flush)) {
+                const std::uint32_t features = g_feature_flush ? g_features_before : g_features_off;
+                if (g_feature_flush)
+                    logf("feature test: the lines below are the last %.1f s, with %s", last_usage_log > 0 ? now - last_usage_log : 0.0,
+                         feature_names(features).c_str());
                 const Renderer::GpuUsage u = renderer.take_gpu_usage();
                 {
                     const auto hs = renderer.take_held_stats();
@@ -2890,11 +2946,16 @@ void render_thread() {
                          (u.intake_ms + u.warp_ms) / (span * 10.0), u.intakes / span, u.intakes ? u.intake_ms / u.intakes : 0.0,
                          u.access_ms / n, u.depth_ms / n, u.colour_ms / n, u.rest_ms / n, u.warps / span, u.warps ? u.warp_ms / u.warps : 0.0,
                          u.skipped / span);
+                    if (features) logf("feature test: %s", feature_names(features).c_str());
                     // (what the presenter's video memory holds, once a minute)
                     static int memory_reports = 0;
                     if (memory_reports++ % 6 == 0) logf("presenter memory: %s", renderer.memory_report().c_str());
                     if (const std::string learn = renderer.hud_learn_report(); !learn.empty()) logf("HUD learning: %s", learn.c_str());
                     if (renderer.intake_gate() && renderer.split()) logf("intake between the warps: %s", renderer.intake_gate_report().c_str());
+                }
+                if (g_feature_flush) {
+                    logf("feature test: from now %s", feature_names(g_features_off).c_str());
+                    g_feature_flush = false;
                 }
             }
             {

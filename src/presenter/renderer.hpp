@@ -451,9 +451,38 @@ public:
     // (dev, key ContinuousWarp: the continuous warp - no gaps by construction, nothing held but the HUD; see ow_tether and
     // dev/plan_continuous_warp.md)
     void set_tether(bool on) { tether_ = on; }
+    // (each pass's work only where it can change its result - the halo of the blend's movers, the mask away from the HUD and the
+    // carried: groups that provably write a constant write it and stop. The same output bit for bit; off for the A/B - the feature test)
+    void set_pass_limits(bool on) { pass_limits_ = on; }
+    // (a variant - the feature test: the frame before mixed in only where something moves on its own within reach; needs the pass
+    // limits' tiles - see cs_to_prev)
+    void set_blend_near_movers(bool on) { blend_near_movers_ = on; }
+    // (the solve's first step in blocks, 64 by default; the feature test's variant starts nearer - see own_warp)
+    void set_tether_first_step(int step) { tether_first_ = step; }
+    // (a variant - the feature test: the solve's steps chosen per area, far ones only where a large tear has to be spread - see
+    // cs_tether_need; the default passes only, in place of the first step and the schedule)
+    void set_tether_adaptive(bool on) { tether_adapt_ = on; }
+    // (blocks with no tear within reach - see cs_tether_need - left as they are by the solve's passes: on by default, the
+    // default passes only; off with the pass limits in the feature test, FW_TETHER_SKIP=0 in seq_replay. 35-50% of the solve's
+    // GPU time, synthetic benchmark no region worse - 2026-11-20)
+    void set_tether_skip(bool on) { tether_skip_ = on; }
+    // (the learned HUD detection alone: where nothing is learned, one pixel of each 2x2 a frame, turning - see cs_hud_count; on by
+    // default, FW_HUD_SPARSE_OFF in seq_replay)
+    void set_hud_sparse(bool on) { hud_sparse_ = on; }
+    // (passes at each coarse step, index log2(step) - 64 at 6 .. 4 at 2; -1 the default count. Shipped: 8 x 2, 4 x 3 since
+    // 2026-11-20 - the far steps' passes spent near: the synthetic pictures better beside the weapon, net error -23; in game no
+    // visible difference (AC6, Cyberpunk). seq_replay FW_TETHER_SCHED overrides, "64:1,32:1,16:1,8:1,4:1" the old one)
+    void set_tether_schedule(const int (&iters)[7]) { for (int i = 0; i < 7; ++i) tether_sched_[i] = iters[i]; }
     void set_tether_iterations(int coarse, int fine, int fine_from) { tether_iters_ = coarse; tether_iters_fine_ = fine; tether_fine_ = fine_from; }  // (dev: the solver's passes per step)
     bool tether() const { return tether_; }
-    void set_tether_block(int b) { tether_block_ = b; }  // (dev: the solve's block in rendered px, 0 by the render size)
+    void set_tether_block(int b) { tether_block_ = b; }  // (dev: the solve's block in rendered px, 0 by the render size - and by speed)
+    void set_seek_layer(bool on) { seek_layer_ = on; }  // (the search pass with a sight-reticle layer too - see ow_seek; off: the full warp)
+    // (the progressive work that gives the same picture bit for bit - the pick in 4 x 4 pieces, the sight search near the centre:
+    // off, each as before - the "Progressive work" box)
+    void set_progressive_exact(bool on) { progressive_exact_ = on; }
+    void set_seek_rim(bool on) { seek_rim_ = on; }  // (the continuous warp's rim rule - see ow_seek_rim; the "Progressive work" box)
+    void set_flow_light(bool on) { flow_light_ = on; }  // (XPAR's own motion estimate with fewer refinements - see estimate_flow; the "Progressive work" box)
+    void set_tether_by_speed(bool on) { tether_by_speed_ = on; }  // (the blocks by the picture's speed - see own_warp; FW_TETHER_SPEED_OFF in replays)
     void set_carried_free(bool on) { carried_free_ = on; }  // (dev: carried pixels - share ~0 - not held by the warp)
     void set_outlines_held(bool on) { outlines_held_ = on; }  // (the mask's outlines and sights, 0.95: held, or warped as carried)
     void set_own_depth_blind(bool on) { own_depth_blind_ = on; }  // (own motion spread over a character at any distance)
@@ -548,7 +577,7 @@ public:
         if (split_) return shown_mask_ ? front_[kPMask].texture.Get() : nullptr;
         return mask_ready_ ? private_[kPMask].texture.Get() : nullptr;
     }
-    void reset_hud_detection() { reset_hud_ = true; mask_ready_ = false; shown_mask_ = false; mem_last_ = -1; flow_previous_ = false; }
+    void reset_hud_detection() { reset_hud_ = true; hud_full_left_ = 16; mask_ready_ = false; shown_mask_ = false; mem_last_ = -1; flow_previous_ = false; }
 
     // Test/diagnostic helper: synchronously reads back the warped output (RGBA16F) or private backbuffer.
     // which: 0 the game's frame, 1 the warped output, 2 the upscaler's output (scene before HUD).
@@ -576,7 +605,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     };
-    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPHudLearned, kPHudTiles, kPWarpClaims, kPStill, kPGrowA, kPGrowB, kPProbe, kPProbeTilesA, kPProbeTilesB, kPShareA, kPShareB, kPShareT, kPShare, kPRetDirtyA, kPRetDirtyB, kPShareT2, kPShareHalf, kPRecColour, kPRecUi, kPShareResid, kPOwnMove, kPPaths, kPShareSeam, kPAttHist, kPMemVis, kPUiTiles, kPWarpBeside, kPWarpHeld, kPLowScene, kPMaskRaw, kPMemF0, kPMemF1, kPMemFZ0, kPMemFZ1, kPGunMove, kPMemRatio, kPMotionProbe, kPMotionGame, kPStencil, kPStenCellsA, kPStenCellsB, kPStenMask, kPStenGrowA, kPStenGrowB, kPStenAge, kPStenLumaA, kPStenLumaB, kPStenElig, kPStenFringeA, kPStenFringeB, kPDepthVA, kPDepthVB, kPMemMask, kPShareSm, kPShareSmA, kPRecOut, kPTetherA, kPTetherB, kPTetherT, kPTetherF, kPTetherP, kPGunFlag, kPOwnT, kPToPrev, kPPrevCol, kPPrevTo, kPFitPart, kPFit, kPTetherRA, kPTetherRB, kPCount };
+    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPHudLearned, kPHudTiles, kPWarpClaims, kPStill, kPGrowA, kPGrowB, kPProbe, kPProbeTilesA, kPProbeTilesB, kPShareA, kPShareB, kPShareT, kPShare, kPRetDirtyA, kPRetDirtyB, kPShareT2, kPShareHalf, kPRecColour, kPRecUi, kPShareResid, kPOwnMove, kPPaths, kPShareSeam, kPAttHist, kPMemVis, kPUiTiles, kPWarpBeside, kPWarpHeld, kPLowScene, kPMaskRaw, kPMemF0, kPMemF1, kPMemFZ0, kPMemFZ1, kPGunMove, kPMemRatio, kPMotionProbe, kPMotionGame, kPStencil, kPStenCellsA, kPStenCellsB, kPStenMask, kPStenGrowA, kPStenGrowB, kPStenAge, kPStenLumaA, kPStenLumaB, kPStenElig, kPStenFringeA, kPStenFringeB, kPDepthVA, kPDepthVB, kPMemMask, kPShareSm, kPShareSmA, kPRecOut, kPTetherA, kPTetherB, kPTetherT, kPTetherF, kPTetherP, kPGunFlag, kPOwnT, kPToPrev, kPPrevCol, kPPrevTo, kPFitPart, kPFit, kPTetherRA, kPTetherRB, kPOwnTiles, kPTetherN, kPTetherS, kPCount };
 
     bool create_pipelines(std::string& error);
     std::string shader_report_;
@@ -729,11 +758,16 @@ private:
     int mem_last_frame_ = 1;
     HeldStats held_stats_;
     std::uint64_t last_warp_serial_ = ~0ull;
+    bool seek_layer_ = true, progressive_exact_ = true, flow_light_ = true, seek_rim_ = true;
+    std::uint64_t speed_serial_ = ~0ull;  // (set_tether_by_speed: the shown frame the blocks were decided for)
+    float speed_last_v_ = 0.0f, speed_frame_v_ = 0.0f;  // (the view's move at the last warp; at the frame before's last, for this frame)
     std::array<std::pair<PrivateId, bool>, 24> warp_srv_ = {};  // (the warp table's SRVs as last set - set_x_srv)
     float claims_matrix_[16] = {};
     bool orbit_centre_turn_ = false, orbit_kind_ = true, share_orbit_ = false, projection_changed_ = false, zoom_freeze_ = true, ui8_force_ = false, flow_stamps_ = false, share_stamps_ = false;
-    bool behind_own_share_ = false, tether_ = true;
-    int tether_iters_ = 1, tether_iters_fine_ = 4, tether_fine_ = 1, tether_block_ = 0;
+    bool behind_own_share_ = false, tether_ = true, pass_limits_ = true, blend_near_movers_ = false;
+    std::uint32_t hud_sparse_turn_ = 0;
+    bool hud_marks_valid_ = false;  // (see cs_hud_count's flag 4096)
+    int tether_iters_ = 1, tether_iters_fine_ = 4, tether_fine_ = 1, tether_block_ = 0, tether_first_ = 64, tether_adapt_ = false, tether_skip_ = true, hud_sparse_ = true, hud_full_left_ = 16, tether_by_speed_ = true, tether_sched_[7] = {-1, -1, 3, 2, 0, 0, 0};  // (8 x 2, 4 x 3 - see set_tether_schedule)
     // (the continuous warp's blocks' nearest pixels - kPTetherP, cs_tether_pick - and what they were picked from: once per shown frame)
     std::array<std::uint64_t, 5> tether_pick_key_{};
     bool tether_pick_valid_ = false;
@@ -759,7 +793,7 @@ private:
     bool learning_stalled_ = true;
     std::uint32_t detection_idle_ = 0;  // game frames since the HUD was last detected (build_no_warp_mask)
     std::uint32_t scene_idle_ = 0;      // game frames since the upscaler's output last came (ingest)
-    ComPtr<ID3D12PipelineState> cs_attached_, cs_ref_pick_, cs_ref_frac_, cs_depth_vec_, cs_mem_mask_, cs_share_weights_, cs_ref_raw_, cs_share_rows_, cs_share_cols_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_hud_apply_, cs_hud_gate_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_own_warp_reset_, cs_own_warp_lean_, cs_own_warp_seek_, cs_own_warp_args_, cs_own_warp_rest_, cs_warp_claims_clear_, cs_warp_claim_, cs_warp_beside_, cs_warp_held_, cs_own_warp_up_, cs_mask_smooth_, cs_memory_, cs_mem_ratio_, cs_mem_relight_, cs_gun_motion_, cs_gun_check_, cs_mem_vis_, cs_hudless_ui_, cs_hudless_keep_, cs_ui_tiles_, cs_layer_unblend_, cs_layer_seam_clear_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_search_par_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_, cs_camera_fill_, cs_probe_tiles_, cs_probe_clear_, cs_probe_score_, cs_share_measure_, cs_share_blur_, cs_share_bins_, cs_share_final_, cs_share_up_, cs_share_seam_, cs_att_hist_, cs_rec_down_, cs_share_resid_, cs_resid_blur_, cs_own_up_, cs_own_halo_h_, cs_own_halo_v_, cs_to_prev_, cs_fit_sums_, cs_fit_total_, cs_tether_init_, cs_tether_step_, cs_tether_fine_, cs_tether_final_, cs_tether_pick_, cs_tether_reach0_, cs_tether_reach_;
+    ComPtr<ID3D12PipelineState> cs_attached_, cs_ref_pick_, cs_ref_frac_, cs_depth_vec_, cs_mem_mask_, cs_share_weights_, cs_ref_raw_, cs_share_rows_, cs_share_cols_, cs_analyze_, cs_reduce_, cs_hud_, cs_hud_world_, cs_mask_, cs_clear_score_, cs_hud_count_, cs_clear_counts_, cs_hud_apply_, cs_hud_gate_, cs_sample_, cs_tint_, cs_hud_tiles_, cs_hud_spread_, cs_scene_clear_, cs_scene_accum_, cs_scene_finish_, cs_scene_tiles_, cs_scene_hud_, cs_scene_fill_, cs_scene_grey_, cs_scene_grey_finish_, cs_scene_wash_, cs_scene_wash_finish_, cs_own_warp_, cs_own_warp_reset_, cs_own_warp_lean_, cs_own_warp_seek_, cs_own_warp_args_, cs_own_warp_rest_, cs_warp_claims_clear_, cs_warp_claim_, cs_warp_beside_, cs_warp_held_, cs_own_warp_up_, cs_mask_smooth_, cs_memory_, cs_mem_ratio_, cs_mem_relight_, cs_gun_motion_, cs_gun_check_, cs_mem_vis_, cs_hudless_ui_, cs_hudless_keep_, cs_ui_tiles_, cs_layer_unblend_, cs_layer_seam_clear_, cs_ramp_rows_, cs_ramp_, cs_flow_luma_, cs_flow_feat_, cs_flow_search_, cs_flow_search_par_, cs_flow_lk_, cs_flow_median_, cs_flow_motion_, cs_flow_fill_, cs_camera_fill_, cs_probe_tiles_, cs_probe_clear_, cs_probe_score_, cs_share_measure_, cs_share_blur_, cs_share_bins_, cs_share_final_, cs_share_up_, cs_share_seam_, cs_att_hist_, cs_rec_down_, cs_share_resid_, cs_resid_blur_, cs_own_up_, cs_own_halo_h_, cs_own_halo_v_, cs_to_prev_, cs_fit_sums_, cs_fit_total_, cs_tether_init_, cs_tether_step_, cs_tether_fine_, cs_tether_final_, cs_tether_pick_, cs_tether_reach0_, cs_tether_reach_, cs_tether_need_, cs_tether_span_;
     ComPtr<ID3D12PipelineState> cs_sten_clear_, cs_sten_hist_, cs_sten_cells_, cs_sten_flood_, cs_sten_apply_, cs_sten_count_, cs_sten_grow_init_, cs_sten_grow_, cs_sten_age_, cs_sten_close_, cs_sten_comp_clear_, cs_sten_comp_count_, cs_sten_comp_max_, cs_sten_prune_, cs_sten_luma_, cs_sten_elig_, cs_sten_fringe_, cs_sten_fringe_apply_;
     // Sight reticles (option): the passes, which history texture holds the latest layer, and whether the layer was
     // built for the frame taken in last / the shown one (see cs_ret_layer).
