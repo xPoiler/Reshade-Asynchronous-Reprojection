@@ -1647,6 +1647,10 @@ void draw_overlay(effect_runtime*) {
              "On: the warp's field solved on coarser blocks while the view is still or slow, the learned HUD detection looking "
              "closely only where HUD was found, the field's untorn blocks skipped, the search pass also with a sight's reticle "
              "layer. Off: each as before - to compare GPU time and picture."},
+            {fw::kDevFewerSubmits, "Fewer interruptions of the game (2026-11-21)",
+             "On: a refresh with nothing new to show sends nothing to the GPU, and a game frame's analysis and HUD/mask/memory "
+             "go to the GPU together - each piece of work sent stops the game's own for a moment. Off: as before - to compare "
+             "the game's fps. The picture is the same."},
         };
         ImGui::TextUnformatted("Unticked = switched off now (not saved). Each change is logged with the GPU time before it.");
         for (const auto& c : categories) {

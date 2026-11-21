@@ -196,7 +196,15 @@ public:
     // Nothing new to show this refresh (the picture presented last is still the right one): what the refresh
     // recorded so far (a frame taken in on the same queue, for one) is submitted, with no warp, no blit and no
     // present - the composition keeps showing the last picture.
-    void skip_frame();
+    // may_quiet: the caller knows the refresh recorded nothing of its own (XPAR's own engine, the picture shown as it is) - with
+    // set_quiet_skips on, the list is then dropped instead of submitted (see skip_frame).
+    void skip_frame(bool may_quiet = false);
+    // Fewer interruptions of the game (Feature test, 2026-11-21): refreshes with nothing new send nothing to the GPU, and a game
+    // frame's analysis and HUD/mask/memory go as one intake piece instead of two. Each submission, even an empty one, stops the
+    // game's GPU work for a moment (AC6, ReShade menu open: ~270 a second, the GPU ~10% idle between the two processes).
+    void set_quiet_skips(bool on) { quiet_skips_ = on; }
+    void set_one_piece(bool on) { one_piece_ = on; }
+    std::uint32_t take_quiet_skips() { const auto n = quiet_skipped_; quiet_skipped_ = 0; return n; }
     // Submits the work recorded since begin_frame without presenting (a new game frame taken in between
     // refreshes, so the refresh itself only warps).
     // continuation: the second half of a frame taken in over two submissions (for the GPU usage log).
@@ -654,6 +662,8 @@ private:
     // one an intake piece waits for; released by hand when no refresh comes - wait_idle, release_intake_gate)
     ComPtr<ID3D12Fence> warp_fence_;
     std::uint64_t warps_signaled_ = 0, gate_requested_ = 0;
+    bool quiet_skips_ = true, one_piece_ = true;
+    std::uint32_t quiet_skipped_ = 0;
     bool gate_on_ = false;
     bool log_stamps_ = true;
     std::int64_t gate_tick_ = 0, gate_period_ = 0, gate_last_end_ = 0, last_refresh_qpc_ = 0;

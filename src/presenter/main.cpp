@@ -692,17 +692,18 @@ std::string feature_names(std::uint32_t off) {
     static const char* const names[] = {"weapon/character carried", "no tears (continuous warp)", "HUD kept still", "background memory",
                                         "movement between frames", "dithered edges", "passes limited to where they matter",
                                         "field solve near steps only (8 x 2, 4 x 3)", "blend only near movers",
-                                        "field solve steps per area", "progressive work (2026-11-20)"};
-    if (!(off & 2047u)) return "everything on, as shipped";
+                                        "field solve steps per area", "progressive work (2026-11-20)",
+                                        "fewer interruptions of the game (2026-11-21)"};
+    if (!(off & 4095u)) return "everything on, as shipped";
     std::string out;
-    for (const int i : {0, 1, 2, 3, 4, 5, 6, 10})  // (categories: off when set)
+    for (const int i : {0, 1, 2, 3, 4, 5, 6, 10, 11})  // (categories: off when set)
         if (off & (1u << i)) { out += out.empty() ? "off: " : ", "; out += names[i]; }
     for (int i = 7; i < 10; ++i)  // (variants: on when set)
         if (off & (1u << i)) { out += out.empty() ? "variant: " : (out.find("variant") == std::string::npos ? " | variant: " : ", "); out += names[i]; }
     return out;
 }
 void apply_feature_test(Settings& s, Renderer& renderer) {
-    const std::uint32_t off = s.dev_features_off & 2047u;
+    const std::uint32_t off = s.dev_features_off & 4095u;
     if (off & kDevCarried) { s.keep_attached = 0; s.follow_share = 0; s.hold_characters = 0; s.hold_reticles = 0; }
     if (off & kDevHud) { s.no_warp_mask = 0; s.use_ui_tags = 0; s.game_hud_layers = 0; s.hud_learn = 0; s.hud_fill = 0; }
     if (off & kDevMemory) s.background_memory = 0;
@@ -717,6 +718,8 @@ void apply_feature_test(Settings& s, Renderer& renderer) {
     renderer.set_progressive_exact(!(off & kDevProgressive));
     renderer.set_flow_light(!(off & kDevProgressive));
     renderer.set_seek_rim(!(off & kDevProgressive));
+    renderer.set_quiet_skips(!(off & kDevFewerSubmits));
+    renderer.set_one_piece(!(off & kDevFewerSubmits));
     renderer.set_blend_near_movers((off & kDevBlendNear) != 0);
     renderer.set_tether_adaptive((off & kDevAdaptSolve) != 0);
     if (off == g_features_off) return;
@@ -2566,7 +2569,7 @@ void render_thread() {
         const bool as_is = !(warped && !unmoved) && !settings.overlay_debug && !settings.show_mask && g_app.has_frames && !g_rec.busy &&
                            !renderer.fps_counter_dirty();
         const bool same_picture = as_is && shown_frame && as_is_frame == shown_frame && as_is_w == renderer.width() && as_is_h == renderer.height();
-        if (same_picture) renderer.skip_frame();
+        if (same_picture) renderer.skip_frame(own_engine);
         // (the recording's dot: red while it records, amber while it is written out - see the blit shader)
         else renderer.finish_frame(warped && !unmoved, (settings.overlay_debug ? (warped ? 1 : 2) : 0) | (g_rec.active ? 4 : g_rec.busy ? 8 : 0), paced_last);
         presented_last = !same_picture;
@@ -2938,7 +2941,8 @@ void render_thread() {
                          pt.warps, pt.ms[Renderer::kPassWarpClaim] * k, pt.ms[Renderer::kPassWarpLean] * k, pt.ms[Renderer::kPassWarpRest] * k);
                 }
                 const auto subs = renderer.take_submissions();
-                if (span > 0) logf("GPU submissions: %.1f/s on the refresh queue, %.1f/s on the intake queue", subs[0] / span, subs[1] / span);
+                const std::uint32_t quiet = renderer.take_quiet_skips();
+                if (span > 0) logf("GPU submissions: %.1f/s on the refresh queue, %.1f/s on the intake queue | refreshes with nothing new sent nothing: %.1f/s", subs[0] / span, subs[1] / span, quiet / span);
                 if (span > 0 && (u.intakes || u.warps)) {
                     const double n = std::max<double>(1, u.split);
                     logf("presenter GPU: %.0f%% of the time | game frames %.1f/s, %.2f ms each (reaching the game's textures %.2f, depth+motion %.2f, "

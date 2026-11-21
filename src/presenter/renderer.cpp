@@ -11420,9 +11420,21 @@ void Renderer::submit_work(bool continuation) {
     continuation_slot_[frame_index_] = continuation;
 }
 
-void Renderer::skip_frame() {
+void Renderer::skip_frame(bool may_quiet) {
     intake_slot_[frame_index_] = false;
     skipped_slot_[frame_index_] = true;
+    // (quiet: nothing sent - the list holds only begin's own commands (its start time stamp, the heaps): no pass stamped, no
+    // descriptors copied, nothing read, and no intake piece waits for this refresh's signal (one does: sent as before, so the
+    // gate's count of refreshes stays right where it is used). The list is closed and dropped; this slot's fence value stays the
+    // one of its last use, already complete. See set_quiet_skips.)
+    if (may_quiet && quiet_skips_ && split_ && context_ == 0 && pass_count_[frame_index_] == 0 && bank_used_[frame_index_ % 6] == 0 &&
+        reading_.empty() && gate_requested_ <= warps_signaled_) {
+        list_->Close();
+        ++quiet_skipped_;
+        LARGE_INTEGER q; QueryPerformanceCounter(&q);
+        last_refresh_qpc_ = q.QuadPart;  // (a refresh came: no piece is released by hand for want of one)
+        return;
+    }
     execute();
     signal_refresh();
     signal();
@@ -11444,6 +11456,7 @@ void Renderer::release_intake_gate() {
 }
 
 void Renderer::intake_break(int next_piece) {
+    if (one_piece_) return;  // (one piece: analysis and HUD/mask/memory in one submission - see set_one_piece)
     if (!split_ || !gate_on_ || !warp_fence_ || context_ != 1) return;
     submit_work(true);
     begin(1);

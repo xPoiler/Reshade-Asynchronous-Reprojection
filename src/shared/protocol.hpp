@@ -190,6 +190,9 @@ enum DevFeature : std::uint32_t {
     // before, for the A/B in game. (What gives the same picture bit for bit - the sight search near the centre, the pick in
     // pieces, the HUD work packed - has no way back)
     kDevProgressive = 1024u,
+    // (a category - set: off) fewer interruptions of the game, 2026-11-21: a refresh with nothing new sends nothing to the GPU, a
+    // game frame's analysis and HUD/mask/memory go as one intake piece (Renderer::set_quiet_skips, set_one_piece); off: as before
+    kDevFewerSubmits = 2048u,
 };
 inline bool dev_off(const Settings& s, std::uint32_t bit) { return (s.dev_features_off & bit) != 0; }
 // (the add-on's HUD capture - the game's HUD layers and HUD learning - as the feature test leaves it)
