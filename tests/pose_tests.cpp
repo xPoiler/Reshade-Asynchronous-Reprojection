@@ -311,6 +311,35 @@ static void auto_latency_tracks_frame_interval() {
     EXPECT(worst < 0.02, "auto mode output continuous (worst step %.4f rad)", worst);
 }
 
+// Auto latency 7 (XPAR adds no latency): predict_camera_time(c) shows the camera as of c exactly - whatever the latency
+// percentile in use, the prediction setting, the frame time swinging or the game's latency wandering - so main.cpp can aim
+// the shown camera at the present less the game's median latency.
+static void camera_time_exact() {
+    PoseModel model;
+    Game g; g.model = &model;
+    for (const double setting : {0.0, -0.016}) {
+        PoseSettings ps; ps.prediction = setting;
+        model.configure(ps);
+        double worst = 0;
+        int checked = 0;
+        for (int i = 0; i < 6000; ++i) {
+            g.fps = (i / 1500) % 2 ? 45.0 : 70.0;  // (frame-time swings)
+            g.latency = 0.03 + 0.008 * std::sin(i * 0.0013);
+            g.step(pattern_x(g.t), pattern_y(g.t));
+            if (i < 600 || i % 7) continue;
+            for (const double ahead : {-0.01, 0.0, 0.012, 0.03}) {
+                const double c = model.source_time() + ahead;
+                const Prediction p = model.predict_camera_time(c);
+                worst = std::max(worst, std::fabs(model.source_time() + p.horizon - c));
+                ++checked;
+            }
+        }
+        EXPECT(checked > 1000 && worst < 1e-6, "camera time exact (prediction %.3f): worst %.2e s over %d", setting, worst, checked);
+        EXPECT(model.latency_median() > 0.02 && model.latency_median() <= model.latency() + 1e-9, "median %.4f, latency in use %.4f",
+               model.latency_median(), model.latency());
+    }
+}
+
 // A menu with a cursor the game draws itself: the mouse moves, the camera does not. The mouse must stop
 // being applied within a fraction of a second, and apply again once the camera follows it.
 static void mouse_ignored_in_menus() {
@@ -595,6 +624,7 @@ int main() {
     driving_keeps_gain();
     cursor_gate_blocks_mouse();
     auto_latency_tracks_frame_interval();
+    camera_time_exact();
     world_up_detection();
     mouse_ignored_in_menus();
     gain_survives_menus();

@@ -10,7 +10,7 @@ namespace fw {
 inline std::int64_t qpc_now() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return v.QuadPart; }
 
 constexpr std::uint32_t kMagic = 0x46574152;  // 'FWAR'
-constexpr std::uint32_t kVersion = 94;  // (94: Settings::dev_features_off; 93: Settings::whole_pixels; 92: Settings::even_pacing; 90: a test build installed 2026-11-12, never committed)
+constexpr std::uint32_t kVersion = 95;  // (95: Shared::handoff, the intake in the game; 94: Settings::dev_features_off; 93: Settings::whole_pixels; 92: Settings::even_pacing; 90: a test build installed 2026-11-12, never committed)
 // (four: the presenter taking one in, one ready, and the add-on writing two - a game that starts its next frame before
 // the last one is presented (its tags and constants come first: Cyberpunk, Enshrouded) has two being written. Three
 // slots, 2026-10-28, dropped 43-55% of their frames before the presenter saw them - the reprojection fed at half the
@@ -104,7 +104,8 @@ struct Settings {
     float prediction_ms;           // show the camera this far ahead of the game's own latency
     std::uint32_t auto_prediction; // 0: manual slider; 1, 2, 4: -(1/n of the measured game frame); 3: 1/2 with HUD layers, 1/4 without, 1 with XPAR's own motion vectors;
                                    // 5: the camera as of now, held back only as far as the uncovered edge needs (edge_limit_pct, edge_unlimited);
-                                   // 6: the lowest latency that uncovers nothing the game has not rendered (now .. one game frame back)
+                                   // 6: the lowest latency that uncovers nothing the game has not rendered (now .. one game frame back);
+                                   // 7: XPAR adds no latency - the turn as of the present less the game's own latency (the XPAR row at 0)
     float present_lead_ms;         // render this long before the next vblank (0: right after the previous one)
     std::uint32_t gpu_priority;    // presenter GPU scheduling class: 0 realtime (default), 1 high, 2 normal
     std::uint32_t no_warp_mask;    // games without HUD layers: detect the HUD and keep it unwarped
@@ -183,7 +184,9 @@ enum DevFeature : std::uint32_t {
                          // off: every pass over the whole picture, as before, for the A/B
     // (variants - set: tried instead of the shipped way)
     kDevNearSolve = 128u,  // (no box: the near-steps solve, 8 x 2, 4 x 3, is the shipped one since 2026-11-20)
-    kDevBlendNear = 256u,  // the frame before blended in only where something moves on its own within reach (not the scenery's own)
+    // (a category since 2026-11-25 - set: off, as before; was a variant) the frame before blended in only where something moves on
+    // its own within reach, not on scenery whose vectors differ a little from the camera's
+    kDevBlendNear = 256u,
     kDevAdaptSolve = 512u,  // (no box: tried 2026-11-20, came out as the shipped solve) the field solve's steps chosen per area
     // (a category again - set: off) the progressive work of 2026-11-20 - the field solve's blocks by the camera's speed, the
     // learned HUD detection by tile, the solve's untorn blocks skipped, the search pass with a sight-reticle layer; off: each as
@@ -364,6 +367,42 @@ struct FsrStats {
     std::uint32_t masks, reactive_w, reactive_h, composition_w, composition_h;
 };
 
+// The intake in the game (dev/PLAN_intake_in_game.md, step 2c): the presenter DLL inside the game takes frames in on the game's
+// own queue and hands each finished set to FrameWarpPresenter.exe, which only warps. A set's textures are named shared handles
+// (object_name(pid, session, "set", -1, id, generation)); its metadata is the Renderer's, as bytes (presenter types).
+constexpr int kHandoffSets = 3, kHandoffTex = 40;
+enum HandoffState : LONG { kSetFree = 0, kSetWriting = 1, kSetReady = 2, kSetShown = 3 };
+struct HandoffTex { std::int32_t id; std::uint32_t generation, width, height; std::int32_t format; };
+struct HandoffSet {
+    volatile LONG state;              // HandoffState: the game side Free -> Writing -> Ready, the exe Ready -> Shown -> Free
+    std::uint32_t count;              // textures in tex
+    HandoffTex tex[kHandoffTex];
+    std::uint8_t meta[96], info[32];  // Renderer::FrameMeta, SetInfo
+    std::uint8_t source[128];         // IngestedSource
+    Camera camera;                    // the frame's camera, as taken in
+    std::uint64_t frame_id, serial;
+    std::uint64_t intake_fence;       // the game side's intake fence value after which the set is complete
+    std::uint64_t warp_release;       // the exe's warp fence value after which no warp reads the set (written when it leaves Shown)
+    // What the exe's refresh reads of the frame besides the Renderer's (main.cpp's source_* and the pose model's add_source):
+    double source_time;               // the frame's time for the pose model (seconds, the presenter's clock)
+    std::int64_t taken_qpc;           // when it was taken in
+    std::uint32_t flags;              // 1 has_sim, 2 camera trusted, 4 camera reset, 8 motion estimated, 16 game HUD layers, 32 mv scale valid
+    std::uint32_t position_epoch;
+    float mv_scale[2];                // the game's vectors to pixels, x and y (mv_scale.scale at the depth's size)
+};
+struct Handoff {
+    volatile LONG game_side;          // 1: the game side takes frames in (the exe warps only); 0: today's path
+    volatile LONG reason;             // why the game side is not running (0 none - see main.cpp)
+    std::uint32_t sets, pad;          // sets in use: 2 or 3
+    std::uint64_t warp_fence_value;   // the exe's warp fence (a shared fence, name object_name(pid, session, "warpfence")): completed value
+    HandoffSet set[kHandoffSets];
+    // The exe's per-display values the intake reads (see Renderer: held_between_, objects_between_, warp_ahead_)
+    volatile LONG held_between, objects_between;
+    float held_back, objects_back, warp_ahead, pad2;
+    volatile LONG64 frames_skipped;   // game frames not taken in: no set free
+    volatile LONG64 game_beat_qpc;    // the game side's last pass (QPC): older than half a second, the exe takes frames in again
+};
+
 struct Shared {
     std::uint32_t magic, version;
     std::uint32_t producer_pid, pad0;
@@ -413,6 +452,7 @@ struct Shared {
     // user's techniques is enabled; the preset as the game has it now, written to FrameWarp\ReShadePreset.ini - +1 each time it is written.
     volatile LONG reshade_fx_active;
     volatile LONG reshade_preset_serial;
+    Handoff handoff;  // (the intake in the game - see Handoff)
     volatile LONG64 timeline_count;
     TimelineEvent timeline[kTimeline];
 };

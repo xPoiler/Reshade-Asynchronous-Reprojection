@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <io.h>
 #include <map>
 #include <mutex>
 #include <shared_mutex>
@@ -765,4 +766,20 @@ void set_profile(const std::wstring& path, const char* build) {
     g_profile_read = false;
 }
 Status status() { return {g_status_cands.load(), g_status_active.load(), g_status_locked.load()}; }
+// (the panel, while HUD learning is off: a saved point is not read then - learning off clears the locked point - so Relearn
+// there forgets the file itself)
+bool saved_point() {
+    std::wstring path;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        path = g_profile;
+    }
+    return !path.empty() && _waccess(path.c_str(), 0) == 0;
+}
+void forget_saved() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_profile.empty() || _wremove(g_profile.c_str()) != 0) return;
+    g_saved = false;
+    fw::diag_log(reshade::log::level::info, "XPAR HUD learning: the saved point forgotten (Relearn, learning off)");
+}
 }  // namespace fw::hud_learn

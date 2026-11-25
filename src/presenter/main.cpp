@@ -56,6 +56,17 @@ struct App {
     // writes reaches the add-on or the exe. What the game's fps loses to it is the intake's cost inside the game while the
     // exe's warp interrupts the game)
     bool shadow = false;
+    // (the intake in the game, dev/PLAN_intake_in_game.md 2c - FW_GAME_INTAKE=1, set by the add-on: this presenter, inside the game,
+    // takes the frames in on the game's own queue - handed over each present, fw_presenter_game_queue - and hands each finished set
+    // to FrameWarpPresenter.exe through Shared::handoff; no window, no warp, no present. The exe warps only meanwhile)
+    bool game_intake = false;
+    std::atomic<ID3D12CommandQueue*> game_queue{nullptr};
+    std::atomic<bool> game_pause{false};  // (development - dev/handoff_e2e: the game side held)
+    // (IntakeAtPresent: the renderer whose kept intake the game's present sends - see Renderer::flush_at_present - and the
+    // game's last present, for where in its frame the intake is sent)
+    std::mutex present_mutex;
+    Renderer* present_renderer = nullptr;
+    std::atomic<std::int64_t> last_present_qpc{0};
     Shared* real_shared = nullptr;
     HANDLE game_process = nullptr;
     HANDLE mapping = nullptr;
@@ -688,6 +699,8 @@ struct MemoryGuard {
 // category of work switched off over the settings by what it does in the picture, so that a game shows what each costs and
 // what it gives. Each change first writes the GPU lines of the time before it (main loop, g_feature_flush), then the new state.
 bool g_tether_env = true;          // (ContinuousWarp as the game's ini has it: the field is off only while the test switches it off)
+bool g_speed_env = true;           // (FieldBlocksBySpeed, on unless =0 - FW_TETHER_SPEED)
+bool g_flow_light_env = false;     // (FlowLight, off unless =1 - FW_FLOW_LIGHT: it moved edges in scenes without game vectors)
 std::uint32_t g_features_off = 0;  // (the categories off as last applied)
 std::uint32_t g_features_before = 0;
 bool g_feature_flush = false;      // (a change: the GPU lines now, for the time before it)
@@ -699,9 +712,9 @@ std::string feature_names(std::uint32_t off) {
                                         "fewer interruptions of the game (2026-11-21)"};
     if (!(off & 4095u)) return "everything on, as shipped";
     std::string out;
-    for (const int i : {0, 1, 2, 3, 4, 5, 6, 10, 11})  // (categories: off when set)
+    for (const int i : {0, 1, 2, 3, 4, 5, 6, 8, 10, 11})  // (categories: off when set)
         if (off & (1u << i)) { out += out.empty() ? "off: " : ", "; out += names[i]; }
-    for (int i = 7; i < 10; ++i)  // (variants: on when set)
+    for (const int i : {7, 9})  // (variants: on when set)
         if (off & (1u << i)) { out += out.empty() ? "variant: " : (out.find("variant") == std::string::npos ? " | variant: " : ", "); out += names[i]; }
     return out;
 }
@@ -715,15 +728,15 @@ void apply_feature_test(Settings& s, Renderer& renderer) {
     renderer.set_tether(g_tether_env && !(off & kDevTether));
     renderer.set_pass_limits(!(off & kDevLimits));
     renderer.set_tether_skip(!(off & (kDevLimits | kDevProgressive)));  // (the solve's untorn blocks left - one of the pass limits)
-    renderer.set_tether_by_speed(!(off & kDevProgressive));
+    renderer.set_tether_by_speed(g_speed_env && !(off & kDevProgressive));
     renderer.set_hud_sparse(!(off & kDevProgressive));
     renderer.set_seek_layer(!(off & kDevProgressive));
     renderer.set_progressive_exact(!(off & kDevProgressive));
-    renderer.set_flow_light(!(off & kDevProgressive));
+    renderer.set_flow_light(g_flow_light_env && !(off & kDevProgressive));
     renderer.set_seek_rim(!(off & kDevProgressive));
     renderer.set_quiet_skips(!(off & kDevFewerSubmits));
     renderer.set_one_piece(!(off & kDevFewerSubmits));
-    renderer.set_blend_near_movers((off & kDevBlendNear) != 0);
+    renderer.set_blend_near_movers(!(off & kDevBlendNear));
     renderer.set_tether_adaptive((off & kDevAdaptSolve) != 0);
     if (off == g_features_off) return;
     const std::uint32_t now_off = off & ~g_features_off;
@@ -966,6 +979,7 @@ void apply_gpu_priority(std::uint32_t setting) {
     // 2026-10-27: 60 pictures a second on screen of the 120 drawn)
     g_applied_priority = setting;
     if (g_app.shadow) { std::snprintf(g_gpu_priority, sizeof(g_gpu_priority), "%s", "the game's (shadow intake)"); return; }
+    if (g_app.game_intake) { std::snprintf(g_gpu_priority, sizeof(g_gpu_priority), "%s", "the game's (its own queue)"); return; }
     using SetClassFn = LONG(APIENTRY*)(HANDLE, int);
     auto fn = reinterpret_cast<SetClassFn>(GetProcAddress(GetModuleHandleW(L"gdi32.dll"), "D3DKMTSetProcessSchedulingPriorityClass"));
     const int wanted = setting == 1 ? 4 : setting == 2 ? 2 : 5;  // D3DKMT class: 2 normal, 4 high, 5 realtime
@@ -1013,6 +1027,16 @@ void render_thread() {
     const std::uint32_t w = sh.backbuffer_width, h = sh.backbuffer_height;
     Renderer::set_shader_cache((g_app.data_dir / L"shadercache").wstring());
     if (g_app.device) renderer.use_device(g_app.device);
+    if (g_app.game_intake) renderer.set_intake_direct(true);  // (the intake's lists run on the game's graphics queue)
+    if (g_app.game_intake && GetEnvironmentVariableW(L"FW_INTAKE_AT_PRESENT", nullptr, 0)) {
+        renderer.set_intake_at_present(true);
+        logf("the intake in the game: its work sent at the game's present (development: IntakeAtPresent)");
+    }
+    struct PresentRenderer {  // (the game's present may send this renderer's kept intake while it lives - see App::present_renderer)
+        Renderer* r;
+        explicit PresentRenderer(Renderer* r) : r(r) { if (g_app.game_intake) { std::lock_guard<std::mutex> l(g_app.present_mutex); g_app.present_renderer = r; } }
+        ~PresentRenderer() { std::lock_guard<std::mutex> l(g_app.present_mutex); if (g_app.present_renderer == r) g_app.present_renderer = nullptr; }
+    } present_renderer(&renderer);
     if (!renderer.init(sh.adapter, g_app.overlay, w, h, static_cast<DXGI_FORMAT>(sh.backbuffer_format), sh.color_space, error)) {
         set_status("Renderer init failed: %s", error.c_str()); logf("renderer init failed: %s", error.c_str());
         g_app.start_failed = true;
@@ -1064,6 +1088,11 @@ void render_thread() {
         // (the continuous warp, on by default: ContinuousWarp=0 - FW_TETHER=0 - holds the character/weapon the old way)
         { wchar_t v[4]{}; const bool off = GetEnvironmentVariableW(L"FW_TETHER", v, 4) && v[0] == L'0'; renderer.set_tether(!off); g_tether_env = !off;
           logf(off ? "continuous warp off: the character/weapon held the old way (ContinuousWarp=0)" : "continuous warp: nothing held but the HUD, no gaps"); }
+        { wchar_t v[4]{}; g_speed_env = !(GetEnvironmentVariableW(L"FW_TETHER_SPEED", v, 4) && v[0] == L'0'); renderer.set_tether_by_speed(g_speed_env);
+          if (!g_speed_env) logf("the continuous warp's blocks by the render size alone, not by the picture's speed (development: FieldBlocksBySpeed=0)"); }
+        g_flow_light_env = env_on(L"FW_FLOW_LIGHT");
+        renderer.set_flow_light(g_flow_light_env);
+        if (g_flow_light_env) logf("XPAR's own motion estimate with fewer refinements (development: FlowLight)");
         if (env_on(L"FW_CARRIED_FREE")) { renderer.set_carried_free(true); logf("carried pixels not held by the warp (development: CarriedFree)"); }
         if (env_on(L"FW_MEM_POS")) { renderer.set_mem_pos(true); logf("the background memory carried with its own positions (development: MemoryPositions)"); }
         if (env_on(L"FW_ATT_ABS")) { renderer.set_att_absolute(true); logf("the attached rule by the share a spot takes (development: AttachedAbsolute)"); }
@@ -1150,6 +1179,8 @@ void render_thread() {
     LONG motion_restarts_seen = 0;
     int search_frames = 0;           // (game frames of the motion search without a find)
     int overlay_settle = 0;          // (game frames after the ReShade menu closed that are not learned from yet - see take_in_finish)
+    float handed_mv[2] = {0, 0};     // (the intake in the game: the motion vectors' scale of the set shown - for the panel)
+    bool handed_mv_valid = false;
     bool scale_from_search = false;  // (the motion scale is the search's)
     // Whether the estimated camera can be learned from: the frame itself was explained, and so were most of the last 60.
     std::deque<bool> estimate_rejects;
@@ -1172,6 +1203,7 @@ void render_thread() {
     const bool camera_use = [] { wchar_t v[4] = {}; return !(GetEnvironmentVariableW(L"FW_CAMERA_USE", v, 4) && v[0] == L'0'); }();
     // (the intake between the warps, on unless IntakeBetweenWarps=0 passes "0" - see Renderer::set_intake_gate)
     renderer.set_intake_gate([] { wchar_t v[4] = {}; return !(GetEnvironmentVariableW(L"FW_INTAKE_GATE", v, 4) && v[0] == L'0'); }());
+    if (g_app.game_intake) renderer.set_intake_gate(false);  // (the intake in the game: no warps here to fit between - see App::game_intake)
     logf("intake between the warps: %s", renderer.intake_gate() ? "on" : "off (IntakeBetweenWarps=0)");
     const bool camera_dump = GetEnvironmentVariableW(L"FW_CAMERA_DUMP", nullptr, 0) != 0;
     bool camera_dumped = false;
@@ -1272,6 +1304,12 @@ void render_thread() {
     std::uint64_t log_paced = 0;  // (presents whose turn even pacing made, since the last log line)
     // Auto latency "camera as of now": the time ahead of Auto's camera in use (s).
     double now_ahead = 0;
+    // Auto latency 7 (XPAR adds no latency): the shown camera's time against the planned wake-up (s, followed gently), and the
+    // wait from the planned wake-up to the present - the XPAR row counts from the present (the last 120 warped presents).
+    double zero_offset = 0;
+    bool zero_offset_set = false;
+    double planned_camera_t = 0;
+    std::deque<double> present_waits;
     std::uint32_t log_presents = 0, capped_windows = 0;
     double log_since = now_seconds();
 
@@ -1283,7 +1321,7 @@ void render_thread() {
             WaitForSingleObjectEx(renderer.waitable(), 100, FALSE);
             swap_wait_ms += (now_seconds() - w0) * 1000.0;
         }
-        else if (!paced_last) sleep_until(qpc_now() + g_qpc_frequency / 1000);
+        else if (!paced_last) sleep_until(qpc_now() + g_qpc_frequency / 1000, !g_app.game_intake);  // (the intake in the game: no spin - see below)
         if (!g_app.running) break;
         if (g_app.shadow) {
             std::memcpy(&sh, g_app.real_shared, sizeof(Shared));
@@ -2041,6 +2079,198 @@ void render_thread() {
             take_in_finish();
             return true;
         };
+        // What the intake's motion fits teach (they come back a few frames later): the motion vectors' scale and whether the
+        // game's camera matches them - wherever the intake runs (here, or the intake in the game below).
+        auto learn_from_fit = [&](const MotionFit& fit) {
+            if (!source.motion_estimated && !scale_from_search && mv_scale.add(fit, source.depth_rect.w, source.depth_rect.h))
+                logf("motion vectors locked: %s, scale %.4g x %.4g (sign %+.0f %+.0f), fit quality %.3f",
+                     mv_scale.pixel_units ? "render pixels" : std::fabs(std::fabs(mv_scale.locked[0]) - 1) < 1e-9 ? "uv" :
+                     std::fabs(std::fabs(mv_scale.locked[0]) - 0.5) < 1e-9 ? "ndc" : "custom units", mv_scale.scale(0, source.depth_rect.w),
+                     mv_scale.scale(1, source.depth_rect.h), mv_scale.locked[0] < 0 ? -1.0 : 1.0, mv_scale.locked[1] < 0 ? -1.0 : 1.0,
+                     mv_scale.quality);
+            // The game's own camera against its motion vectors (camera_check.hpp): when they never agree
+            // while the camera moves, the camera is estimated from the motion vectors from here on.
+            if (have_source_kind && !source_was_estimated && g_app.shared->game_camera_check == 0 &&
+                camera_check.verdict == CameraCheck::kUndecided) {
+                const auto verdict = camera_check.add(fit.gc, fit.gg, fit.cc, fit.samples, mv_scale.valid);
+                if (verdict == CameraCheck::kTrusted)
+                    logf("the game's camera matches its motion vectors");
+                else if (verdict == CameraCheck::kUnusable) {
+                    InterlockedExchange(&g_app.shared->game_camera_check, 1);
+                    poor_estimate_windows = 0;
+                    logf("the game's camera does not match its motion vectors (%d of %d frames with camera motion): "
+                         "estimating the camera from the motion vectors instead", camera_check.consistent, camera_check.frames);
+                }
+            }
+        };
+        // The intake in the game (dev/PLAN_intake_in_game.md 2c, App::game_intake): each new frame taken in on the game's own queue
+        // into a set the exe has let go of, the finished set handed over (Shared::handoff) - nothing else here: no refresh, no warp.
+        if (g_app.game_intake) {
+            static ID3D12CommandQueue* on_queue = nullptr;
+            static int write_set = 0;           // (the handoff set the renderer's set being written stands for: two, in turn)
+            static std::uint64_t handed = 0;    // (sets handed over)
+            static std::uint64_t waiting_seen = 0;
+            static double sent_after_present_ms = 0;
+            static std::uint32_t sent_count = 0;
+            Handoff& ho = sh.handoff;
+            presented_last = paced_last = false;  // (no swap chain to wait for at the top of the loop: nothing is presented here)
+            // (development - dev/handoff_e2e: the game side held, as if its thread had stopped - no heartbeat, nothing taken in)
+            if (g_app.game_pause.load()) { sleep_until(qpc_now() + g_qpc_frequency / 1000); continue; }
+            InterlockedExchange64(&ho.game_beat_qpc, qpc_now());
+            auto stop = [&](LONG reason) { if (ho.game_side) logf("the intake in the game stops (reason %ld)", reason); ho.reason = reason; ho.game_side = 0; };
+            if (!renderer.session_open(sh.session)) {
+                held.clear(); source = {}; source_frame = 0; intake.slot = -1; incoming = {};
+                renderer.set_share_sets(true);
+                renderer.set_share_names(GetCurrentProcessId(), sh.session);
+                renderer.drop_sets();  // (sets of a session before carry its name: made again under this one's)
+                if (!renderer.open_session(sh.producer_pid, sh.session, error)) { stop(1); Sleep(100); continue; }
+                logf("session %llu opened (the intake in the game)", static_cast<unsigned long long>(sh.session));
+                ho.sets = 2;
+                for (auto& hs : ho.set) { hs.state = kSetFree; hs.warp_release = 0; }
+                write_set = 0;
+            }
+            ID3D12CommandQueue* q = g_app.game_queue.load();
+            if (q != on_queue && renderer.set_intake_queue(q)) {
+                on_queue = q;
+                logf("intake on the game's own queue");
+            }
+            if (on_queue && !renderer.split()) renderer.set_split(true);
+            if (!on_queue || !renderer.split()) { stop(2); sleep_until(qpc_now() + g_qpc_frequency / 1000); continue; }
+            // (slots back to the game once their intake has run - as below)
+            for (auto it = held.begin(); it != held.end();) {
+                if (it->slot != intake.slot && renderer.intake_completed(it->release_value)) {
+                    InterlockedCompareExchange(&sh.slots[it->slot].state, kFree, kReading);
+                    it = held.erase(it);
+                } else ++it;
+            }
+            // A finished intake: handed over.
+            if (renderer.intake_pending() && renderer.show_intake()) {
+                commit_incoming();
+                Renderer::SetExport ex;
+                HandoffSet& hs = ho.set[write_set];
+                if (renderer.export_shown(ex)) {
+                    hs.count = std::uint32_t(ex.count);
+                    for (int k = 0; k < ex.count; ++k)
+                        hs.tex[k] = {ex.tex[k].id, std::uint32_t(ex.tex[k].gen), ex.tex[k].w, ex.tex[k].h, ex.tex[k].format};
+                    std::memcpy(hs.meta, ex.meta, sizeof(hs.meta));
+                    std::memcpy(hs.info, ex.info, sizeof(hs.info));
+                    static_assert(sizeof(IngestedSource) <= sizeof(HandoffSet::source), "the frame fits the handoff set");
+                    std::memcpy(hs.source, &source, sizeof(IngestedSource));
+                    hs.camera = source_camera;
+                    hs.frame_id = source_frame;
+                    hs.serial = ++handed;
+                    hs.source_time = source_time;
+                    hs.taken_qpc = qpc_now();
+                    hs.flags = (source_has_sim ? 1u : 0u) | (source_camera.reset ? 4u : 0u) | (source.motion_estimated ? 8u : 0u) |
+                               (game_has_hud_layers ? 16u : 0u) | (mv_scale.valid ? 32u : 0u) | 2u;
+                    hs.position_epoch = source_camera.position_epoch;
+                    hs.mv_scale[0] = float(mv_scale.scale(0, source.depth_rect.w));
+                    hs.mv_scale[1] = float(mv_scale.scale(1, source.depth_rect.h));
+                    InterlockedExchange(&hs.state, kSetReady);
+                } else {
+                    InterlockedExchange(&hs.state, kSetFree);
+                }
+                write_set = (write_set + 1) % 2;
+            }
+            // The next frame, into the set the exe has let go of (its warps past it) - never a wait: no free set, no intake.
+            HandoffSet& next = ho.set[write_set];
+            const bool free_set = next.state == kSetFree && ho.warp_fence_value >= next.warp_release;
+            const int newest = !renderer.intake_pending() && intake.slot < 0 ? find_newest() : -1;
+            if (newest >= 0 && sh.slots[newest].camera.estimated) {
+                stop(3);  // (an estimated camera needs the CPU between the intake's steps - today's path, see step 4)
+            } else if (newest >= 0 && free_set) {
+                InterlockedExchange(&next.state, kSetWriting);
+                // (what the intake makes for the warp follows the exe's display - its values, see Handoff)
+                renderer.set_warp_ahead(ho.warp_ahead);
+                renderer.set_held_between(ho.held_between != 0, ho.held_back);
+                renderer.set_objects_between(int(ho.objects_between), ho.objects_back);
+                renderer.begin_intake();
+                renderer.set_intake_piece(0);
+                const bool taken = take_in_start(newest);
+                const bool valid = taken && !intake.sampled && take_in_finish();
+                renderer.submit_work();
+                if (!renderer.intake_at_present()) {  // (where in the game's frame it went in: after its last present by this much)
+                    const std::int64_t p = g_app.last_present_qpc.load();
+                    if (p) { sent_after_present_ms += double(qpc_now() - p) * 1000.0 / double(g_qpc_frequency); ++sent_count; }
+                }
+                if (valid) renderer.mark_intake_complete();
+                else InterlockedExchange(&next.state, kSetFree);
+                ho.game_side = 1;
+            } else if (newest >= 0 && sh.slots[newest].frame_id != waiting_seen) {
+                waiting_seen = sh.slots[newest].frame_id;
+                if (!free_set) InterlockedIncrement64(&ho.frames_skipped);
+            }
+            renderer.set_log_stamps(diag());  // (the passes' GPU times read back for the log alone - as for the exe)
+            {  // (the intake's readbacks: its notes, its motion fits - as below for the exe)
+                for (const auto& note : renderer.take_notes()) logf("%s", note.c_str());
+                MotionFit fit;
+                if (renderer.take_motion_fit(fit)) learn_from_fit(fit);
+            }
+            // What the intake in the game costs, every 10 s (dev/PLAN_intake_in_game.md 2d): its GPU time on the game's queue per
+            // frame taken in - as the exe's "presenter GPU" line breaks it down - its submissions there, this thread's CPU time
+            // (it polls inside the game's process), and the sets handed over / frames left out for want of a free set.
+            {
+                static double last = 0;
+                static std::uint64_t cpu_before = 0, handed_before = 0;
+                static LONG64 skipped_before = 0;
+                const double t = now_seconds();
+                auto thread_cpu = []() {
+                    FILETIME c{}, e{}, k{}, u{};
+                    if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) return std::uint64_t(0);
+                    return (std::uint64_t(k.dwHighDateTime) << 32 | k.dwLowDateTime) + (std::uint64_t(u.dwHighDateTime) << 32 | u.dwLowDateTime);
+                };
+                if (last == 0) { last = t; cpu_before = thread_cpu(); handed_before = handed; skipped_before = ho.frames_skipped; renderer.take_gpu_usage(); renderer.take_submissions(); renderer.take_pass_times(); }
+                else if (t - last >= 10.0) {
+                    const double span = t - last;
+                    const std::uint64_t cpu = thread_cpu();
+                    const auto u = renderer.take_gpu_usage();
+                    const auto subs = renderer.take_submissions();
+                    const double n = std::max<double>(1, u.split);
+                    logf("the intake in the game: %.1f frames/s taken in on the game's queue, %.2f ms GPU each (reaching the game's textures %.2f, "
+                         "depth+motion %.2f, colour copies %.2f, HUD/masks/motion %.2f) | %.1f submissions/s there | this thread's CPU %.1f%% of a core | "
+                         "sets handed over %.1f/s, frames left out (no set free) %.1f/s",
+                         u.intakes / span, u.intakes ? u.intake_ms / u.intakes : 0.0, u.access_ms / n, u.depth_ms / n, u.colour_ms / n, u.rest_ms / n,
+                         (subs[0] + subs[1]) / span, double(cpu - cpu_before) * 1e-7 / span * 100.0, double(handed - handed_before) / span,
+                         double(ho.frames_skipped - skipped_before) / span);
+                    const Renderer::PassTimes pt = renderer.take_pass_times();
+                    if (pt.frames) {
+                        const double k = 1.0 / pt.frames;
+                        logf("game frame GPU by pass (ms, %u frames): motion analysis %.2f, moving objects / generated images %.2f, HUD %.2f, "
+                             "character/weapon + stretch %.2f, mask %.2f, background memory %.2f", pt.frames, pt.ms[Renderer::kPassAnalyze] * k,
+                             pt.ms[Renderer::kPassObjects] * k, pt.ms[Renderer::kPassHud] * k, pt.ms[Renderer::kPassCharacter] * k,
+                             pt.ms[Renderer::kPassMask] * k, pt.ms[Renderer::kPassMemory] * k);
+                    }
+                    const auto kept = renderer.take_deferred_stats();
+                    if (renderer.intake_at_present())
+                        logf("the intake in the game: sent at the game's present (IntakeAtPresent) - %u, kept %.2f ms on average from recorded to sent",
+                             kept.first, kept.second);
+                    else if (sent_count)
+                        logf("the intake in the game: sent %.2f ms after the game's last present on average (%u)", sent_after_present_ms / sent_count, sent_count);
+                    sent_after_present_ms = 0; sent_count = 0;
+                    static int memory_reports = 0;  // (what its video memory holds, once a minute - as the exe's)
+                    if (memory_reports++ % 6 == 0) logf("the intake in the game, memory: %s", renderer.memory_report().c_str());
+                    last = t; cpu_before = cpu; handed_before = handed; skipped_before = ho.frames_skipped;
+                }
+            }
+            // (new frames looked for every half millisecond - waited for without spinning: a precise wait spins its last half millisecond,
+            // which here was all of it - ~40% of a core at time-critical priority inside the game's process, dev/handoff_e2e)
+            sleep_until(qpc_now() + g_qpc_frequency / 2000, false);
+            continue;
+        }
+        // (this exe while the game side takes the frames in - see App::game_intake: it warps only, from the sets handed over)
+        const bool from_game = !g_app.in_process && sh.handoff.game_side == 1 &&
+                               qpc_now() - sh.handoff.game_beat_qpc < g_qpc_frequency / 2;  // (a game side that stopped: frames taken in here again)
+        if (from_game != renderer.warp_only()) {
+            if (renderer.wait_idle()) {
+                renderer.set_warp_only(from_game);
+                intake.slot = -1; incoming = {};  // (an intake of this exe's own under way: dropped - the GPU is past it, its slot goes back)
+                // (release values left by an exe before this one count on its fence, not this one's: none kept)
+                if (from_game) for (auto& o : sh.handoff.set) if (o.state != kSetWriting) o.warp_release = 0;
+                logf("%s", from_game ? "the intake in the game: this presenter warps only, from the sets the game side hands over"
+                                     : "the intake in the game stopped: frames taken in here again");
+            }
+        }
+        if (from_game && !renderer.split()) renderer.set_split(true);
         // DWM composes shortly after each vblank; a frame that is not finished by then waits a
         // whole refresh. Render `lead` ms before the next vblank so the GPU has room even when the
         // game delays our work.
@@ -2061,7 +2291,8 @@ void render_thread() {
         // Split queues with XPAR's own engine when paced (Latewarp and the unpaced path record everything on
         // the realtime queue). Switched only while no frame is being taken in.
         {
-            const bool want_split = paced && (settings.warp_engine == 1 || !latewarp.ready());
+            // (and always while it warps only: the sets handed over are split queues' sets - see Renderer::import_shown)
+            const bool want_split = renderer.warp_only() || (paced && (settings.warp_engine == 1 || !latewarp.ready()));
             if (want_split != renderer.split() && intake.slot < 0) {
                 if (renderer.intake_pending() && renderer.show_intake()) commit_incoming();
                 if (!renderer.intake_pending() && renderer.set_split(want_split)) {
@@ -2092,7 +2323,7 @@ void render_thread() {
             frame_tick = tick; frame_vblank = v;
             renderer.set_intake_window(tick, static_cast<std::int64_t>(vblank.period));  // (the intake between the warps - see set_intake_gate)
             const std::int64_t budget = static_cast<std::int64_t>((intake_ms + 1.0) * 1e-3 * f);
-            const bool can_take_in = g_app.visible && !generation_aside() && renderer.session_open(sh.session) &&
+            const bool can_take_in = g_app.visible && !generation_aside() && renderer.session_open(sh.session) && !renderer.warp_only() &&
                                      sh.backbuffer_width == renderer.width() && sh.backbuffer_height == renderer.height();
             for (;;) {
                 const std::int64_t t = qpc_now();
@@ -2158,6 +2389,69 @@ void render_thread() {
         }
         wake_qpc = qpc_now();
         if (renderer.intake_pending() && renderer.show_intake()) commit_incoming();
+        // The newest set the game side has handed over (App::game_intake): opened, shown, the one before let go of once the warps
+        // recorded so far are past it.
+        if (renderer.warp_only() && renderer.session_open(sh.session)) {
+            static std::uint64_t imported = 0, imported_session = 0;
+            Handoff& ho = sh.handoff;
+            if (imported_session != sh.session) { imported = 0; imported_session = sh.session; }
+            const int sets = int(std::clamp<std::uint32_t>(ho.sets, 1u, std::uint32_t(kHandoffSets)));
+            int best = -1;
+            for (int k = 0; k < sets; ++k)
+                if (ho.set[k].state == kSetReady && ho.set[k].serial > imported && (best < 0 || ho.set[k].serial > ho.set[best].serial)) best = k;
+            if (best >= 0) {
+                HandoffSet& hs = ho.set[best];
+                static Renderer::SetExport ex;
+                ex = Renderer::SetExport{};
+                ex.count = int(std::min<std::uint32_t>(hs.count, Renderer::kMaxSetTex));
+                for (int k = 0; k < ex.count; ++k)
+                    ex.tex[k] = {hs.tex[k].id, hs.tex[k].generation, nullptr, hs.tex[k].width, hs.tex[k].height, hs.tex[k].format};
+                std::memcpy(ex.meta, hs.meta, sizeof(ex.meta));
+                std::memcpy(ex.info, hs.info, sizeof(ex.info));
+                if (renderer.import_shown(ex, sh.producer_pid, sh.session)) {
+                    IngestedSource s{};
+                    std::memcpy(&s, hs.source, sizeof(IngestedSource));
+                    source = s;
+                    source_camera = hs.camera;
+                    source_basis = to_basis(hs.camera);
+                    source_masked = renderer.no_warp_mask() != nullptr;
+                    source_frame = hs.frame_id;
+                    source_time = hs.source_time;
+                    source_has_sim = (hs.flags & 1u) != 0;
+                    source_motion_estimated = (hs.flags & 8u) != 0;
+                    game_has_hud_layers = (hs.flags & 16u) != 0;
+                    handed_mv_valid = (hs.flags & 32u) != 0;
+                    handed_mv[0] = hs.mv_scale[0]; handed_mv[1] = hs.mv_scale[1];
+                    g_app.model.set_camera_trusted((hs.flags & 2u) != 0);
+                    g_app.model.add_source(hs.frame_id, hs.source_time, seconds(hs.taken_qpc), source_basis, hs.camera.reset != 0, now_seconds(),
+                                           hs.position_epoch);
+                    first_eval = true;
+                    if (shown_frame != source_frame) shown_since = now_seconds();
+                    shown_frame = source_frame;
+                    InterlockedCompareExchange(&hs.state, kSetShown, kSetReady);
+                    ++stat_sources;  // (the game's frame rate - the frame counter, the panel: each set handed over is a frame taken in)
+                } else {
+                    static std::uint64_t failed = 0;
+                    if (++failed % 600 == 1) logf("the intake in the game: a set could not be opened (%llu so far)", static_cast<unsigned long long>(failed));
+                    hs.warp_release = renderer.warp_fence_signaled();
+                    InterlockedCompareExchange(&hs.state, kSetFree, kSetReady);  // (consumed all the same: never tried again)
+                }
+                imported = hs.serial;
+                // Every other set the warp no longer reads - the one shown before, one handed over but already older - back to the game
+                // side once the warps recorded so far are past it (never one being written). No state kept here: a set left Shown or
+                // Ready by an earlier exe, a session before or a failed import goes back as well.
+                for (int k = 0; k < sets; ++k) {
+                    if (k == best) continue;
+                    HandoffSet& o = ho.set[k];
+                    const LONG st = o.state;
+                    if (st == kSetShown || (st == kSetReady && o.serial < hs.serial)) {
+                        o.warp_release = renderer.warp_fence_signaled();
+                        InterlockedCompareExchange(&o.state, kSetFree, st);
+                    }
+                }
+            }
+            ho.warp_fence_value = renderer.warp_fence_completed();
+        }
 
         if (!renderer.session_open(sh.session)) {
             held.clear(); source = {}; source_frame = 0; intake.slot = -1; incoming = {};
@@ -2189,7 +2483,7 @@ void render_thread() {
         ps.input_paced = settings.even_pacing != 0;  // (Even pacing: the stick's turn shown evenly - PoseModel::input_paced_theta)
         ps.async_fit = true;  // (the fit runs on its own thread: tens of ms with a controller)
         ps.rotation_extrapolation = settings.rotation_extrapolation;
-        ps.prediction = settings.prediction_ms / 1000.0;
+        ps.prediction = settings.auto_prediction == 7 ? 0.0 : settings.prediction_ms / 1000.0;  // (7: none - see predict_camera_time)
         // Auto: half a game frame, or a quarter when the game sends no HUD layers - the HUD/weapon mask
         // misses some pixels (semi-transparent HUD), and a shorter warp moves them less. A whole game frame
         // when XPAR estimates the motion from the picture itself (no DLSS or FSR): its camera cannot be
@@ -2334,6 +2628,8 @@ void render_thread() {
             // (paced: the camera as of the planned wake-up, a fixed time before the refresh it is meant for - not
             // the moment the loop got there, which varies by a fraction of a millisecond and would jitter the motion)
             const double t_camera = frame_tick && seconds(frame_tick) <= now ? seconds(frame_tick) : now;
+            planned_camera_t = t_camera;
+            if (settings.auto_prediction != 7) zero_offset_set = false;
             g_app.model.set_position_clock(t_camera);
             Prediction p = g_app.model.predict(t_camera);
             // Camera as of now (Auto latency 5): Auto's camera moved forward to this moment, the mouse up to now
@@ -2413,6 +2709,25 @@ void render_thread() {
                 } else
                     now_ahead = std::clamp(now_ahead + std::clamp(allowed - now_ahead, -1.5e-3, turning ? 0.25e-3 : 0.0), oldest, ahead);
                 if (now_ahead != 0) p = g_app.model.predict(t_camera + now_ahead);
+            } else if (settings.auto_prediction == 7) {
+                // XPAR adds no latency: the turn shown as of the present less the game's own latency - the median the XPAR row
+                // under the frame counter counts against (LatencyRows), which then reads 0. Not ahead of the game's latency (5,
+                // camera as of now), not behind it (the fractions; 6 in turns), whatever the frame time does: in a turn the view
+                // runs past the newest frame by its age (the edge fill covers what that uncovers), and past a late frame it runs on
+                // instead of falling behind (up to max_horizon). Movement is not predicted (position_at: as in every mode).
+                double wait = 0;
+                if (!present_waits.empty()) {
+                    std::vector<double> v(present_waits.begin(), present_waits.end());
+                    std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+                    wait = v[v.size() / 2];
+                }
+                const double game_latency = g_app.model.latency_median() > 0 ? g_app.model.latency_median() : g_app.model.latency();
+                const double target = wait - game_latency;  // (the camera's time against the planned wake-up)
+                // (followed at most 0.1 ms a refresh: the median steps as frames come in - a jump would show as a hitch in a turn)
+                if (!zero_offset_set) { zero_offset = target; zero_offset_set = true; }
+                else zero_offset += std::clamp(target - zero_offset, -0.1e-3, 0.1e-3);
+                p = g_app.model.predict_camera_time(t_camera + zero_offset);
+                now_ahead = zero_offset + g_app.model.latency();  // (the same time, as predict(t_camera + now_ahead) asks it)
             } else {
                 now_ahead = 0;
             }
@@ -2490,8 +2805,9 @@ void render_thread() {
                 const double held_back = !source_has_sim && interval > 0 ? std::clamp(1.0 - (now_seconds() - shown_since) / interval, 0.0, 1.0) : g_app.model.position_frames_back(shown_frame);
                 // (MotionReference: whatever moves with the screen, a third-person character too - see Renderer::set_motion_reference)
                 static const bool motion_ref_between = GetEnvironmentVariableW(L"FW_MOTION_REF", nullptr, 0) != 0;
-                renderer.set_held_between(generated < 0 && !dev_off(settings, kDevCarried | kDevBetween) &&  // (the feature test: either category off)
-                                          (motion_ref_between || !g_app.model.orbited_within(g_app.model.source_time(), 10.0)), float(held_back));
+                const bool held_between = generated < 0 && !dev_off(settings, kDevCarried | kDevBetween) &&  // (the feature test: either category off)
+                                          (motion_ref_between || !g_app.model.orbited_within(g_app.model.source_time(), 10.0));
+                renderer.set_held_between(held_between, float(held_back));
                 // (Settings::object_interp, A/B: what moves on its own at that moment too - Renderer::set_objects_between. The camera
                 // still, the frame is no longer shown as it is while that moment lies before it: what moves in it is drawn at
                 // every refresh - whether anything in the frame does move is not known here, so every such refresh is warped)
@@ -2500,6 +2816,11 @@ void render_thread() {
                 // everything is as before this option existed, the weapon's own shift included)
                 const bool objects_between = settings.object_interp != 0 && settings.follow_share != 0 && !(own_engine_on() && source.generated > 0);
                 renderer.set_objects_between(objects_between ? int(std::min<std::uint32_t>(settings.object_interp, 2u)) : 0, float(held_back));  // (1 shift, 2 the two frames blended)
+                // (the same for the intake in the game - it has no refresh of its own: see the game-side block, Handoff)
+                sh.handoff.warp_ahead = 0.0f;
+                sh.handoff.held_back = sh.handoff.objects_back = float(held_back);
+                InterlockedExchange(&sh.handoff.held_between, held_between ? 1 : 0);
+                InterlockedExchange(&sh.handoff.objects_between, objects_between ? LONG(std::min<std::uint32_t>(settings.object_interp, 2u)) : 0);
                 // (the log, every 10 s while it is on: how many refreshes were drawn with the next frame already in the camera model
                 // but not yet shown - those the moment was once counted from the wrong frame for, see PoseModel::position_frames_back)
                 if (objects_between) {
@@ -2748,6 +3069,11 @@ void render_thread() {
                 const double camera_t = g_app.model.source_time() + applied.horizon;
                 lat_behind.push_back((now - camera_t) * 1000.0);
                 shown_presents[ps.last_present_count % 64] = {ps.last_present_count, now_seconds(), camera_t, false, frame_vblank};
+                if (planned_camera_t > 0) {  // (Auto latency 7: from the planned wake-up to the present)
+                    const double wait = now_seconds() - planned_camera_t;
+                    if (wait >= 0 && wait < 0.05) present_waits.push_back(wait);
+                    while (present_waits.size() > 120) present_waits.pop_front();
+                }
                 if (ps.hr == S_OK && ps.present_count && ps.last_present_count >= ps.present_count)
                     lat_queued.push_back(double(ps.last_present_count - ps.present_count));
             }
@@ -2839,26 +3165,7 @@ void render_thread() {
                              fit.samples > 0 ? fit.moving / fit.samples : 0.0, agree[0], agree[1], source.depth_rect.w, source.depth_rect.h,
                              camera_fit);
             }
-            if (have_fit && !source.motion_estimated && !scale_from_search && mv_scale.add(fit, source.depth_rect.w, source.depth_rect.h))
-                logf("motion vectors locked: %s, scale %.4g x %.4g (sign %+.0f %+.0f), fit quality %.3f",
-                     mv_scale.pixel_units ? "render pixels" : std::fabs(std::fabs(mv_scale.locked[0]) - 1) < 1e-9 ? "uv" :
-                     std::fabs(std::fabs(mv_scale.locked[0]) - 0.5) < 1e-9 ? "ndc" : "custom units", mv_scale.scale(0, source.depth_rect.w),
-                     mv_scale.scale(1, source.depth_rect.h), mv_scale.locked[0] < 0 ? -1.0 : 1.0, mv_scale.locked[1] < 0 ? -1.0 : 1.0,
-                     mv_scale.quality);
-            // The game's own camera against its motion vectors (camera_check.hpp): when they never agree
-            // while the camera moves, the camera is estimated from the motion vectors from here on.
-            if (have_fit && have_source_kind && !source_was_estimated && g_app.shared->game_camera_check == 0 &&
-                camera_check.verdict == CameraCheck::kUndecided) {
-                const auto verdict = camera_check.add(fit.gc, fit.gg, fit.cc, fit.samples, mv_scale.valid);
-                if (verdict == CameraCheck::kTrusted)
-                    logf("the game's camera matches its motion vectors");
-                else if (verdict == CameraCheck::kUnusable) {
-                    InterlockedExchange(&g_app.shared->game_camera_check, 1);
-                    poor_estimate_windows = 0;
-                    logf("the game's camera does not match its motion vectors (%d of %d frames with camera motion): "
-                         "estimating the camera from the motion vectors instead", camera_check.consistent, camera_check.frames);
-                }
-            }
+            if (have_fit) learn_from_fit(fit);
             vram.poll(now, notes.empty() ? nullptr : "texture change");
             sh.presenter.vram_pressure = vram.pressure_until >= now ? 1u : 0u;
             sh.presenter.vram_adapter_mb = float(vram.total_mb); sh.presenter.vram_adapter_size_mb = float(vram.size_mb);
@@ -2923,6 +3230,10 @@ void render_thread() {
             st.effective_prediction_ms = float(g_app.model.effective_prediction() * 1000.0);
             st.mv_scale_x = mv_scale.valid ? float(mv_scale.scale(0, source.depth_rect.w)) : 0.0f;
             st.mv_scale_y = mv_scale.valid ? float(mv_scale.scale(1, source.depth_rect.h)) : 0.0f;
+            if (renderer.warp_only()) {  // (the game side's, with the set shown - see the import)
+                st.mv_scale_x = handed_mv_valid ? handed_mv[0] : 0.0f;
+                st.mv_scale_y = handed_mv_valid ? handed_mv[1] : 0.0f;
+            }
             st.mv_fit_quality = float(mv_scale.quality);
             st.moving_fraction = float(mv_scale.moving_fraction);
             // What the presenter costs the GPU (shared with the game), every 10 s.
@@ -3129,10 +3440,12 @@ void follow_game_window() {
     POINT origin{0, 0};
     bool show = alive && !IsIconic(game) && g_app.shared->settings.enabled && GetClientRect(game, &rc) && ClientToScreen(game, &origin);
     const HWND fg = GetForegroundWindow();
-    show = show && (fg == game || fg == g_app.overlay);
+    // (development - dev/handoff_e2e, FW_SHOW_UNFOCUSED=1: shown whatever is in front)
+    static const bool show_unfocused = GetEnvironmentVariableW(L"FW_SHOW_UNFOCUSED", nullptr, 0) != 0;
+    show = show && (fg == game || fg == g_app.overlay || show_unfocused);
     g_app.visible = show;
     // Never cover the game until we actually have frames to show (avoids a black overlay).
-    if (show && g_app.has_frames && !g_app.shadow) {  // (the shadow intake works while the game is in front, never shown)
+    if (show && g_app.has_frames && !g_app.shadow && !g_app.game_intake) {  // (the shadow intake works while the game is in front, never shown)
         const int w = rc.right - rc.left, h = rc.bottom - rc.top;
         SetWindowPos(g_app.overlay, HWND_TOPMOST, origin.x, origin.y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         g_app.client_w = static_cast<std::uint32_t>(w); g_app.client_h = static_cast<std::uint32_t>(h);
@@ -3317,6 +3630,9 @@ static int presenter_main(HINSTANCE instance, DWORD pid, const std::filesystem::
         wchar_t shadow[4]{};
         g_app.shadow = g_app.in_process && GetEnvironmentVariableW(L"FW_SHADOW_INTAKE", shadow, 4) && shadow[0] == L'1';
         if (g_app.shadow) g_app.base_dir /= L"shadow";  // (its own logs and shader cache: the exe keeps FrameWarp's)
+        wchar_t game_intake[4]{};
+        g_app.game_intake = g_app.in_process && !g_app.shadow && GetEnvironmentVariableW(L"FW_GAME_INTAKE", game_intake, 4) && game_intake[0] == L'1';
+        if (g_app.game_intake) g_app.base_dir /= L"game_intake";  // (its own logs and shader cache, as the shadow's)
     }
     g_app.data_dir = g_app.base_dir;
     {
@@ -3339,7 +3655,7 @@ static int presenter_main(HINSTANCE instance, DWORD pid, const std::filesystem::
 
     // One presenter per game.
     const std::wstring mutex_name = L"Local\\FrameWarpPresenter_" + std::to_wstring(g_app.pid);
-    HANDLE single = g_app.shadow ? nullptr : CreateMutexW(nullptr, TRUE, mutex_name.c_str());  // (the shadow beside the exe: see App::shadow)
+    HANDLE single = g_app.shadow || g_app.game_intake ? nullptr : CreateMutexW(nullptr, TRUE, mutex_name.c_str());  // (the shadow beside the exe: see App::shadow)
     if (single && GetLastError() == ERROR_ALREADY_EXISTS) { logf("presenter already running"); g_files.stop(); return 0; }
 
     g_app.game_process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, g_app.pid);
@@ -3391,6 +3707,7 @@ static int presenter_main(HINSTANCE instance, DWORD pid, const std::filesystem::
     RAWINPUTDEVICE rid{0x01, 0x02, RIDEV_INPUTSINK, g_app.overlay};  // generic desktop / mouse
     std::thread mouse_reader;
     if (g_app.shadow) logf("shadow intake (development): Show original's intake beside FrameWarpPresenter.exe - no window, no claims");
+    else if (g_app.game_intake) logf("the intake in the game: frames taken in on the game's own queue, handed to FrameWarpPresenter.exe - no window");
     else if (g_app.in_process) mouse_reader = start_mouse_from_helper();
     else if (!RegisterRawInputDevices(&rid, 1, sizeof(rid))) logf("raw input registration failed");
     SetTimer(g_app.overlay, 1, 100, nullptr);
@@ -3420,6 +3737,16 @@ static int presenter_main(HINSTANCE instance, DWORD pid, const std::filesystem::
 #ifdef FW_PRESENTER_DLL
 // The presenter inside the game: FrameWarpPresenter.dll, called by the add-on on a thread of its own with the game's
 // D3D12 device; returns when the presenter ends (not 0: it did not start - see App::start_failed).
+// (the intake in the game: the queue the game presents on, from the add-on at each present - see App::game_intake)
+extern "C" __declspec(dllexport) void fw_presenter_game_queue(ID3D12CommandQueue* queue) {
+    fw::g_app.game_queue.store(queue);
+    fw::g_app.last_present_qpc.store(fw::qpc_now());
+    std::lock_guard<std::mutex> lock(fw::g_app.present_mutex);
+    if (fw::g_app.present_renderer && fw::g_app.present_renderer->intake_at_present()) fw::g_app.present_renderer->flush_at_present();
+}
+// (development - dev/handoff_e2e: the intake in the game held and let go, as if its thread stopped)
+extern "C" __declspec(dllexport) void fw_presenter_game_pause(int on) { fw::g_app.game_pause.store(on != 0); }
+
 extern "C" __declspec(dllexport) int fw_presenter_run(DWORD pid, ID3D12Device* device, const wchar_t* base_dir) {
     HMODULE self = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,

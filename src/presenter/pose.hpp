@@ -711,6 +711,9 @@ public:
     }
 
     // Camera for display at wall time `now`, relative to the newest source.
+    // The camera as of camera_t (Auto latency 7, XPAR adds no latency - main.cpp): predict asked for the time that shows it,
+    // whatever the latency percentile in use and the prediction setting (predict(t) shows t - (latency_ - prediction)).
+    Prediction predict_camera_time(double camera_t) const { return predict(camera_t + latency_ - effective_prediction()); }
     Prediction predict(double now) const {
         Prediction out;
         paced_last_ = false;

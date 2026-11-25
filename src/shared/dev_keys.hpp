@@ -32,6 +32,11 @@ inline constexpr DevKey kDevKeys[] = {
     {"StencilDump", "FW_STENCIL_DUMP", L"FW_STENCIL_DUMP", '1', false},
     {"MotionReference", "FW_MOTION_REF", L"FW_MOTION_REF", '1', false},  // (what moves with the screen by the game's vectors - Renderer::set_motion_reference)
     {"StencilMask", "FW_STENCIL_MASK", L"FW_STENCIL_MASK", '1', false},
+    // (2026-11-25, split out of the Feature test's "Progressive work": FieldBlocksBySpeed on by default - =0: the field's blocks by
+    // the render size alone; FlowLight off by default - =1: XPAR's own motion estimate with fewer refinements, which moved edges in
+    // the synthetic scenes without game vectors (orbit_est, 30 fps: a pillar's edge ~25 px off). Both still need "Progressive work" ticked)
+    {"FieldBlocksBySpeed", "FW_TETHER_SPEED", L"FW_TETHER_SPEED", '1', true},
+    {"FlowLight", "FW_FLOW_LIGHT", L"FW_FLOW_LIGHT", '1', false},
     {"ContinuousWarp", "FW_TETHER", L"FW_TETHER", '1', true},  // (on by default since 2026-11-07: ContinuousWarp=0 brings back the old holding - Renderer::set_tether)  // (the character from the game's stencil - Renderer::stencil_character)  // (the depth's stencil, every 60th frame - see Producer::stencil_dump)
 };
 

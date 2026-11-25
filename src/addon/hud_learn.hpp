@@ -45,4 +45,6 @@ struct Status { std::uint32_t candidates = 0, active = 0, locked = 0; };
 // stand for another draw, or none - read by an updated add-on it is ignored and deleted, and learned again.
 void set_profile(const std::wstring& path, const char* build);
 Status status();
+bool saved_point();   // (a learned point is saved for this game - FrameWarp\profiles\hud_point.txt)
+void forget_saved();  // (deletes it: learned again once HUD learning is on)
 }

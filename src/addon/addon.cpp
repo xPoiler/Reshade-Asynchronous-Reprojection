@@ -74,20 +74,29 @@ std::uint32_t to_dxgi_color_space(color_space cs) {
 // sharing the GPU with the realtime warp, not the second process.
 // Once per game run: when it ends, or did not start, FrameWarpPresenter.exe takes over)
 std::atomic<bool> g_in_process_running{false}, g_in_process_used{false};
+// (the intake in the game, dev/PLAN_intake_in_game.md 2c - [FrameWarp] IntakeInGame=1, development: FrameWarpPresenter.dll inside the
+// game takes the frames in on the game's own queue beside FrameWarpPresenter.exe, which then only warps; the DLL is handed the queue
+// the game presents on at each present)
+using GameQueueFn = void (*)(ID3D12CommandQueue*);
+std::atomic<GameQueueFn> g_game_queue_fn{nullptr};
 bool launch_in_process(const std::wstring& dir) {
     char value[8] = {};
     size_t size = sizeof(value);
+    bool game_intake = false;
+    if (reshade::get_config_value(nullptr, "FrameWarp", "IntakeInGame", value, &size) && value[0] == '1') game_intake = true;
+    size = sizeof(value);
     // (development, the hybrid's gate - ShadowIntake=1: the presenter's intake alone inside the game beside the exe, which
     // starts as usual - see App::shadow in the presenter)
     bool shadow = false;
     if (reshade::get_config_value(nullptr, "FrameWarp", "ShadowIntake", value, &size) && value[0] == '1') shadow = true;
     size = sizeof(value);
-    if (!shadow && (!reshade::get_config_value(nullptr, "FrameWarp", "InProcessPresenter", value, &size) || value[0] != '1')) return false;
+    if (!shadow && !game_intake && (!reshade::get_config_value(nullptr, "FrameWarp", "InProcessPresenter", value, &size) || value[0] != '1')) return false;
     ID3D12Device* device = g_producer ? g_producer->game_d3d12_device() : nullptr;
     if (!device || g_in_process_used.exchange(true)) return false;
     // (RivaTuner's overlay hooks every present in the game's process, ours too, and broke on the presenter's first one -
     // Armored Core VI at its title screen, 2026-10-27: the exe while it is there)
-    if (GetModuleHandleW(L"RTSSHooks64.dll")) {
+    // (not for the intake in the game: it never presents)
+    if (!game_intake && GetModuleHandleW(L"RTSSHooks64.dll")) {
         g_producer->log_line("FrameWarp: RivaTuner's overlay is hooked into the game - FrameWarpPresenter.exe instead of the presenter inside the game");
         return false;
     }
@@ -99,6 +108,24 @@ bool launch_in_process(const std::wstring& dir) {
         return false;
     }
     device->AddRef();
+    if (game_intake && !shadow) {
+        g_game_queue_fn = reinterpret_cast<GameQueueFn>(GetProcAddress(dll, "fw_presenter_game_queue"));
+        if (!g_game_queue_fn.load()) { device->Release(); g_producer->log_line("FrameWarp: the intake in the game needs a newer FrameWarpPresenter.dll"); return false; }
+        SetEnvironmentVariableW(L"FW_GAME_INTAKE", L"1");
+        {  // (development, IntakeAtPresent=1: the intake's work sent at the game's present - see Renderer::set_intake_at_present)
+            char at[8] = {};
+            size_t at_size = sizeof(at);
+            const bool at_present = reshade::get_config_value(nullptr, "FrameWarp", "IntakeAtPresent", at, &at_size) && at[0] == '1';
+            SetEnvironmentVariableW(L"FW_INTAKE_AT_PRESENT", at_present ? L"1" : nullptr);
+        }
+        g_producer->log_line("FrameWarp: the intake in the game (IntakeInGame=1): FrameWarpPresenter.dll takes the frames in on the game's queue, the exe warps");
+        std::thread([run, device, dir]() {
+            run(GetCurrentProcessId(), device, dir.c_str());
+            device->Release();
+            g_game_queue_fn = nullptr;
+        }).detach();
+        return false;  // (the exe as usual - it warps only while the DLL hands sets over)
+    }
     if (shadow) {
         SetEnvironmentVariableW(L"FW_SHADOW_INTAKE", L"1");
         std::thread([run, device, dir]() { run(GetCurrentProcessId(), device, dir.c_str()); device->Release(); }).detach();
@@ -847,6 +874,9 @@ struct State {
     int slot = 0, passes = 8, logged = 0, skipped = 0;
     double ms_sum = 0, freq = 1;
 } g;
+// (QueueLoadPasses=N: N passes every present, not calibrated - the same work whatever else cuts in on the GPU; the timestamps
+// then include other processes' work, e.g. the presenter's warps)
+int g_fixed_passes = 0;
 
 bool setup(ID3D12CommandQueue* queue) {
     if (g.queue == queue) return !g.failed;
@@ -903,7 +933,9 @@ void on_present(command_queue* queue) {
         char value[32] = {};
         size_t size = sizeof(value);
         if (reshade::get_config_value(nullptr, "FrameWarp", "QueueLoadMs", value, &size)) g.target_ms = std::atof(value);
-        g.wanted = g.target_ms > 0;
+        size = sizeof(value);
+        if (reshade::get_config_value(nullptr, "FrameWarp", "QueueLoadPasses", value, &size)) g_fixed_passes = std::clamp(std::atoi(value), 0, 400);
+        g.wanted = g.target_ms > 0 || g_fixed_passes > 0;
         if (g.wanted) reshade::log::message(reshade::log::level::info, "XPAR queue load (prototype): key set - Ctrl+Shift+L turns it on and off");
     }
     if (!g.wanted || !queue || queue->get_device()->get_api() != device_api::d3d12) return;
@@ -932,7 +964,7 @@ void on_present(command_queue* queue) {
                 g.ms_sum += ms;
                 // (passes follow the target: proportional, damped, 1..400)
                 const double want = g.passes * g.target_ms / std::max(ms, 0.01);
-                g.passes = std::clamp(int(std::lround(0.7 * g.passes + 0.3 * want)), 1, 400);
+                g.passes = g_fixed_passes ? g_fixed_passes : std::clamp(int(std::lround(0.7 * g.passes + 0.3 * want)), 1, 400);
                 if (++g.logged >= 600) {
                     char text[160];
                     std::snprintf(text, sizeof(text), "XPAR queue load (prototype): target %.2f ms, measured %.2f ms a present on the game's queue, %d passes, %d presents skipped",
@@ -952,6 +984,7 @@ void on_present(command_queue* queue) {
     g.list->SetComputeRootDescriptorTable(0, g.heap->GetGPUDescriptorHandleForHeapStart());
     g.list->EndQuery(g.stamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, s * 2);
     D3D12_RESOURCE_BARRIER uav{}; uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; uav.UAV.pResource = g.tex.Get();
+    if (g_fixed_passes) g.passes = g_fixed_passes;
     for (int i = 0; i < g.passes; ++i) {
         g.list->Dispatch(3840 / 8, 2160 / 8, 1);
         g.list->ResourceBarrier(1, &uav);
@@ -969,6 +1002,9 @@ void on_present(command_queue* queue) {
 }  // namespace queue_load
 
 void on_present(command_queue* queue, swapchain* chain, const rect*, const rect*, uint32_t, const rect*) {
+    // (the intake in the game: the queue the game presents on, for FrameWarpPresenter.dll - see g_game_queue_fn)
+    if (const GameQueueFn fn = g_game_queue_fn.load(); fn && queue && queue->get_device()->get_api() == device_api::d3d12)
+        fn(reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()));
     queue_load::on_present(queue);
     // (a swap chain made after the followed one presents: it is the game's now - see g_waiting_chain)
     if (chain && chain == g_waiting_chain.load()) {
@@ -1353,17 +1389,20 @@ void draw_overlay(effect_runtime*) {
              "unaffected either way.");
         if (shown_in_ui(kHiddenFromUi.rotation_extrapolation)) ImGui::SliderFloat("Rotation extrapolation", &s.rotation_extrapolation, 0.0f, 1.0f);
         static const char* const kAutoModes[] = {"Off (manual slider)", "Auto (1/2, 1/4 without HUD layers, 1 without DLSS/FSR)", "1 game frame", "1/2 game frame",
-                                                 "1/4 game frame", "Camera as of now (edge-limited)", "Lowest latency without edge fill (default)"};
-        static const std::uint32_t kAutoValues[] = {0, 3, 1, 2, 4, 5, 6};
+                                                 "1/4 game frame", "Camera as of now (edge-limited)", "Lowest latency without edge fill (default)",
+                                                 "XPAR adds no latency"};
+        static const std::uint32_t kAutoValues[] = {0, 3, 1, 2, 4, 5, 6, 7};
         int auto_index = 0;
-        for (int i = 0; i < 7; ++i) if (kAutoValues[i] == s.auto_prediction) auto_index = i;
+        for (int i = 0; i < 8; ++i) if (kAutoValues[i] == s.auto_prediction) auto_index = i;
         if (shown_in_ui(kHiddenFromUi.auto_latency)) {
-        if (ImGui::Combo("Auto latency", &auto_index, kAutoModes, 7)) s.auto_prediction = kAutoValues[auto_index];
+        if (ImGui::Combo("Auto latency", &auto_index, kAutoModes, 8)) s.auto_prediction = kAutoValues[auto_index];
         hint("How far behind the newest camera the view is shown. Auto: between the game's last frames (smoothest). "
              "Camera as of now: the lowest latency - the mouse up to this moment - held back only as far as needed to keep "
              "what a fast turn uncovers at the screen's edge under the limit below. Lowest latency without edge fill: the "
              "camera as of now whenever that shows nothing the game has not rendered, down to one game frame back during "
-             "fast turns (what the warp reveals then comes from the game's last frames: keep Background memory on).");
+             "fast turns (what the warp reveals then comes from the game's last frames: keep Background memory on). XPAR adds no "
+             "latency: the turn exactly as old as the game's own frames are when they are done - the XPAR row under the frame "
+             "counter at 0 - while turning and while the frame time swings; in fast turns the screen's edge needs the edge fill.");
         }
         if (s.auto_prediction == 5 && shown_in_ui(kHiddenFromUi.edge_limit)) {
             bool unlimited = s.edge_unlimited != 0;
@@ -1380,7 +1419,8 @@ void draw_overlay(effect_runtime*) {
             ImGui::SameLine();
             ImGui::TextDisabled("%.1f ms (game frame %.1f ms)", p.effective_prediction_ms, p.frame_interval_ms);
         }
-        if (shown_in_ui(kHiddenFromUi.latency_smoothness)) {
+        // (hidden only while Auto latency sets it: with Auto latency Off it is the latency - GitHub issue, 2026-11-24)
+        if (shown_in_ui(kHiddenFromUi.latency_smoothness) || (!auto_latency && shown_in_ui(kHiddenFromUi.auto_latency))) {
             if (auto_latency) ImGui::BeginDisabled();
             ImGui::SliderFloat("Latency <-> smoothness (ms)", &s.prediction_ms, -40.0f, 30.0f, "%.0f");
             if (auto_latency) ImGui::EndDisabled();
@@ -1668,10 +1708,31 @@ void draw_overlay(effect_runtime*) {
             }
         }
         {
+            // Where the HUD is taken from, as one choice (2026-11-25, user: in the simplified panel too). It sets the three switches
+            // listed below with ShowAllSettings=1 - KeepHudStill (use_ui_tags), GameHudLayers, HudLearn - each remembered per
+            // game as before; a mix none of the choices makes shows as "Custom" and is left alone until one is picked.
+            static const char* const kHudFrom[] = {"Automatic (default)", "The game's own HUD layer", "Learned HUD point", "Detected",
+                                                   "Custom (set below)"};
+            struct HudFrom { bool tags, layers, learn; };
+            static constexpr HudFrom kHudFromFlags[] = {{true, true, true}, {true, true, false}, {false, false, true}, {false, false, false}};
+            int hud_from = 4;
+            for (int i = 0; i < 4; ++i)
+                if (kHudFromFlags[i].tags == (s.use_ui_tags != 0) && kHudFromFlags[i].layers == (s.game_hud_layers != 0) &&
+                    kHudFromFlags[i].learn == (s.hud_learn != 0))
+                    hud_from = i;
+            if (ImGui::Combo("Take the HUD from", &hud_from, kHudFrom, hud_from == 4 ? 5 : 4) && hud_from < 4) {
+                s.use_ui_tags = kHudFromFlags[hud_from].tags;
+                s.game_hud_layers = kHudFromFlags[hud_from].layers;
+                s.hud_learn = kHudFromFlags[hud_from].learn;
+            }
+            hint("Automatic: the game's own HUD layer or HUD-less picture where it has one, else the point where the game draws its "
+                 "HUD (learned), else the HUD is detected. The game's own HUD layer: only that, else detected - for a game where the "
+                 "learned point takes something that is not the HUD. Learned HUD point: only the learned point, else detected - for a "
+                 "game where the wrong layer is taken. Detected: always detected (\"Find the HUD\"). Remembered per game.");
             static const char* const kHudFind[] = {"Learned from camera motion", "From the upscaler output (DLSS or FSR)",
                                                    "Upscaler output + camera motion check (default)"};
             int find = s.hud_from_scene > 2 ? 2 : int(s.hud_from_scene);
-            if (shown_in_ui(kHiddenFromUi.find_hud)) {
+            if (shown_in_ui(kHiddenFromUi.find_hud) || hud_from == 3) {
                 ImGui::BeginDisabled(why_hud != nullptr);
                 if (ImGui::Combo("Find the HUD", &find, kHudFind, 3)) {
                     s.hud_from_scene = find;
@@ -1707,6 +1768,12 @@ void draw_overlay(effect_runtime*) {
                                         lh.learn_probes);
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Relearn")) ++s.hud_relearn;
+            } else if (fw::hud_learn::saved_point()) {
+                // (learning off: nothing learned is in use, the saved point waits for learning to be on again - Relearn forgets it)
+                ImGui::TextDisabled("HUD learning: off - a learned point is saved for when it is on");
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Relearn")) fw::hud_learn::forget_saved();
+                hint("Forgets the saved point: the HUD point is learned again once HUD learning is on.");
             }
             // Where the HUD comes from right now, and the game's own HUD layer if XPAR found one.
             if (hud_kept && g_producer && g_producer->shared()) {
@@ -1799,13 +1866,18 @@ void draw_overlay(effect_runtime*) {
              "attached around it, the continuous warp's field what has no tear between near and far within reach - the "
              "same picture (but for a few pixels at the screen's edge). Off: every pass over the whole picture, as before."},
             {fw::kDevProgressive, "Progressive work (2026-11-20)",
-             "On: the warp's field solved on coarser blocks while the view is still or slow, the learned HUD detection looking "
-             "closely only where HUD was found, the field's untorn blocks skipped, the search pass also with a sight's reticle "
-             "layer. Off: each as before - to compare GPU time and picture."},
+             "On: the warp's field solved on coarser blocks while the view is still or slow (dev key FieldBlocksBySpeed, on; =0 off), "
+             "the learned HUD detection looking closely only where HUD was found, the field's untorn blocks skipped, the search "
+             "pass also with a sight's reticle layer, the own motion estimate lighter (dev key FlowLight=1 only - off by default: "
+             "it moved edges where the game gives no vectors). Off: each as before - to compare GPU time and picture."},
             {fw::kDevFewerSubmits, "Fewer interruptions of the game (2026-11-21)",
              "On: a refresh with nothing new to show sends nothing to the GPU, and a game frame's analysis and HUD/mask/memory "
              "go to the GPU together - each piece of work sent stops the game's own for a moment. Off: as before - to compare "
              "the game's fps. The picture is the same."},
+            {fw::kDevBlendNear, "Blend the frame before only near movers (2026-11-25)",
+             "On: XPAR frame generation mixes in the frame before only where something moves on its own within reach - not on "
+             "scenery whose vectors differ a little from the camera's. Needs \"Passes limited to where they matter\" on. Off: "
+             "blended wherever the vectors differ from the camera's, as before."},
         };
         ImGui::TextUnformatted("Unticked = switched off now (not saved). Each change is logged with the GPU time before it.");
         for (const auto& c : categories) {
@@ -1813,19 +1885,7 @@ void draw_overlay(effect_runtime*) {
             if (ImGui::Checkbox(c.name, &on)) s.dev_features_off = on ? (s.dev_features_off & ~c.bit) : (s.dev_features_off | c.bit);
             hint(c.what);
         }
-        // (variants: ticked = tried instead of the shipped way)
-        static const Category variants[] = {
-            {fw::kDevBlendNear, "Variant: blend the frame before only near movers",
-             "XPAR frame generation mixes in the frame before only where something moves on its own within reach - not on "
-             "scenery whose vectors differ a little from the camera's. Needs \"Passes limited to where they matter\" on."},
-        };
-        ImGui::Separator();
-        ImGui::TextUnformatted("Variants (ticked = tried instead of the shipped way):");
-        for (const auto& c : variants) {
-            bool on = fw::dev_off(s, c.bit);
-            if (ImGui::Checkbox(c.name, &on)) s.dev_features_off = on ? (s.dev_features_off | c.bit) : (s.dev_features_off & ~c.bit);
-            hint(c.what);
-        }
+        // (variants - ticked = tried instead of the shipped way: none now; blend only near movers shipped 2026-11-25)
         if (ImGui::Button("All as shipped")) s.dev_features_off = 0;
     }
 

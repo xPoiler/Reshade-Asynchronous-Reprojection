@@ -17,6 +17,7 @@
 #include <string>
 #include <functional>
 #include <vector>
+#include <unordered_map>
 #include <mutex>
 #include <atomic>
 #include <cstdio>
@@ -492,8 +493,8 @@ public:
     // off, each as before - the "Progressive work" box)
     void set_progressive_exact(bool on) { progressive_exact_ = on; }
     void set_seek_rim(bool on) { seek_rim_ = on; }  // (the continuous warp's rim rule - see ow_seek_rim; the "Progressive work" box)
-    void set_flow_light(bool on) { flow_light_ = on; }  // (XPAR's own motion estimate with fewer refinements - see estimate_flow; the "Progressive work" box)
-    void set_tether_by_speed(bool on) { tether_by_speed_ = on; }  // (the blocks by the picture's speed - see own_warp; FW_TETHER_SPEED_OFF in replays)
+    void set_flow_light(bool on) { flow_light_ = on; }  // (XPAR's own motion estimate with fewer refinements - see estimate_flow; off by default since 2026-11-25: dev key FlowLight=1)
+    void set_tether_by_speed(bool on) { tether_by_speed_ = on; }  // (the blocks by the picture's speed - see own_warp; dev key FieldBlocksBySpeed, =0 off)
     void set_carried_free(bool on) { carried_free_ = on; }  // (dev: carried pixels - share ~0 - not held by the warp)
     void set_outlines_held(bool on) { outlines_held_ = on; }  // (the mask's outlines and sights, 0.95: held, or warped as carried)
     void set_own_depth_blind(bool on) { own_depth_blind_ = on; }  // (own motion spread over a character at any distance)
@@ -589,10 +590,10 @@ public:
     float last_present_call_ms() const { return last_present_call_ms_; }  // how long the last Present call took (CPU)
     std::int64_t last_submit_qpc() const { return last_submit_qpc_; }   // when the last presented frame's work was submitted (as in last_timing)
     ID3D12Resource* no_warp_mask() const {
-        if (split_) return shown_mask_ ? front_[kPMask].texture.Get() : nullptr;
+        if (split_) return shown_.mask ? front_[kPMask].texture.Get() : nullptr;
         return mask_ready_ ? private_[kPMask].texture.Get() : nullptr;
     }
-    void reset_hud_detection() { reset_hud_ = true; hud_full_left_ = 16; mask_ready_ = false; shown_mask_ = false; mem_last_ = -1; flow_previous_ = false; }
+    void reset_hud_detection() { reset_hud_ = true; hud_full_left_ = 16; mask_ready_ = false; shown_.mask = false; mem_last_ = -1; flow_previous_ = false; }
 
     // Test/diagnostic helper: synchronously reads back the warped output (RGBA16F) or private backbuffer.
     // which: 0 the game's frame, 1 the warped output, 2 the upscaler's output (scene before HUD).
@@ -612,6 +613,58 @@ public:
     void release_stash();
     // The presenter's textures, largest first (name WxH MB), and their total; for the log.
     std::string memory_report();
+    // Development (the intake in the game, step 2a): with split queues, reads across the seam between the intake and the warp
+    // since set_split - the warp (context 0) reading a texture the intake (context 1) writes, other than the shown set; the
+    // intake reading the shown set; the intake reading a texture the warp writes. Empty when nothing crossed.
+    std::string seam_report() const;
+    std::uint32_t seam_faults() const;  // (the warp's reads of the set the intake writes, stale reads, tables naming it: 0 or a fault)
+    void set_seam_clobber(bool on) { seam_clobber_ = on; }
+    void set_seam_audit(bool on) { seam_audit_ = on; }
+    // The intake in the game, step 2b: the shown set handed from the Renderer that takes frames in to one that only warps,
+    // through shared handles (in one process for now - seq_replay FW_HANDOFF). share_sets: the set's textures made shareable
+    // (before any is made). export_shown (split queues, after show_intake): the shown set's textures and what the warp
+    // reads with them. import_shown (warp_only): opens them (once per texture) as its shown set.
+    struct SharedSetTex { std::int32_t id = -1; std::uint64_t gen = 0; HANDLE handle = nullptr; std::uint32_t w = 0, h = 0; std::int32_t format = 0; };
+    static constexpr int kMaxSetTex = 40;
+    struct SetExport {
+        SharedSetTex tex[kMaxSetTex];
+        int count = 0;
+        std::uint8_t meta[96] = {};   // (FrameMeta)
+        std::uint8_t info[32] = {};   // (SetInfo of the shown set)
+        std::uint64_t serial = 0;
+    };
+    void set_share_sets(bool on) { share_sets_ = on; }
+    // (across processes: the handles named as the slots' textures are - object_name(pid, session, "set", -1, id, generation) -
+    // so the other side opens them by name; import_shown with the intake side's pid and session opens them so)
+    void set_share_names(DWORD pid, std::uint64_t session) { share_pid_ = pid; share_session_ = session; }
+    DWORD share_pid_ = 0;
+    std::uint64_t share_session_ = 0;
+    // (the sets change hands - this renderer's own and the ones handed over never mix: all of them let go of, once the GPU is past
+    // them. After wait_idle)
+    void set_warp_only(bool on);
+    void drop_sets();  // (every set let go of, once the GPU is past it - and the values that go with them)
+    bool warp_only() const { return warp_only_; }
+    // (the refresh queue's fence: the last value signalled - every warp recorded so far is before it - and the value completed)
+    std::uint64_t warp_fence_signaled() const { return fence_values_[0]; }
+    std::uint64_t warp_fence_completed() const { return fences_[0] ? fences_[0]->GetCompletedValue() : 0; }
+    // (step 2c: the intake's work submitted to another queue of this device - the game's present queue, its lists' type -
+    // instead of the presenter's own; nullptr: its own again. Only while no intake is in flight - wait_idle first)
+    bool set_intake_queue(ID3D12CommandQueue* queue);
+    // (the intake in the game, development - IntakeAtPresent: the intake's work on the game's queue sent at the game's present -
+    // from the game's thread, between its frames - not when it is recorded. Recorded as before; its waits, list and signal kept
+    // until flush_at_present, called from the game's present. Before set_intake_queue)
+    void set_intake_at_present(bool on) { intake_at_present_ = on; }
+    bool intake_at_present() const { return intake_at_present_; }
+    void flush_at_present();
+    // (since the last call: intake submissions sent at a present, and how long they waited for it on average, ms)
+    std::pair<std::uint32_t, double> take_deferred_stats();
+    void set_intake_direct(bool on) { intake_direct_ = on; }  // (before init: the intake's lists DIRECT, as in the game - to run on a graphics queue)
+    bool intake_direct_ = false;
+    bool export_shown(SetExport& out) const;
+    bool import_shown(const SetExport& in, DWORD pid = 0, std::uint64_t session = 0);
+    std::string handoff_report() const;  // (warp_only: textures bound that it neither made nor was handed - none expected)
+    // Development (step 2a): three sets with split queues - written, shown, shown before (see back_). Before set_split.
+    void set_three_sets(bool on) { if (!split_) three_sets_ = on; }
 
 private:
     struct Private {
@@ -621,6 +674,33 @@ private:
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     };
     enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPHudLearned, kPHudTiles, kPWarpClaims, kPStill, kPGrowA, kPGrowB, kPProbe, kPProbeTilesA, kPProbeTilesB, kPShareA, kPShareB, kPShareT, kPShare, kPRetDirtyA, kPRetDirtyB, kPShareT2, kPShareHalf, kPRecColour, kPRecUi, kPShareResid, kPOwnMove, kPPaths, kPShareSeam, kPAttHist, kPMemVis, kPUiTiles, kPWarpBeside, kPWarpHeld, kPLowScene, kPMaskRaw, kPMemF0, kPMemF1, kPMemFZ0, kPMemFZ1, kPGunMove, kPMemRatio, kPMotionProbe, kPMotionGame, kPStencil, kPStenCellsA, kPStenCellsB, kPStenMask, kPStenGrowA, kPStenGrowB, kPStenAge, kPStenLumaA, kPStenLumaB, kPStenElig, kPStenFringeA, kPStenFringeB, kPDepthVA, kPDepthVB, kPMemMask, kPShareSm, kPShareSmA, kPRecOut, kPTetherA, kPTetherB, kPTetherT, kPTetherF, kPTetherP, kPGunFlag, kPOwnT, kPToPrev, kPPrevCol, kPPrevTo, kPFitPart, kPFit, kPTetherRA, kPTetherRB, kPOwnTiles, kPTetherN, kPTetherS, kPProbeFoot, kPCount };
+
+    // What the warp reads of a frame taken in besides its textures (the intake in the game, step 2a): with split queues
+    // the shown frame's, made by the intake and handed over with the set (show_intake, set_split); the single queue reads
+    // the intake's own values where it has no shown_ field. One block, so the exe can be handed it with the set.
+    struct FrameMeta {
+        bool mask = false, fill = false, stretch = false, share_mask = false, layer = false;
+        PrivateId ret = kPRetA;
+        int mem = -1;  // the background memory picture (kPMem0 + mem)
+        bool game_vectors = false, flow_ui_masked = false, share_orbit = false, mem_front_valid = false;
+        // (the layer's verdicts read back from the intake - see begin)
+        bool blend_linear = false, layer_linear = false, layer_full = false;
+        int layer_trust = 0;
+    };
+    FrameMeta shown_;
+    FrameMeta made_meta() const;  // the intake's values for the frame it took in last (what show_intake hands over)
+    // (development, the seam's check - set_seam_clobber: with split queues the intake's own values scrambled while a warp is
+    // recorded, so a warp that reads one of them instead of the shown frame's changes its output)
+    struct LiveValues {
+        bool built_mask, mask_ready, fill_ready, stretch_built, share_mask_built, layer_built, game_vectors, flow_ui_masked, share_orbit, mem_front_valid;
+        bool blend_linear, layer_linear, layer_full;
+        int layer_trust;
+        PrivateId ret_latest;
+        int mem_pending, mem_last;
+    };
+    LiveValues live_values() const;
+    void set_live_values(const LiveValues& v);
+    bool seam_clobber_ = false;
 
     bool create_pipelines(std::string& error);
     std::string shader_report_;
@@ -636,12 +716,41 @@ private:
                id == kPRetLayer || id == kPUiTiles || id == kPGunMove;
     }
     const Private& shown(PrivateId id) const { return split_ && shown_id(id) ? front_[id] : private_[id]; }
-    void swap_shown();  // exchanges the two sets (and the per-texture descriptors)
+    void swap_shown(bool rotate = false);  // exchanges the two sets (and the per-texture descriptors); rotate: the three (three_sets_)
     void copy_shown_to_output();  // unwarped refresh with split queues (the shown frame as it is)
     ID3D12GraphicsCommandList* begin(int context);
     void execute();  // closes and submits list_ on its context's queue (with the waits it needs)
     void signal();   // signals its context's fence for the frame slot
     void transition(Private& p, D3D12_RESOURCE_STATES to);
+    // (seam_report: which context wrote each private_ texture with split queues, and the reads that crossed)
+    std::uint8_t seam_written_[kPCount] = {};
+    std::uint32_t seam_warp_reads_[kPCount] = {}, seam_intake_front_[kPCount] = {}, seam_intake_warpmade_[kPCount] = {}, seam_stale_[kPCount] = {};
+    bool seam_fresh_[kPCount] = {};  // (written by this intake so far - begin_intake clears it)
+    bool shown_fresh_[kPCount] = {};  // (seam_fresh_ of the shown frame's intake - handed over at the swap)
+    std::uint32_t seam_warp_stale_[kPCount] = {};  // (the warp reading a shown texture its frame's intake did not write)
+    void seam_write(PrivateId id) { if (split_) { seam_written_[id] |= std::uint8_t(1u << context_); if (context_ == 1) seam_fresh_[id] = true; } }
+    void seam_read(PrivateId id, bool front);
+    // (development, the seam's audit - set_seam_audit: which texture each descriptor was last made for, and the warp's tables
+    // naming a texture of the set the intake writes)
+    bool seam_audit_ = false;
+    std::unordered_map<UINT, ID3D12Resource*> desc_res_;
+    std::uint32_t seam_desc_w_[kPCount] = {};
+    UINT note_desc(UINT index, ID3D12Resource* r);
+    void audit_table(UINT index, UINT count);
+    bool seam_tool_ = false;
+    // (step 2b - see export_shown: the shareable textures' handles by resource and a number per texture made; the warp side's
+    // opened textures by that number; the textures it made itself; binds of ones it has not)
+    bool share_sets_ = false, warp_only_ = false;
+    struct ShareEntry { HANDLE handle = nullptr; std::uint64_t gen = 0; };
+    std::unordered_map<ID3D12Resource*, ShareEntry> share_entries_;
+    std::uint64_t share_gen_ = 0;
+    std::unordered_map<std::uint64_t, ComPtr<ID3D12Resource>> opened_sets_;
+    bool made_here_[kPCount] = {};
+    std::uint32_t handoff_missing_[kPCount] = {};
+    static bool handed_id(PrivateId id) {
+        return shown_id(id) || (id >= kPMem0 && id <= kPMemZ1) || (id >= kPMemF0 && id <= kPMemFZ1) || id == kPRetA || id == kPRetB;
+    }  // (read_back, write_back, the stash and the recorder: diagnostics, not counted)
+    struct SeamTool { bool& on; explicit SeamTool(bool& b) : on(b) { on = true; } ~SeamTool() { on = false; } };
     ID3D12Resource* shared_texture(int slot, int kind, std::uint32_t generation);
     D3D12_CPU_DESCRIPTOR_HANDLE cpu(UINT index) const;
     D3D12_GPU_DESCRIPTOR_HANDLE gpu(UINT index) const;
@@ -652,6 +761,7 @@ private:
     // HUD in this frame from the upscaler's output (into the HUD score texture, 1 = HUD).
     bool detect_hud_from_scene(const struct XConstants& base, bool fill, PrivateId out = kPHudScore);
     void set_x_srv(UINT index, PrivateId id, bool from_shown = false);
+    void set_x_srv_back(UINT index, PrivateId id);  // (the set shown before - three_sets_)
     void set_x_uav(UINT index, PrivateId id);
     // (args: dispatched from that buffer at args_offset instead, ExecuteIndirect)
     void x_dispatch(ID3D12PipelineState* pso, const void* constants, UINT srv_table, UINT uav_table, UINT groups_x, UINT groups_y,
@@ -662,6 +772,18 @@ private:
     static constexpr int kRing = 6;
     ComPtr<ID3D12Device> device_, external_device_;
     ComPtr<ID3D12CommandQueue> queue_, iqueue_;
+    struct DeferredIntake {
+        ComPtr<ID3D12CommandList> list;
+        std::uint64_t game_wait = 0, release_wait = 0, signal = 0;
+        std::int64_t recorded_qpc = 0;
+    };
+    bool intake_at_present_ = false;
+    std::mutex deferred_mutex_;
+    std::vector<DeferredIntake> deferred_;
+    std::uint32_t deferred_sent_ = 0;
+    double deferred_wait_ms_ = 0;
+    void send_deferred_locked(ID3D12CommandQueue* q);
+    ComPtr<ID3D12CommandQueue> outside_iqueue_;  // (set_intake_queue: the game's own queue - the intake in the game, step 2c)
     ComPtr<ID3D12CommandAllocator> allocators_[kRing];
     ComPtr<ID3D12GraphicsCommandList> list_, lists_[2];
     ComPtr<ID3D12Fence> fences_[2];
@@ -687,8 +809,8 @@ private:
     bool split_ = false;
     std::uint64_t pending_show_ = 0;   // intake fence value after which the written set can be shown
     std::uint64_t release_wait_ = 0;   // realtime fence value the intake waits for before rewriting (swap)
-    bool built_mask_ = false, shown_mask_ = false, shown_fill_ = false, stretch_built_ = false, shown_stretch_ = false;
-    bool share_mask_built_ = false, shown_share_mask_ = false;  // (the warp reads the shares and the HUD mask, no warp mask - ow_mask_at)
+    bool built_mask_ = false, stretch_built_ = false;
+    bool share_mask_built_ = false;  // (the warp reads the shares and the HUD mask, no warp mask - ow_mask_at)
     // Own motion estimation (games that give depth but no motion vectors): fills the motion texture from
     // the picture of this game frame and the previous one. Called by ingest, between the depth and the
     // motion samples.
@@ -704,8 +826,9 @@ private:
     bool partial_motion_ = false;  // ...the game's where it drew them, XPAR's own elsewhere (kPMotionGame: the game's as drawn)
     float partial_clear_[2] = {};  // (the game's value where nothing is drawn)
     Rect2 last_depth_rect_{};      // (its depth's valid region)
-    int mem_last_ = -1, mem_shown_ = -1, mem_pending_ = -1;  // background memory buffer written last / read by the warp / of the frame to show
-    ID3D12CommandQueue* context_queue() const { return context_ ? iqueue_.Get() : queue_.Get(); }
+    int mem_last_ = -1, mem_pending_ = -1;  // background memory buffer written last / of the frame to show (shown_.mem: read by the warp)
+    ID3D12CommandQueue* intake_queue() const { return outside_iqueue_ ? outside_iqueue_.Get() : iqueue_.Get(); }
+    ID3D12CommandQueue* context_queue() const { return context_ ? intake_queue() : queue_.Get(); }
     ComPtr<IDXGIFactory4> factory_;
     ComPtr<IDXGISwapChain3> swapchain_;
     ComPtr<IDCompositionDevice> dcomp_;
@@ -761,7 +884,7 @@ private:
     // (what each set of shown textures holds - swapped with them: the frame's count, whether it follows the one before, and the
     // count kPToPrev was written at)
     struct SetInfo { std::uint64_t serial = 0, to_prev = ~0ull; bool consecutive = false; };
-    SetInfo info_p_, info_f_, info_prev_;  // (private_, front_, and the copies' - single queue)
+    SetInfo info_p_, info_f_, info_prev_, info_b_;  // (private_, front_, the copies' - single queue - and back_)
     bool colour_remade_ = false;  // (this intake made the picture's texture anew - see ingest)
     std::array<std::uint32_t, 6> consecutive_area_{};  // (the depth's rendered area and size of the frame taken in before - see ingest)
     std::uint64_t ingest_serial_ = 0;
@@ -775,13 +898,13 @@ private:
     int mem_last_frame_ = 1;
     HeldStats held_stats_;
     std::uint64_t last_warp_serial_ = ~0ull;
-    bool seek_layer_ = true, progressive_exact_ = true, flow_light_ = true, seek_rim_ = true;
+    bool seek_layer_ = true, progressive_exact_ = true, flow_light_ = false, seek_rim_ = true;
     std::uint64_t speed_serial_ = ~0ull;  // (set_tether_by_speed: the shown frame the blocks were decided for)
     float speed_last_v_ = 0.0f, speed_frame_v_ = 0.0f;  // (the view's move at the last warp; at the frame before's last, for this frame)
     std::array<std::pair<PrivateId, bool>, 24> warp_srv_ = {};  // (the warp table's SRVs as last set - set_x_srv)
     float claims_matrix_[16] = {};
     bool orbit_centre_turn_ = false, orbit_kind_ = true, share_orbit_ = false, projection_changed_ = false, zoom_freeze_ = true, ui8_force_ = false, flow_stamps_ = false, share_stamps_ = false;
-    bool behind_own_share_ = false, tether_ = true, pass_limits_ = true, blend_near_movers_ = false;
+    bool behind_own_share_ = false, tether_ = true, pass_limits_ = true, blend_near_movers_ = true;
     std::uint32_t hud_sparse_turn_ = 0;
     bool hud_marks_valid_ = false;  // (see cs_hud_count's flag 4096)
     int tether_iters_ = 1, tether_iters_fine_ = 4, tether_fine_ = 1, tether_block_ = 0, tether_first_ = 64, tether_adapt_ = false, tether_skip_ = true, hud_sparse_ = true, hud_full_left_ = 16, tether_by_speed_ = true, tether_sched_[7] = {-1, -1, 3, 2, 0, 0, 0};  // (8 x 2, 4 x 3 - see set_tether_schedule)
@@ -816,8 +939,8 @@ private:
     // built for the frame taken in last / the shown one (see cs_ret_layer).
     ComPtr<ID3D12PipelineState> cs_ret_cells_, cs_ret_cells_flat_, cs_ret_enclose_, cs_ret_layer_, cs_ret_align_, cs_ret_pick_, cs_ret_args_, cs_ret_shift_;
     ComPtr<ID3D12Resource> ret_buf_;  // the reticle's tracking sums and the shift chosen (cs_ret_align)
-    bool ret_flip_ = false, layer_built_ = false, shown_layer_ = false;
-    PrivateId ret_latest_ = kPRetA, ret_shown_ = kPRetA;  // the sight reticles' layer the intake wrote last / the shown frame's
+    bool ret_flip_ = false, layer_built_ = false;
+    PrivateId ret_latest_ = kPRetA;  // the sight reticles' layer the intake wrote last (shown_.ret: the shown frame's)
     ComPtr<ID3D12Resource> samples_, samples_readback_;
     UINT samples_count_ = 0;
     float last_flush_ms_ = 0;
@@ -981,6 +1104,10 @@ private:
 
     Private private_[kPCount];
     Private front_[kPCount];  // the shown set (split queues; shown_id textures only)
+    // (three_sets_, the intake in the game step 2a: the set shown before the shown one, kept whole - the two-frame blend's frame
+    // before - so the intake never writes a set a warp may read; set_three_sets, off by default: a third set of VRAM)
+    Private back_[kPCount];
+    bool three_sets_ = false;
     DWORD pid_ = 0;
     std::uint64_t session_ = 0;
     ComPtr<ID3D12Fence> fence_game_;
