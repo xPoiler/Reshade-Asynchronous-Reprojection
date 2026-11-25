@@ -7,6 +7,7 @@
 #include <iterator>
 #include <mutex>
 #include <d3d11.h>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -101,6 +102,7 @@ std::uint32_t g_presents = 0, g_copies_out = 0, g_copies_in = 0, g_final_binds =
 std::unordered_map<std::uint64_t, std::uint32_t> g_rt_bound;
 // For the log: what was taken, and how its state was known (on the final list / elsewhere this frame / not at all).
 std::uint64_t g_logged = 0;
+bool g_logged_final11 = false;  // (the Direct3D 11 final draw's shader resources, logged once - see drawn_final_d3d11)
 std::uint32_t g_frames = 0, g_same_list = 0, g_elsewhere = 0, g_skipped = 0, g_not_read = 0, g_at_copy = 0, g_with_depth_n = 0;
 
 void end_of_frame(device* dev, command_list* cmd, const char* at);
@@ -135,7 +137,7 @@ bool coverage_format(format f) {
 void target_set(command_list* cmd, uint32_t n, const resource_view* views) {
     if (!cmd || n < 2 || !views) return;
     device* dev = cmd->get_device();
-    if (!layer_api(dev)) return;
+    if (!layer_api(dev) && !(dev && dev->get_api() == device_api::d3d11)) return;
     std::lock_guard<std::mutex> lock(g_mutex);
     for (uint32_t i = 0; i < n; ++i) {
         if (!views[i].handle) continue;
@@ -169,7 +171,7 @@ void cleared_to_transparent(device* dev, resource_view rtv, bool inverted = fals
 bool on_clear(command_list* cmd, resource_view rtv, const float color[4], uint32_t, const rect*) {
     if (!cmd || !rtv.handle || !color || color[0] != 0 || color[1] != 0 || color[2] != 0 || (color[3] != 0 && color[3] != 1)) return false;
     device* dev = cmd->get_device();
-    if (layer_api(dev)) cleared_to_transparent(dev, rtv, color[3] == 1);
+    if (layer_api(dev) || (dev && dev->get_api() == device_api::d3d11)) cleared_to_transparent(dev, rtv, color[3] == 1);
     return false;
 }
 void on_barrier(command_list* cmd, uint32_t count, const resource* resources, const resource_usage*, const resource_usage* new_states) {
@@ -354,9 +356,13 @@ void target(command_list* cmd, resource_view first, bool depth) {
         tl_back_buffer = is_back_buffer(r.handle) ? r.handle : 0;
         tl_inverted = g_inverted.count(r.handle) || g_inverted_seen.count(r.handle) ? r.handle : 0;
     }
-    if (dev->get_api() == device_api::d3d11) {  // (third pattern: what each draw goes into)
+    if (dev->get_api() == device_api::d3d11) {  // (third pattern: what each draw goes into; first: a layer drawn into)
         std::lock_guard<std::mutex> lock(g_mutex);
         g_rt[cmd->get_native()] = {r.handle, depth};
+        if (const auto it = g_cleared.find(r.handle); it != g_cleared.end()) {
+            it->second = ++g_order;
+            if (depth) g_with_depth.insert(r.handle);
+        }
         return;
     }
     if (!layer_api(dev)) return;
@@ -534,6 +540,78 @@ bool reads(command_list* cmd, std::uint64_t picture) {
     }
     return found;
 }
+// First pattern on Direct3D 11 (Baldur's Gate 3): the game clears a texture of the back buffer's size to transparent, draws
+// its HUD into it, and its final draw into the back buffer reads it together with the picture. A draw into a back buffer
+// (without depth) that reads a layer cleared and drawn into this frame: that layer is the frame's HUD - handed over at once
+// (Producer::on_hud_before_d3d11, kind 4, a copy on this context) and the frame's layers start over. Certain, not guessed:
+// the final draw reads it. Layers drawn without depth first; with depth only in a frame with no other (as pick). The
+// final draw's shader resources are written to the log once, with what each is - which of a game's layers carry HUD.
+bool drawn_final_d3d11(command_list* cmd) {
+    std::uint64_t layer = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        const auto rt = g_rt.find(cmd->get_native());
+        if (rt == g_rt.end() || !rt->second.res || rt->second.depth || !is_back_buffer(rt->second.res) || !g_order || g_taken) return false;
+        auto* context = reinterpret_cast<ID3D11DeviceContext*>(cmd->get_native());
+        ID3D11ShaderResourceView* views[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
+        context->PSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, views);
+        std::uint64_t read[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
+        for (UINT i = 0; i < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++i) {
+            if (!views[i]) continue;
+            ID3D11Resource* r = nullptr;
+            views[i]->GetResource(&r);
+            if (r) { read[i] = reinterpret_cast<std::uint64_t>(r); r->Release(); }
+            views[i]->Release();
+        }
+        bool any_plain = false;
+        for (const std::uint64_t r : read) {
+            const auto it = r ? g_cleared.find(r) : g_cleared.end();
+            if (it != g_cleared.end() && it->second && !g_with_depth.count(r)) any_plain = true;
+        }
+        std::uint64_t best = 0;
+        for (const std::uint64_t r : read) {
+            const auto it = r ? g_cleared.find(r) : g_cleared.end();
+            if (it == g_cleared.end() || !it->second || g_inverted.count(r) || (any_plain && g_with_depth.count(r))) continue;
+            if (it->second > best) { best = it->second; layer = r; }
+        }
+        if (!g_logged_final11) {
+            g_logged_final11 = true;
+            std::string text = "XPAR: the final draw (Direct3D 11) reads:";
+            device* dev = cmd->get_device();
+            for (UINT i = 0; i < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++i) {
+                if (!read[i] || !dev) continue;
+                const resource_desc d = dev->get_resource_desc(resource{read[i]});
+                const auto it = g_cleared.find(read[i]);
+                const bool cleared = it != g_cleared.end();
+                char item[160];
+                std::snprintf(item, sizeof(item), " t%u %ux%u format %u%s%s%s;", i, d.texture.width, d.texture.height, static_cast<unsigned>(d.texture.format),
+                              !cleared ? "" : it->second ? " (cleared to transparent, drawn into" : " (cleared to transparent, not drawn into",
+                              cleared && g_with_depth.count(read[i]) ? ", with depth" : "", cleared ? ")" : "");
+                text += item;
+            }
+            text += layer ? " - the HUD layer taken" : " - no HUD layer among them";
+            fw::diag_log(reshade::log::level::info, text.c_str());
+        }
+        if (!layer) return false;
+        ++g_frames; ++g_same_list;
+        if (g_with_depth.count(layer)) ++g_with_depth_n;
+        if (layer != g_logged) {
+            g_logged = layer;
+            char text[200];
+            std::snprintf(text, sizeof(text), "XPAR: the game's HUD layer found (Direct3D 11: %ux%u, format %u%s, read by the final draw) - taken as the frame's UI layer",
+                          g_width, g_height, static_cast<unsigned>(cmd->get_device()->get_resource_desc(resource{layer}).texture.format),
+                          g_with_depth.count(layer) ? ", drawn with depth" : "");
+            fw::diag_log(reshade::log::level::info, text);
+        }
+        // (the frame's layers start over - as end_of_frame)
+        g_triggered = true;
+        g_cleared.clear(); g_with_depth.clear(); g_inverted.clear(); g_last_state.clear();
+        g_order = 0;
+        g_taken = false;
+    }
+    if (g_take_before) g_take_before(layer, 4, cmd->get_native());
+    return true;
+}
 // What each draw means (kinds handed over: 0 the copy before the HUD, 1 no HUD this frame, 2 the copy confirmed - the
 // final draw reads its picture, 3 the copy given up). A copy counts only once the draw onto the back buffer reads the
 // picture it was taken from (a game's alpha-blended draw into some other picture is never handed over); a picture
@@ -593,6 +671,7 @@ void drawn(command_list* cmd) {
         return;
     }
     if (g_api != device_api::d3d11 || !cmd) return;
+    if (drawn_final_d3d11(cmd)) return;
     std::uint64_t picture = 0, given_up = 0;
     std::uint32_t kind = 0;
     {

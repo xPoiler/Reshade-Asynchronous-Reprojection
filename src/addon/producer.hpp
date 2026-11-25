@@ -173,7 +173,8 @@ public:
     // at the present the picture with its HUD compared with that copy, and what differs (the HUD) goes into the frame's UI
     // slot as its coverage.
     // kind (ui_layer.hpp): 0 copy, 1 no HUD this frame (an empty HUD handed over), 2 the copy confirmed (only a confirmed
-    // one is handed over), 3 the copy given up.
+    // one is handed over), 3 the copy given up; 4 (first pattern on Direct3D 11) the game's own HUD layer, read by the final
+    // draw - copied, and handed over at the present as a Direct3D 12 layer is (RGBA, its colour and coverage).
     void on_hud_before_d3d11(ID3D11Resource* picture, std::uint32_t kind, ID3D11DeviceContext* context);
     // HUD learning (hud_learn.hpp): a copy of the picture at a candidate point (the game's list / immediate context);
     // at the present compared with the final picture, into the frame's probe slot (kHudProbe) with the candidate.
@@ -312,6 +313,8 @@ private:
     bool ensure_own(Texture& t, const D3D12_RESOURCE_DESC& source);
     // Direct3D 11, third pattern: the copy before the HUD, the picture it was taken from, the comparison's pass and output
     Microsoft::WRL::ComPtr<ID3D11Texture2D> d11_before_, d11_cover_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> d11_layer_;  // (first pattern on Direct3D 11: the game's HUD layer, copied at the final draw)
+    bool d11_layer_taken_ = false;
     Microsoft::WRL::ComPtr<ID3D11Resource> d11_picture_;
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> d11_cover_cs_;
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> d11_motion_cs_;  // (on_motion_d3d11)
@@ -319,8 +322,15 @@ private:
     const ID3D11Resource* d11_motion_held_ = nullptr;  // (the target d11_motion_small_ holds from its clear this frame - compared, never used)
     bool d11_motion_held_logged_ = false;
     bool d11_shrink_motion(ID3D11DeviceContext* context, ID3D11Resource* source, std::uint32_t width, std::uint32_t height);
+    bool d11_pass(ID3D11DeviceContext* context, ID3D11ComputeShader* cs, ID3D11Resource* source, DXGI_FORMAT view_format, ID3D11Texture2D* into,
+                  std::uint32_t width, std::uint32_t height);
+    // A depth in a depth format, as R32F (on_tag_d3d11: Direct3D 11 opens no shared depth-format texture)
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> d11_depth_cs_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> d11_depth_r32_;
+    bool d11_depth_to_r32(ID3D11DeviceContext* context, ID3D11Resource* source, DXGI_FORMAT view_format, std::uint32_t width, std::uint32_t height);
     bool d11_before_taken_ = false, d11_cs_failed_ = false, d11_none_ = false, d11_confirmed_ = false;
     void d3d11_cover(ID3D11DeviceContext* context, int slot);
+    void d3d11_layer(ID3D11DeviceContext* context, int slot);
     bool ensure_d11_cover_cs(ID3D11Device* device);
     // HUD learning: the copy at the candidate point (Direct3D 12 / 11), its candidate, presents since; the comparison.
     Microsoft::WRL::ComPtr<ID3D12Resource> probe_pending_, probe_cov_, probe_end_;

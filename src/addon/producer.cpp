@@ -356,7 +356,9 @@ void Producer::release_textures() {
     if (hudless_vk_.handle) CloseHandle(hudless_vk_.handle);
     hudless_vk_ = Texture{};
     hudless_vk_fresh_ = false;
-    d11_before_.Reset(); d11_cover_.Reset(); d11_picture_.Reset(); d11_cover_cs_.Reset(); d11_readable_.Reset();
+    d11_before_.Reset(); d11_cover_.Reset(); d11_picture_.Reset(); d11_cover_cs_.Reset(); d11_readable_.Reset(); d11_layer_.Reset();
+    d11_layer_taken_ = false;
+    d11_depth_cs_.Reset(); d11_depth_r32_.Reset();
     d11_before_taken_ = d11_cs_failed_ = d11_none_ = d11_confirmed_ = false;
     for (auto& r : retired_) {
         if (vk_) vk_->destroy(r.vk);
@@ -1200,6 +1202,29 @@ void Producer::on_hud_before_d3d11(ID3D11Resource* picture, std::uint32_t kind, 
         return;
     }
     if (!picture) return;
+    if (kind == 4) {  // (the game's own HUD layer, at the final draw that reads it: copied as it is - see d3d11_layer)
+        ComPtr<ID3D11Texture2D> layer;
+        D3D11_TEXTURE2D_DESC ld{};
+        if (FAILED(picture->QueryInterface(IID_PPV_ARGS(&layer)))) return;
+        layer->GetDesc(&ld);
+        if (ld.SampleDesc.Count != 1) return;
+        D3D11_TEXTURE2D_DESC have{};
+        if (d11_layer_) d11_layer_->GetDesc(&have);
+        if (!d11_layer_ || have.Width != ld.Width || have.Height != ld.Height || have.Format != ld.Format) {
+            ComPtr<ID3D11Device> device;
+            context->GetDevice(&device);
+            D3D11_TEXTURE2D_DESC d = ld;
+            d.MipLevels = 1; d.ArraySize = 1; d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE; d.CPUAccessFlags = 0; d.MiscFlags = 0;
+            d11_layer_.Reset();
+            if (!device || FAILED(device->CreateTexture2D(&d, nullptr, &d11_layer_))) { set_message("HUD layer (Direct3D 11): copy failed"); return; }
+        }
+        if (ld.MipLevels == 1 && ld.ArraySize == 1) context->CopyResource(d11_layer_.Get(), picture);
+        else context->CopySubresourceRegion(d11_layer_.Get(), 0, 0, 0, 0, picture, 0, nullptr);
+        d11_layer_taken_ = true;
+        shared_->hooks.ui_layer_w = ld.Width; shared_->hooks.ui_layer_h = ld.Height; shared_->hooks.ui_layer_format = ld.Format;
+        ++shared_->hooks.ui_layer_taken;
+        return;
+    }
     ComPtr<ID3D11Texture2D> texture;
     D3D11_TEXTURE2D_DESC pd{};
     if (FAILED(picture->QueryInterface(IID_PPV_ARGS(&texture)))) return;
@@ -1415,6 +1440,29 @@ void Producer::d3d11_learned(ID3D11DeviceContext* context, int slot) {
     info.valid = 1;
     m.hud_learned = used ? 1 : 2;
     ++shared_->hooks.learn_used;
+}
+
+// Direct3D 11, first pattern: the game's HUD layer copied at the final draw (on_hud_before_d3d11, kind 4) into the frame's UI
+// slot - as it is: RGBA, its colour premultiplied as the game blends it on and its coverage, as a Direct3D 12 layer is handed
+// over (kUiAlphaShader copies those as they are too). Ahead of the third pattern and of HUD learning.
+void Producer::d3d11_layer(ID3D11DeviceContext* context, int slot) {
+    if (!d11_layer_taken_) return;
+    d11_layer_taken_ = false;
+    auto& m = shared_->slots[slot];
+    if (m.tex[kUi].valid || !d11_layer_) return;  // (a UI layer the game tags itself)
+    D3D11_TEXTURE2D_DESC ld{};
+    d11_layer_->GetDesc(&ld);
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = ld.Width; desc.Height = ld.Height; desc.Format = typed_format(ld.Format);
+    if (!ensure_texture(slot, kUi, desc)) return;
+    auto& t = textures_[slot][kUi];
+    context->CopyResource(t.d11.Get(), d11_layer_.Get());
+    auto& info = m.tex[kUi];
+    info.width = ld.Width; info.height = ld.Height; info.format = t.desc.Format;
+    info.generation = t.generation; info.ext_x = info.ext_y = 0; info.ext_w = ld.Width; info.ext_h = ld.Height;
+    info.valid = 1;
+    ++shared_->hooks.ui_layer_handed;
 }
 
 void Producer::d3d11_cover(ID3D11DeviceContext* context, int slot) {
@@ -2179,12 +2227,23 @@ bool Producer::d11_shrink_motion(ID3D11DeviceContext* context, ID3D11Resource* s
         d11_motion_small_.Reset();
         if (FAILED(device->CreateTexture2D(&d, nullptr, &d11_motion_small_))) return false;
     }
+    return d11_pass(context, d11_motion_cs_.Get(), source, d11_srv_format(sd.Format), d11_motion_small_.Get(), width, height);
+}
+
+// One compute pass on the game's context: `source` (seen as `view_format`) read by `cs` into `into` (width x height). Where the game
+// still has `source` bound to draw into - as a render target or as its depth - its targets are set aside for the pass and put back:
+// Direct3D 11 reads nothing from a texture bound as one. The game's compute shader and the views the pass uses are put back too.
+bool Producer::d11_pass(ID3D11DeviceContext* context, ID3D11ComputeShader* cs, ID3D11Resource* source, DXGI_FORMAT view_format, ID3D11Texture2D* into,
+                        std::uint32_t width, std::uint32_t height) {
+    ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    if (!device || !cs || !into) return false;
     ComPtr<ID3D11ShaderResourceView> from_view;
     ComPtr<ID3D11UnorderedAccessView> to_view;
     D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
-    sv.Format = d11_srv_format(sd.Format); sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels = 1;
+    sv.Format = view_format; sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels = 1;
     if (FAILED(device->CreateShaderResourceView(source, &sv, &from_view)) ||
-        FAILED(device->CreateUnorderedAccessView(d11_motion_small_.Get(), nullptr, &to_view))) return false;
+        FAILED(device->CreateUnorderedAccessView(into, nullptr, &to_view))) return false;
     ID3D11RenderTargetView* old_rtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
     ID3D11DepthStencilView* old_dsv = nullptr;
     context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, old_rtv, &old_dsv);
@@ -2195,6 +2254,11 @@ bool Producer::d11_shrink_motion(ID3D11DeviceContext* context, ID3D11Resource* s
         bound = i + 1;
         ComPtr<ID3D11Resource> r;
         old_rtv[i]->GetResource(&r);
+        source_bound = source_bound || r.Get() == source;
+    }
+    if (old_dsv) {
+        ComPtr<ID3D11Resource> r;
+        old_dsv->GetResource(&r);
         source_bound = source_bound || r.Get() == source;
     }
     // (the game's pixel shader UAVs stay as they are)
@@ -2209,7 +2273,7 @@ bool Producer::d11_shrink_motion(ID3D11DeviceContext* context, ID3D11Resource* s
     context->CSGetUnorderedAccessViews(0, 1, old_uav);
     ID3D11ShaderResourceView* srvs[1] = {from_view.Get()};
     ID3D11UnorderedAccessView* uavs[1] = {to_view.Get()};
-    context->CSSetShader(d11_motion_cs_.Get(), nullptr, 0);
+    context->CSSetShader(cs, nullptr, 0);
     context->CSSetShaderResources(0, 1, srvs);
     context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
     context->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
@@ -2225,6 +2289,49 @@ bool Producer::d11_shrink_motion(ID3D11DeviceContext* context, ID3D11Resource* s
     for (auto* v : old_rtv) if (v) v->Release();
     if (old_dsv) old_dsv->Release();
     return true;
+}
+
+// The view that reads the depth out of a Direct3D 11 depth texture (its stencil left out); DXGI_FORMAT_UNKNOWN when it is no depth format.
+// Direct3D 11 cannot open a shared texture in one of these (only what could be a render target), so such a depth goes over as R32F.
+static DXGI_FORMAT d11_depth_view(DXGI_FORMAT f) {
+    switch (f) {
+        case DXGI_FORMAT_R24G8_TYPELESS: case DXGI_FORMAT_D24_UNORM_S8_UINT: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        case DXGI_FORMAT_R32G8X24_TYPELESS: case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+        case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_D32_FLOAT: return DXGI_FORMAT_R32_FLOAT;
+        case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_D16_UNORM: return DXGI_FORMAT_R16_UNORM;
+        default: return DXGI_FORMAT_UNKNOWN;
+    }
+}
+static const char kD11DepthShader[] = R"(
+Texture2D<float> from : register(t0);
+RWTexture2D<float> to : register(u0);
+[numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
+    uint w, h;
+    to.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    to[id.xy] = from.Load(int3(id.xy, 0));
+}
+)";
+// A depth texture in a depth format: its top-left width x height (the area that holds the frame) written as R32F into d11_depth_r32_.
+bool Producer::d11_depth_to_r32(ID3D11DeviceContext* context, ID3D11Resource* source, DXGI_FORMAT view_format, std::uint32_t width, std::uint32_t height) {
+    ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    if (!device) return false;
+    if (!d11_depth_cs_) {
+        ComPtr<ID3DBlob> code, errors;
+        if (FAILED(D3DCompile(kD11DepthShader, sizeof(kD11DepthShader) - 1, "depth_r32", nullptr, nullptr, "main", "cs_5_0", 0, 0, &code, &errors)) ||
+            FAILED(device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &d11_depth_cs_))) return false;
+    }
+    D3D11_TEXTURE2D_DESC cd{};
+    if (d11_depth_r32_) d11_depth_r32_->GetDesc(&cd);
+    if (!d11_depth_r32_ || cd.Width != width || cd.Height != height) {
+        D3D11_TEXTURE2D_DESC d{};
+        d.Width = width; d.Height = height; d.MipLevels = 1; d.ArraySize = 1; d.Format = DXGI_FORMAT_R32_FLOAT;
+        d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+        d11_depth_r32_.Reset();
+        if (FAILED(device->CreateTexture2D(&d, nullptr, &d11_depth_r32_))) return false;
+    }
+    return d11_pass(context, d11_depth_cs_.Get(), source, view_format, d11_depth_r32_.Get(), width, height);
 }
 // The game clears the target it drew into this frame before its present (EDF6: its whole G-buffer, after the HUD): made small now, handed over at the
 // present - else the search and the warp got the clear value everywhere, and the target was ruled out without a word.
@@ -2277,6 +2384,18 @@ void Producer::on_tag_d3d11(std::uint64_t frame, Tex kind, ID3D11Resource* sourc
     D3D11_TEXTURE2D_DESC sd{};
     texture->GetDesc(&sd);
     if (sd.SampleDesc.Count != 1) return;
+    // A depth in a depth format (DLSS's in Baldur's Gate 3: R24G8): its area that holds the frame, as R32F (see d11_depth_view).
+    if (const DXGI_FORMAT view = kind == kDepth ? d11_depth_view(sd.Format) : DXGI_FORMAT_UNKNOWN; view != DXGI_FORMAT_UNKNOWN) {
+        if (!ext_w || !ext_h) { ext_x = ext_y = 0; ext_w = sd.Width; ext_h = sd.Height; }
+        if (ext_x || ext_y || ext_x + ext_w > sd.Width || ext_y + ext_h > sd.Height || !(sd.BindFlags & D3D11_BIND_SHADER_RESOURCE) ||
+            !d11_depth_to_r32(context, source, view, ext_w, ext_h)) {
+            ++shared_->hooks.copies_failed;
+            return;
+        }
+        source = d11_depth_r32_.Get();
+        d11_depth_r32_->GetDesc(&sd);
+        ext_w = ext_h = 0;  // (the whole of the copy)
+    }
     const int slot = slot_for_frame(frame, true);
     if (slot < 0) return;
     slot_list_[slot] = 0; slot_submitted_[slot] = true;  // (the immediate context: on the GPU's way at once)
@@ -2324,7 +2443,11 @@ std::uint64_t Producer::begin_present_d3d11(ID3D11Resource* backbuffer, ID3D11De
         info.generation = t.generation; info.ext_x = info.ext_y = 0; info.ext_w = sd.Width; info.ext_h = sd.Height;
         info.valid = 1;
     }
+    d3d11_layer(context, slot);  // (first pattern: the game's own HUD layer, if the final draw read one this frame)
     d3d11_cover(context, slot);  // (third pattern: the HUD, if a copy before it was taken this frame)
+    // (HUD learning paused while the game gives its HUD, as begin_present: after 60 frames with it, until 600 without)
+    if (m.tex[kUi].valid || m.tex[kHudless].valid) { game_hud_frames_ = std::min(game_hud_frames_ + 1, 60u); game_hud_missing_ = 0; }
+    else if (++game_hud_missing_ >= 600) game_hud_frames_ = 0;
     d3d11_probe(context, slot);  // (HUD learning: the copy at this frame's candidate point)
     d3d11_learned(context, slot);  // (...the learned point, where nothing else gave the HUD)
     m.qpc_present = qpc_now();

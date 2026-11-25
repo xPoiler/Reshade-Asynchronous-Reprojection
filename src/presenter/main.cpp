@@ -85,6 +85,7 @@ struct App {
     FILE* csv_motion = nullptr;   // per game frame: agreement of the motion vectors with depth + camera
     FILE* csv_sources = nullptr;  // ingested frames + camera
     FILE* csv_outputs = nullptr;  // presented frames + applied warp
+    FILE* csv_probe = nullptr;    // per probed game frame: HUD learning's numbers (hud_learn_rules.hpp; replayed by hud_learn_tests)
     FILE* csv_share = nullptr;    // per game frame: what the near-camera spots learn their follow share from (Renderer::ShareDiag)
     std::int64_t events_read = 0;
     bool mark_was_down = false, dump_was_down = false, record_was_down = false;
@@ -430,6 +431,8 @@ void open_recordings() {
             "qpc,sl_constants,sl_tags,sl_tags_for_frame,sl_markers,sl_evaluate,sl_new_frame_token,sl_set_feature_loaded,sl_allocate,sl_free,"
             "sl_get_feature_function,ngx_creates,ngx_dlss_creates,ngx_evaluates,ngx_dlss_evaluates,ngx_feature1,ngx_feature11,ngx_feature13,"
             "ngx_published,ngx_joined,fsr_creates,fsr_dispatches,fsr_published,generation_calls,presents,frames,frames_published,slots_dropped");
+        g_app.csv_probe = open_csv(L"probe.csv",
+            "row,cand,locked,area,same_min,same_max,world_min,world_max,ref_possible,ref,hud_tiles,covered,beyond,kept,repeated,fail,pick,qpc,usual,usual_now,tiles,cut,detect_telling");
         g_app.csv_motion = open_csv(L"motion.csv", "qpc,frame,samples,moving_fraction,agree_x,agree_y,render_w,render_h,camera_fit");
         g_app.csv_sources = open_csv(L"sources.csv",
             "frame,qpc_sim,qpc_constants,qpc_present,qpc_ingest,px,py,pz,fx,fy,fz,ux,uy,uz,rx,ry,rz,fov,aspect,reset,mouse_gate,has_depth,has_hudless,"
@@ -1823,7 +1826,17 @@ void render_thread() {
                         frames = without = found = gaps = 0;
                     }
                 }
-                renderer.score_hud_probe(s, cam.clip_to_prev_clip);  // (HUD learning: see hud_learn.hpp)
+                {   // (the panel's Relearn: the presenter's scores start over too - kept, the add-on was handed the same point
+                    // again a second later, EDF6 2026-11-24. The add-on's own drops keep them: see hud_learn.cpp)
+                    static std::uint32_t relearn_seen = settings.hud_relearn;
+                    if (settings.hud_relearn != relearn_seen) {
+                        relearn_seen = settings.hud_relearn;
+                        renderer.hud_learn_forget();
+                        logf("HUD learning: Relearn - the candidates' scores, points set aside and the point in use forgotten");
+                    }
+                }
+                renderer.set_probe_csv(rec(g_app.csv_probe));  // (diagnostics: every probed frame - see hud_learn_rules.hpp)
+                renderer.score_hud_probe(s, cam.clip_to_prev_clip, cam.reset != 0);  // (HUD learning: see hud_learn.hpp)
                 sh.presenter.hud_learn_pick = renderer.hud_learn_pick();
                 sh.presenter.hud_learn_fail = renderer.hud_learn_fail();
                 // Whole characters held (option): before the mask and the moving objects, which both read the analysis.
@@ -1928,8 +1941,10 @@ void render_thread() {
                                  hs.scene_pass_ms[17] / hs.scene_frames);
                         }
                         if (hs.frames)
-                            logf("HUD detection: %d frames, learned from %d (HUD-like share %.0f%%), %d with too little detail, %d held back by the guard%s",
+                            logf("HUD detection: %d frames, learned from %d (HUD-like share %.0f%%), %d with too little detail, %d held back by the guard"
+                                 " (telling px a frame: unchanged %.0f, changed %.0f)%s",
                                  hs.frames, hs.learned, hs.learned ? 100.0 * hs.share_sum / hs.learned : 0.0, hs.too_little, hs.guarded,
+                                 hs.evidence_sum / hs.frames, hs.changed_sum / hs.frames,
                                  settings.hud_from_scene == 2 && hs.scene_frames ? (renderer.learning_stalled()
                                      ? " - barely learning: the upscaler output's HUD taken without its confirmation"
                                      : " - confirming the upscaler output's HUD") : "");
@@ -2954,7 +2969,14 @@ void render_thread() {
                     // (what the presenter's video memory holds, once a minute)
                     static int memory_reports = 0;
                     if (memory_reports++ % 6 == 0) logf("presenter memory: %s", renderer.memory_report().c_str());
-                    if (const std::string learn = renderer.hud_learn_report(); !learn.empty()) logf("HUD learning: %s", learn.c_str());
+                    // (one line per candidate: the whole report is longer than a log line)
+                    if (const std::string learn = renderer.hud_learn_report(); !learn.empty())
+                        for (std::size_t at = 0; at < learn.size();) {
+                            std::size_t end = learn.find(" | ", at);
+                            if (end == std::string::npos) end = learn.size();
+                            if (end > at) logf("HUD learning: %s%s", at ? "  " : "", learn.substr(at, end - at).c_str());
+                            at = end + 3;
+                        }
                     if (renderer.intake_gate() && renderer.split()) logf("intake between the warps: %s", renderer.intake_gate_report().c_str());
                 }
                 if (g_feature_flush) {
@@ -3389,7 +3411,7 @@ static int presenter_main(HINSTANCE instance, DWORD pid, const std::filesystem::
     if (g_app.shared) g_app.shared->presenter.pid = 0;
     logf("exit");
     g_files.stop();
-    for (FILE* csv : {g_app.csv_events, g_app.csv_mouse, g_app.csv_sources, g_app.csv_outputs, g_app.csv_motion, g_app.csv_stick, g_app.csv_hooks, g_app.csv_upscaler, g_app.csv_share}) if (csv) std::fclose(csv);
+    for (FILE* csv : {g_app.csv_events, g_app.csv_mouse, g_app.csv_sources, g_app.csv_outputs, g_app.csv_motion, g_app.csv_stick, g_app.csv_hooks, g_app.csv_upscaler, g_app.csv_share, g_app.csv_probe}) if (csv) std::fclose(csv);
     if (g_app.log) std::fclose(g_app.log);
     if (single) CloseHandle(single);
     return g_app.start_failed ? 2 : 0;

@@ -555,6 +555,11 @@ int main(int argc, char** argv) {
         LONG neon_x = -1;
         const LONG neon_y0 = LONG(H * 3 / 8), neon_y1 = LONG(H / 2);
         bool combined_hud = false;  // HUD from the upscaler's output + camera-motion check
+        // HUD learning (the add-on's hud_learn): a candidate copy of the picture taken while the HUD patch is drawn, before
+        // its stripes from probe_split on (0: none), and scored by the presenter at each ingest (probe_score)
+        std::uint32_t probe_cand = 0;
+        LONG probe_split = 0;
+        bool probe_score = false;
         bool turn_rule = false;     // attached: what stays nearly still on screen while the camera turns
         bool memory = false;        // background memory: updated at ingest, used by the own warp
         LONG strip_half = 8;        // half width of the weapon strip (render px)
@@ -638,7 +643,12 @@ int main(int argc, char** argv) {
                 // 0: opaque green; 1: teal, shifted 2 px (the content changed); 2: green at 50% over the scene
                 const float blend[4] = {0.5f * bg, 0.5f * bg + 0.5f, 0.5f * bg, 1};
                 const float* colour = hud_patch_colour == 1 ? teal : hud_patch_colour == 2 ? blend : green;
+                bool probed = false;
                 for (LONG x = hx0 + (hud_patch_colour == 1 ? 2 : 0); x < hx1; x += 4) {
+                    if (probe_cand && !probed && x >= probe_split) {
+                        producer.on_hud_probe(backbuffer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, list.Get(), probe_cand, false, false);
+                        probed = true;
+                    }
                     const D3D12_RECT stripe{x, hy0, std::min(x + 2, hx1), hy1};
                     list->ClearRenderTargetView(rtv, colour, 1, &stripe);
                 }
@@ -770,6 +780,7 @@ int main(int argc, char** argv) {
             renderer.begin_frame();
             IngestedSource s = renderer.ingest(sh, s_slot);
             renderer.analyze_motion(s, analyze_cam->clip_to_prev_clip, 1.0f, 1.0f, true, true, near_rule, turn_rule);
+            if (probe_score) renderer.score_hud_probe(s, moving_cam.clip_to_prev_clip, false);  // (before the mask, as main does)
             renderer.build_no_warp_mask(s, moving_cam.clip_to_prev_clip, hud, weapon, weapon, true, combined_hud, hud_fill, stretch, true);  // (sight reticles on: must not disturb the masks)
             if (memory) renderer.update_memory(s, analyze_cam->clip_to_prev_clip, true, memory_consecutive);
             renderer.finish_frame(false, 0);
@@ -1035,6 +1046,37 @@ int main(int argc, char** argv) {
         show(repeat_scene, yaw);
         const double rep_x1 = cyan_x();
         EXPECT(rep_x0 > 0 && rep_x1 < rep_x0 - 20.0, "repeating scenery is not taken for HUD (%.1f -> %.1f)", rep_x0, rep_x1);
+        // (S) HUD learning's reference without the upscaler's output (EDF6, 2026-11-24): the plain detection's learned map. A
+        // candidate whose copy is taken before the HUD patch holds all of the confirmed HUD; one taken before only its last
+        // eighth holds little of it - and both are compared with it (without the reference EDF6 picked the first point
+        // scored, holding 7% of its HUD).
+        {
+            renderer.reset_hud_detection();
+            for (int i = 0; i < 7; ++i) ingest_frame(publish(477 + i, (i & 1) ? 0.3f : 0.1f, (i & 1) ? 12 : -12, false, true), true, false);
+            probe_score = true;
+            constexpr std::uint32_t kWhole = 0x5100a, kEighth = 0x5100b;
+            int fid = 484;  // (frame ids keep rising: (E) starts at 500)
+            for (const std::uint32_t cand : {kWhole, kEighth}) {
+                probe_cand = cand;
+                probe_split = cand == kWhole ? hx0 : hx0 + (hx1 - hx0) * 7 / 8;
+                for (int i = 0; i < 5; ++i, ++fid) ingest_frame(publish(fid, (i & 1) ? 0.3f : 0.1f, (i & 1) ? 12 : -12, false, true), true, false);
+            }
+            probe_cand = 0;
+            for (int i = 0; i < 6; ++i, ++fid) ingest_frame(publish(fid, (i & 1) ? 0.3f : 0.1f, (i & 1) ? 12 : -12, false, true), true, false);
+            probe_score = false;
+            const auto& scores = renderer.hud_learn_rules().scores();
+            const auto whole = scores.find(kWhole), eighth = scores.find(kEighth);
+            const bool both = whole != scores.end() && eighth != scores.end();
+            const double whole_share = both && whole->second.hud_tiles > 0 ? whole->second.covered / whole->second.hud_tiles : -1;
+            const double eighth_share = both && eighth->second.hud_tiles > 0 ? eighth->second.covered / eighth->second.hud_tiles : -1;
+            std::printf("HUD learning without the upscaler's output: whole patch holds %.2f of the confirmed HUD (%u frames compared), "
+                        "its last eighth %.2f (%u)\n", whole_share, both ? whole->second.ref_frames : 0u, eighth_share,
+                        both ? eighth->second.ref_frames : 0u);
+            EXPECT(both && whole->second.ref_frames >= 3 && eighth->second.ref_frames >= 3,
+                   "without the upscaler's output the candidates are compared with the plain detection's map");
+            EXPECT(whole_share >= 0.9, "the candidate holding the whole HUD holds the confirmed HUD (%.2f)", whole_share);
+            EXPECT(eighth_share >= 0 && eighth_share <= 0.35, "the candidate holding an eighth of it holds little of it (%.2f)", eighth_share);
+        }
         // (E) Semi-transparent HUD (50% over a scene that changes every frame): detected by its edges.
         renderer.reset_hud_detection();
         hud_patch_colour = 2;

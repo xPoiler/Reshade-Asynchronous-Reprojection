@@ -18,6 +18,7 @@ namespace {
 Producer* g_producer = nullptr;
 InlineHook g_create_hook, g_evaluate_hook;
 InlineHook g_vk_create_hook, g_vk_create1_hook, g_vk_evaluate_hook;
+InlineHook g_d3d11_create_hook, g_d3d11_evaluate_hook;
 
 // NGX's Vulkan resource description (nvsdk_ngx_defs_vk.h of the DLSS SDK): what the Vulkan parameters point to.
 struct NgxImageViewVk {
@@ -41,6 +42,9 @@ using VkEvaluateFn = NVSDK_NGX_Result(NVSDK_CONV*)(VkCommandBuffer, const NVSDK_
 using CreateFn = NVSDK_NGX_Result(NVSDK_CONV*)(ID3D12GraphicsCommandList*, NVSDK_NGX_Feature, NVSDK_NGX_Parameter*, NVSDK_NGX_Handle**);
 using EvaluateFn = NVSDK_NGX_Result(NVSDK_CONV*)(ID3D12GraphicsCommandList*, const NVSDK_NGX_Handle*, const NVSDK_NGX_Parameter*,
                                                   PFN_NVSDK_NGX_ProgressCallback);
+using CreateD3D11Fn = NVSDK_NGX_Result(NVSDK_CONV*)(ID3D11DeviceContext*, NVSDK_NGX_Feature, NVSDK_NGX_Parameter*, NVSDK_NGX_Handle**);
+using EvaluateD3D11Fn = NVSDK_NGX_Result(NVSDK_CONV*)(ID3D11DeviceContext*, const NVSDK_NGX_Handle*, const NVSDK_NGX_Parameter*,
+                                                       PFN_NVSDK_NGX_ProgressCallback);
 
 // Feature handles are opaque: remember which pointers belong to which feature.
 struct HandleEntry { std::atomic<const void*> handle{nullptr}; std::atomic<std::uint32_t> feature{0}; };
@@ -79,11 +83,23 @@ std::atomic<std::int64_t> g_last_dlss_publish{0};
 
 NgxStats* stats() { return g_producer && g_producer->shared() ? &g_producer->shared()->ngx : nullptr; }
 
-void describe(const NVSDK_NGX_Parameter* p, const char* name, std::uint32_t& w, std::uint32_t& h, std::uint32_t& format) {
-    ID3D12Resource* r = nullptr;
-    if (p->Get(name, &r) != NVSDK_NGX_Result_Success || !r) { w = h = format = 0; return; }
+void desc_of(ID3D12Resource* r, std::uint32_t& w, std::uint32_t& h, std::uint32_t& format) {
     const auto d = r->GetDesc();
     w = static_cast<std::uint32_t>(d.Width); h = d.Height; format = static_cast<std::uint32_t>(d.Format);
+}
+void desc_of(ID3D11Resource* r, std::uint32_t& w, std::uint32_t& h, std::uint32_t& format) {
+    ID3D11Texture2D* texture = nullptr;
+    if (FAILED(r->QueryInterface(IID_PPV_ARGS(&texture)))) { w = h = format = 0; return; }
+    D3D11_TEXTURE2D_DESC d{};
+    texture->GetDesc(&d);
+    texture->Release();
+    w = d.Width; h = d.Height; format = static_cast<std::uint32_t>(d.Format);
+}
+template <class Res>
+void describe(const NVSDK_NGX_Parameter* p, const char* name, std::uint32_t& w, std::uint32_t& h, std::uint32_t& format) {
+    Res* r = nullptr;
+    if (p->Get(name, &r) != NVSDK_NGX_Result_Success || !r) { w = h = format = 0; return; }
+    desc_of(r, w, h, format);
 }
 
 // A feature was created (either API): remember its handle, and DLSS's sizes and flags.
@@ -113,6 +129,12 @@ NVSDK_NGX_Result NVSDK_CONV hk_create(ID3D12GraphicsCommandList* list, NVSDK_NGX
     on_created(result, feature, params, out);
     return result;
 }
+NVSDK_NGX_Result NVSDK_CONV hk_d3d11_create(ID3D11DeviceContext* context, NVSDK_NGX_Feature feature, NVSDK_NGX_Parameter* params,
+                                            NVSDK_NGX_Handle** out) {
+    const auto result = reinterpret_cast<CreateD3D11Fn>(g_d3d11_create_hook.original())(context, feature, params, out);
+    on_created(result, feature, params, out);
+    return result;
+}
 NVSDK_NGX_Result NVSDK_CONV hk_vk_create(VkCommandBuffer cb, NVSDK_NGX_Feature feature, NVSDK_NGX_Parameter* params, NVSDK_NGX_Handle** out) {
     const auto result = reinterpret_cast<VkCreateFn>(g_vk_create_hook.original())(cb, feature, params, out);
     on_created(result, feature, params, out);
@@ -125,29 +147,128 @@ NVSDK_NGX_Result NVSDK_CONV hk_vk_create1(VkDevice device, VkCommandBuffer cb, N
     return result;
 }
 
-NVSDK_NGX_Result NVSDK_CONV hk_evaluate(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* params,
-                                        PFN_NVSDK_NGX_ProgressCallback callback) {
-    std::uint64_t published = 0;  // frame whose DLSS output is copied once the evaluation is recorded
-    ID3D12Resource* output = nullptr;
-    std::uint32_t output_w = 0, output_h = 0;
-    struct Generation { ID3D12Resource *image = nullptr, *real = nullptr; std::uint64_t frame = 0; std::uint32_t index = 0, per_frame = 1; } generation;
-    if (auto* s = stats()) {
-        ++s->evaluate_calls;
-        std::uint32_t feature = feature_of(handle);
-        if (feature == 0xFFFFFFFFu && params) {
-            // Created before our hooks (or CreateFeature could not be hooked): an evaluation that carries
-            // both depth and motion vectors is an upscaler; treat it as DLSS from now on.
-            ID3D12Resource *depth = nullptr, *motion = nullptr;
-            if (params->Get(NVSDK_NGX_Parameter_Depth, &depth) == NVSDK_NGX_Result_Success && depth &&
-                params->Get(NVSDK_NGX_Parameter_MotionVectors, &motion) == NVSDK_NGX_Result_Success && motion) {
-                feature = NVSDK_NGX_Feature_SuperSampling;
-                remember(handle, feature);
-                if (!s->dlss_feature) s->dlss_feature = feature;
-                ++s->identified_by_inputs;
+// The upscaled output of a DLSS evaluation, copied once the evaluation is recorded (HUD from the scene only).
+template <class Res> struct DlssOutput { std::uint64_t frame = 0; Res* resource = nullptr; std::uint32_t w = 0, h = 0; };
+
+// What a DLSS evaluation shares between Direct3D 12 and 11 (Res: ID3D12Resource or ID3D11Resource): the feature identified,
+// its inputs described, and its depth and motion vectors handed to tag(frame, kind, resource, width, height), which
+// records their copy on the evaluation's own command list or context. Returns the feature.
+template <class Res, class Tag>
+std::uint32_t before_evaluate(NgxStats* s, const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* params, DlssOutput<Res>& out, Tag tag) {
+    ++s->evaluate_calls;
+    std::uint32_t feature = feature_of(handle);
+    if (feature == 0xFFFFFFFFu && params) {
+        // Created before our hooks (or CreateFeature could not be hooked): an evaluation that carries
+        // both depth and motion vectors is an upscaler; treat it as DLSS from now on.
+        Res *depth = nullptr, *motion = nullptr;
+        if (params->Get(NVSDK_NGX_Parameter_Depth, &depth) == NVSDK_NGX_Result_Success && depth &&
+            params->Get(NVSDK_NGX_Parameter_MotionVectors, &motion) == NVSDK_NGX_Result_Success && motion) {
+            feature = NVSDK_NGX_Feature_SuperSampling;
+            remember(handle, feature);
+            if (!s->dlss_feature) s->dlss_feature = feature;
+            ++s->identified_by_inputs;
+        }
+    }
+    if (feature < 16) ++s->feature_calls[feature];
+    else ++s->unknown_handle_calls;
+    if (is_dlss(feature) && params) {
+        ++s->dlss_calls;
+        g_producer->note_game_depth();
+        describe<Res>(params, NVSDK_NGX_Parameter_Depth, s->depth_w, s->depth_h, s->depth_format);
+        describe<Res>(params, NVSDK_NGX_Parameter_MotionVectors, s->mv_w, s->mv_h, s->mv_format);
+        describe<Res>(params, NVSDK_NGX_Parameter_Color, s->color_w, s->color_h, s->color_format);
+        describe<Res>(params, NVSDK_NGX_Parameter_Output, s->output_w, s->output_h, s->output_format);
+        float f = 0; unsigned int v = 0; int reset = 0;
+        if (params->Get(NVSDK_NGX_Parameter_Jitter_Offset_X, &f) == NVSDK_NGX_Result_Success) s->jitter[0] = f;
+        if (params->Get(NVSDK_NGX_Parameter_Jitter_Offset_Y, &f) == NVSDK_NGX_Result_Success) s->jitter[1] = f;
+        if (params->Get(NVSDK_NGX_Parameter_MV_Scale_X, &f) == NVSDK_NGX_Result_Success) s->mv_scale[0] = f;
+        if (params->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &f) == NVSDK_NGX_Result_Success) s->mv_scale[1] = f;
+        if (params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &v) == NVSDK_NGX_Result_Success) s->subrect_w = v;
+        if (params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &v) == NVSDK_NGX_Result_Success) s->subrect_h = v;
+        if (params->Get(NVSDK_NGX_Parameter_Reset, &reset) == NVSDK_NGX_Result_Success && reset) ++s->resets;
+        // (diagnostics: which optional masks the game hands DLSS - pixels whose motion vectors it does not trust)
+        {
+            static const std::pair<const char*, std::uint32_t> kMasks[] = {
+                {NVSDK_NGX_Parameter_TransparencyMask, kNgxMaskTransparency}, {NVSDK_NGX_Parameter_IsParticleMask, kNgxMaskParticles},
+                {NVSDK_NGX_Parameter_AnimatedTextureMask, kNgxMaskAnimatedTexture},
+                {NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, kNgxMaskBiasCurrentColor},
+                {NVSDK_NGX_Parameter_DLSS_TransparencyLayer, kNgxMaskTransparencyLayer},
+                {NVSDK_NGX_Parameter_DLSS_TransparencyLayerOpacity, kNgxMaskTransparencyOpacity},
+                {NVSDK_NGX_Parameter_DLSS_TransparencyLayerMvecs, kNgxMaskTransparencyMvecs},
+                {NVSDK_NGX_Parameter_DLSS_DisocclusionMask, kNgxMaskDisocclusion}, {NVSDK_NGX_Parameter_DLSS_ResponsivityMask, kNgxMaskResponsivity}};
+            std::uint32_t masks = 0;
+            for (const auto& [name, bit] : kMasks) {
+                Res* r = nullptr;
+                if (params->Get(name, &r) == NVSDK_NGX_Result_Success && r) masks |= bit;
+            }
+            s->masks = masks;
+            describe<Res>(params, NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, s->bias_w, s->bias_h, s->bias_format);
+        }
+        // Games without a Streamline camera: publish this frame's depth and motion vectors with a camera
+        // the presenter estimates from the motion vectors. (Streamline games publish through their own
+        // hooks; once slSetConstants has been seen, this stays off - unless that camera was found
+        // unusable, see Shared::game_camera_check.)
+        auto* shared = g_producer->shared();
+        Res *depth = nullptr, *motion = nullptr;
+        const bool inputs = shared && s->dlss_calls > 60 &&
+                            params->Get(NVSDK_NGX_Parameter_Depth, &depth) == NVSDK_NGX_Result_Success && depth &&
+                            params->Get(NVSDK_NGX_Parameter_MotionVectors, &motion) == NVSDK_NGX_Result_Success && motion;
+        const bool no_camera = shared && (shared->hooks.constants_calls == 0 || g_producer->game_camera_unusable());
+        // A game that sends its Streamline camera but whose depth and motion vectors do not reach the
+        // Streamline hooks (none for a second while DLSS runs): they are taken here, for the frame being
+        // rendered, with the game's own camera - as the FSR hook does.
+        if (inputs && !no_camera && streamline_camera_recent() && !streamline_depth_recent()) {
+            const std::uint64_t frame = g_producer->rendering_frame() ? g_producer->rendering_frame() : streamline_current_frame();
+            if (frame) {
+                g_last_dlss_publish = qpc_now();
+                const std::uint32_t w = s->subrect_w ? s->subrect_w : s->depth_w, h = s->subrect_h ? s->subrect_h : s->depth_h;
+                const MotionSize ms = motion_size(s, w, h);
+                tag(frame, kDepth, depth, w, h);
+                tag(frame, kMotion, motion, ms.w, ms.h);
+                ++s->frames_joined;
+                if (shared->settings.hud_from_scene && params->Get(NVSDK_NGX_Parameter_Output, &out.resource) == NVSDK_NGX_Result_Success && out.resource) {
+                    out.frame = frame; out.w = s->out_w; out.h = s->out_h;
+                }
             }
         }
-        if (feature < 16) ++s->feature_calls[feature];
-        else ++s->unknown_handle_calls;
+        // Only after 60 DLSS evaluations without any Streamline camera: a Streamline game sets its camera
+        // before its first DLSS call, so it can never reach this (and frame numbers cannot mix).
+        if (inputs && no_camera) {
+            const std::uint64_t frame = next_upscaler_frame();
+            g_last_dlss_publish = qpc_now();
+            Camera cam{};
+            cam.valid = 1;
+            cam.estimated = 1;
+            cam.reset = reset ? 1u : 0u;
+            // Unreal and most modern engines use reversed depth; the create flags say so when we saw them.
+            cam.depth_inverted = (s->create_flags == 0 || (s->create_flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted)) ? 1u : 0u;
+            cam.jitter[0] = s->jitter[0]; cam.jitter[1] = s->jitter[1];
+            cam.mvec_scale[0] = s->mv_scale[0] != 0 ? s->mv_scale[0] : 1.0f;  // motion vector * scale = render pixels
+            cam.mvec_scale[1] = s->mv_scale[1] != 0 ? s->mv_scale[1] : 1.0f;
+            const std::uint32_t w = s->subrect_w ? s->subrect_w : s->depth_w, h = s->subrect_h ? s->subrect_h : s->depth_h;
+            const MotionSize ms = motion_size(s, w, h);
+            cam.mvec_scale[0] *= ms.sx; cam.mvec_scale[1] *= ms.sy;
+            g_producer->on_constants(frame, cam);
+            tag(frame, kDepth, depth, w, h);
+            tag(frame, kMotion, motion, ms.w, ms.h);
+            ++s->frames_published;
+            if (shared->settings.hud_from_scene && params->Get(NVSDK_NGX_Parameter_Output, &out.resource) == NVSDK_NGX_Result_Success && out.resource) {
+                out.frame = frame; out.w = s->out_w; out.h = s->out_h;
+            }
+        }
+    }
+    return feature;
+}
+
+NVSDK_NGX_Result NVSDK_CONV hk_evaluate(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* params,
+                                        PFN_NVSDK_NGX_ProgressCallback callback) {
+    DlssOutput<ID3D12Resource> out;
+    struct Generation { ID3D12Resource *image = nullptr, *real = nullptr; std::uint64_t frame = 0; std::uint32_t index = 0, per_frame = 1; } generation;
+    if (auto* s = stats()) {
+        // (DLSS inputs are in a shader-resource state when evaluated)
+        const std::uint32_t feature = before_evaluate(s, handle, params, out, [list](std::uint64_t frame, Tex kind, ID3D12Resource* r, std::uint32_t w, std::uint32_t h) {
+            g_producer->on_tag(frame, kind, r, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, 0, 0, w, h, list);
+        });
         if (feature == kFrameGeneration && params) {
             // (diagnostics: 7 | MultiFrameIndex << 8 | MultiFrameCount << 16, frame: BackbufferFrameID)
             unsigned int index = 0, count = 0, enable = 1;
@@ -171,102 +292,13 @@ NVSDK_NGX_Result NVSDK_CONV hk_evaluate(ID3D12GraphicsCommandList* list, const N
                 generation = {image, real, 0, index <= count ? index : 0u, count ? count : 1u};
             }
         }
-        if (is_dlss(feature) && params) {
-            ++s->dlss_calls;
-            g_producer->note_game_depth();
-            describe(params, NVSDK_NGX_Parameter_Depth, s->depth_w, s->depth_h, s->depth_format);
-            describe(params, NVSDK_NGX_Parameter_MotionVectors, s->mv_w, s->mv_h, s->mv_format);
-            describe(params, NVSDK_NGX_Parameter_Color, s->color_w, s->color_h, s->color_format);
-            describe(params, NVSDK_NGX_Parameter_Output, s->output_w, s->output_h, s->output_format);
-            float f = 0; unsigned int v = 0; int reset = 0;
-            if (params->Get(NVSDK_NGX_Parameter_Jitter_Offset_X, &f) == NVSDK_NGX_Result_Success) s->jitter[0] = f;
-            if (params->Get(NVSDK_NGX_Parameter_Jitter_Offset_Y, &f) == NVSDK_NGX_Result_Success) s->jitter[1] = f;
-            if (params->Get(NVSDK_NGX_Parameter_MV_Scale_X, &f) == NVSDK_NGX_Result_Success) s->mv_scale[0] = f;
-            if (params->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &f) == NVSDK_NGX_Result_Success) s->mv_scale[1] = f;
-            if (params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &v) == NVSDK_NGX_Result_Success) s->subrect_w = v;
-            if (params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &v) == NVSDK_NGX_Result_Success) s->subrect_h = v;
-            if (params->Get(NVSDK_NGX_Parameter_Reset, &reset) == NVSDK_NGX_Result_Success && reset) ++s->resets;
-            // (diagnostics: which optional masks the game hands DLSS - pixels whose motion vectors it does not trust)
-            {
-                static const std::pair<const char*, std::uint32_t> kMasks[] = {
-                    {NVSDK_NGX_Parameter_TransparencyMask, kNgxMaskTransparency}, {NVSDK_NGX_Parameter_IsParticleMask, kNgxMaskParticles},
-                    {NVSDK_NGX_Parameter_AnimatedTextureMask, kNgxMaskAnimatedTexture},
-                    {NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, kNgxMaskBiasCurrentColor},
-                    {NVSDK_NGX_Parameter_DLSS_TransparencyLayer, kNgxMaskTransparencyLayer},
-                    {NVSDK_NGX_Parameter_DLSS_TransparencyLayerOpacity, kNgxMaskTransparencyOpacity},
-                    {NVSDK_NGX_Parameter_DLSS_TransparencyLayerMvecs, kNgxMaskTransparencyMvecs},
-                    {NVSDK_NGX_Parameter_DLSS_DisocclusionMask, kNgxMaskDisocclusion}, {NVSDK_NGX_Parameter_DLSS_ResponsivityMask, kNgxMaskResponsivity}};
-                std::uint32_t masks = 0;
-                for (const auto& [name, bit] : kMasks) {
-                    ID3D12Resource* r = nullptr;
-                    if (params->Get(name, &r) == NVSDK_NGX_Result_Success && r) masks |= bit;
-                }
-                s->masks = masks;
-                describe(params, NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, s->bias_w, s->bias_h, s->bias_format);
-            }
-            // Games without a Streamline camera: publish this frame's depth and motion vectors with a camera
-            // the presenter estimates from the motion vectors. (Streamline games publish through their own
-            // hooks; once slSetConstants has been seen, this stays off - unless that camera was found
-            // unusable, see Shared::game_camera_check.)
-            auto* shared = g_producer->shared();
-            ID3D12Resource *depth = nullptr, *motion = nullptr;
-            const bool inputs = shared && s->dlss_calls > 60 &&
-                                params->Get(NVSDK_NGX_Parameter_Depth, &depth) == NVSDK_NGX_Result_Success && depth &&
-                                params->Get(NVSDK_NGX_Parameter_MotionVectors, &motion) == NVSDK_NGX_Result_Success && motion;
-            const bool no_camera = shared && (shared->hooks.constants_calls == 0 || g_producer->game_camera_unusable());
-            // A game that sends its Streamline camera but whose depth and motion vectors do not reach the
-            // Streamline hooks (none for a second while DLSS runs): they are taken here, for the frame being
-            // rendered, with the game's own camera - as the FSR hook does.
-            if (inputs && !no_camera && streamline_camera_recent() && !streamline_depth_recent()) {
-                const std::uint64_t frame = g_producer->rendering_frame() ? g_producer->rendering_frame() : streamline_current_frame();
-                if (frame) {
-                    g_last_dlss_publish = qpc_now();
-                    const std::uint32_t w = s->subrect_w ? s->subrect_w : s->depth_w, h = s->subrect_h ? s->subrect_h : s->depth_h;
-                    const auto state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-                    const MotionSize ms = motion_size(s, w, h);
-                    g_producer->on_tag(frame, kDepth, depth, state, 0, 0, w, h, list);
-                    g_producer->on_tag(frame, kMotion, motion, state, 0, 0, ms.w, ms.h, list);
-                    ++s->frames_joined;
-                    if (shared->settings.hud_from_scene && params->Get(NVSDK_NGX_Parameter_Output, &output) == NVSDK_NGX_Result_Success && output) {
-                        published = frame; output_w = s->out_w; output_h = s->out_h;
-                    }
-                }
-            }
-            // Only after 60 DLSS evaluations without any Streamline camera: a Streamline game sets its camera
-            // before its first DLSS call, so it can never reach this (and frame numbers cannot mix).
-            if (inputs && no_camera) {
-                const std::uint64_t frame = next_upscaler_frame();
-                g_last_dlss_publish = qpc_now();
-                Camera cam{};
-                cam.valid = 1;
-                cam.estimated = 1;
-                cam.reset = reset ? 1u : 0u;
-                // Unreal and most modern engines use reversed depth; the create flags say so when we saw them.
-                cam.depth_inverted = (s->create_flags == 0 || (s->create_flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted)) ? 1u : 0u;
-                cam.jitter[0] = s->jitter[0]; cam.jitter[1] = s->jitter[1];
-                cam.mvec_scale[0] = s->mv_scale[0] != 0 ? s->mv_scale[0] : 1.0f;  // motion vector * scale = render pixels
-                cam.mvec_scale[1] = s->mv_scale[1] != 0 ? s->mv_scale[1] : 1.0f;
-                const std::uint32_t w = s->subrect_w ? s->subrect_w : s->depth_w, h = s->subrect_h ? s->subrect_h : s->depth_h;
-                const MotionSize ms = motion_size(s, w, h);
-                cam.mvec_scale[0] *= ms.sx; cam.mvec_scale[1] *= ms.sy;
-                g_producer->on_constants(frame, cam);
-                // DLSS inputs are in a shader-resource state when evaluated.
-                const auto state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-                g_producer->on_tag(frame, kDepth, depth, state, 0, 0, w, h, list);
-                g_producer->on_tag(frame, kMotion, motion, state, 0, 0, ms.w, ms.h, list);
-                ++s->frames_published;
-                if (shared->settings.hud_from_scene && params->Get(NVSDK_NGX_Parameter_Output, &output) == NVSDK_NGX_Result_Success && output) {
-                    published = frame; output_w = s->out_w; output_h = s->out_h;
-                }
-            }
-        }
     }
     fw::ui_probe::mark(reinterpret_cast<std::uint64_t>(list), "upscaler: NGX evaluate (DLSS)");
     const NVSDK_NGX_Result result = reinterpret_cast<EvaluateFn>(g_evaluate_hook.original())(list, handle, params, callback);
     // The upscaled scene (before post-processing and HUD): DLSS writes its output as an unordered-access
     // resource, recorded on this list just now.
-    if (published && output && result == NVSDK_NGX_Result_Success)
-        g_producer->on_tag(published, kScene, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 0, 0, output_w, output_h, list);
+    if (out.frame && out.resource && result == NVSDK_NGX_Result_Success)
+        g_producer->on_tag(out.frame, kScene, out.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 0, 0, out.w, out.h, list);
     // DLSS Frame Generation: one evaluation per generated image (MultiFrameIndex of MultiFrameCount), written
     // as an unordered-access output, from the frame's picture (an input, shader-readable like DLSS's).
     if (generation.image && result != NVSDK_NGX_Result_Success)
@@ -274,6 +306,25 @@ NVSDK_NGX_Result NVSDK_CONV hk_evaluate(ID3D12GraphicsCommandList* list, const N
     if (generation.image && result == NVSDK_NGX_Result_Success)
         g_producer->on_generated(generation.frame, generation.index, generation.per_frame, generation.image, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, generation.real,
                                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, list);
+    return result;
+}
+
+// DLSS in Direct3D 11 games (BG3): as hk_evaluate, on the context DLSS runs on - the immediate one, where the copies are on
+// the GPU's way at once (a deferred context is left alone: its copies would run whenever the game executes it). No frame
+// generation: DLSS's needs Direct3D 12.
+NVSDK_NGX_Result NVSDK_CONV hk_d3d11_evaluate(ID3D11DeviceContext* context, const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* params,
+                                              PFN_NVSDK_NGX_ProgressCallback callback) {
+    DlssOutput<ID3D11Resource> out;
+    const bool immediate = context && context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
+    if (auto* s = stats(); s && immediate) {
+        before_evaluate(s, handle, params, out, [context](std::uint64_t frame, Tex kind, ID3D11Resource* r, std::uint32_t w, std::uint32_t h) {
+            g_producer->on_tag_d3d11(frame, kind, r, 0, 0, w, h, context);
+        });
+    }
+    fw::ui_probe::mark(reinterpret_cast<std::uint64_t>(context), "upscaler: NGX evaluate (DLSS, D3D11)");
+    const NVSDK_NGX_Result result = reinterpret_cast<EvaluateD3D11Fn>(g_d3d11_evaluate_hook.original())(context, handle, params, callback);
+    if (out.frame && out.resource && result == NVSDK_NGX_Result_Success)
+        g_producer->on_tag_d3d11(out.frame, kScene, out.resource, 0, 0, out.w, out.h, context);
     return result;
 }
 
@@ -392,7 +443,7 @@ bool dlss_publishing() {
 void install_ngx_hooks(Producer* producer) {
     g_producer = producer;
     if (g_create_hook.installed() && g_evaluate_hook.installed() && g_vk_create_hook.installed() && g_vk_create1_hook.installed() &&
-        g_vk_evaluate_hook.installed()) return;
+        g_vk_evaluate_hook.installed() && g_d3d11_create_hook.installed() && g_d3d11_evaluate_hook.installed()) return;
     HMODULE ngx = GetModuleHandleW(L"_nvngx.dll");
     if (!ngx) return;
     struct Entry { InlineHook& hook; const char* name; void* detour; std::uint32_t bit; };
@@ -402,6 +453,8 @@ void install_ngx_hooks(Producer* producer) {
         {g_vk_create_hook, "NVSDK_NGX_VULKAN_CreateFeature", reinterpret_cast<void*>(&hk_vk_create), 4},
         {g_vk_create1_hook, "NVSDK_NGX_VULKAN_CreateFeature1", reinterpret_cast<void*>(&hk_vk_create1), 8},
         {g_vk_evaluate_hook, "NVSDK_NGX_VULKAN_EvaluateFeature", reinterpret_cast<void*>(&hk_vk_evaluate), 16},
+        {g_d3d11_create_hook, "NVSDK_NGX_D3D11_CreateFeature", reinterpret_cast<void*>(&hk_d3d11_create), 32},
+        {g_d3d11_evaluate_hook, "NVSDK_NGX_D3D11_EvaluateFeature", reinterpret_cast<void*>(&hk_d3d11_evaluate), 64},
     };
     for (auto& e : entries) {
         if (e.hook.installed()) continue;

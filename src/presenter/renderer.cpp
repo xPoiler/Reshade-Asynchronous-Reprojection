@@ -18,7 +18,7 @@ namespace fw {
 std::atomic<std::int64_t> g_present_entered{0};  // (see renderer.hpp)
 namespace {
 // HUD learning: a point changing this share of the screen or more is no HUD (a stopgap: EDF6's HUD 9-17%, its menus 86%).
-constexpr double kHudPickArea = 0.6;
+constexpr double kHudRepeatShareCpu = 0.85;  // (the HUD detection's frame guard - the shaders' kHudRepeatShare, see hud_update)
 
 const char kShaders[] = R"(
 Texture2D<float4> src : register(t0);
@@ -1821,6 +1821,8 @@ float2 edge(Texture2D<float4> t, int2 p) {  // Sobel luminance gradient
     return float2((c + 2 * f + i) - (a + 2 * d + g), (g + 2 * h + i) - (a + 2 * b + c)) * 0.25;
 }
 RWByteAddressBuffer hud_counts_u : register(u1);  // [0] evidence pixels, [4] changed pixels (this frame)
+// The frame guard: at most this share of the telling pixels looking unchanged (see hud_update; kHudRepeatShareCpu the same)
+static const float kHudRepeatShare = 0.85;
 // 0: nothing to learn; 1: evidence for HUD (weight); 2: clearly changed where motion would show it;
 // 3: first-person weapon range; 4: clearly changed elsewhere.
 uint hud_classify(uint2 id, out float weight) {
@@ -1996,10 +1998,12 @@ float hud_update(uint2 id) {
         return v;
     }
     if (kind != 1) return -1.0;
-    // A real HUD covers a small part of the screen. When most telling pixels look unchanged, the frame
-    // itself is suspect (repeated image, hitch, camera data without a new image): learn nothing from it.
+    // When nearly all telling pixels look unchanged, the frame itself is suspect (repeated image, hitch, camera data without a
+    // new image): learn nothing from it. Nearly all: 0.35 held back every pan in Baldur's Gate 3 - its big, finely drawn HUD
+    // over dark scenery is 0.47-0.64 of the telling pixels; repeated frames there 0.95-1.0, games that learn 0.13-0.34
+    // (kHudRepeatShare, and the counts' log in Renderer::begin).
     const uint evidence = hud_counts_u.Load(0), changed = hud_counts_u.Load(4);
-    if (evidence + changed < 256 || evidence > 0.35 * (evidence + changed)) return -1.0;
+    if (evidence + changed < 256 || evidence > kHudRepeatShare * (evidence + changed)) return -1.0;
     const float v = lerp(hud_score_u[id], 1.0, weight);
     hud_score_u[id] = v;
     return v;
@@ -2139,7 +2143,7 @@ RWTexture2D<float> apply_learned_u : register(u1);
     if (any(p >= out_size) || !(flags & 2)) return;
     // (the frame's guard, as cs_hud: the counts of a quarter of the pixels, scaled)
     const uint evidence = apply_counts_t.Load(0), changed = apply_counts_t.Load(4);
-    const bool frame_ok = (evidence + changed) * step * step >= 256 && evidence <= 0.35 * (evidence + changed);
+    const bool frame_ok = (evidence + changed) * step * step >= 256 && evidence <= kHudRepeatShare * (evidence + changed);
     float weight;
     const uint kind = hud_kind_of(id.xy, weight);
     // World evidence and persistence (as cs_hud_world).
@@ -2198,7 +2202,7 @@ groupshared float gate_gs[64];
     const uint kind = hud_kind_of(id.xy, weight);
     if (kind == 1) {
         const uint evidence = hud_counts_u.Load(0), changed = hud_counts_u.Load(4);
-        if (evidence + changed >= 256 && evidence <= 0.35 * (evidence + changed)) world = lerp(world, 0.0, weight);
+        if (evidence + changed >= 256 && evidence <= kHudRepeatShare * (evidence + changed)) world = lerp(world, 0.0, weight);
     } else if ((kind == 2 || kind == 4) && hud_follows_world(id.xy)) {
         world = lerp(world, 1.0, 0.5);
     }
@@ -2238,20 +2242,45 @@ RWTexture2D<float> pr_tiles_u : register(u0);
 // ...and against the previous frame's tiles of the same candidate, where the camera's motion moves a tile by at least a
 // tile and a half (closer, the two can not be told apart): the overlap at the same spot (what stays on the screen - the
 // HUD) and where the scenery came from (what moves with it). u1: [0] the share that differs (all tiles), [1]/[2] min/max at
-// the same spot, [3]/[4] min/max where the scenery came from (x256).
+// the same spot, [3]/[4] min/max where the scenery came from (x256); [5] tiles holding HUD the detection has confirmed (t3,
+// the map it learned itself - combined or plain - flag 1: over 0.6 at any of 16 spots; never a HUD map taken from elsewhere,
+// the upscaler output's guess or the point's own layer), [6] of them those the candidate differs on, [7] tiles the candidate
+// differs on that hold no confirmed HUD (hud_learn_rules.hpp); [8]/[9] the point in use (flag 2): its usual tiles (u0, a
+// running average of its tiles over ~500 frames, started over with flag 4) and of them what it gives now (min) - a panel
+// opened over the HUD keeps them, a point that lands on another place by spells does not.
 Texture2D<float> ps_now_t : register(t0);
 Texture2D<float> ps_prev_t : register(t1);
 Texture2D<float> ps_depth_t : register(t2);
+Texture2D<float> ps_hud_t : register(t3);
+RWTexture2D<float> ps_foot_u : register(u0);
 RWByteAddressBuffer ps_sums_u : register(u1);
 [numthreads(1, 1, 1)] void cs_probe_clear(uint3 id : SV_DispatchThreadID) {
-    ps_sums_u.Store4(0, uint4(0, 0, 0, 0));
-    ps_sums_u.Store4(16, uint4(0, 0, 0, 0));
+    [unroll] for (uint k = 0; k < 64; k += 16) ps_sums_u.Store4(k, uint4(0, 0, 0, 0));
 }
 [numthreads(8, 8, 1)] void cs_probe_score(uint3 id : SV_DispatchThreadID) {
     if (any(id.xy >= mv_size)) return;
     const float h = ps_now_t.Load(int3(id.xy, 0));
     uint ignored;
     ps_sums_u.InterlockedAdd(0, uint(h * 256.0), ignored);
+    if (flags & 2) {
+        const float usual = (flags & 4) ? h : ps_foot_u[id.xy];
+        ps_sums_u.InterlockedAdd(32, uint(usual * 256.0), ignored);
+        ps_sums_u.InterlockedAdd(36, uint(min(h, usual) * 256.0), ignored);
+        ps_foot_u[id.xy] = lerp(usual, h, 1.0 / 512.0);
+    }
+    if (flags & 1) {
+        uint sw, sh;
+        ps_hud_t.GetDimensions(sw, sh);
+        bool found = false;
+        [unroll] for (int k = 0; k < 16; ++k) {
+            const uint2 p = min(id.xy * 16 + uint2((k & 3) * 4 + 2, (k >> 2) * 4 + 2), out_size - 1);
+            if (ps_hud_t.Load(int3(p * uint2(sw, sh) / out_size, 0)) > 0.6) found = true;
+        }
+        if (found) {
+            ps_sums_u.InterlockedAdd(20, 1, ignored);
+            if (h > 1.0 / 64.0) ps_sums_u.InterlockedAdd(24, 1, ignored);
+        } else if (h > 1.0 / 64.0) ps_sums_u.InterlockedAdd(28, 1, ignored);
+    }
     const float2 uv = (float2(id.xy) * 16.0 + 8.0) / float2(out_size);
     const int2 pr = int2(rect.xy) + int2(min(uint2(saturate(uv) * float2(rect.zw)), rect.zw - 1));
     const float4 pv = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, ps_depth_t.Load(int3(pr, 0)), 1), clip_to_prev);
@@ -7499,13 +7528,13 @@ bool Renderer::create_pipelines(std::string& error) {
     if (FAILED(device_->CreateCommittedResource(&rbh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&grow_readback_)))) {
         error = "held area readback"; return false;
     }
-    bd.Width = kRing * 32;
+    bd.Width = kRing * 64;
     if (FAILED(device_->CreateCommittedResource(&rbh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&probe_readback_)))) {
         error = "HUD learning readback"; return false;
     }
     {
         D3D12_RESOURCE_DESC pb = bd;
-        pb.Width = 32; pb.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        pb.Width = 64; pb.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &pb, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&probe_sums_)))) {
             error = "HUD learning buffer"; return false;
         }
@@ -8618,6 +8647,7 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
     if (reset) {
         // New or resized score: start from "not HUD".
         reset_hud_ = false;
+        hud_rules_.reference_reset();  // (HUD learning's reference starts over with it)
         transition(private_[kPHudScore], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         set_x_uav(kXHudUav + 0, kPHudScore); set_x_uav(kXHudUav + 1, kPHudScore);
         XConstants z = c; z.flags = 0;
@@ -8625,6 +8655,7 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
         x_dispatch(cs_clear_score_.Get(), &z, kXHudSrv, kXHudUav, (ow + 7) / 8, (oh + 7) / 8);
     }
     fill_ready_ = false;
+    hud_ref_ = 0;  // (set below by the path that learns: see score_hud_probe)
     // A HUD-less picture without a UI layer: the HUD is where the frame differs from it (see cs_hudless_*).
     const bool from_hudless = hud && src.has_hudless && !src.has_ui && private_[kPHudless].texture && private_[kPHudless].width == ow &&
                               private_[kPHudless].height == oh;
@@ -8793,6 +8824,7 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
         if (ensure_private(kPWorld, cw, ch, DXGI_FORMAT_R32_FLOAT) && ensure_private(kPHudLearned, cw, ch, DXGI_FORMAT_R32_FLOAT) &&
             ensure_private(kPHudTiles, tw, th, DXGI_FORMAT_R8_UNORM) && ensure_hud_gate()) {
             world = true;
+            hud_ref_ = 1;
             world_half = check_step == 2;
             set_x_srv(kXHudSrv + 0, kPBackbuffer);
             set_x_srv(kXHudSrv + 1, kPPrevious);
@@ -8829,6 +8861,7 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
                 list_->ResourceBarrier(1, &uav);
             }
             if (new_learned || reset) {
+                hud_rules_.reference_reset();
                 set_x_uav(kXLearnedUav + 0, kPHudLearned);
                 device_->CreateUnorderedAccessView(hud_counts_.Get(), nullptr, &raw, cpu(kXLearnedUav + 1));
                 x_dispatch(cs_clear_score_.Get(), &z, kXHudSrv, kXLearnedUav, (cw + 7) / 8, (ch + 7) / 8);
@@ -8861,6 +8894,7 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
                 auto to_read = transition_barrier(hud_counts_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 list_->ResourceBarrier(1, &to_read);
                 hud_pending_[frame_index_] = true;
+                hud_pending_seq_[frame_index_] = intake_seq_;
                 hud_count_scale_[frame_index_] = check_step * check_step;
             }
             x_dispatch(cs_hud_apply_.Get(), &c, kXHudApplySrv, kXHudApplyUav, g.mv_size[0], g.mv_size[1], gated, 12);
@@ -8902,6 +8936,7 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
     // (the progressive detection's tile marks hold only while this path runs frame after frame on the same score map)
     if (!(hud && previous && !from_scene && !from_hudless && !from_layer && !hidden) || reset) hud_marks_valid_ = false;
     if (hud && previous && !from_scene && !from_hudless && !from_layer && !hidden) {
+        hud_ref_ = reset_hud_ ? 0 : 2;  // (not on the frame the upscaler output or a layer stopped: the map still holds what they gave, cleared next frame)
         set_x_srv(kXHudSrv + 0, kPBackbuffer);
         set_x_srv(kXHudSrv + 1, kPPrevious);
         set_x_srv(kXHudSrv + 2, kPDepth);
@@ -8955,6 +8990,7 @@ ID3D12Resource* Renderer::build_no_warp_mask(const IngestedSource& src, const fl
         std::swap(to_copy.Transition.StateBefore, to_copy.Transition.StateAfter);
         list_->ResourceBarrier(1, &to_copy);
         hud_pending_[frame_index_] = true;
+        hud_pending_seq_[frame_index_] = intake_seq_;
     }
     transition(private_[kPHudScore], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     pass_stamp(kPassHud);
@@ -10502,6 +10538,8 @@ ID3D12GraphicsCommandList* Renderer::begin(int context) {
             readback_->Unmap(0, &none);
         }
     }
+    // (this frame held back by the HUD detection's guard / learned from by it - see the probe scores below)
+    bool repeated_picture = false, detection_learned = false, detection_telling = false;
     // Motion-vector fit sums recorded by analyze_motion in that frame.
     if (fit_pending_[frame_index_] && fit_readback_) {
         fit_pending_[frame_index_] = false;
@@ -10545,46 +10583,6 @@ ID3D12GraphicsCommandList* Renderer::begin(int context) {
                 if (t[i + 1] >= t[i]) hud_stats_.scene_pass_ms[i] += double(t[i + 1] - t[i]) * 1000.0 / double(timestamp_frequency_);
             D3D12_RANGE none{0, 0};
             scene_stamps_readback_->Unmap(0, &none);
-        }
-    }
-    if (probe_pending_[frame_index_] && probe_readback_) {
-        probe_pending_[frame_index_] = false;
-        std::uint32_t* v = nullptr;
-        D3D12_RANGE range{frame_index_ * 32, frame_index_ * 32 + 32};
-        if (SUCCEEDED(probe_readback_->Map(0, &range, reinterpret_cast<void**>(&v)))) {
-            const std::uint32_t* u = v + frame_index_ * 8;
-            auto& sc = probe_scores_[probe_pending_cand_[frame_index_]];
-            ++sc.frames;
-            const double frame_area = double(u[0]) / 256.0 / std::max(1u, probe_pending_tiles_[frame_index_]);
-            sc.area += frame_area;
-            if (u[2] + u[4] > 0) {
-                ++sc.scored;
-                sc.same_min += u[1] / 256.0; sc.same_max += u[2] / 256.0;
-                sc.world_min += u[3] / 256.0; sc.world_max += u[4] / 256.0;
-            }
-            // The learned point in use, checked over its recent frames: stays on the screen (0.8) and clearly more than
-            // it moves with the scenery (0.1), over 60 scored frames - else reported, and its scores dropped. Not on frames where it
-            // changes kHudPickArea of the screen or more - a menu or a loading screen the game draws with the HUD's shaders, never
-            // picked as a HUD either (hud_learn_pick). EDF6: its saved point, learned in a mission, dropped 12 s after each launch
-            // in its menus (86% of the screen, stays on the screen 0.63).
-            const std::uint32_t cand = probe_pending_cand_[frame_index_];
-            if (probe_pending_locked_[frame_index_]) {
-                if (cand != probe_locked_) { probe_locked_ = cand; probe_check_n_ = 0; probe_check_same_ = 1; probe_check_world_ = 0; }
-                if (u[2] > 0 && u[4] > 0 && frame_area < kHudPickArea) {
-                    const double a = 1.0 / std::min(60.0, double(++probe_check_n_));
-                    probe_check_same_ += a * (u[1] / double(u[2]) - probe_check_same_);
-                    probe_check_world_ += a * (u[3] / double(u[4]) - probe_check_world_);
-                    if (probe_check_n_ >= 60 && (probe_check_same_ < 0.8 || probe_check_same_ - probe_check_world_ < 0.1)) {
-                        probe_fail_ = cand;
-                        probe_scores_.erase(cand);
-                        probe_check_n_ = 0;
-                    }
-                }
-            } else if (probe_fail_ && cand != probe_fail_) {
-                probe_fail_ = 0;  // (learning again)
-            }
-            D3D12_RANGE none{0, 0};
-            probe_readback_->Unmap(0, &none);
         }
     }
     if (grow_pending_[frame_index_] && grow_readback_) {
@@ -10668,20 +10666,52 @@ ID3D12GraphicsCommandList* Renderer::begin(int context) {
             ++hud_stats_.frames;
             hud_stats_.evidence_sum += evidence; hud_stats_.changed_sum += changed;
             // Same rule as cs_hud.
+            detection_telling = evidence + changed >= 256;
             if (evidence + changed < 256) ++hud_stats_.too_little;
-            else if (evidence > 0.35 * (evidence + changed)) ++hud_stats_.guarded;
-            else { ++hud_stats_.learned; hud_stats_.share_sum += double(evidence) / double(evidence + changed); }
+            else if (evidence > kHudRepeatShareCpu * (evidence + changed)) { ++hud_stats_.guarded; repeated_picture = true; }
+            else { ++hud_stats_.learned; hud_stats_.share_sum += double(evidence) / double(evidence + changed); detection_learned = true; }
             // (is it learning here: at least a tenth of every 300 frames learned from)
             ++learn_frames_;
-            if (evidence + changed >= 256 && evidence <= 0.35 * (evidence + changed)) ++learn_learned_;
+            if (evidence + changed >= 256 && evidence <= kHudRepeatShareCpu * (evidence + changed)) ++learn_learned_;
             if (learn_frames_ >= 300) {
                 learning_stalled_ = learn_learned_ < 30;
                 learn_frames_ = learn_learned_ = 0;
             }
+            // (kept by its game frame, for that frame's probe - see drain_probes)
+            const std::uint64_t seq = hud_pending_seq_[frame_index_];
+            probe_pairing_.verdict(seq, detection_learned, detection_telling, repeated_picture);
             D3D12_RANGE none{0, 0};
             hud_readback_->Unmap(0, &none);
         }
     }
+    // (probed frames wait for the HUD detection's verdict on the same game frame - see drain_probes)
+    if (probe_pending_[frame_index_] && probe_readback_) {
+        probe_pending_[frame_index_] = false;
+        std::uint32_t* v = nullptr;
+        D3D12_RANGE range{frame_index_ * 64, frame_index_ * 64 + 64};
+        if (SUCCEEDED(probe_readback_->Map(0, &range, reinterpret_cast<void**>(&v)))) {
+            const std::uint32_t* u = v + frame_index_ * 16;
+            fw::hudlearn::Pairing::Wait w;
+            w.seq = probe_pending_seq_[frame_index_];
+            fw::hudlearn::ProbeFrame& f = w.f;
+            f.cand = probe_pending_cand_[frame_index_];
+            f.locked = probe_pending_locked_[frame_index_];
+            f.area = double(u[0]) / 256.0 / std::max(1u, probe_pending_tiles_[frame_index_]);
+            f.same_min = u[1] / 256.0; f.same_max = u[2] / 256.0; f.world_min = u[3] / 256.0; f.world_max = u[4] / 256.0;
+            f.ref_possible = probe_pending_ref_[frame_index_];
+            f.hud_tiles = u[5]; f.covered = u[6]; f.beyond = u[7];
+            if (f.locked && u[8] > 0) f.kept = double(u[9]) / double(u[8]);
+            f.cut = probe_pending_cut_[frame_index_];
+            f.tiles = double(std::max(1u, probe_pending_tiles_[frame_index_]));
+            for (int k = 0; k < 10; ++k) w.raw[k] = u[k];
+            LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+            w.qpc = now.QuadPart;
+            probe_pairing_.probe(w);
+            D3D12_RANGE none{0, 0};
+            probe_readback_->Unmap(0, &none);
+        }
+    }
+    drain_probes();
     if (ret_args_pending_[frame_index_] && ret_args_readback_) {
         ret_args_pending_[frame_index_] = false;
         std::uint32_t* v = nullptr;
@@ -10949,7 +10979,7 @@ int Renderer::estimate_motion(DXGI_FORMAT colour, bool write_motion, const Parti
     return had_previous ? 1 : 0;
 }
 
-void Renderer::score_hud_probe(const IngestedSource& src, const float clip_to_prev_clip[16]) {
+void Renderer::score_hud_probe(const IngestedSource& src, const float clip_to_prev_clip[16], bool camera_cut) {
     const std::uint32_t cand = src.has_probe ? src.hud_candidate : 0;
     const auto& depth = private_[kPDepth];
     if (!cand || !private_[kPProbe].texture || !depth.texture || !probe_sums_) { probe_prev_ = 0; return; }
@@ -10977,10 +11007,38 @@ void Renderer::score_hud_probe(const IngestedSource& src, const float clip_to_pr
         set_x_srv(kXProbeScoreSrv + 0, now);
         set_x_srv(kXProbeScoreSrv + 1, prev);
         set_x_srv(kXProbeScoreSrv + 2, kPDepth);
+        // (the HUD the detection has confirmed - the map it learned itself, the combined detection's or, in a game without the
+        // upscaler's output, the plain detection's (EDF6); never a HUD map taken from elsewhere - to see how much of it the
+        // candidate holds; see cs_probe_score and hud_ref_)
+        const PrivateId ref_map = hud_ref_ == 1 ? kPHudLearned : kPHudScore;
+        const bool ref = hud_ref_ != 0 && private_[ref_map].texture != nullptr;
+        if (ref && hud_ref_ != probe_ref_kind_) {  // (the other detection's map now: its size measured afresh)
+            if (probe_ref_kind_) hud_rules_.reference_reset();
+            probe_ref_kind_ = hud_ref_;
+        }
+        if (ref) {
+            transition(private_[ref_map], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            set_x_srv(kXProbeScoreSrv + 3, ref_map);
+            c.flags |= 1u;
+        }
+        // (the point in use: its usual tiles - started over for a new point)
+        const bool locked = src.hud_learned == 1;
+        const bool foot_new = !private_[kPProbeFoot].texture || private_[kPProbeFoot].width != tw || private_[kPProbeFoot].height != th;
+        const bool foot = locked && ensure_private(kPProbeFoot, tw, th, DXGI_FORMAT_R32_FLOAT);
+        if (foot) {
+            c.flags |= 2u;
+            if (probe_foot_cand_ != cand || foot_new) { c.flags |= 4u; probe_foot_cand_ = cand; }
+            set_x_uav(kXProbeScoreUav + 0, kPProbeFoot);
+            transition(private_[kPProbeFoot], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
         D3D12_UNORDERED_ACCESS_VIEW_DESC raw{};
         raw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; raw.Format = DXGI_FORMAT_R32_TYPELESS;
-        raw.Buffer.NumElements = 8; raw.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-        device_->CreateUnorderedAccessView(probe_sums_.Get(), nullptr, &raw, cpu(kXProbeScoreUav + 0));
+        raw.Buffer.NumElements = 16; raw.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        if (!foot) {  // (u0 is a texture in the shader: a null one when no point is in use)
+            D3D12_UNORDERED_ACCESS_VIEW_DESC none{};
+            none.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D; none.Format = DXGI_FORMAT_R32_FLOAT;
+            device_->CreateUnorderedAccessView(nullptr, nullptr, &none, cpu(kXProbeScoreUav + 0));
+        }
         device_->CreateUnorderedAccessView(probe_sums_.Get(), nullptr, &raw, cpu(kXProbeScoreUav + 1));
         D3D12_RESOURCE_BARRIER sums{}; sums.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; sums.UAV.pResource = probe_sums_.Get();
         x_dispatch(cs_probe_clear_.Get(), &c, kXProbeScoreSrv, kXProbeScoreUav, 1, 1);
@@ -10988,46 +11046,75 @@ void Renderer::score_hud_probe(const IngestedSource& src, const float clip_to_pr
         x_dispatch(cs_probe_score_.Get(), &c, kXProbeScoreSrv, kXProbeScoreUav, (tw + 7) / 8, (th + 7) / 8);
         auto to_copy = transition_barrier(probe_sums_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         list_->ResourceBarrier(1, &to_copy);
-        list_->CopyBufferRegion(probe_readback_.Get(), UINT64(frame_index_) * 32, probe_sums_.Get(), 0, 32);
+        list_->CopyBufferRegion(probe_readback_.Get(), UINT64(frame_index_) * 64, probe_sums_.Get(), 0, 64);
+        if (foot) transition(private_[kPProbeFoot], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         std::swap(to_copy.Transition.StateBefore, to_copy.Transition.StateAfter);
         list_->ResourceBarrier(1, &to_copy);
         probe_pending_[frame_index_] = true;
         probe_pending_cand_[frame_index_] = cand;
-        probe_pending_locked_[frame_index_] = src.hud_learned == 1;
+        probe_pending_locked_[frame_index_] = locked;
+        probe_pending_ref_[frame_index_] = ref;
+        probe_pending_cut_[frame_index_] = camera_cut;
         probe_pending_tiles_[frame_index_] = tw * th;
+        probe_pending_seq_[frame_index_] = intake_seq_;
     }
     probe_prev_ = cand;
     probe_flip_ = !probe_flip_;
 }
 
-// The pick: of the candidates scored on 30 frames or more that change under 60% of the screen, stay on the screen (0.9
-// or more) and clearly more than they move with the scenery (by 0.2), the one changing the most - the earliest point
-// after which only the HUD is drawn.
-std::uint32_t Renderer::hud_learn_pick() const {
-    std::uint32_t pick = 0;
-    double pick_area = -1;
-    for (const auto& [cand, sc] : probe_scores_) {
-        if (sc.scored < 30 || !sc.frames || sc.same_max <= 0 || sc.world_max <= 0) continue;
-        const double area = sc.area / sc.frames, same = sc.same_min / sc.same_max, world = sc.world_min / sc.world_max;
-        if (area < kHudPickArea && same >= 0.9 && same - world >= 0.2 && area > pick_area) { pick = cand; pick_area = area; }
-    }
-    return pick;
+// The pick, the checks of the point in use and the points set aside: hud_learn_rules.hpp.
+// HUD learning: each probed frame goes to the rules (hud_learn_rules.hpp) with the HUD detection's verdict on the same
+// game frame - whether it learned from it (then its map is the reference), had enough telling pixels, or held it back as a
+// repeated picture. The verdict is read back from its own slot, possibly later than the probe: the probe waits for it, and
+// goes without one (nothing learned, nothing repeated) once a later frame's verdict is in or 8 game frames have passed (the
+// detection did not run on it).
+void Renderer::drain_probes() {
+    probe_pairing_.drain(intake_seq_, [&](const fw::hudlearn::Pairing::Wait& w) {
+        const fw::hudlearn::ProbeFrame& f = w.f;
+        hud_rules_.add(f);
+        if (probe_csv_)
+            std::fprintf(probe_csv_, "%llu,%08x,%d,%.5f,%.2f,%.2f,%.2f,%.2f,%d,%d,%u,%u,%u,%.3f,%d,%08x,%08x,%lld,%u,%u,%.0f,%d,%d\n",
+                         static_cast<unsigned long long>(probe_csv_row_), f.cand, f.locked ? 1 : 0, f.area, f.same_min, f.same_max,
+                         f.world_min, f.world_max, f.ref_possible ? 1 : 0, f.ref ? 1 : 0, w.raw[5], w.raw[6], w.raw[7], f.kept,
+                         f.repeated ? 1 : 0, hud_rules_.fail(), hud_rules_.pick(), static_cast<long long>(w.qpc), w.raw[8], w.raw[9], f.tiles,
+                         f.cut ? 1 : 0, f.detect_telling ? 1 : 0);
+        ++probe_csv_row_;
+    });
 }
+
+void Renderer::hud_learn_forget() {
+    hud_rules_ = fw::hudlearn::Rules{};
+    probe_pairing_.clear();
+    probe_foot_cand_ = 0;
+    probe_prev_ = 0;
+}
+
+std::uint32_t Renderer::hud_learn_pick() const { return hud_rules_.pick(); }
 
 std::string Renderer::hud_learn_report() const {
     std::string out;
-    char item[160];
-    if (const std::uint32_t pick = hud_learn_pick()) { std::snprintf(item, sizeof(item), "pick %08x | ", pick); out += item; }
+    char item[256];
+    if (const std::uint32_t pick = hud_rules_.pick()) { std::snprintf(item, sizeof(item), "pick %08x | ", pick); out += item; }
     else out += "no pick yet | ";
-    if (probe_locked_) {
-        std::snprintf(item, sizeof(item), "in use %08x: stays on the screen %.2f, moves with the scenery %.2f (%u) | ", probe_locked_, probe_check_same_,
-                      probe_check_world_, probe_check_n_);
+    if (!hud_rules_.unstable().empty()) {
+        out += "set aside (their HUD changes from frame to frame):";
+        for (const std::uint32_t id : hud_rules_.unstable()) { std::snprintf(item, sizeof(item), " %08x", id); out += item; }
+        out += " | ";
+    }
+    if (const std::uint32_t locked = hud_rules_.locked()) {
+        const auto& in = hud_rules_.in_use();
+        std::snprintf(item, sizeof(item), "in use %08x: stays on the screen %.2f, moves with the scenery %.2f (%u) | ", locked, in.same, in.world, in.n);
         out += item;
     }
-    for (const auto& [cand, sc] : probe_scores_) {
-        std::snprintf(item, sizeof(item), "%s%08x: %u frames, differs on %.1f%%, stays on the screen %.2f, moves with the scenery %.2f (%u scored)",
+    for (const auto& [cand, sc] : hud_rules_.scores()) {
+        bool by_ref = false;
+        const bool holds = hud_rules_.holds_hud(sc, by_ref);
+        std::snprintf(item, sizeof(item), "%s%08x: %u frames, differs on %.1f%%, stays on the screen %.2f, moves with the scenery %.2f (%u scored), "
+                      "holds %.0f%% of the confirmed HUD (%.0f%% of it beyond, %u frames compared)%s",
                       out.empty() ? "" : " | ", cand, sc.frames, sc.frames ? 100.0 * sc.area / sc.frames : 0.0,
-                      sc.same_max > 0 ? sc.same_min / sc.same_max : 0.0, sc.world_max > 0 ? sc.world_min / sc.world_max : 0.0, sc.scored);
+                      sc.same_max > 0 ? sc.same_min / sc.same_max : 0.0, sc.world_max > 0 ? sc.world_min / sc.world_max : 0.0, sc.scored,
+                      sc.hud_tiles > 0 ? 100.0 * sc.covered / sc.hud_tiles : 0.0, 100.0 * fw::hudlearn::Rules::tightness(sc), sc.ref_frames,
+                      holds ? "" : by_ref ? " - holds too little of it" : " - waiting for the detection");
         out += item;
     }
     return out;
@@ -11063,6 +11150,7 @@ IngestedSource Renderer::ingest(const Shared& shared, int slot, const std::funct
     // counts it: counted here too, each refresh before the swap rebuilt the continuous warp's picks and reaches - eight passes -
     // from the same depth)
     if (!split_) ++shown_serial_;
+    ++intake_seq_;  // (a game frame: its probe and its HUD detection paired by this - see drain_probes)
     back_valid_ = false;  // (the set written from here on no longer holds the frame before whole - see own_warp)
     IngestedSource out;
     const auto& m = shared.slots[slot];
@@ -11606,7 +11694,7 @@ void Renderer::release_stash() {
 }
 
 std::string Renderer::memory_report() {
-    static const char* const kNames[] = {"Backbuffer", "Hudless", "Ui", "Depth", "Motion", "ZeroUi", "Output", "Object", "ObjKindA", "ObjKindB", "Gen0", "Gen1", "Gen2", "GenZ0", "GenZ1", "GenZ2", "Previous", "HudScore", "Mask", "Scene", "Attached", "World", "Fill", "Mem0", "Mem1", "MemZ0", "MemZ1", "RampRows", "Ramp", "WarpMask", "HudKind", "StashColor", "StashDepth", "StashMotion", "StashHudless", "Stash2Color", "Stash2Hudless", "Stash2Depth", "Stash2Motion", "LumaA", "LumaB", "Feat", "FlowA", "FlowB", "RetCells", "RetEncl", "RetA", "RetB", "RetLayer", "HudLearned", "HudTiles", "WarpClaims", "Still", "GrowA", "GrowB", "Probe", "ProbeTilesA", "ProbeTilesB", "ShareA", "ShareB", "ShareT", "Share", "RetDirtyA", "RetDirtyB", "ShareT2", "ShareHalf", "RecColour", "RecUi", "ShareResid", "OwnMove", "Paths", "ShareSeam", "AttHist", "MemVis", "UiTiles", "WarpBeside", "WarpHeld", "LowScene", "MaskRaw", "MemF0", "MemF1", "MemFZ0", "MemFZ1", "GunMove", "MemRatio", "MotionProbe", "MotionGame", "Stencil", "StenCellsA", "StenCellsB", "StenMask", "StenGrowA", "StenGrowB", "StenAge", "StenLumaA", "StenLumaB", "StenElig", "StenFringeA", "StenFringeB", "DepthVA", "DepthVB", "MemMask", "ShareSm", "ShareSmA", "RecOut", "TetherA", "TetherB", "TetherT", "TetherF", "TetherP", "GunFlag", "OwnT", "ToPrev", "PrevCol", "PrevTo", "FitPart", "Fit", "TetherRA", "TetherRB", "OwnTiles", "TetherN", "TetherS"};
+    static const char* const kNames[] = {"Backbuffer", "Hudless", "Ui", "Depth", "Motion", "ZeroUi", "Output", "Object", "ObjKindA", "ObjKindB", "Gen0", "Gen1", "Gen2", "GenZ0", "GenZ1", "GenZ2", "Previous", "HudScore", "Mask", "Scene", "Attached", "World", "Fill", "Mem0", "Mem1", "MemZ0", "MemZ1", "RampRows", "Ramp", "WarpMask", "HudKind", "StashColor", "StashDepth", "StashMotion", "StashHudless", "Stash2Color", "Stash2Hudless", "Stash2Depth", "Stash2Motion", "LumaA", "LumaB", "Feat", "FlowA", "FlowB", "RetCells", "RetEncl", "RetA", "RetB", "RetLayer", "HudLearned", "HudTiles", "WarpClaims", "Still", "GrowA", "GrowB", "Probe", "ProbeTilesA", "ProbeTilesB", "ShareA", "ShareB", "ShareT", "Share", "RetDirtyA", "RetDirtyB", "ShareT2", "ShareHalf", "RecColour", "RecUi", "ShareResid", "OwnMove", "Paths", "ShareSeam", "AttHist", "MemVis", "UiTiles", "WarpBeside", "WarpHeld", "LowScene", "MaskRaw", "MemF0", "MemF1", "MemFZ0", "MemFZ1", "GunMove", "MemRatio", "MotionProbe", "MotionGame", "Stencil", "StenCellsA", "StenCellsB", "StenMask", "StenGrowA", "StenGrowB", "StenAge", "StenLumaA", "StenLumaB", "StenElig", "StenFringeA", "StenFringeB", "DepthVA", "DepthVB", "MemMask", "ShareSm", "ShareSmA", "RecOut", "TetherA", "TetherB", "TetherT", "TetherF", "TetherP", "GunFlag", "OwnT", "ToPrev", "PrevCol", "PrevTo", "FitPart", "Fit", "TetherRA", "TetherRB", "OwnTiles", "TetherN", "TetherS", "ProbeFoot"};
     static_assert(sizeof(kNames) / sizeof(kNames[0]) == kPCount, "a name for every private texture");
     struct Item { std::string name; double mb; };
     std::vector<Item> items;
@@ -11765,6 +11853,8 @@ bool Renderer::read_back(int which, std::vector<std::uint16_t>& pixels, std::uin
             float c[4] = {0, 0, 0, 1};
             if (desc.Format == DXGI_FORMAT_R32_FLOAT) std::memcpy(&c[0], &v, 4);
             else if (desc.Format == DXGI_FORMAT_R16_FLOAT) { out[std::size_t(x) * 4] = std::uint16_t(v); out[std::size_t(x) * 4 + 1] = 0; out[std::size_t(x) * 4 + 2] = 0; out[std::size_t(x) * 4 + 3] = 0x3C00; continue; }
+            // (R32_UINT - the HUD detection's kinds: the raw value, low half then high half, in the first two)
+            else if (desc.Format == DXGI_FORMAT_R32_UINT) { out[std::size_t(x) * 4] = std::uint16_t(v); out[std::size_t(x) * 4 + 1] = std::uint16_t(v >> 16); out[std::size_t(x) * 4 + 2] = 0; out[std::size_t(x) * 4 + 3] = 0; continue; }
             else if (desc.Format == DXGI_FORMAT_R8_UNORM) c[0] = float(v) / 255.0f;
             else if (desc.Format == DXGI_FORMAT_R16_UNORM) c[0] = float(v) / 65535.0f;
             else if (desc.Format == DXGI_FORMAT_R16G16_UNORM) { c[0] = float(v & 0xFFFFu) / 65535.0f; c[1] = float(v >> 16) / 65535.0f; }

@@ -2,6 +2,7 @@
 // Presenter-side D3D12: own device + high-priority queue on the game's adapter, a DirectComposition
 // swapchain on the overlay window, conversion of shared captures into typed private textures, and
 // the final blit. Latewarp evaluation is recorded between ingest() and present().
+#include "presenter/hud_learn_rules.hpp"
 #include "presenter/latewarp12.hpp"
 #include "shared/protocol.hpp"
 #include <d3d12.h>
@@ -12,11 +13,13 @@
 #include <array>
 #include <cmath>
 #include <map>
+#include <set>
 #include <string>
 #include <functional>
 #include <vector>
 #include <mutex>
 #include <atomic>
+#include <cstdio>
 #include <memory>
 
 namespace fw {
@@ -548,11 +551,15 @@ public:
     // HUD learning: this game frame's probe scored against the previous one of the same candidate (tiles of 16 px:
     // the same spot on the screen, and where the camera's motion brings the scenery from); the scores so far, per
     // candidate, for the log.
-    void score_hud_probe(const IngestedSource& src, const float clip_to_prev_clip[16]);
+    void score_hud_probe(const IngestedSource& src, const float clip_to_prev_clip[16], bool camera_cut);
     std::string hud_learn_report() const;
     // The pick of the candidates scored so far (0: none), and the learned point that stopped behaving like a HUD (0: none).
     std::uint32_t hud_learn_pick() const;
-    std::uint32_t hud_learn_fail() const { return probe_fail_; }
+    std::uint32_t hud_learn_fail() const { return hud_rules_.fail(); }
+    const fw::hudlearn::Rules& hud_learn_rules() const { return hud_rules_; }  // (pipeline test)
+    // The panel's Relearn: everything learned about the candidates starts over (scores, points set aside, the point in use).
+    void hud_learn_forget();
+    void set_probe_csv(std::FILE* f) { probe_csv_ = f; }  // (diagnostics: one row per probed game frame - see hud_learn_rules.hpp)
     // Keep a copy of the previous game frame's colour at each ingest (background for uncovered areas).
     void set_keep_previous_colour(bool on) { keep_previous_ = on; if (!on) previous_valid_ = false; }
     bool take_motion_fit(MotionFit& fit);
@@ -613,7 +620,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     };
-    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPHudLearned, kPHudTiles, kPWarpClaims, kPStill, kPGrowA, kPGrowB, kPProbe, kPProbeTilesA, kPProbeTilesB, kPShareA, kPShareB, kPShareT, kPShare, kPRetDirtyA, kPRetDirtyB, kPShareT2, kPShareHalf, kPRecColour, kPRecUi, kPShareResid, kPOwnMove, kPPaths, kPShareSeam, kPAttHist, kPMemVis, kPUiTiles, kPWarpBeside, kPWarpHeld, kPLowScene, kPMaskRaw, kPMemF0, kPMemF1, kPMemFZ0, kPMemFZ1, kPGunMove, kPMemRatio, kPMotionProbe, kPMotionGame, kPStencil, kPStenCellsA, kPStenCellsB, kPStenMask, kPStenGrowA, kPStenGrowB, kPStenAge, kPStenLumaA, kPStenLumaB, kPStenElig, kPStenFringeA, kPStenFringeB, kPDepthVA, kPDepthVB, kPMemMask, kPShareSm, kPShareSmA, kPRecOut, kPTetherA, kPTetherB, kPTetherT, kPTetherF, kPTetherP, kPGunFlag, kPOwnT, kPToPrev, kPPrevCol, kPPrevTo, kPFitPart, kPFit, kPTetherRA, kPTetherRB, kPOwnTiles, kPTetherN, kPTetherS, kPCount };
+    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPHudLearned, kPHudTiles, kPWarpClaims, kPStill, kPGrowA, kPGrowB, kPProbe, kPProbeTilesA, kPProbeTilesB, kPShareA, kPShareB, kPShareT, kPShare, kPRetDirtyA, kPRetDirtyB, kPShareT2, kPShareHalf, kPRecColour, kPRecUi, kPShareResid, kPOwnMove, kPPaths, kPShareSeam, kPAttHist, kPMemVis, kPUiTiles, kPWarpBeside, kPWarpHeld, kPLowScene, kPMaskRaw, kPMemF0, kPMemF1, kPMemFZ0, kPMemFZ1, kPGunMove, kPMemRatio, kPMotionProbe, kPMotionGame, kPStencil, kPStenCellsA, kPStenCellsB, kPStenMask, kPStenGrowA, kPStenGrowB, kPStenAge, kPStenLumaA, kPStenLumaB, kPStenElig, kPStenFringeA, kPStenFringeB, kPDepthVA, kPDepthVB, kPMemMask, kPShareSm, kPShareSmA, kPRecOut, kPTetherA, kPTetherB, kPTetherT, kPTetherF, kPTetherP, kPGunFlag, kPOwnT, kPToPrev, kPPrevCol, kPPrevTo, kPFitPart, kPFit, kPTetherRA, kPTetherRB, kPOwnTiles, kPTetherN, kPTetherS, kPProbeFoot, kPCount };
 
     bool create_pipelines(std::string& error);
     std::string shader_report_;
@@ -826,13 +833,26 @@ private:
     std::uint32_t probe_pending_cand_[kRing] = {}, probe_pending_tiles_[kRing] = {};
     std::uint32_t probe_prev_ = 0;  // the candidate of the probe the previous game frame brought (0: none)
     bool probe_flip_ = false;
-    struct ProbeScore { std::uint32_t frames = 0, scored = 0; double area = 0, same_min = 0, same_max = 0, world_min = 0, world_max = 0; };
-    std::map<std::uint32_t, ProbeScore> probe_scores_;
     bool probe_pending_locked_[kRing] = {};
-    // The learned point in use, checked: its recent scores (running averages), how many; failed: it is reported (see
-    // PresenterStatus::hud_learn_fail) and its scores so far dropped.
-    std::uint32_t probe_locked_ = 0, probe_fail_ = 0, probe_check_n_ = 0;
-    double probe_check_same_ = 1, probe_check_world_ = 0;
+    bool probe_pending_ref_[kRing] = {};  // (the detection's confirmed map compared - see cs_probe_score's flag 1)
+    bool probe_pending_cut_[kRing] = {};  // (a camera cut between the two frames)
+    // The pick, the point in use checked, points set aside: fed one frame at a time (hud_learn_rules.hpp).
+    fw::hudlearn::Rules hud_rules_;
+    std::uint32_t probe_foot_cand_ = 0;  // (the point whose usual tiles kPProbeFoot holds)
+    // The HUD map the detection itself learned, as build_no_warp_mask last left it - the probe's reference: 1 the combined
+    // detection's (kPHudLearned), 2 the plain learned detection's (kPHudScore: a game without the upscaler's output - EDF6),
+    // 0 none (the HUD map is the point's layer, a HUD-less picture's or the upscaler output's guess: never a reference).
+    int hud_ref_ = 0;
+    int probe_ref_kind_ = 0;  // (the reference the probes last compared with: a switch starts its size over - Rules::reference_reset)
+    // A probed frame and the HUD detection of the same game frame, paired by the game frame (intake_seq_), not by the ring
+    // slot: the two may be recorded in different command lists (split queues with the intake in pieces - "Fewer
+    // interruptions" off), each in a slot of its own, and then a probe was read with the next frame's verdict.
+    std::uint64_t intake_seq_ = 0;  // (game frames taken in - ingest)
+    std::uint64_t probe_pending_seq_[kRing] = {}, hud_pending_seq_[kRing] = {};
+    fw::hudlearn::Pairing probe_pairing_;
+    void drain_probes();  // (each waiting probe with its frame's verdict, to the rules and probe.csv)
+    std::FILE* probe_csv_ = nullptr;
+    std::uint64_t probe_csv_row_ = 0;
     ComPtr<ID3D12Resource> warp_list_, warp_args_, warp_list_old_;  // (see ensure_warp_list; the old one kept until the next resize)
     ComPtr<ID3D12CommandSignature> dispatch_sig_;
     ComPtr<ID3D12Resource> ret_args_;

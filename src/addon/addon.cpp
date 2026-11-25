@@ -21,6 +21,7 @@
 #include "addon/frame_cap.hpp"
 #include "shared/dev_keys.hpp"
 #include <d3d12.h>
+#include <d3dcompiler.h>
 #include <dxgi1_2.h>
 #include <shlobj.h>
 #include <exdisp.h>
@@ -814,7 +815,161 @@ bool on_tag_copy(command_list* cmd, resource, resource) {
 void on_execute_command_list(command_queue*, command_list* cmd) {
     if (g_producer && cmd) g_producer->on_execute(cmd->get_native());
 }
-void on_present(command_queue*, swapchain* chain, const rect*, const rect*, uint32_t, const rect*) {
+// (development prototype, dev/PLAN_queue_load_prototype.md - [FrameWarp] QueueLoadMs=2.0, Direct3D 12 games: a dummy compute load
+// on the game's own present queue at each present, calibrated by GPU time stamps to that many ms, toggled live with Ctrl+Shift+L.
+// The question: does work on the game's own queue cost the game only its own GPU time - no switch between processes, nothing
+// copied across? Test with reprojection off (the presenter paused). Never waits: a slot whose last use is not done is skipped.)
+namespace queue_load {
+using Microsoft::WRL::ComPtr;
+constexpr int kSlots = 3;
+constexpr char kShader[] = R"(
+RWTexture2D<float4> t : register(u0);
+[numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
+    float4 v = t[id.xy];
+    [unroll] for (int i = 0; i < 16; ++i) v = frac(v * 1.6180339 + float4(0.1, 0.2, 0.3, 0.4) + sin(v.wxyz));
+    t[id.xy] = v;
+})";
+struct State {
+    bool checked = false, wanted = false, failed = false, on = false, key_was_down = false;
+    double target_ms = 0;
+    ID3D12CommandQueue* queue = nullptr;
+    ComPtr<ID3D12Device> device;
+    ComPtr<ID3D12RootSignature> root;
+    ComPtr<ID3D12PipelineState> pso;
+    ComPtr<ID3D12Resource> tex, readback;
+    ComPtr<ID3D12DescriptorHeap> heap;
+    ComPtr<ID3D12QueryHeap> stamps;
+    ComPtr<ID3D12Fence> fence;
+    ComPtr<ID3D12CommandAllocator> alloc[kSlots];
+    ComPtr<ID3D12GraphicsCommandList> list;
+    std::uint64_t slot_value[kSlots] = {}, fence_value = 0;
+    bool slot_pending[kSlots] = {};
+    int slot = 0, passes = 8, logged = 0, skipped = 0;
+    double ms_sum = 0, freq = 1;
+} g;
+
+bool setup(ID3D12CommandQueue* queue) {
+    if (g.queue == queue) return !g.failed;
+    g = State{true, g.wanted, false, g.on, g.key_was_down, g.target_ms};
+    g.queue = queue;
+    g.failed = true;
+    if (FAILED(queue->GetDevice(IID_PPV_ARGS(&g.device)))) return false;
+    const D3D12_COMMAND_QUEUE_DESC qd = queue->GetDesc();
+    if (qd.Type != D3D12_COMMAND_LIST_TYPE_DIRECT && qd.Type != D3D12_COMMAND_LIST_TYPE_COMPUTE) return false;
+    UINT64 f = 0;
+    if (FAILED(queue->GetTimestampFrequency(&f)) || !f) return false;
+    g.freq = double(f);
+    ComPtr<ID3DBlob> code, errors;
+    if (FAILED(D3DCompile(kShader, sizeof(kShader) - 1, "queue_load", nullptr, nullptr, "main", "cs_5_0", 0, 0, &code, &errors))) return false;
+    D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0};
+    D3D12_ROOT_PARAMETER param{};
+    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    param.DescriptorTable = {1, &range};
+    D3D12_ROOT_SIGNATURE_DESC rsd{1, &param, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ComPtr<ID3DBlob> rs;
+    if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rs, &errors)) ||
+        FAILED(g.device->CreateRootSignature(0, rs->GetBufferPointer(), rs->GetBufferSize(), IID_PPV_ARGS(&g.root)))) return false;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = g.root.Get();
+    pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+    if (FAILED(g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso)))) return false;
+    D3D12_HEAP_PROPERTIES def{}; def.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC td{};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; td.Width = 3840; td.Height = 2160; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1; td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (FAILED(g.device->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&g.tex)))) return false;
+    D3D12_HEAP_PROPERTIES rb{}; rb.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = kSlots * 16; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(g.device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g.readback)))) return false;
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    if (FAILED(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g.heap)))) return false;
+    g.device->CreateUnorderedAccessView(g.tex.Get(), nullptr, nullptr, g.heap->GetCPUDescriptorHandleForHeapStart());
+    D3D12_QUERY_HEAP_DESC qh{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, kSlots * 2, 0};
+    if (FAILED(g.device->CreateQueryHeap(&qh, IID_PPV_ARGS(&g.stamps)))) return false;
+    if (FAILED(g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g.fence)))) return false;
+    for (auto& a : g.alloc) if (FAILED(g.device->CreateCommandAllocator(qd.Type, IID_PPV_ARGS(&a)))) return false;
+    if (FAILED(g.device->CreateCommandList(0, qd.Type, g.alloc[0].Get(), nullptr, IID_PPV_ARGS(&g.list)))) return false;
+    g.list->Close();
+    g.failed = false;
+    reshade::log::message(reshade::log::level::info, "XPAR queue load (prototype): ready on the game's present queue");
+    return true;
+}
+
+void on_present(command_queue* queue) {
+    if (!g.checked) {
+        g.checked = true;
+        char value[32] = {};
+        size_t size = sizeof(value);
+        if (reshade::get_config_value(nullptr, "FrameWarp", "QueueLoadMs", value, &size)) g.target_ms = std::atof(value);
+        g.wanted = g.target_ms > 0;
+        if (g.wanted) reshade::log::message(reshade::log::level::info, "XPAR queue load (prototype): key set - Ctrl+Shift+L turns it on and off");
+    }
+    if (!g.wanted || !queue || queue->get_device()->get_api() != device_api::d3d12) return;
+    const bool down = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000) && (GetAsyncKeyState('L') & 0x8000);
+    if (down && !g.key_was_down) {
+        g.on = !g.on;
+        char text[96];
+        std::snprintf(text, sizeof(text), "XPAR queue load (prototype): %s (target %.2f ms a present)", g.on ? "ON" : "OFF", g.target_ms);
+        reshade::log::message(reshade::log::level::info, text);
+    }
+    g.key_was_down = down;
+    if (!g.on) return;
+    auto* q = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
+    if (!setup(q)) return;
+    const int s = g.slot;
+    if (g.slot_pending[s]) {
+        if (g.fence->GetCompletedValue() < g.slot_value[s]) { ++g.skipped; return; }  // (never wait)
+        std::uint64_t* t = nullptr;
+        D3D12_RANGE r{SIZE_T(s) * 16, SIZE_T(s) * 16 + 16};
+        if (SUCCEEDED(g.readback->Map(0, &r, reinterpret_cast<void**>(&t)))) {
+            const std::uint64_t a = t[s * 2], b = t[s * 2 + 1];
+            D3D12_RANGE none{0, 0};
+            g.readback->Unmap(0, &none);
+            if (b > a) {
+                const double ms = double(b - a) * 1000.0 / g.freq;
+                g.ms_sum += ms;
+                // (passes follow the target: proportional, damped, 1..400)
+                const double want = g.passes * g.target_ms / std::max(ms, 0.01);
+                g.passes = std::clamp(int(std::lround(0.7 * g.passes + 0.3 * want)), 1, 400);
+                if (++g.logged >= 600) {
+                    char text[160];
+                    std::snprintf(text, sizeof(text), "XPAR queue load (prototype): target %.2f ms, measured %.2f ms a present on the game's queue, %d passes, %d presents skipped",
+                                  g.target_ms, g.ms_sum / g.logged, g.passes, g.skipped);
+                    reshade::log::message(reshade::log::level::info, text);
+                    g.logged = 0; g.ms_sum = 0; g.skipped = 0;
+                }
+            }
+        }
+        g.slot_pending[s] = false;
+    }
+    g.alloc[s]->Reset();
+    g.list->Reset(g.alloc[s].Get(), g.pso.Get());
+    ID3D12DescriptorHeap* heaps[] = {g.heap.Get()};
+    g.list->SetDescriptorHeaps(1, heaps);
+    g.list->SetComputeRootSignature(g.root.Get());
+    g.list->SetComputeRootDescriptorTable(0, g.heap->GetGPUDescriptorHandleForHeapStart());
+    g.list->EndQuery(g.stamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, s * 2);
+    D3D12_RESOURCE_BARRIER uav{}; uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; uav.UAV.pResource = g.tex.Get();
+    for (int i = 0; i < g.passes; ++i) {
+        g.list->Dispatch(3840 / 8, 2160 / 8, 1);
+        g.list->ResourceBarrier(1, &uav);
+    }
+    g.list->EndQuery(g.stamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, s * 2 + 1);
+    g.list->ResolveQueryData(g.stamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, s * 2, 2, g.readback.Get(), UINT64(s) * 16);
+    if (FAILED(g.list->Close())) return;
+    ID3D12CommandList* lists[] = {g.list.Get()};
+    q->ExecuteCommandLists(1, lists);
+    q->Signal(g.fence.Get(), ++g.fence_value);
+    g.slot_value[s] = g.fence_value;
+    g.slot_pending[s] = true;
+    g.slot = (s + 1) % kSlots;
+}
+}  // namespace queue_load
+
+void on_present(command_queue* queue, swapchain* chain, const rect*, const rect*, uint32_t, const rect*) {
+    queue_load::on_present(queue);
     // (a swap chain made after the followed one presents: it is the game's now - see g_waiting_chain)
     if (chain && chain == g_waiting_chain.load()) {
         fw::diag_log(reshade::log::level::info, "XPAR: the newer swap chain presents: followed from now on");

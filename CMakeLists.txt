@@ -113,6 +113,10 @@ if(BUILD_TESTING)
   add_executable(hook_tests tests/hook_tests.cpp src/common/inline_hook.cpp)
   target_link_libraries(hook_tests PRIVATE fw_options)
   add_test(NAME inline_hook COMMAND hook_tests)
+  add_executable(hud_learn_tests tests/hud_learn_tests.cpp)
+  target_link_libraries(hud_learn_tests PRIVATE fw_options)
+  target_include_directories(hud_learn_tests PRIVATE src)
+  add_test(NAME hud_learn COMMAND hud_learn_tests)
 
   # End-to-end on the real GPU: producer on one device, presenter renderer + Latewarp on another.
   add_executable(pipeline_tests tests/pipeline_tests.cpp src/addon/producer.cpp src/addon/vk_transport.cpp "${CMAKE_BINARY_DIR}/shaders.rc")
