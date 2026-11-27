@@ -154,45 +154,93 @@ inline CameraBasis apply_rotation(const CameraBasis& c, Vec3 world_up, double ya
 }
 
 // Raw mouse history (thread-safe: input thread appends, render thread queries).
+// Each event's move counts as spread evenly over the time since the event before it (a steady rate over that gap), not as
+// all at its own instant. Windows merges the mouse for raw-input listeners that are not in front (since Windows 11
+// KB5028185): XPAR's reader - the overlay, or the --mouse-for helper inside the game - gets ~125 messages a second, each the
+// sum of the moves since the last, stamped at the newest (measured: 8.0 ms apart in every installed game with a 1000 Hz
+// mouse; to-consolidate #13). Counted at their stamps, the moves come up to 8 ms late in steps, and the camera fit lands on
+// smoothing and a delay the game does not have. Nothing here assumes a polling rate: a report every 0.125 ms (8 kHz, in
+// front) spreads over its 0.125 ms. The gap is capped at 1.5x the usual gap between recent moves, so the first move after
+// the mouse rested starts just before itself, not back at the last move seconds ago.
+// Integral over [a, b] of rate * (1 - exp(-(t_end - t)/tau)) dt (tau <= 0: rate * (b - a)).
+inline double smoothed_rate_segment(double a, double b, double rate, double t_end, double tau) {
+    if (b <= a || rate == 0.0) return 0.0;
+    if (tau <= 0) return rate * (b - a);
+    return rate * ((b - a) - tau * (std::exp(-(t_end - b) / tau) - std::exp(-(t_end - a) / tau)));
+}
+// One event's part of the input in (t0, t1], smoothed by tau as of t_end: spread over [ts, t], or at t when ts == t.
+inline double mouse_event_part(double ts, double t, double v, double t0, double t1, double t_end, double tau) {
+    if (v == 0.0) return 0.0;
+    if (ts >= t) return t > t0 && t <= t1 ? (tau > 0 ? v * (1.0 - std::exp(-(t_end - t) / tau)) : v) : 0.0;
+    return smoothed_rate_segment(std::max(t0, ts), std::min(t1, t), v / (t - ts), t_end, tau);
+}
+
 class MouseHistory {
 public:
+    // (the cap: 1.5x the median of the last kGaps gaps under kMovingGap - the gaps while the mouse moves; until kMinGaps are
+    // known, events count at their stamps as before)
+    static constexpr int kGaps = 64, kMinGaps = 8;
+    static constexpr double kMovingGap = 0.05, kCapFactor = 1.5;
     void add(double t, long dx, long dy) {
         std::lock_guard lock(mutex_);
-        samples_.push_back({t, dx, dy});
+        double ts = t;
+        if (!samples_.empty() && t > samples_.back().t) {
+            const double gap = t - samples_.back().t;
+            if (gap < kMovingGap) {
+                gaps_[gap_n_ % kGaps] = gap;
+                ++gap_n_;
+            }
+            if (spread_ && gap_n_ >= kMinGaps) {
+                const int n = int(std::min<std::uint64_t>(gap_n_, kGaps));
+                double sorted[kGaps];
+                std::copy(gaps_, gaps_ + n, sorted);
+                std::nth_element(sorted, sorted + n / 2, sorted + n);
+                ts = t - std::min(gap, kCapFactor * sorted[n / 2]);
+            }
+        }
+        samples_.push_back({ts, t, dx, dy});
         while (samples_.size() > 2 && samples_.front().t < t - 60.0) samples_.pop_front();
     }
-    // Sum over events with t0 < t_i <= t1 of dc_i * (1 - exp(-(t_end - t_i)/tau)) (tau 0: plain sum).
+    // The input over (t0, t1], each part weighted by 1 - exp(-(t_end - t)/tau) (tau <= 0: the plain sum).
     double filtered(int axis, double t0, double t1, double t_end, double tau) const {
         std::lock_guard lock(mutex_);
         auto it = std::upper_bound(samples_.begin(), samples_.end(), t0, [](double v, const Sample& s) { return v < s.t; });
         double total = 0;
-        for (; it != samples_.end() && it->t <= t1; ++it) {
-            const double dc = axis ? double(it->dy) : double(it->dx);
-            total += tau > 0 ? dc * (1.0 - std::exp(-(t_end - it->t) / tau)) : dc;
-        }
+        for (; it != samples_.end() && it->ts <= t1; ++it)
+            total += mouse_event_part(it->ts, it->t, axis ? double(it->dy) : double(it->dx), t0, t1, t_end, tau);
         return total;
     }
     double counts(int axis, double t0, double t1) const { return filtered(axis, t0, t1, t1, 0.0); }
-    // Any movement with t0 < t_i <= t1.
+    // Any movement in (t0, t1].
     bool moved(double t0, double t1) const {
         std::lock_guard lock(mutex_);
         auto it = std::upper_bound(samples_.begin(), samples_.end(), t0, [](double v, const Sample& s) { return v < s.t; });
-        for (; it != samples_.end() && it->t <= t1; ++it) if (it->dx || it->dy) return true;
+        for (; it != samples_.end() && it->ts <= t1; ++it)
+            if ((it->dx || it->dy) && (it->ts < t1 || it->t <= t1)) return true;
         return false;
     }
-    void reset() { std::lock_guard lock(mutex_); samples_.clear(); }
-    // The events after `from`, for the fit (which works on its own copy, without the lock).
-    void copy_since(double from, std::vector<double>& t, std::vector<double>& dx, std::vector<double>& dy) const {
+    void reset() { std::lock_guard lock(mutex_); samples_.clear(); gap_n_ = 0; }
+    // (development: false counts every event at its stamp, as before the spread - replay.exe FW_NO_SPREAD=1, the pose tests)
+    void set_spread(bool on) { std::lock_guard lock(mutex_); spread_ = on; }
+    // The events after `from`, for the fit (which works on its own copy, without the lock): each one's spread start ts and
+    // its own time t.
+    void copy_since(double from, std::vector<double>& ts, std::vector<double>& t, std::vector<double>& dx,
+                    std::vector<double>& dy) const {
         std::lock_guard lock(mutex_);
         auto it = std::upper_bound(samples_.begin(), samples_.end(), from, [](double v, const Sample& s) { return v < s.t; });
         if (it != samples_.begin()) --it;  // (one before: the windows start after `from`)
-        for (; it != samples_.end(); ++it) { t.push_back(it->t); dx.push_back(double(it->dx)); dy.push_back(double(it->dy)); }
+        for (; it != samples_.end(); ++it) {
+            ts.push_back(it->ts); t.push_back(it->t); dx.push_back(double(it->dx)); dy.push_back(double(it->dy));
+        }
     }
 
 private:
-    struct Sample { double t; long dx, dy; };
+    struct Sample { double ts, t; long dx, dy; };
     mutable std::mutex mutex_;
     std::deque<Sample> samples_;
+    double gaps_[kGaps]{};
+    std::uint64_t gap_n_ = 0;
+    bool spread_ = true;
 };
 
 // Controller right stick history (thread-safe: the controller thread appends, the render thread queries). A
@@ -367,8 +415,15 @@ struct AxisParams {
 };
 
 // Camera-only motion over h seconds from angular velocity w under first-order smoothing.
+// tau 0: the previous turn carried on, w * h, with the input on top unsmoothed - its own model, kept as it always was: smoothed
+// real cameras fit it best at times (E33, DOOM, RE2 replays: 5-160% worse turn error without it).
+// kNoSmoothing: no smoothing - the camera moves by the input alone, nothing of its own (the formula's limit as tau goes to 0).
+// Before it, a camera with no smoothing could not be fitted as one: the fit took 30 ms of smoothing and 30 ms of delay instead
+// (the XPAR test game) and the modes that show the camera ahead barely moved it (to-consolidate #13, dev/PLAN_camera_fit.md).
+// (Every input sum takes tau <= 0 as a plain sum: no smoothing on the input either way)
+constexpr double kNoSmoothing = -1.0;
 inline double velocity_term(double tau, double w, double h) {
-    return tau > 0 ? tau * w * (1.0 - std::exp(-h / tau)) : w * h;
+    return tau > 0 ? tau * w * (1.0 - std::exp(-h / tau)) : tau == 0 ? w * h : 0.0;
 }
 
 struct PoseSettings {
@@ -562,6 +617,17 @@ public:
         src_.theta[0] = f.theta[0]; src_.theta[1] = f.theta[1];
         src_.w[0] = src_.w[1] = 0;
         src_.dt = 0;
+        // (frames the presenter did not take in between - every other one, at times: the game's frame interval measured across
+        // them too, the span divided by the game frames it holds. Measured only between frames taken in a row, it stayed 0 with
+        // every other one missing, and nothing was held back: the newest position shown up to 1.6 refreshes early - pose_tests)
+        if (!f.consecutive && f.continuous && frames_.size() >= 2) {
+            const Frame& a = frames_[frames_.size() - 2];
+            intervals_.push_back((t - a.t) / double(id - a.id));
+            if (intervals_.size() > 15) intervals_.pop_front();
+            std::vector<double> sorted(intervals_.begin(), intervals_.end());
+            std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
+            frame_interval_ = sorted[sorted.size() / 2];
+        }
         if (f.consecutive && frames_.size() >= 2) {
             const Frame& a = frames_[frames_.size() - 2];
             src_.dt = t - a.t;
@@ -976,7 +1042,7 @@ private:
     struct FitFrame { double t; double theta[2]; bool gate, consecutive; };
     struct FitJob {
         std::vector<FitFrame> frames;
-        std::vector<double> mouse_t, mouse_v[2], stick_t, stick_v[2];
+        std::vector<double> mouse_ts, mouse_t, mouse_v[2], stick_t, stick_v[2];
         AxisParams params[2];
         std::uint64_t generation = 0;
     };
@@ -984,7 +1050,7 @@ private:
         job.frames.reserve(frames_.size());
         for (const Frame& f : frames_) job.frames.push_back({f.t, {f.theta[0], f.theta[1]}, f.gate, f.consecutive});
         const double from = frames_.empty() ? 0.0 : frames_.front().t - 0.05;  // (the delay grid reaches 10 ms before)
-        mouse.copy_since(from, job.mouse_t, job.mouse_v[0], job.mouse_v[1]);
+        mouse.copy_since(from, job.mouse_ts, job.mouse_t, job.mouse_v[0], job.mouse_v[1]);
         stick.copy_since(from, job.stick_t, job.stick_v[0], job.stick_v[1]);
         job.params[0] = params_[0]; job.params[1] = params_[1];
         job.generation = generation_;
@@ -993,18 +1059,18 @@ private:
     // Forward cursors over the copied input: the fit's windows only move forward through the frames (a window
     // starting earlier than the last one - a cut in the history - looks the start up again).
     struct MouseCursor {
+        const std::vector<double>& ts;
         const std::vector<double>& t;
         const std::vector<double>& v;
         std::size_t i = 0;
         double last_t0 = -1e300;
-        // Sum over events with t0 < t_i <= t1 of v_i * (1 - exp(-(t_end - t_i)/tau)): MouseHistory::filtered.
+        // The input over (t0, t1], smoothed by tau as of t_end: MouseHistory::filtered.
         double sum(double t0, double t1, double t_end, double tau) {
             if (t0 < last_t0) i = 0;
             last_t0 = t0;
             while (i < t.size() && t[i] <= t0) ++i;
             double total = 0;
-            for (std::size_t j = i; j < t.size() && t[j] <= t1; ++j)
-                total += tau > 0 ? v[j] * (1.0 - std::exp(-(t_end - t[j]) / tau)) : v[j];
+            for (std::size_t j = i; j < t.size() && ts[j] <= t1; ++j) total += mouse_event_part(ts[j], t[j], v[j], t0, t1, t_end, tau);
             return total;
         }
     };
@@ -1031,9 +1097,18 @@ private:
     // The fit: tau and delay on a grid, the gains by least squares; with stick input in the history, the
     // mouse and stick gains together and the stick's response curve on the grid too. Without stick input it
     // is exactly the mouse-only fit it always was.
+public:
+    // (the gate below; development: replay.exe FW_NS_GATE)
+    inline static double no_smoothing_gate = 0.5;
+private:
     static void fit_params(FitJob& job) {
-        static constexpr double kTaus[] = {0.0, 0.03, 0.05, 0.07, 0.09, 0.12, 0.15, 0.2, 0.3};
-        static constexpr double kDelays[] = {-0.01, 0.0, 0.01, 0.02, 0.03};
+        // (kNoSmoothing last: on a tie the earlier entries win, as before it was there)
+        static constexpr double kTaus[] = {0.0, 0.03, 0.05, 0.07, 0.09, 0.12, 0.15, 0.2, 0.3, kNoSmoothing};
+        // (the delay counts from the frame's time stamp - the game's constants time, paced - not its present: a game that reads
+        // the mouse before it stamps the frame fits a negative one. DOOM Eternal reads it ~20 ms before: with the grid's bottom
+        // at -10 ms the fit took 30 ms of smoothing and twice the gain instead (2026-11-27, to-consolidate #13). Down to -100 ms
+        // a wide grid found wrong fits that happen to line up - DOOM's yaw gain -9.9 at -80 ms with 300 ms smoothing)
+        static constexpr double kDelays[] = {-0.05, -0.04, -0.03, -0.02, -0.01, 0.0, 0.01, 0.02, 0.03};
         static constexpr double kPowers[] = {1.0, 2.0, 3.0};
         auto& frames = job.frames;
         // Half-second stretches where the camera clearly did not follow the mouse are left out: the model as it
@@ -1044,7 +1119,7 @@ private:
         // (Nothing to judge with before a gain is learned.)
         const double g0 = job.params[0].fitted ? job.params[0].gain : 0.0, g1 = job.params[1].fitted ? job.params[1].gain : 0.0;
         if ((g0 != 0.0 || g1 != 0.0) && !frames.empty()) {
-            MouseCursor m0{job.mouse_t, job.mouse_v[0]}, m1{job.mouse_t, job.mouse_v[1]};
+            MouseCursor m0{job.mouse_ts, job.mouse_t, job.mouse_v[0]}, m1{job.mouse_ts, job.mouse_t, job.mouse_v[1]};
             std::size_t s = 0;
             while (s < frames.size()) {
                 std::size_t e = s;
@@ -1066,7 +1141,7 @@ private:
         // the most mouse movement), not the model's gain: a gain learned too small took every real turn for one of these and
         // could never grow again. (Four times, a quarter degree: stopgaps, as the rule above.)
         if (!frames.empty()) {
-            MouseCursor m0{job.mouse_t, job.mouse_v[0]}, m1{job.mouse_t, job.mouse_v[1]};
+            MouseCursor m0{job.mouse_ts, job.mouse_t, job.mouse_v[0]}, m1{job.mouse_ts, job.mouse_t, job.mouse_v[1]};
             struct Stretch { std::size_t s, e; double counts, turned; bool stick; };
             // (the right stick moved during the stretch or held from before it - the no-input rule's test: a turn the stick explains is
             // no camera of the game's own, and judged by the mouse alone every stick turn was one)
@@ -1151,6 +1226,7 @@ private:
             }
             double best_rms = 1e30, best_tau = out.tau, best_delay = out.delay, best_gain = 0, hold_rms = 0;
             double best_stick = out.stick_gain, best_power = out.stick_power;
+            struct { double rms = 1e30, delay = 0, gain = 0, hold = 0, stick = 0, power = 1; } ns;  // (the best fit with no smoothing)
             bool informative = false;        // enough mouse movement in the history to judge a gain
             bool stick_informative = false;  // ... stick movement
             for (double tau : kTaus)
@@ -1158,7 +1234,7 @@ private:
                     for (int pi = 0; pi < 3; ++pi) {
                         const double power = kPowers[pi];
                         if (pi > 0 && !stick_used) break;  // (no stick input: the curve does not matter)
-                        MouseCursor mc{job.mouse_t, job.mouse_v[k]};
+                        MouseCursor mc{job.mouse_ts, job.mouse_t, job.mouse_v[k]};
                         StickCursor sc{job.stick_t, curved[pi]};
                         // (enough stick movement to trust a gain: judged on the deflection itself, the same for every curve. Through
                         // the curve tried, a stick held about half way - 0.5, squared 0.25 - fell under it for the squared and cubed
@@ -1205,11 +1281,22 @@ private:
                             sse = syy - 2 * g * suy - 2 * gs * svy + g * g * suu + gs * gs * svv + 2 * g * gs * suv;
                         }
                         const double rms = std::sqrt(std::max(0.0, sse) / n);
-                        if (rms < best_rms) {
+                        if (tau == kNoSmoothing) {  // (judged apart: see below)
+                            if (rms < ns.rms) { ns.rms = rms; ns.delay = d; ns.gain = g; ns.hold = std::sqrt(hold / n); ns.stick = gs; ns.power = power; }
+                        } else if (rms < best_rms) {
                             best_rms = rms; best_tau = tau; best_delay = d; best_gain = g; hold_rms = std::sqrt(hold / n);
                             if (stick_used) { best_stick = gs; best_power = power; }
                         }
                     }
+            // No smoothing taken only when it explains the camera clearly better than every smoothed model: under 0.5x the best
+            // one's error (a stopgap). The XPAR test game's camera, which has none: 0.29x offline. Taken whenever it fits best,
+            // the installed games' sessions (replay.exe on their FrameWarp\logs, 2026-11-25/26) traded: Cyberpunk's pitch error
+            // -48%, DOOM's yaw -7%, but AC6's yaw +20%, DOOM's pitch +15% - their fits then sat on the delay grid's lowest step.
+            // At 0.5x all eight come out as before (to-consolidate #13)
+            if (ns.rms < no_smoothing_gate * best_rms) {
+                best_rms = ns.rms; best_tau = kNoSmoothing; best_delay = ns.delay; best_gain = ns.gain; hold_rms = ns.hold;
+                if (stick_used) { best_stick = ns.stick; best_power = ns.power; }
+            }
             // Too little movement lately (standing still, menus, the ReShade menu open): keep what was learned
             // instead of dropping to no mouse at all until the next movement is learned again. Each input keeps
             // its own gain while only the other one moves (switching between mouse and controller).

@@ -377,6 +377,8 @@ private:
 public:
     std::uint32_t hud_given() const { return hud_given_; }
     bool game_gives_hud() const { return game_hud_frames_ >= 60; }  // (HUD learning paused, see begin_present)
+    // Relearn: what the producer learned of the game's HUD forgotten (ui_layer::forget's part here: the layer's share lately)
+    void forget_hud() { std::lock_guard lock(mutex_); ui_layer_share_ = 1.0; ui_pending_valid_ = false; hudless_age_ = 2; }
 private:
     // ...handed over as its coverage only (alpha, 8-bit, one channel - made at the present on ReShade's list): a few MB a
     // frame whatever the game's format, and the frames' textures never change when a menu brings a layer of another one.

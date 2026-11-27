@@ -213,7 +213,10 @@ std::uint32_t before_evaluate(NgxStats* s, const NVSDK_NGX_Handle* handle, const
         const bool inputs = shared && s->dlss_calls > 60 &&
                             params->Get(NVSDK_NGX_Parameter_Depth, &depth) == NVSDK_NGX_Result_Success && depth &&
                             params->Get(NVSDK_NGX_Parameter_MotionVectors, &motion) == NVSDK_NGX_Result_Success && motion;
-        const bool no_camera = shared && (shared->hooks.constants_calls == 0 || g_producer->game_camera_unusable());
+        // (also a Streamline game whose constants carry no camera and whose depth does not reach the Streamline hooks - they publish
+        // such a frame themselves when it does)
+        const bool no_camera = shared && (shared->hooks.constants_calls == 0 || g_producer->game_camera_unusable() ||
+                                          (streamline_no_camera_recent() && !streamline_depth_recent()));
         // A game that sends its Streamline camera but whose depth and motion vectors do not reach the
         // Streamline hooks (none for a second while DLSS runs): they are taken here, for the frame being
         // rendered, with the game's own camera - as the FSR hook does.

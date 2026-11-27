@@ -111,7 +111,7 @@ struct Game {
     // Advances 1 ms: mouse event, camera integration, maybe a rendered frame.
     void step(long dx, long dy) {
         t += 0.001;
-        if (dx || dy) model->mouse.add(t, dx, dy);
+        mouse_out(dx, dy);
         if (!menu) { target[0] += gain_x * dx; target[1] += gain_y * dy; }
         target[0] += stick_gain_x * StickHistory::curve(sx, stick_power) * 0.001;
         target[0] += self_turn * 0.001;
@@ -134,6 +134,30 @@ struct Game {
             in_flight.erase(in_flight.begin());
             last_sim = f.t;
             if (feed_model) { model->add_source(++frame, f.t, t, camera_at(f.yaw, f.pitch), false, t); fed.push_back(f); }
+        }
+    }
+    // How the mouse reaches the model: every ms (default); reports_per_ms reports inside each ms (an 8 kHz mouse: 8);
+    // batch: merged the way Windows hands the mouse to a raw-input listener not in front - one event every 7-9 ms, the sum
+    // of the moves since the last, stamped at the newest.
+    int reports_per_ms = 1;
+    bool batch = false;
+    long batch_dx = 0, batch_dy = 0;
+    double batch_newest = 0, batch_due = 0;
+    int batch_i = 0;
+    void mouse_out(long dx, long dy) {
+        for (int j = 0; j < reports_per_ms; ++j) {
+            const long px = dx / reports_per_ms + (j < std::labs(dx) % reports_per_ms ? (dx > 0 ? 1 : -1) : 0);
+            const long py = dy / reports_per_ms + (j < std::labs(dy) % reports_per_ms ? (dy > 0 ? 1 : -1) : 0);
+            const double tj = t - 0.001 * double(reports_per_ms - 1 - j) / reports_per_ms;
+            if (!px && !py) continue;
+            if (!batch) { model->mouse.add(tj, px, py); continue; }
+            batch_dx += px; batch_dy += py; batch_newest = tj;
+        }
+        if (batch && t >= batch_due) {
+            if (batch_dx || batch_dy) model->mouse.add(batch_newest + 0.00004, batch_dx, batch_dy);
+            batch_dx = batch_dy = 0;
+            static constexpr double kGaps[] = {0.008, 0.007, 0.009, 0.008, 0.008, 0.0075, 0.0085};
+            batch_due = t + kGaps[batch_i++ % 7] - 1e-9;
         }
     }
     std::vector<Out> in_flight;
@@ -582,7 +606,7 @@ static void worker_fit_matches() {
 // newer frame's position a whole step early - ahead of that, while the older picture was still shown. Behind it (waiting
 // for the next frame over the gap) is allowed: a frame the presenter never took cannot be shown.
 static void position_across_skipped_frames() {
-    for (const int drop_every : {0, 3}) {  // (every other frame missing: no frame interval is measured, nothing held back - open, dev/TODO.md)
+    for (const int drop_every : {0, 3, 2}) {  // (2: every other frame missing - no two frames in a row)
         PoseModel model;
         const double fps = 60.0, speed = 120.0, latency = 0.030;  // (units a second, backwards along the view)
         auto camera_then = [&](double t) { CameraBasis c = camera_at(0, 0); c.pos = c.fwd * (-speed * t); return c; };
@@ -612,6 +636,54 @@ static void position_across_skipped_frames() {
     }
 }
 
+// A camera with no smoothing and no delay (the XPAR test game): fitted as one (kNoSmoothing). Without that entry the grid's
+// tau 0 is the previous turn carried on with the mouse on top, and this fitted 30 ms of smoothing and 30 ms of delay, gain
+// 3-9% high (to-consolidate #13, dev/PLAN_camera_fit.md).
+// case: 0 every ms (in front), 1 merged into ~8 ms batches (Windows, a listener not in front - XPAR's), 2 an 8 kHz mouse
+// in front, 3 an 8 kHz mouse merged, 4 every ms with the game reading its input 20 ms before it stamps the frame (DOOM
+// Eternal: fits a -20 ms delay); spread false: every event counted at its stamp (before the spread - printed, not checked)
+static void fit_unsmoothed_camera(int input_case = 0, bool spread = true) {
+    const double kPi = 3.14159265358979;
+    auto sn = [&](double t, double period) { return std::sin(2 * kPi * t / period); };
+    static const char* kCase[] = {"every ms", "8 ms batches", "8 kHz", "8 kHz in 8 ms batches", "input read 20 ms before the frame"};
+    for (int path = 0; path < 3; ++path) {
+        PoseModel model;
+        model.mouse.set_spread(spread);
+        // (batched: the spread is checked here, not the no-smoothing gate - with the batches the no-smoothing fit does not get
+        // under the gate's 0.5x of the best smoothed one's error; the gate stays as the installed games' replays judged it)
+        const double gate = PoseModel::no_smoothing_gate;
+        if (input_case == 1 || input_case == 3) PoseModel::no_smoothing_gate = 1.0;
+        Game g; g.model = &model;
+        g.batch = input_case == 1 || input_case == 3;
+        g.reports_per_ms = input_case >= 2 ? 8 : 1;
+        g.tau = 1e-6; g.delay = input_case == 4 ? 0.02 : 0.0; g.fps = 41.1; g.latency = 0.02; g.gain_x = 0.0005; g.gain_y = 0.0005;
+        double sent[2] = {0, 0};
+        for (int i = 0; i < 20000; ++i) {
+            const double t = g.t + 0.001;
+            // (the test game's turn, aim and strafe paths - dev/testgame/scene.hpp - the mouse sent every ms as it does)
+            const double yaw = path == 0 ? 0.9 * sn(t, 2.0) + 0.21 * sn(t, 0.9) : path == 1 ? 0.45 * sn(t, 1.8) + 0.12 * sn(t, 0.6) : 0.6 * sn(t, 2.2);
+            const double pitch = path == 0 ? 0.05 * sn(t, 1.3) : path == 1 ? 0.04 * sn(t, 1.2) : 0.04 * sn(t, 1.1);
+            const long dx = std::lround((yaw - sent[0]) / g.gain_x), dy = std::lround((pitch - sent[1]) / g.gain_y);
+            sent[0] += dx * g.gain_x; sent[1] += dy * g.gain_y;
+            g.step(dx, dy);
+        }
+        model.fit();
+        PoseModel::no_smoothing_gate = gate;
+        const auto& x = model.params(0);
+        if (!spread) {
+            std::printf("  (without the spread, %s, path %d: tau %.0f ms, delay %.0f ms, gain %+.1f%%, quality %.3f)\n", kCase[input_case],
+                        path, x.tau * 1000, x.delay * 1000, (x.gain / g.gain_x - 1.0) * 100, x.quality);
+            continue;
+        }
+        const double gain_margin = input_case == 0 || input_case == 2 ? 0.01 : 0.02;
+        const double want_delay = input_case == 4 ? -0.02 : 0.0;
+        EXPECT(x.fitted && x.tau == kNoSmoothing && std::fabs(x.delay - want_delay) < 1e-9, "%s, path %d: no smoothing, the delay fitted (tau %.0f ms, delay %.0f ms)", kCase[input_case], path, x.tau * 1000, x.delay * 1000);
+        EXPECT(std::fabs(x.gain / g.gain_x - 1.0) < gain_margin, "%s, path %d: yaw gain %g (true %g)", kCase[input_case], path, x.gain, g.gain_x);
+        // (batched: the moves inside each batch are spread evenly, not where they were - the rest of the error)
+        EXPECT(x.quality > (gain_margin > 0.01 ? 0.97 : 0.98), "%s, path %d: yaw quality %.3f", kCase[input_case], path, x.quality);
+    }
+}
+
 int main() {
     position_across_skipped_frames();
     frame_clock_tests();
@@ -619,6 +691,8 @@ int main() {
     rotation_conventions();
     right_handed_projection();
     fit_recovers_smoothed_camera();
+    for (int c = 0; c < 5; ++c) fit_unsmoothed_camera(c);
+    fit_unsmoothed_camera(1, false);
     prediction_is_accurate_and_continuous();
     input_turn_matches_camera();
     driving_keeps_gain();

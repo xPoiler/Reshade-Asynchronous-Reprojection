@@ -8,6 +8,7 @@
 #include "presenter/renderer.hpp"
 #include "presenter/output_effects.hpp"
 #include "shared/camera_check.hpp"
+#include "shared/test_bench.hpp"
 #include <shellapi.h>
 #include <compressapi.h>
 #include <winternl.h>  // NTSTATUS for d3dkmthk.h
@@ -116,6 +117,106 @@ App& g_app = *new App;
 // (XPRESS saved 17%), to %LOCALAPPDATA%\FrameWarp\recordings\<game exe>\seq_N. A clip ends when the key is pressed
 // again, after kRecMaxSeconds, or when kRecMaxBytes are held (~27 MB a frame: ~4 s at 50 fps).
 void logf(const char* format, ...);
+
+// Development (dev key TestBench=1 -> FW_TESTBENCH; src/shared/test_bench.hpp, dev/testgame): every refresh handed to the XPAR
+// test game's scorer - the picture presented (a copy of the back buffer into a ring of shared textures, made in finish_frame) and
+// what it was drawn from. Off: nothing of it runs.
+struct BenchDoor {
+    bool on = false;
+    HANDLE mapping = nullptr;
+    bench::Header* h = nullptr;
+    Microsoft::WRL::ComPtr<ID3D12Resource> tex[bench::kSlots];
+    HANDLE tex_handle[bench::kSlots]{};
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    HANDLE fence_handle = nullptr;
+    UINT64 value = 0;
+    std::uint32_t w = 0, hgt = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    ID3D12Device* device = nullptr;
+    int next_slot = 0;
+    std::int64_t written = 0;
+    struct FrameQpc { std::uint64_t frame; std::int64_t qpc; };
+    FrameQpc frames[64]{};
+    int frame_pos = 0;
+
+    void note_frame(std::uint64_t frame, std::int64_t qpc_present) {
+        if (!on) return;
+        frames[frame_pos] = {frame, qpc_present};
+        frame_pos = (frame_pos + 1) % 64;
+    }
+    std::int64_t frame_qpc(std::uint64_t frame) const {
+        for (const auto& f : frames) if (f.frame == frame && f.qpc) return f.qpc;
+        return 0;
+    }
+    bool ensure(DWORD pid, Renderer& r) {
+        if (!h) {
+            const std::wstring name = L"Local\\XPAR_Bench_" + std::to_wstring(pid);
+            mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(bench::Header), name.c_str());
+            if (!mapping) { on = false; return false; }
+            h = static_cast<bench::Header*>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(bench::Header)));
+            if (!h) { on = false; return false; }
+            std::memset(h, 0, sizeof(bench::Header));
+            h->magic = bench::kMagic; h->version = bench::kVersion;
+            logf("test bench: refreshes handed to the test game's scorer (%ls)", name.c_str());
+        }
+        if (!r.device() || !r.width() || !r.height()) return false;
+        const DXGI_FORMAT f = r.swap_format();
+        if (tex[0] && r.width() == w && r.height() == hgt && f == format && r.device() == device) return true;
+        device = r.device(); w = r.width(); hgt = r.height(); format = f;
+        for (int i = 0; i < bench::kSlots; ++i) {
+            tex[i].Reset();
+            if (tex_handle[i]) { CloseHandle(tex_handle[i]); tex_handle[i] = nullptr; }
+            D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+            D3D12_RESOURCE_DESC d{};
+            d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; d.Width = w; d.Height = hgt; d.DepthOrArraySize = 1; d.MipLevels = 1;
+            d.Format = f; d.SampleDesc.Count = 1;
+            if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&tex[i]))) ||
+                FAILED(device->CreateSharedHandle(tex[i].Get(), nullptr, GENERIC_ALL,
+                                                  (L"Local\\XPAR_Bench_" + std::to_wstring(pid) + L"_tex" + std::to_wstring(i)).c_str(), &tex_handle[i]))) {
+                logf("test bench: shared texture %d failed", i);
+                tex[0].Reset();
+                return false;
+            }
+        }
+        if (!fence) {
+            if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fence))) ||
+                FAILED(device->CreateSharedHandle(fence.Get(), nullptr, GENERIC_ALL, (L"Local\\XPAR_Bench_" + std::to_wstring(pid) + L"_fence").c_str(), &fence_handle))) {
+                logf("test bench: shared fence failed");
+                tex[0].Reset();
+                return false;
+            }
+        }
+        for (auto& b : h->slot_busy) b = 0;
+        h->width = w; h->height = hgt; h->format = std::uint32_t(f);
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&h->generation));
+        logf("test bench: %ux%u, format %u", w, hgt, unsigned(f));
+        return true;
+    }
+    // A free slot for this refresh's picture, the renderer's copy armed (-1: none free - the scorer is behind or not there).
+    int arm(DWORD pid, Renderer& r) {
+        if (!on || !ensure(pid, r)) return -1;
+        for (int k = 0; k < bench::kSlots; ++k) {
+            const int s = (next_slot + k) % bench::kSlots;
+            if (h->slot_busy[s] == 0) {
+                h->slot_busy[s] = 1;
+                next_slot = (s + 1) % bench::kSlots;
+                r.set_bench_copy(tex[s].Get(), fence.Get(), ++value);
+                return s;
+            }
+        }
+        return -1;
+    }
+    void publish(bench::Refresh e) {
+        if (!on || !h) return;
+        ++written;
+        e.serial = std::uint64_t(written);
+        h->ring[(written - 1) % bench::kRing] = e;
+        MemoryBarrier();
+        h->written = written;
+    }
+};
+BenchDoor g_bench;
+std::atomic<bool> g_bench_input_owned{false};  // (TestBench: the test game's script drives the mouse - bench_input_thread)
 struct SequenceRecorder {
     static constexpr double kRecMaxSeconds = 10.0;
     static constexpr std::size_t kRecMaxBytes = std::size_t(6) << 30;
@@ -719,6 +820,14 @@ std::string feature_names(std::uint32_t off) {
     return out;
 }
 void apply_feature_test(Settings& s, Renderer& renderer) {
+    // (development, FW_DEV_OFF=<DevFeature bits>: categories off from the start without the panel - the test game's batches)
+    static const std::uint32_t env_off = [] {
+        wchar_t b[32]{};
+        const std::uint32_t v = GetEnvironmentVariableW(L"FW_DEV_OFF", b, 32) ? std::uint32_t(_wtoi(b)) : 0u;
+        if (v) logf("Feature test from FW_DEV_OFF: categories %u off (development)", v);
+        return v;
+    }();
+    s.dev_features_off |= env_off;
     const std::uint32_t off = s.dev_features_off & 4095u;
     if (off & kDevCarried) { s.keep_attached = 0; s.follow_share = 0; s.hold_characters = 0; s.hold_reticles = 0; }
     if (off & kDevHud) { s.no_warp_mask = 0; s.use_ui_tags = 0; s.game_hud_layers = 0; s.hud_learn = 0; s.hud_fill = 0; }
@@ -1093,9 +1202,17 @@ void render_thread() {
         g_flow_light_env = env_on(L"FW_FLOW_LIGHT");
         renderer.set_flow_light(g_flow_light_env);
         if (g_flow_light_env) logf("XPAR's own motion estimate with fewer refinements (development: FlowLight)");
+        if (env_on(L"FW_LAYER_MOTION")) { renderer.set_layer_check_motion(true); logf("the game's HUD layer checked by the scenery's motion where there is no upscaler output (development: LayerCheckMotion)"); }
+        {   // (CameraScenery, on unless =0 - FW_CAMERA_SCENERY)
+            wchar_t v[4]{};
+            const bool off = GetEnvironmentVariableW(L"FW_CAMERA_SCENERY", v, 4) && v[0] == L'0';
+            renderer.set_camera_scenery(!off);
+            if (off) logf("with XPAR's own motion estimate, the scenery's motion not from the camera found (development: CameraScenery=0)");
+        }
         if (env_on(L"FW_CARRIED_FREE")) { renderer.set_carried_free(true); logf("carried pixels not held by the warp (development: CarriedFree)"); }
         if (env_on(L"FW_MEM_POS")) { renderer.set_mem_pos(true); logf("the background memory carried with its own positions (development: MemoryPositions)"); }
         if (env_on(L"FW_ATT_ABS")) { renderer.set_att_absolute(true); logf("the attached rule by the share a spot takes (development: AttachedAbsolute)"); }
+        if (env_on(L"FW_TESTBENCH")) { g_bench.on = true; logf("test bench on: every refresh handed to the XPAR test game's scorer (development: TestBench)"); }
         if (env_on(L"FW_ALWAYS_WARP")) { g_always_warp = true; logf("every refresh warped and presented, also with nothing moved and with the ReShade overlay open (development: AlwaysWarp)"); }
         if (env_on(L"FW_DITHER_NO_BAND")) { renderer.set_edge_dither_band(false); logf("dithered screen edges without their band inside the picture (development: EdgeDitherNoBand)"); }
         if (env_on(L"FW_DITHER_HOLES")) { renderer.set_dither_holes(true); logf("what no frame has dithered (development: DitherHoles)"); }
@@ -1785,6 +1902,7 @@ void render_thread() {
                 if (!m.qpc_sim_start && (s.motion_estimated || cam.estimated)) source_time = frame_clock.next(m.frame_id, presented);
                 else { source_time = presented; frame_clock.reset(); }
                 source_frame = m.frame_id;
+                g_bench.note_frame(m.frame_id, m.qpc_present);
                 frame_times.emplace_back(m.frame_id, source_time);
                 if (frame_times.size() > 8) frame_times.pop_front();
                 g_app.model.set_camera_trusted((!cam.estimated || estimate_trusted) && !overlay_frame);
@@ -1864,13 +1982,13 @@ void render_thread() {
                         frames = without = found = gaps = 0;
                     }
                 }
-                {   // (the panel's Relearn: the presenter's scores start over too - kept, the add-on was handed the same point
-                    // again a second later, EDF6 2026-11-24. The add-on's own drops keep them: see hud_learn.cpp)
-                    static std::uint32_t relearn_seen = settings.hud_relearn;
-                    if (settings.hud_relearn != relearn_seen) {
-                        relearn_seen = settings.hud_relearn;
+                {   // (the panel's Relearn - or the test bench's: the presenter's scores start over too - kept, the add-on was handed
+                    // the same point again a second later, EDF6 2026-11-24. The add-on's own drops keep them: see hud_learn.cpp)
+                    static std::uint32_t relearn_seen = settings.hud_relearn + sh.presenter.bench_relearn;
+                    if (settings.hud_relearn + sh.presenter.bench_relearn != relearn_seen) {
+                        relearn_seen = settings.hud_relearn + sh.presenter.bench_relearn;
                         renderer.hud_learn_forget();
-                        logf("HUD learning: Relearn - the candidates' scores, points set aside and the point in use forgotten");
+                        logf("HUD: Relearn - everything learned of the game's HUD forgotten (candidates, layer check, colour fit, detected map)");
                     }
                 }
                 renderer.set_probe_csv(rec(g_app.csv_probe));  // (diagnostics: every probed frame - see hud_learn_rules.hpp)
@@ -2504,7 +2622,8 @@ void render_thread() {
         g_app.model.configure(ps);
         CURSORINFO cursor{sizeof(cursor)};
         const bool cursor_visible = GetCursorInfo(&cursor) && (cursor.flags & CURSOR_SHOWING);
-        g_app.model.set_mouse_gate(!cursor_visible);
+        // (TestBench, the test game's script driving the mouse: the cursor is the user's, working in another window - not a menu)
+        g_app.model.set_mouse_gate(!cursor_visible || g_bench_input_owned.load(std::memory_order_relaxed));
         if (settings.reset_calibration != last_reset) {
             last_reset = settings.reset_calibration;
             g_app.model.reset_fit();
@@ -2621,6 +2740,8 @@ void render_thread() {
         const double now = now_seconds();
         bool warped = false;
         bool unmoved = false;  // own engine: the displayed camera is the frame's own, the frame is shown as it is
+        double bench_held_back = 0;  // (TestBench: what this refresh drew moving things for)
+        bool bench_held_between = false, bench_objects_between = false;
         Prediction applied{};
         // FrameWarp's own warp engine when chosen, or when Latewarp is not available.
         const bool own_engine = settings.warp_engine == 1 || !latewarp.ready();
@@ -2808,6 +2929,7 @@ void render_thread() {
                 const bool held_between = generated < 0 && !dev_off(settings, kDevCarried | kDevBetween) &&  // (the feature test: either category off)
                                           (motion_ref_between || !g_app.model.orbited_within(g_app.model.source_time(), 10.0));
                 renderer.set_held_between(held_between, float(held_back));
+                bench_held_back = held_back; bench_held_between = held_between;
                 // (Settings::object_interp, A/B: what moves on its own at that moment too - Renderer::set_objects_between. The camera
                 // still, the frame is no longer shown as it is while that moment lies before it: what moves in it is drawn at
                 // every refresh - whether anything in the frame does move is not known here, so every such refresh is warped)
@@ -2815,6 +2937,7 @@ void render_thread() {
                 // frame between them shifted back as well would step unevenly, and the passes behind it would run for nothing - with it
                 // everything is as before this option existed, the weapon's own shift included)
                 const bool objects_between = settings.object_interp != 0 && settings.follow_share != 0 && !(own_engine_on() && source.generated > 0);
+                bench_objects_between = objects_between;
                 renderer.set_objects_between(objects_between ? int(std::min<std::uint32_t>(settings.object_interp, 2u)) : 0, float(held_back));  // (1 shift, 2 the two frames blended)
                 // (the same for the intake in the game - it has no refresh of its own: see the game-side block, Handoff)
                 sh.handoff.warp_ahead = 0.0f;
@@ -2905,9 +3028,50 @@ void render_thread() {
         const bool as_is = !(warped && !unmoved) && !settings.overlay_debug && !settings.show_mask && g_app.has_frames && !g_rec.busy &&
                            !renderer.fps_counter_dirty();
         const bool same_picture = as_is && shown_frame && as_is_frame == shown_frame && as_is_w == renderer.width() && as_is_h == renderer.height();
+        // (development, TestBench: this refresh's picture copied for the test game's scorer - BenchDoor)
+        const int bench_slot = g_bench.on && !same_picture ? g_bench.arm(g_app.pid, renderer) : -1;
+        const std::int64_t bench_call = qpc_now();
         if (same_picture) renderer.skip_frame(own_engine);
         // (the recording's dot: red while it records, amber while it is written out - see the blit shader)
         else renderer.finish_frame(warped && !unmoved, (settings.overlay_debug ? (warped ? 1 : 2) : 0) | (g_rec.active ? 4 : g_rec.busy ? 8 : 0), paced_last);
+        if (g_bench.on && g_bench.h) {
+            bench::Refresh e{};
+            e.fence_value = bench_slot >= 0 ? g_bench.value : 0;
+            e.slot = bench_slot;
+            e.flags = (warped && !unmoved ? bench::kWarped : 0u) | (same_picture ? bench::kRepeat : 0u) |
+                      (!g_app.visible || !g_app.has_frames ? bench::kNotShown : 0u) | (source_camera.estimated ? bench::kEstimated : 0u) |
+                      (!same_picture && bench_slot < 0 ? bench::kNoCopy : 0u);
+            if (bench_objects_between) e.flags |= bench::kObjectsBetween;
+            if (bench_held_between) e.flags |= bench::kHeldBetween;
+            e.qpc_present_call = bench_call;
+            e.qpc_target_vblank = frame_vblank;
+            e.qpc_camera = planned_camera_t > 0 ? static_cast<std::int64_t>((planned_camera_t + now_ahead) * double(g_qpc_frequency)) : 0;
+            e.source_frame = shown_frame;
+            e.source_qpc_present = g_bench.frame_qpc(shown_frame);
+            const bool aimed = warped && !unmoved;  // (the camera the warp drew for; as it is: the frame's own)
+            const CameraBasis& target = aimed ? applied.camera : source_basis;
+            auto put = [](float* d, const Vec3& v) { d[0] = float(v.x); d[1] = float(v.y); d[2] = float(v.z); };
+            put(e.source_pos, source_basis.pos); put(e.source_right, source_basis.right); put(e.source_up, source_basis.up); put(e.source_fwd, source_basis.fwd);
+            put(e.target_pos, target.pos); put(e.target_right, target.right); put(e.target_up, target.up); put(e.target_fwd, target.fwd);
+            e.frame_interval = float(g_app.model.frame_interval());
+            e.held_back = aimed ? float(bench_held_back) : 0.0f;
+            e.hud_source = sh.presenter.hud_source;
+            e.source_qpc_model = static_cast<std::int64_t>(g_app.model.source_time() * double(g_qpc_frequency));
+            e.model_latency_ms = float(g_app.model.latency() * 1000.0);
+            e.display_ahead_ms = float(now_ahead * 1000.0);
+            e.game_latency_ms = float((g_app.model.latency_median() > 0 ? g_app.model.latency_median() : g_app.model.latency()) * 1000.0);
+            for (int k = 0; k < 2; ++k) {
+                e.model_delay_ms[k] = float(g_app.model.params(k).delay * 1000.0);
+                e.model_tau_ms[k] = float(g_app.model.params(k).tau * 1000.0);
+            }
+            e.auto_mode = std::uint32_t(settings.auto_prediction);
+            const auto ps = renderer.present_stats();
+            e.present_count = ps.last_present_count; e.present_refresh_count = ps.present_refresh; e.sync_refresh_count = ps.sync_refresh; e.sync_qpc = ps.sync_qpc;
+            if (vblank.valid()) g_bench.h->refresh_hz_x1000 = std::uint32_t(double(g_qpc_frequency) / vblank.period * 1000.0);
+            g_bench.h->hud_source = sh.presenter.hud_source;      // (the HUD cycle: where this refresh's HUD came from)
+            sh.presenter.bench_relearn = g_bench.h->hud_relearn;  // (...and its asks to learn the HUD again)
+            g_bench.publish(e);
+        }
         presented_last = !same_picture;
         as_is_frame = as_is ? shown_frame : 0;
         as_is_w = renderer.width(); as_is_h = renderer.height();
@@ -3222,7 +3386,7 @@ void render_thread() {
             const auto &px = g_app.model.params(0), &py = g_app.model.params(1);
             st.gain_x = float(g_app.model.gain(0)); st.gain_y = float(g_app.model.gain(1));
             st.delay_ms = float(px.delay * 1000.0);
-            st.tau_x_ms = float(px.tau * 1000.0); st.tau_y_ms = float(py.tau * 1000.0);
+            st.tau_x_ms = float(std::max(0.0, px.tau) * 1000.0); st.tau_y_ms = float(std::max(0.0, py.tau) * 1000.0);  // (kNoSmoothing shown as 0)
             st.latency_ms = float(g_app.model.latency() * 1000.0);
             st.orbit_cm = float(g_app.model.consistent_orbit());
             st.orbit_in_use = measured_orbit() && g_app.model.orbit() > 0;
@@ -3306,8 +3470,10 @@ void render_thread() {
                 auto changed = [](double a, double b) { return (a == 0) != (b == 0) || (a != 0 && std::fabs(b / a - 1.0) > 0.2); };
                 if (changed(logged[0], px.gain) || changed(logged[1], py.gain) || std::fabs(logged[2] - px.quality) > 0.1 ||
                     std::fabs(logged[3] - py.quality) > 0.1) {
-                    logf("camera model: yaw gain %.4g (quality %.2f, smoothing %.0f ms, delay %.0f ms), pitch gain %.4g (quality %.2f, smoothing %.0f ms, delay %.0f ms)",
-                         px.gain, px.quality, px.tau * 1000.0, px.delay * 1000.0, py.gain, py.quality, py.tau * 1000.0, py.delay * 1000.0);
+                    // (smoothing "none": kNoSmoothing - the camera by the input alone; 0 ms: the previous turn carried on, the input on top)
+                    auto smooth = [](double tau) { char b[24]; if (tau < 0) std::snprintf(b, sizeof(b), "none"); else std::snprintf(b, sizeof(b), "%.0f ms", tau * 1000.0); return std::string(b); };
+                    logf("camera model: yaw gain %.4g (quality %.2f, smoothing %s, delay %.0f ms), pitch gain %.4g (quality %.2f, smoothing %s, delay %.0f ms)",
+                         px.gain, px.quality, smooth(px.tau).c_str(), px.delay * 1000.0, py.gain, py.quality, smooth(py.tau).c_str(), py.delay * 1000.0);
                     logged[0] = px.gain; logged[1] = py.gain; logged[2] = px.quality; logged[3] = py.quality;
                 }
             }
@@ -3442,7 +3608,9 @@ void follow_game_window() {
     const HWND fg = GetForegroundWindow();
     // (development - dev/handoff_e2e, FW_SHOW_UNFOCUSED=1: shown whatever is in front)
     static const bool show_unfocused = GetEnvironmentVariableW(L"FW_SHOW_UNFOCUSED", nullptr, 0) != 0;
-    show = show && (fg == game || fg == g_app.overlay || show_unfocused);
+    // (TestBench - only the XPAR test game has it: shown with the game behind other windows too, from the start - a bench runs in
+    // the background, and a game started by a background batch never gets the focus; click-through and never activated as always)
+    show = show && (fg == game || fg == g_app.overlay || show_unfocused || g_bench.on);
     g_app.visible = show;
     // Never cover the game until we actually have frames to show (avoids a black overlay).
     if (show && g_app.has_frames && !g_app.shadow && !g_app.game_intake) {  // (the shadow intake works while the game is in front, never shown)
@@ -3452,6 +3620,39 @@ void follow_game_window() {
     } else if (IsWindowVisible(g_app.overlay)) {
         ShowWindow(g_app.overlay, SW_HIDE);
     }
+}
+
+void take_mouse(std::int64_t q, long dx, long dy);
+// (TestBench: the test game's scripted mouse moves, from the bench header - see shared/test_bench.hpp; not from Windows)
+void bench_input_thread() {
+    const std::wstring base = L"Local\\XPAR_Bench_" + std::to_wstring(g_app.pid);
+    HANDLE signal = CreateEventW(nullptr, FALSE, FALSE, (base + L"_input").c_str());
+    HANDLE map = nullptr;
+    const bench::Header* h = nullptr;
+    std::int64_t taken = 0;
+    while (g_app.running) {
+        if (signal) WaitForSingleObject(signal, 50); else Sleep(5);
+        if (!h) {
+            map = OpenFileMappingW(FILE_MAP_READ, FALSE, base.c_str());
+            if (map) h = static_cast<const bench::Header*>(MapViewOfFile(map, FILE_MAP_READ, 0, 0, sizeof(bench::Header)));
+            if (!h) continue;
+        }
+        const bool owned = h->input_owner == 1;
+        if (owned != g_bench_input_owned.load()) {
+            g_bench_input_owned = owned;
+            logf(owned ? "test bench: the test game's script drives the mouse (Windows' mouse not taken; shown while the game is behind other windows)"
+                       : "test bench: the mouse from Windows again");
+        }
+        const std::int64_t n = h->mouse_written;
+        if (n - taken > bench::kMouseRing) taken = n - bench::kMouseRing;
+        for (; taken < n; ++taken) {
+            const auto& e = h->mouse[taken % bench::kMouseRing];
+            if (owned) take_mouse(e.qpc, e.dx, e.dy);
+        }
+    }
+    if (h) UnmapViewOfFile(h);
+    if (map) CloseHandle(map);
+    if (signal) CloseHandle(signal);
 }
 
 void take_mouse(std::int64_t q, long dx, long dy) {
@@ -3501,7 +3702,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             UINT size = sizeof(raw);
             if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT, &raw, &size, sizeof(RAWINPUTHEADER)) != UINT(-1) &&
                 raw.header.dwType == RIM_TYPEMOUSE && !(raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) &&
-                (raw.data.mouse.lLastX || raw.data.mouse.lLastY))
+                (raw.data.mouse.lLastX || raw.data.mouse.lLastY) && !g_bench_input_owned.load(std::memory_order_relaxed))
                 take_mouse(qpc_now(), raw.data.mouse.lLastX, raw.data.mouse.lLastY);
             break;  // DefWindowProc must still run for WM_INPUT cleanup
         }
@@ -3712,6 +3913,11 @@ static int presenter_main(HINSTANCE instance, DWORD pid, const std::filesystem::
     else if (!RegisterRawInputDevices(&rid, 1, sizeof(rid))) logf("raw input registration failed");
     SetTimer(g_app.overlay, 1, 100, nullptr);
     follow_game_window();
+    std::thread bench_input;
+    {   // (TestBench - as render_thread reads it; g_bench.on is set there, not started yet)
+        wchar_t v[4]{};
+        if (GetEnvironmentVariableW(L"FW_TESTBENCH", v, 4) && v[0] == L'1') bench_input = std::thread(bench_input_thread);
+    }
 
     std::thread renderer(render_thread);
     SetThreadPriority(renderer.native_handle(), THREAD_PRIORITY_TIME_CRITICAL);
@@ -3725,6 +3931,7 @@ static int presenter_main(HINSTANCE instance, DWORD pid, const std::filesystem::
     renderer.join();
     controller.join();
     if (mouse_reader.joinable()) mouse_reader.join();
+    if (bench_input.joinable()) bench_input.join();
     if (g_app.shared) g_app.shared->presenter.pid = 0;
     logf("exit");
     g_files.stop();

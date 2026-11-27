@@ -493,6 +493,15 @@ public:
     // off, each as before - the "Progressive work" box)
     void set_progressive_exact(bool on) { progressive_exact_ = on; }
     void set_seek_rim(bool on) { seek_rim_ = on; }  // (the continuous warp's rim rule - see ow_seek_rim; the "Progressive work" box)
+    // (development, dev/PLAN_exact_camera_motion.md step 0: XPAR's own motion estimate refined only down to level k - the finer
+    // levels take the coarser one's displacements as they are; 0 = every level, as shipped)
+    void set_flow_stop(int k) { flow_stop_ = k; }
+    // (development, dev key LayerCheckMotion: the game's HUD layer checked where there is no upscaler output to check it against -
+    // by the scenery's motion under it: a HUD stays on the screen, a layer of the 3D picture moves with the scenery. See cs_layer_check)
+    void set_layer_check_motion(bool on) { layer_check_motion_ = on; }
+    // (development, same plan: with XPAR's own motion estimate and the camera known, fill_from_camera gives the scenery the
+    // camera's motion - the estimate's kept where it moves on its own, see cs_camera_fill flag 1)
+    void set_camera_scenery(bool on, float gate_px = 2.0f, bool by_confidence = false) { camera_scenery_ = on; camera_scenery_gate_ = gate_px; camera_scenery_conf_ = by_confidence; }
     void set_flow_light(bool on) { flow_light_ = on; }  // (XPAR's own motion estimate with fewer refinements - see estimate_flow; off by default since 2026-11-25: dev key FlowLight=1)
     void set_tether_by_speed(bool on) { tether_by_speed_ = on; }  // (the blocks by the picture's speed - see own_warp; dev key FieldBlocksBySpeed, =0 off)
     void set_carried_free(bool on) { carried_free_ = on; }  // (dev: carried pixels - share ~0 - not held by the warp)
@@ -558,7 +567,9 @@ public:
     std::uint32_t hud_learn_pick() const;
     std::uint32_t hud_learn_fail() const { return hud_rules_.fail(); }
     const fw::hudlearn::Rules& hud_learn_rules() const { return hud_rules_; }  // (pipeline test)
-    // The panel's Relearn: everything learned about the candidates starts over (scores, points set aside, the point in use).
+    // The panel's Relearn: everything learned about the candidates starts over (scores, points set aside, the point in use) - and
+    // all else learned of the game's HUD, as on a fresh start: the layer's check and trust, its colour fit and blend space, the
+    // detected HUD map (user 2026-11-26: "relearn button should make xpar forget everything as if it was a fresh start").
     void hud_learn_forget();
     void set_probe_csv(std::FILE* f) { probe_csv_ = f; }  // (diagnostics: one row per probed game frame - see hud_learn_rules.hpp)
     // Keep a copy of the previous game frame's colour at each ingest (background for uncovered areas).
@@ -587,6 +598,10 @@ public:
     bool record_motion_samples(const IngestedSource& src, std::uint32_t grid_w, std::uint32_t grid_h);
     bool read_motion_samples(std::vector<float>& out);
     float last_flush_ms() const { return last_flush_ms_; }  // how long sample_motion waited for the GPU
+    DXGI_FORMAT swap_format() const { return swap_format_; }
+    // (development, TestBench: the next presented picture copied into `dest` - a shared texture of the back buffer's size and format -
+    // and `fence` signalled to `value` once it is done; one refresh only)
+    void set_bench_copy(ID3D12Resource* dest, ID3D12Fence* fence, UINT64 value) { bench_dest_ = dest; bench_fence_ = fence; bench_value_ = value; }
     float last_present_call_ms() const { return last_present_call_ms_; }  // how long the last Present call took (CPU)
     std::int64_t last_submit_qpc() const { return last_submit_qpc_; }   // when the last presented frame's work was submitted (as in last_timing)
     ID3D12Resource* no_warp_mask() const {
@@ -673,7 +688,7 @@ private:
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     };
-    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPHudLearned, kPHudTiles, kPWarpClaims, kPStill, kPGrowA, kPGrowB, kPProbe, kPProbeTilesA, kPProbeTilesB, kPShareA, kPShareB, kPShareT, kPShare, kPRetDirtyA, kPRetDirtyB, kPShareT2, kPShareHalf, kPRecColour, kPRecUi, kPShareResid, kPOwnMove, kPPaths, kPShareSeam, kPAttHist, kPMemVis, kPUiTiles, kPWarpBeside, kPWarpHeld, kPLowScene, kPMaskRaw, kPMemF0, kPMemF1, kPMemFZ0, kPMemFZ1, kPGunMove, kPMemRatio, kPMotionProbe, kPMotionGame, kPStencil, kPStenCellsA, kPStenCellsB, kPStenMask, kPStenGrowA, kPStenGrowB, kPStenAge, kPStenLumaA, kPStenLumaB, kPStenElig, kPStenFringeA, kPStenFringeB, kPDepthVA, kPDepthVB, kPMemMask, kPShareSm, kPShareSmA, kPRecOut, kPTetherA, kPTetherB, kPTetherT, kPTetherF, kPTetherP, kPGunFlag, kPOwnT, kPToPrev, kPPrevCol, kPPrevTo, kPFitPart, kPFit, kPTetherRA, kPTetherRB, kPOwnTiles, kPTetherN, kPTetherS, kPProbeFoot, kPCount };
+    enum PrivateId { kPBackbuffer, kPHudless, kPUi, kPDepth, kPMotion, kPZeroUi, kPOutput, kPObject, kPObjKindA, kPObjKindB, kPGen0, kPGen1, kPGen2, kPGenZ0, kPGenZ1, kPGenZ2, kPPrevious, kPHudScore, kPMask, kPScene, kPAttached, kPWorld, kPFill, kPMem0, kPMem1, kPMemZ0, kPMemZ1, kPRampRows, kPRamp, kPWarpMask, kPHudKind, kPStashColor, kPStashDepth, kPStashMotion, kPStashHudless, kPStash2Color, kPStash2Hudless, kPStash2Depth, kPStash2Motion, kPLumaA, kPLumaB, kPFeat, kPFlowA, kPFlowB, kPRetCells, kPRetEncl, kPRetA, kPRetB, kPRetLayer, kPHudLearned, kPHudTiles, kPWarpClaims, kPStill, kPGrowA, kPGrowB, kPProbe, kPProbeTilesA, kPProbeTilesB, kPShareA, kPShareB, kPShareT, kPShare, kPRetDirtyA, kPRetDirtyB, kPShareT2, kPShareHalf, kPRecColour, kPRecUi, kPShareResid, kPOwnMove, kPPaths, kPShareSeam, kPAttHist, kPMemVis, kPUiTiles, kPWarpBeside, kPWarpHeld, kPLowScene, kPMaskRaw, kPMemF0, kPMemF1, kPMemFZ0, kPMemFZ1, kPGunMove, kPMemRatio, kPMotionProbe, kPMotionGame, kPStencil, kPStenCellsA, kPStenCellsB, kPStenMask, kPStenGrowA, kPStenGrowB, kPStenAge, kPStenLumaA, kPStenLumaB, kPStenElig, kPStenFringeA, kPStenFringeB, kPDepthVA, kPDepthVB, kPMemMask, kPShareSm, kPShareSmA, kPRecOut, kPTetherA, kPTetherB, kPTetherT, kPTetherF, kPTetherP, kPGunFlag, kPOwnT, kPToPrev, kPPrevCol, kPPrevTo, kPFitPart, kPFit, kPTetherRA, kPTetherRB, kPOwnTiles, kPTetherN, kPTetherS, kPProbeFoot, kPLayerPrev, kPCount };
 
     // What the warp reads of a frame taken in besides its textures (the intake in the game, step 2a): with split queues
     // the shown frame's, made by the intake and handed over with the set (show_intake, set_split); the single queue reads
@@ -823,6 +838,10 @@ private:
     int flow_luma_ = 0;            // which brightness pyramid holds the previous frame
     bool flow_previous_ = false;   // ...and whether it does (false: no motion this frame)
     bool own_motion_ = false;      // the current frame's motion vectors are XPAR's own (samples: confident ones only)
+    int flow_stop_ = 0;
+    bool camera_scenery_ = false;
+    float camera_scenery_gate_ = 2.0f;
+    bool camera_scenery_conf_ = false;
     bool partial_motion_ = false;  // ...the game's where it drew them, XPAR's own elsewhere (kPMotionGame: the game's as drawn)
     float partial_clear_[2] = {};  // (the game's value where nothing is drawn)
     Rect2 last_depth_rect_{};      // (its depth's valid region)
@@ -845,7 +864,7 @@ private:
     void w_dispatch_indirect(ID3D12PipelineState* pso, const void* constants, const float w[kWConstants], UINT table, ID3D12Resource* args);
     bool ensure_warp_list(UINT ow, UINT oh);
     bool ensure_hud_gate();
-    ComPtr<ID3D12PipelineState> cs_gen_depth_, cs_gen_unui_, cs_hudless_clear_, cs_hudless_count_, cs_hudless_score_, cs_hudless_fill_, cs_layer_hud_, cs_layer_check_clear_, cs_layer_check_, cs_obj_join_init_, cs_obj_join_, cs_obj_join_final_, cs_still_, cs_hold_fill_, cs_grow_init_, cs_grow_clear_, cs_grow_, cs_grow_final_, cs_copy4_;
+    ComPtr<ID3D12PipelineState> cs_gen_depth_, cs_gen_unui_, cs_hudless_clear_, cs_hudless_count_, cs_hudless_score_, cs_hudless_fill_, cs_layer_hud_, cs_layer_check_clear_, cs_layer_check_, cs_layer_keep_, cs_obj_join_init_, cs_obj_join_, cs_obj_join_final_, cs_still_, cs_hold_fill_, cs_grow_init_, cs_grow_clear_, cs_grow_, cs_grow_final_, cs_copy4_;
     bool warp_splat_ = false;  // set_warp_splat
     bool rig_check_ = false;   // set_rig_check
     bool still_reset_ = false; // hold_characters: the score starts over
@@ -944,6 +963,9 @@ private:
     ComPtr<ID3D12Resource> samples_, samples_readback_;
     UINT samples_count_ = 0;
     float last_flush_ms_ = 0;
+    ID3D12Resource* bench_dest_ = nullptr;
+    ID3D12Fence* bench_fence_ = nullptr;
+    UINT64 bench_value_ = 0;
     float last_present_call_ms_ = 0;
     std::int64_t last_submit_qpc_ = 0;
     ComPtr<ID3D12Resource> hud_counts_, hud_readback_, scene_fit_, scene_stamps_readback_, hud_gate_args_;
@@ -1018,6 +1040,8 @@ private:
     bool blend_linear_ = false, layer_linear_ = false;
     int layer_trust_ = 0;
     bool layer_cover_only_[kRing] = {};  // (that readback: the coverage alone - see build_no_warp_mask)
+    bool layer_motion_[kRing] = {};      // ...and checked by the scenery's motion (set_layer_check_motion)
+    bool layer_check_motion_ = false, layer_prev_ok_ = false;  // (development: see set_layer_check_motion; kPLayerPrev: the frame before's layer)
     bool layer_full_ = false;            // ...the latest one read back: 90% of the screen or more
     bool layer_taken_ = false;           // ...one read back with some of it, under 90%: taken as the HUD, unchecked
     bool layer_learned_ = false;         // the last layer was the add-on's learned HUD point's (its absence: no word on the HUD)

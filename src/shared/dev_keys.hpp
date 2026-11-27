@@ -37,6 +37,18 @@ inline constexpr DevKey kDevKeys[] = {
     // the synthetic scenes without game vectors (orbit_est, 30 fps: a pillar's edge ~25 px off). Both still need "Progressive work" ticked)
     {"FieldBlocksBySpeed", "FW_TETHER_SPEED", L"FW_TETHER_SPEED", '1', true},
     {"FlowLight", "FW_FLOW_LIGHT", L"FW_FLOW_LIGHT", '1', false},
+    // (2026-11-25, dev/PLAN_exact_camera_motion.md step 1: with XPAR's own motion estimate and the game's camera found, the scenery's
+    // motion from that camera and depth - the estimate kept where it is 2 render px or more off it. On by default since 2026-11-25 (fine in
+    // EDF6): CameraScenery=0 turns it off)
+    {"CameraScenery", "FW_CAMERA_SCENERY", L"FW_CAMERA_SCENERY", '1', true},
+    // (2026-11-25: the game's HUD layer checked by the scenery's motion where there is no upscaler output - Renderer::set_layer_check_motion)
+    {"LayerCheckMotion", "FW_LAYER_MOTION", L"FW_LAYER_MOTION", '1', false},
+    // (2026-11-25: the fourth HUD pattern on Direct3D 11 - the HUD drawn straight onto the back buffer after the picture, a HUD-less copy
+    // before it; ui_layer.cpp, dev/PLAN_d3d11_fourth_pattern.md. On by default since 2026-11-25 (Metro: its HUD 3.7 -> 0.1 ms):
+    // D3D11BackBufferHud=0 turns it off)
+    {"D3D11BackBufferHud", "FW_D3D11_BB_HUD", L"FW_D3D11_BB_HUD", '1', true},
+    // (2026-11-25: every refresh handed to the XPAR test game's scorer - BenchDoor in main.cpp, src/shared/test_bench.hpp, dev/testgame)
+    {"TestBench", "FW_TESTBENCH", L"FW_TESTBENCH", '1', false},
     {"ContinuousWarp", "FW_TETHER", L"FW_TETHER", '1', true},  // (on by default since 2026-11-07: ContinuousWarp=0 brings back the old holding - Renderer::set_tether)  // (the character from the game's stencil - Renderer::stencil_character)  // (the depth's stencil, every 60th frame - see Producer::stencil_dump)
 };
 

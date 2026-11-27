@@ -42,4 +42,8 @@ void init(std::function<void(std::uint64_t, std::uint32_t, std::uint64_t, bool)>
 void shutdown();
 // Every present of the game's swapchain: its back buffers and size; one frame ends.
 void on_present(reshade::api::swapchain* chain);
+// Relearn (the panel's, or the test bench's): everything learned about how the game draws its HUD forgotten - the patterns seen,
+// the final pictures, the layers known over frames - as on a fresh start (user 2026-11-26: "relearn button should make xpar forget
+// everything as if it was a fresh start"; a game draws its HUD one way, so nothing is forgotten on its own).
+void forget();
 }

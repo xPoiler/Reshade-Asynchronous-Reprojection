@@ -10,6 +10,8 @@ bool streamline_loaded();
 bool streamline_camera_recent();
 // ...and depth within the last second (some games tag depth and motion vectors only while DLSS is on).
 bool streamline_depth_recent();
+// The game's Streamline constants carried no camera (sl::INVALID_FLOAT) within the last second.
+bool streamline_no_camera_recent();
 // The frame of the newest Streamline camera data.
 std::uint64_t streamline_current_frame();
 // Asks Streamline which features are loaded (results go to HookStats). Call from the present thread.

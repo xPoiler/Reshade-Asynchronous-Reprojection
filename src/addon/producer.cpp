@@ -2384,17 +2384,19 @@ void Producer::on_tag_d3d11(std::uint64_t frame, Tex kind, ID3D11Resource* sourc
     D3D11_TEXTURE2D_DESC sd{};
     texture->GetDesc(&sd);
     if (sd.SampleDesc.Count != 1) return;
-    // A depth in a depth format (DLSS's in Baldur's Gate 3: R24G8): its area that holds the frame, as R32F (see d11_depth_view).
+    // A depth in a depth format (DLSS's in Baldur's Gate 3: R24G8): as R32F (see d11_depth_view), the area that holds the frame. With the
+    // frame at an offset (a Streamline game's extent), the whole texture and the area kept as the extent: the motion vectors tagged with
+    // the same extent come at the texture's size, and the presenter takes depth and vectors of one size as one grid.
     if (const DXGI_FORMAT view = kind == kDepth ? d11_depth_view(sd.Format) : DXGI_FORMAT_UNKNOWN; view != DXGI_FORMAT_UNKNOWN) {
         if (!ext_w || !ext_h) { ext_x = ext_y = 0; ext_w = sd.Width; ext_h = sd.Height; }
-        if (ext_x || ext_y || ext_x + ext_w > sd.Width || ext_y + ext_h > sd.Height || !(sd.BindFlags & D3D11_BIND_SHADER_RESOURCE) ||
-            !d11_depth_to_r32(context, source, view, ext_w, ext_h)) {
+        if (ext_x + ext_w > sd.Width || ext_y + ext_h > sd.Height || !(sd.BindFlags & D3D11_BIND_SHADER_RESOURCE) ||
+            !d11_depth_to_r32(context, source, view, ext_x || ext_y ? sd.Width : ext_w, ext_x || ext_y ? sd.Height : ext_h)) {
             ++shared_->hooks.copies_failed;
             return;
         }
         source = d11_depth_r32_.Get();
         d11_depth_r32_->GetDesc(&sd);
-        ext_w = ext_h = 0;  // (the whole of the copy)
+        if (!ext_x && !ext_y) ext_w = ext_h = 0;  // (the whole of the copy)
     }
     const int slot = slot_for_frame(frame, true);
     if (slot < 0) return;

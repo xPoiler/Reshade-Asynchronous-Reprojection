@@ -271,6 +271,9 @@ struct PresenterStatus {
     float reshade_gpu_ms;
     volatile LONG64 reshade_drawn_qpc;
     char reshade_note[160];
+    // (development, TestBench: the XPAR test game asks HUD learning to start again - its HUD cycle switches how the HUD is drawn;
+    // added to the panel's Relearn counter by the add-on)
+    std::uint32_t bench_relearn;
 };
 
 struct HookStats {

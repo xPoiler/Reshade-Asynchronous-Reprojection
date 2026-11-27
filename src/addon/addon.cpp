@@ -270,6 +270,11 @@ void launch_presenter() {
         if (GetEnvironmentVariableW(key.wenv, v, 2) == 1) env_args += L" --env " + std::wstring(key.wenv) + L"=" + v;
     }
     if (g_producer && g_producer->shared() && g_producer->shared()->settings.record_diagnostics) env_args += L" --env FW_DIAG=1";
+    {  // (development, FW_DEV_OFF=<bits>: the Feature test's categories off from the start - the presenter's apply_feature_test)
+        wchar_t v[16] = {};
+        const DWORD n = GetEnvironmentVariableW(L"FW_DEV_OFF", v, 16);
+        if (n > 0 && n < 16) env_args += L" --env FW_DEV_OFF=" + std::wstring(v);
+    }
     fw::register_stencil_dump_events();  // (StencilDump/StencilMask: hooked only when one is on - see reshade_feed.cpp)
     DWORD error = ERROR_FILE_NOT_FOUND;
     for (const auto& path : candidates) {
@@ -1025,9 +1030,20 @@ void on_present(command_queue* queue, swapchain* chain, const rect*, const rect*
             // presenter. Returnal with DLSS FG: candidates tried for nothing, copies taken every frame. A learned point is kept.)
             // (and while the ReShade menu is open: it is drawn on the picture the comparison reads, and taken for HUD - EDF6's saved
             // point dropped when the menu was opened and closed while turning)
+            {   // (Relearn: also what was found of how the game draws its HUD - hud_learn drops its point itself)
+                static std::uint32_t relearn_seen = 0;
+                const std::uint32_t relearn = sh.settings.hud_relearn + sh.presenter.bench_relearn;
+                if (relearn != relearn_seen) {
+                    relearn_seen = relearn;
+                    fw::ui_layer::forget();
+                    g_producer->forget_hud();
+                    fw::diag_log(reshade::log::level::info, "XPAR: Relearn - how the game draws its HUD forgotten, found again as on a fresh start");
+                }
+            }
             fw::hud_learn::on_present(chain, fw::hud_learn_on(sh.settings), g_producer->game_gives_hud() || g_producer->generation_active() || sh.overlay_open != 0,
                                       sh.presenter.hud_learn_pick,
-                                      sh.presenter.hud_learn_fail, sh.settings.hud_relearn, sh.presents_without_frame < 3);  // (3: as the presenter's "has frames")
+                                      sh.presenter.hud_learn_fail, sh.settings.hud_relearn + sh.presenter.bench_relearn,
+                                      sh.presents_without_frame < 3);  // (3: as the presenter's "has frames")
         }
         const auto learn = fw::hud_learn::status();
         g_producer->shared()->hooks.learn_candidates = learn.candidates;

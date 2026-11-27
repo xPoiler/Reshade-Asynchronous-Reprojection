@@ -1,4 +1,5 @@
 #include "addon/ui_layer.hpp"
+#include "addon/fourth_pattern.hpp"
 #include <reshade.hpp>
 #include <algorithm>
 #include <atomic>
@@ -35,6 +36,11 @@ bool g_triggered = false;              // a frame's end was seen since the last 
 struct Bound { std::uint64_t res = 0; bool depth = false; };
 std::unordered_map<std::uint64_t, Bound> g_rt;
 std::unordered_map<std::uint64_t, std::uint8_t> g_blend, g_bound_blend;
+// Fourth pattern on Direct3D 11 (development key D3D11BackBufferHud - dev/PLAN_d3d11_fourth_pattern.md): the pixel shader bound on
+// each context, each back buffer's steps this frame, and whether the third pattern confirmed a copy of its own this frame
+std::unordered_map<std::uint64_t, std::uint64_t> g_bound_ps;
+std::unordered_map<std::uint64_t, fw::fourth::State> g_bb11;
+bool g_bb11_on = true, g_bb11_logged = false, g_third_frame = false;
 std::unordered_set<std::uint64_t> g_overwritten;
 std::uint64_t g_logged_before = 0;
 std::uint64_t g_hud_picture = 0;  // the picture the HUD was last seen drawn into (third pattern)
@@ -519,6 +525,10 @@ void on_bind_pipeline(command_list* cmd, pipeline_stage stages, pipeline p) {
         tl_pipeline = p.handle;
         return;
     }
+    if (g_api == device_api::d3d11 && cmd && (static_cast<uint32_t>(stages) & static_cast<uint32_t>(pipeline_stage::pixel_shader))) {
+        std::lock_guard<std::mutex> lock(g_mutex);  // (fourth pattern on Direct3D 11: what draws - see fourth_pattern.hpp)
+        g_bound_ps[cmd->get_native()] = p.handle;
+    }
     if (g_api != device_api::d3d11 || !cmd || !(static_cast<uint32_t>(stages) & static_cast<uint32_t>(pipeline_stage::output_merger))) return;
     std::lock_guard<std::mutex> lock(g_mutex);
     const auto it = g_blend.find(p.handle);
@@ -672,6 +682,33 @@ void drawn(command_list* cmd) {
     }
     if (g_api != device_api::d3d11 || !cmd) return;
     if (drawn_final_d3d11(cmd)) return;
+    if (g_bb11_on) {  // (fourth pattern on Direct3D 11: the HUD drawn straight onto the back buffer - see fourth_pattern.hpp)
+        std::uint64_t bb = 0;
+        fw::fourth::Act act = fw::fourth::Act::None;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            const auto rt = g_rt.find(cmd->get_native());
+            if (rt != g_rt.end() && rt->second.res && !rt->second.depth && is_back_buffer(rt->second.res) && !g_third_frame) {
+                bb = rt->second.res;
+                const auto b = g_bound_blend.find(cmd->get_native());
+                const std::uint8_t blend = b != g_bound_blend.end() ? b->second : 0;
+                const auto ps = g_bound_ps.find(cmd->get_native());
+                act = fw::fourth::step(g_bb11[bb], blend == 0, blend == 1, ps != g_bound_ps.end() ? ps->second : 0);
+            }
+        }
+        if (act != fw::fourth::Act::None && g_take_before) {
+            if (act == fw::fourth::Act::Take) {
+                if (!g_bb11_logged) {
+                    g_bb11_logged = true;
+                    fw::diag_log(reshade::log::level::info, "XPAR: the game draws its HUD straight onto the back buffer after the picture (Direct3D 11) - a HUD-less copy taken before it");
+                }
+                g_take_before(bb, 0, cmd->get_native());  // (the copy, before this draw)
+                g_take_before(bb, 2, cmd->get_native());  // (confirmed: it is the picture on the screen)
+            } else {
+                g_take_before(bb, 3, cmd->get_native());
+            }
+        }
+    }
     std::uint64_t picture = 0, given_up = 0;
     std::uint32_t kind = 0;
     {
@@ -685,6 +722,7 @@ void drawn(command_list* cmd) {
                 g_took = 0;
                 if (!reads(cmd, picture)) return;
                 kind = 2;
+                g_third_frame = true;  // (the third pattern's own copy this frame: the fourth stands aside)
                 g_hud_picture = picture;
                 if (picture != g_logged_before) {
                     g_logged_before = picture;
@@ -766,6 +804,17 @@ void init(std::function<void(std::uint64_t, std::uint32_t, std::uint64_t, bool)>
     reshade::register_event<reshade::addon_event::end_render_pass>(on_end_pass);
     reshade::register_event<reshade::addon_event::reset_command_list>(on_reset);
 }
+void forget() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_vk_finished = 0; g_vk_layer_frame = false;
+    g_bb11.clear(); g_third_frame = false; g_overwritten.clear(); g_hud_picture = 0; g_took = 0; g_given_up.clear();
+    g_bb_step.clear(); g_bb_picture_pipeline.clear(); g_bb_seen = false;
+    g_cleared.clear(); g_inverted.clear(); g_inverted_draws.clear(); g_inverted_seen.clear(); g_multi.clear(); g_inverted_state.clear();
+    g_with_depth.clear(); g_order = 0; g_taken = false; g_end_pending = false; g_pending_presents = 0;
+    g_states.clear(); g_last_state.clear(); g_finals.clear(); g_rt_bound.clear();
+    g_logged = 0; g_logged_finals = 0; g_logged_before = 0;
+}
+
 void shutdown() {
     reshade::unregister_event<reshade::addon_event::reset_command_list>(on_reset);
     reshade::unregister_event<reshade::addon_event::destroy_resource>(on_destroy_resource);
@@ -808,6 +857,12 @@ void on_present(swapchain* chain) {
     g_overwritten.clear();
     g_took = 0;
     g_given_up.clear();
+    g_bb11.clear();
+    g_third_frame = false;
+    if (g_presents % 300 == 0) {  // (dev key D3D11BackBufferHud: on unless =0)
+        wchar_t v[4]{};
+        g_bb11_on = !(GetEnvironmentVariableW(L"FW_D3D11_BB_HUD", v, 4) && v[0] == L'0');
+    }
     g_vk_finished = 0;
     g_vk_layer_frame = false;
     if (g_end_pending && ++g_pending_presents >= 2) {  // (never made readable: not taken)
