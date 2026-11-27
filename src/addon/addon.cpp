@@ -1181,7 +1181,7 @@ void hint(const char* text, const char* why) {
 struct HiddenFromUi {
     bool rotation_extrapolation = true;
     bool auto_latency = false;
-    bool edge_limit = false;            // (Auto latency "camera as of now")
+    bool edge_limit = false;            // (Auto latency 5, "Newest camera input possible")
     bool latency_smoothness = true;     // (the manual latency slider, Auto latency off)
     bool floor_release = true;
     bool max_extrapolation = true;
@@ -1209,6 +1209,8 @@ struct HiddenFromUi {
     bool fill_behind_hud = true;
     bool force_borderless = false;
     bool invert_warp = true;
+    bool even_pacing = true;            // (controller; on by default)
+    bool whole_pixels = true;           // (XPAR engine; on by default)
 };
 constexpr HiddenFromUi kHiddenFromUi;
 bool shown_in_ui(bool hidden) {
@@ -1398,32 +1400,36 @@ void draw_overlay(effect_runtime*) {
             reshade::set_config_value(nullptr, "FrameWarp", "Controller", controller ? "1" : "0");
         }
         bool even = s.even_pacing != 0;
+        if (shown_in_ui(kHiddenFromUi.even_pacing)) {
         if (ImGui::Checkbox("Even pacing (controller)", &even)) s.even_pacing = even;
         hint("While the right stick turns the camera, the turn shown follows the stick, matched to the game's camera over its "
              "last frames, instead of when each game frame arrived: even at any frame rate, also in games whose frames carry "
              "uneven game time (fixed simulation steps). Off: the turn between game frames, as they came. The mouse is "
              "unaffected either way.");
+        }
         if (shown_in_ui(kHiddenFromUi.rotation_extrapolation)) ImGui::SliderFloat("Rotation extrapolation", &s.rotation_extrapolation, 0.0f, 1.0f);
         static const char* const kAutoModes[] = {"Off (manual slider)", "Auto (1/2, 1/4 without HUD layers, 1 without DLSS/FSR)", "1 game frame", "1/2 game frame",
-                                                 "1/4 game frame", "Camera as of now (edge-limited)", "Lowest latency without edge fill (default)",
-                                                 "XPAR adds no latency"};
+                                                 "1/4 game frame", "Newest camera input possible (worse artifacts)",
+                                                 "Balanced mode (clean edges, default)", "No latency added or removed by XPAR"};
         static const std::uint32_t kAutoValues[] = {0, 3, 1, 2, 4, 5, 6, 7};
         int auto_index = 0;
         for (int i = 0; i < 8; ++i) if (kAutoValues[i] == s.auto_prediction) auto_index = i;
         if (shown_in_ui(kHiddenFromUi.auto_latency)) {
         if (ImGui::Combo("Auto latency", &auto_index, kAutoModes, 8)) s.auto_prediction = kAutoValues[auto_index];
         hint("How far behind the newest camera the view is shown. Auto: between the game's last frames (smoothest). "
-             "Camera as of now: the lowest latency - the mouse up to this moment - held back only as far as needed to keep "
-             "what a fast turn uncovers at the screen's edge under the limit below. Lowest latency without edge fill: the "
-             "camera as of now whenever that shows nothing the game has not rendered, down to one game frame back during "
-             "fast turns (what the warp reveals then comes from the game's last frames: keep Background memory on). XPAR adds no "
-             "latency: the turn exactly as old as the game's own frames are when they are done - the XPAR row under the frame "
+             "Newest camera input possible: the lowest latency - your mouse or stick input up to this moment, always (No edge limit, on by "
+             "default) - at the cost of more artifacts: a fast turn uncovers more at the screen's edge and widens what the warp "
+             "has to bend beside the character or weapon. Balanced mode: your mouse or stick input up to this moment whenever that shows "
+             "nothing the game has not rendered, down to one game frame back during fast turns, so the screen's edges stay "
+             "clean (what the warp reveals then comes from the game's last frames: keep Background memory on). No latency "
+             "added or removed by XPAR: the turn exactly as old as the game's own frames are when they are done - the XPAR row under the frame "
              "counter at 0 - while turning and while the frame time swings; in fast turns the screen's edge needs the edge fill.");
         }
         if (s.auto_prediction == 5 && shown_in_ui(kHiddenFromUi.edge_limit)) {
             bool unlimited = s.edge_unlimited != 0;
             if (ImGui::Checkbox("No edge limit", &unlimited)) s.edge_unlimited = unlimited;
-            hint("Always the camera as of now, however much a fast turn uncovers at the screen's edge.");
+            hint("On (default): always your mouse or stick input up to this moment, however much a fast turn uncovers at the screen's edge. "
+                 "Off: held back as far as the limit below needs.");
             if (unlimited) ImGui::BeginDisabled();
             ImGui::SliderFloat("Extra uncovered edge (% of width)", &s.edge_limit_pct, 0.0f, 25.0f, "%.1f");
             if (unlimited) ImGui::EndDisabled();
@@ -1613,7 +1619,7 @@ void draw_overlay(effect_runtime*) {
                  "edge (sharper close to it, streaks further out); dithered shows the game's frame as it is there, mixed into "
                  "the warped picture in a fine pattern near the edge - noisy, not smeared. Remembered per game.", why_engine);
         }
-        {
+        if (shown_in_ui(kHiddenFromUi.whole_pixels)) {
             ImGui::BeginDisabled(why_engine != nullptr);
             bool whole = s.whole_pixels != 0;
             if (ImGui::Checkbox("Whole pixels (XPAR engine)", &whole)) s.whole_pixels = whole;

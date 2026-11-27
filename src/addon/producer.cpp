@@ -50,6 +50,7 @@ void default_settings(Settings& s) {
     s.hud_learn = 1;  // learn where the game draws its HUD
     s.follow_share = 1;  // the character/weapon by the share of the turn it follows
     s.share_from_input = 1;  // ...of the turn the input explains
+    s.edge_unlimited = 1;  // Auto latency 5 ("Newest camera input possible"): always the input up to now, no edge limit (user 2026-11-27)
     s.edge_limit_pct = 0.0f;  // camera as of now: no more of the edge uncovered than Auto's
     s.edge_fill = 2;  // dithered (the frame as it is past the edge, a dithered band inside it - user, 2026-10-21); soft and extended edge pixels are the options
     s.no_warp_mask = 1;   // HUD detection in games without HUD layers
@@ -68,7 +69,7 @@ void default_settings(Settings& s) {
     s.memory_resolution = 2;  // (the background memory at a quarter of the picture's resolution: with the continuous warp it fills only
                               // the screen edges and behind the HUD - no difference seen against 1/2 or full, Requiem; full ~16x the video memory)
     s.hud_from_scene = 2;  // HUD from the upscaler's output + camera-motion check (learned HUD without an upscaler output)
-    s.auto_prediction = 6;     // default: the lowest latency without edge fill (now .. one game frame back); 3: Auto - 1/2 game frame, 1/4 in games
+    s.auto_prediction = 6;     // default: Balanced mode (clean edges) - now .. one game frame back; 3: Auto - 1/2 game frame, 1/4 in games
                                // without HUD layers (shorter warps hide mask misses), 1 without DLSS/FSR (XPAR's own motion); 1: full, 2: half, 4: quarter
     s.manual_gain_x = s.manual_gain_y = 0.0f; s.manual_delay_ms = 0.0f;
     s.use_controller = 1;  // the right stick drives rotation too

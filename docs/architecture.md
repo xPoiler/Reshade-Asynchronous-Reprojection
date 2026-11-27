@@ -68,7 +68,7 @@ Defaults come from `default_settings` in [producer.cpp](../src/addon/producer.cp
 | Follow share | On; input-driven and other camera motion are distinguished. |
 | Background memory | On, at 1/4 of the picture's width and height. |
 | Uncovered screen edges | Dithered. |
-| Camera latency | Lowest latency without edge fill (`auto_prediction = 6`). |
+| Camera latency | Balanced mode (clean edges) (`auto_prediction = 6`). |
 | Present lead | Automatic; 6 ms is the manual setting's initial value. |
 | Detailed diagnostics | Off unless enabled or forced by a developer override. |
 
